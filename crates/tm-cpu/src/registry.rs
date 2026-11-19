@@ -32,7 +32,11 @@ const GENERIC_TABLE: KernelTable = KernelTable {
 #[cfg(target_arch = "aarch64")]
 mod aarch64_wrappers {
     use super::*;
-    use crate::aarch64::{dotprod, i8mm, neon_v80};
+    #[cfg(feature = "dotprod")]
+    use crate::aarch64::dotprod;
+    #[cfg(feature = "i8mm")]
+    use crate::aarch64::i8mm;
+    use crate::aarch64::neon_v80;
 
     fn neon_v80_vec_dot(x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
         // SAFETY: `NEON_V80_TABLE` is only selected when NEON is supported (always on aarch64).
@@ -62,11 +66,13 @@ mod aarch64_wrappers {
         unsafe { neon_v80::gemm_q4_0_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
     }
 
+    #[cfg(feature = "dotprod")]
     fn dotprod_vec_dot(x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
         // SAFETY: `DOTPROD_TABLE` is only selected after runtime `dotprod` detection.
         unsafe { dotprod::vec_dot_q4_0_q8_0(x, y) }
     }
 
+    #[cfg(feature = "dotprod")]
     fn dotprod_gemv(
         w: &[BlockQ4_0],
         x: &[BlockQ8_0],
@@ -78,6 +84,7 @@ mod aarch64_wrappers {
         unsafe { dotprod::gemv_q4_0_q8_0(w, x, out, rows, cols_blocks) }
     }
 
+    #[cfg(feature = "dotprod")]
     fn dotprod_gemm(
         w: &[BlockQ4_0],
         x: &[BlockQ8_0],
@@ -90,6 +97,7 @@ mod aarch64_wrappers {
         unsafe { dotprod::gemm_q4_0_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
     }
 
+    #[cfg(feature = "i8mm")]
     fn i8mm_gemm(
         w: &[BlockQ4_0],
         x: &[BlockQ8_0],
@@ -109,6 +117,7 @@ mod aarch64_wrappers {
         gemm_q4_0_q8_0: neon_v80_gemm,
     };
 
+    #[cfg(feature = "dotprod")]
     pub const DOTPROD_TABLE: KernelTable = KernelTable {
         isa: Isa::NeonDotprod,
         vec_dot_q4_0_q8_0: dotprod_vec_dot,
@@ -116,6 +125,7 @@ mod aarch64_wrappers {
         gemm_q4_0_q8_0: dotprod_gemm,
     };
 
+    #[cfg(feature = "i8mm")]
     pub const I8MM_TABLE: KernelTable = KernelTable {
         isa: Isa::NeonI8mm,
         vec_dot_q4_0_q8_0: dotprod_vec_dot,
@@ -124,8 +134,8 @@ mod aarch64_wrappers {
     };
 }
 
-/// Selects the kernel table for a requested `Isa`, falling back to `Generic`
-/// if the target CPU does not support it or no specialized kernel exists yet.
+/// Selects the kernel table for a requested `Isa`, falling back to the widest
+/// compiled tier if the target CPU or feature set does not include it.
 pub fn select_kernels(isa: Isa) -> &'static KernelTable {
     let caps = detect_caps();
     if !isa_supported(isa, caps) {
@@ -136,10 +146,20 @@ pub fn select_kernels(isa: Isa) -> &'static KernelTable {
         Isa::Generic => &GENERIC_TABLE,
         #[cfg(target_arch = "aarch64")]
         Isa::NeonV80 => &aarch64_wrappers::NEON_V80_TABLE,
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", feature = "dotprod"))]
         Isa::NeonDotprod => &aarch64_wrappers::DOTPROD_TABLE,
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", not(feature = "dotprod")))]
+        Isa::NeonDotprod => &aarch64_wrappers::NEON_V80_TABLE,
+        #[cfg(all(target_arch = "aarch64", feature = "i8mm"))]
         Isa::NeonI8mm => &aarch64_wrappers::I8MM_TABLE,
+        #[cfg(all(target_arch = "aarch64", not(feature = "i8mm"), feature = "dotprod"))]
+        Isa::NeonI8mm => &aarch64_wrappers::DOTPROD_TABLE,
+        #[cfg(all(
+            target_arch = "aarch64",
+            not(feature = "i8mm"),
+            not(feature = "dotprod")
+        ))]
+        Isa::NeonI8mm => &aarch64_wrappers::NEON_V80_TABLE,
         _ => &GENERIC_TABLE,
     }
 }

@@ -4,6 +4,7 @@
 //! Per `AGENTS.md` rule #1, unstable ISA instructions (`i8mm`, `fp16` arithmetic,
 //! `sme`) live exclusively in this module using `core::arch::asm!`.
 
+#[cfg(feature = "i8mm")]
 use core::arch::aarch64::{int8x16_t, int32x4_t};
 use core::arch::asm;
 
@@ -14,6 +15,7 @@ use core::arch::asm;
 ///
 /// # Safety
 /// Caller must guarantee the CPU supports the `i8mm` feature.
+#[cfg(feature = "i8mm")]
 #[target_feature(enable = "i8mm")]
 #[inline]
 pub unsafe fn vmmlaq_s32(mut acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
@@ -31,18 +33,19 @@ pub unsafe fn vmmlaq_s32(mut acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int3
     acc
 }
 
-/// Hardware IEEE 754 binary16 (`u16`) -> `f32` conversion via base ARMv8.0 `fcvt s, h`.
+/// Hardware IEEE 754 binary16 (`u16`) -> `f32` conversion via base ARMv8.0 `ins` + `fcvt s, h`.
 ///
-/// Base ARMv8.0-A guarantees FP16 storage conversion (`fcvt s, h`), including on
-/// Cortex-A53 (Pi Zero 2W), Cortex-A76 (Pi 5), and Apple Silicon.
+/// Both `ins v.h[0], w` and `fcvt s, h` are mandatory base ARMv8.0-A instructions
+/// (unlike `fmov h, w` which requires `fullfp16`), so this works on Cortex-A53
+/// (Pi Zero 2W), Cortex-A72 (Pi 4), Cortex-A76 (Pi 5), and Apple Silicon.
 #[inline(always)]
 pub fn f16_to_f32_hw(bits: u16) -> f32 {
     let out: f32;
-    // SAFETY: `fmov h, w` + `fcvt s, h` are mandatory base ARMv8.0 FP instructions
+    // SAFETY: `ins v.h[0], w` + `fcvt s, h` are mandatory base ARMv8.0 NEON/FP instructions
     // operating purely on registers with no memory access.
     unsafe {
         asm!(
-            "fmov {tmp:h}, {inp:w}",
+            "ins {tmp:v}.h[0], {inp:w}",
             "fcvt {out:s}, {tmp:h}",
             inp = in(reg) bits as u32,
             tmp = out(vreg) _,

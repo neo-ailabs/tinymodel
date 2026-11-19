@@ -7,5 +7,14 @@ repository.workspace = true
 rust-version.workspace = true
 description = "CPU compute kernels (generic, aarch64 NEON/dotprod/i8mm, x86_64) and thread pool for tinymodel"
 
+[features]
+default = ["edge"]
+# Micro tier (Pi Zero 2W / Pi 4): ARMv8.0 NEON + generic only, minimal binary size.
+micro = []
+# Edge / Host tier (Pi 5 / phones / Apple Silicon / x86): runtime ISA dispatch across dotprod + i8mm.
+edge = ["dotprod", "i8mm"]
+dotprod = []
+i8mm = ["dotprod"]
+
 [dependencies]
 tm-core = { path = "../tm-core" }
