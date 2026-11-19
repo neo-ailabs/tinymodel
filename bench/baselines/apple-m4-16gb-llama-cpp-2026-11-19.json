@@ -1,0 +1,1217 @@
+{
+  "schema": "tinymodel-m0-baseline",
+  "schema_version": 1,
+  "protocol_id": "tinymodel-m0-v1",
+  "created_at_utc": "2026-11-19T01:54:18.691509+00:00",
+  "device_tag": "apple-m4-16gb",
+  "engine": {
+    "name": "llama.cpp",
+    "commit": "b001d7b",
+    "cpu_cmake_flags": "-DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DGGML_CPU_KLEIDIAI=ON -DGGML_METAL=OFF -DGGML_BLAS=OFF",
+    "metal_cmake_flags": "-DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DGGML_CPU_KLEIDIAI=ON -DGGML_METAL=ON -DGGML_BLAS=ON"
+  },
+  "hardware": {
+    "os": "Darwin",
+    "os_release": "27.2.0",
+    "arch": "arm64",
+    "os_version": "27.2",
+    "cpu_brand": "Apple M4",
+    "ram_bytes": 17179869184,
+    "ncpu": 10,
+    "p_cores": 4,
+    "e_cores": 6,
+    "arm_features": {
+      "FEAT_DotProd": true,
+      "FEAT_I8MM": true,
+      "FEAT_FP16": true,
+      "FEAT_BF16": true,
+      "FEAT_SME": true,
+      "FEAT_SME2": true
+    }
+  },
+  "thermal_initial": {
+    "macos_thermal_state": "nominal"
+  },
+  "thermal_final": {
+    "macos_thermal_state": "nominal"
+  },
+  "stream_bandwidth": [
+    {
+      "threads": 1,
+      "array_mib": 512.0,
+      "Copy_gbs": 83.55,
+      "Scale_gbs": 82.46,
+      "Add_gbs": 89.6,
+      "Triad_gbs": 89.3,
+      "Read_gbs": 53.32
+    },
+    {
+      "threads": 4,
+      "array_mib": 512.0,
+      "Copy_gbs": 100.87,
+      "Scale_gbs": 97.24,
+      "Add_gbs": 93.23,
+      "Triad_gbs": 93.41,
+      "Read_gbs": 78.96
+    },
+    {
+      "threads": 8,
+      "array_mib": 512.0,
+      "Copy_gbs": 95.05,
+      "Scale_gbs": 94.76,
+      "Add_gbs": 92.34,
+      "Triad_gbs": 92.7,
+      "Read_gbs": 102.81
+    },
+    {
+      "threads": 10,
+      "array_mib": 512.0,
+      "Copy_gbs": 93.23,
+      "Scale_gbs": 91.99,
+      "Add_gbs": 92.55,
+      "Triad_gbs": 91.93,
+      "Read_gbs": 106.97
+    }
+  ],
+  "prompt_manifest": {
+    "protocol_id": "tinymodel-m0-v1",
+    "schema_version": 1,
+    "files": {
+      "prompt_medium.txt": {
+        "bytes": 2160,
+        "sha256": "00baeb7d82880c1e01636f777212586e2953cfe114e01ef00e0852c70d720cc3"
+      },
+      "prompt_short.txt": {
+        "bytes": 1605,
+        "sha256": "cd8eae7de951bce7fb11fd7d755856a76cb25f2a75850e6528faaa9fe8944d71"
+      }
+    }
+  },
+  "models": [
+    {
+      "filename": "Llama-3.2-1B-Instruct-Q4_0.gguf",
+      "file_bytes": 773025824,
+      "file_mib": 737.21,
+      "sha256": "66bfbb2d48bdb77cd56bd03ef820deff3c4a74b1a09de3b917ae13e72c1a70c2",
+      "modes": {
+        "cpu_norepack": {
+          "threads": 4,
+          "bench": {
+            "pp512": {
+              "median_tps": 223.61,
+              "avg_tps": 222.32,
+              "stddev_tps": 4.59,
+              "samples_tps": [
+                218.13,
+                216.87,
+                227.02,
+                225.96,
+                223.61
+              ]
+            },
+            "model_size_bytes": 765194368,
+            "model_n_params": 1235814432,
+            "build_commit": "b001d7b",
+            "tg128": {
+              "median_tps": 88.12,
+              "avg_tps": 88.15,
+              "stddev_tps": 0.05,
+              "samples_tps": [
+                88.11,
+                88.15,
+                88.23,
+                88.12,
+                88.11
+              ]
+            },
+            "effective_decode_bw_gbs": 67.43,
+            "stream_read_bw_util_pct": 63.0
+          },
+          "e2e_greedy": {
+            "generated_sha256": "35ed837e3a9e7c71cb2c51fb7cdaa349d95054cf51c05c5f4638bd282c3ba304",
+            "generated_preview": "This paper presents a detailed analysis of the trade-offs between prefill and decode phases, and proposes a hybrid approach that balances the benefits of both",
+            "load_ms": 1289.93,
+            "prompt_eval_ms": 1289.59,
+            "prompt_tokens": 290,
+            "prompt_tps": 224.88,
+            "eval_ms": 479.92,
+            "eval_runs": 39,
+            "eval_tps": 81.26,
+            "max_rss_mib": 901.72,
+            "peak_footprint_mib": 145.83
+          },
+          "thermal": {
+            "macos_thermal_state": "nominal"
+          }
+        },
+        "cpu_kleidiai": {
+          "threads": 4,
+          "bench": {
+            "pp512": {
+              "median_tps": 597.52,
+              "avg_tps": 597.23,
+              "stddev_tps": 0.76,
+              "samples_tps": [
+                597.62,
+                598.13,
+                596.42,
+                597.52,
+                596.44
+              ]
+            },
+            "model_size_bytes": 765194368,
+            "model_n_params": 1235814432,
+            "build_commit": "b001d7b",
+            "tg128": {
+              "median_tps": 84.19,
+              "avg_tps": 84.2,
+              "stddev_tps": 0.2,
+              "samples_tps": [
+                84.1,
+                83.94,
+                84.42,
+                84.38,
+                84.19
+              ]
+            },
+            "effective_decode_bw_gbs": 64.42,
+            "stream_read_bw_util_pct": 60.2
+          },
+          "e2e_greedy": {
+            "generated_sha256": "35ed837e3a9e7c71cb2c51fb7cdaa349d95054cf51c05c5f4638bd282c3ba304",
+            "generated_preview": "This paper presents a detailed analysis of the trade-offs between prefill and decode phases, and proposes a hybrid approach that balances the benefits of both",
+            "load_ms": 485.0,
+            "prompt_eval_ms": 484.65,
+            "prompt_tokens": 290,
+            "prompt_tps": 598.37,
+            "eval_ms": 502.97,
+            "eval_runs": 39,
+            "eval_tps": 77.54,
+            "max_rss_mib": 2662.92,
+            "peak_footprint_mib": 1916.88
+          },
+          "thermal": {
+            "macos_thermal_state": "nominal"
+          }
+        },
+        "metal": {
+          "ngl": 99,
+          "flash_attn": true,
+          "bench": {
+            "pp512": {
+              "median_tps": 1676.72,
+              "avg_tps": 1676.92,
+              "stddev_tps": 0.71,
+              "samples_tps": [
+                1676.24,
+                1676.72,
+                1678.11,
+                1676.57,
+                1676.95
+              ]
+            },
+            "model_size_bytes": 765194368,
+            "model_n_params": 1235814432,
+            "build_commit": "b001d7b",
+            "tg128": {
+              "median_tps": 112.4,
+              "avg_tps": 112.26,
+              "stddev_tps": 0.46,
+              "samples_tps": [
+                112.4,
+                111.57,
+                112.08,
+                112.77,
+                112.49
+              ]
+            },
+            "effective_decode_bw_gbs": 86.01,
+            "stream_read_bw_util_pct": 80.4
+          },
+          "e2e_greedy": {
+            "generated_sha256": "35ed837e3a9e7c71cb2c51fb7cdaa349d95054cf51c05c5f4638bd282c3ba304",
+            "generated_preview": "This paper presents a detailed analysis of the trade-offs between prefill and decode phases, and proposes a hybrid approach that balances the benefits of both",
+            "load_ms": 316.24,
+            "prompt_eval_ms": 315.6,
+            "prompt_tokens": 290,
+            "prompt_tps": 918.87,
+            "eval_ms": 354.07,
+            "eval_runs": 39,
+            "eval_tps": 110.15,
+            "max_rss_mib": 949.69,
+            "peak_footprint_mib": 191.3
+          },
+          "thermal": {
+            "macos_thermal_state": "nominal"
+          }
+        }
+      },
+      "model_size_bytes": 765194368,
+      "model_n_params": 1235814432,
+      "llama_cpp_commit": "b001d7b"
+    },
+    {
+      "filename": "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+      "file_bytes": 807694368,
+      "file_mib": 770.28,
+      "sha256": "3f5a22426976ab26cfe84dba63c1d08391717abb1af893e10f1b2968d862dcc1",
+      "modes": {
+        "cpu_norepack": {
+          "threads": 4,
+          "bench": {
+            "pp512": {
+              "median_tps": 215.22,
+              "avg_tps": 215.15,
+              "stddev_tps": 0.16,
+              "samples_tps": [
+                215.26,
+                214.91,
+                215.29,
+                215.22,
+                215.09
+              ]
+            },
+            "model_size_bytes": 799862912,
+            "model_n_params": 1235814432,
+            "build_commit": "b001d7b",
+            "tg128": {
+              "median_tps": 85.15,
+              "avg_tps": 85.23,
+              "stddev_tps": 0.18,
+              "samples_tps": [
+                85.1,
+                85.23,
+                85.55,
+                85.15,
+                85.14
+              ]
+            },
+            "effective_decode_bw_gbs": 68.11,
+            "stream_read_bw_util_pct": 63.7
+          },
+          "e2e_greedy": {
+            "generated_sha256": "55fa52a3564a621e9f697eb5366deb714bc6881640d5ff56cbc25b8eacee42ab",
+            "generated_preview": "This paper presents a detailed analysis of the trade-offs between prefill and decode phases, and proposes a novel hybrid approach that optimizes both phases fo",
+            "load_ms": 1348.79,
+            "prompt_eval_ms": 1348.44,
+            "prompt_tokens": 290,
+            "prompt_tps": 215.06,
+            "eval_ms": 419.21,
+            "eval_runs": 33,
+            "eval_tps": 78.72,
+            "max_rss_mib": 934.62,
+            "peak_footprint_mib": 145.69
+          },
+          "thermal": {
+            "macos_thermal_state": "nominal"
+          }
+        },
+        "cpu_kleidiai": {
+          "threads": 4,
+          "bench": {
+            "pp512": {
+              "median_tps": 479.2,
+              "avg_tps": 473.62,
+              "stddev_tps": 10.39,
+              "samples_tps": [
+                455.83,
+                472.89,
+                479.88,
+                480.3,
+                479.2
+              ]
+            },
+            "model_size_bytes": 799862912,
+            "model_n_params": 1235814432,
+            "build_commit": "b001d7b",
+            "tg128": {
+              "median_tps": 86.38,
+              "avg_tps": 86.84,
+              "stddev_tps": 1.91,
+              "samples_tps": [
+                88.26,
+                86.38,
+                85.26,
+                84.96,
+                89.35
+              ]
+            },
+            "effective_decode_bw_gbs": 69.09,
+            "stream_read_bw_util_pct": 64.6
+          },
+          "e2e_greedy": {
+            "generated_sha256": "12c6503bcbb39e695cb2dc9af8713ca8bf555596004d3714cc1ac7d5e2b54781",
+            "generated_preview": "This paper presents a detailed analysis of the trade-offs between prefill and decode phases, and proposes a novel hybrid approach that balances the benefits of",
+            "load_ms": 620.38,
+            "prompt_eval_ms": 620.02,
+            "prompt_tokens": 290,
+            "prompt_tps": 467.73,
+            "eval_ms": 383.63,
+            "eval_runs": 31,
+            "eval_tps": 80.81,
+            "max_rss_mib": 2464.39,
+            "peak_footprint_mib": 1685.19
+          },
+          "thermal": {
+            "macos_thermal_state": "nominal"
+          }
+        },
+        "metal": {
+          "ngl": 99,
+          "flash_attn": true,
+          "bench": {
+            "pp512": {
+              "median_tps": 1596.72,
+              "avg_tps": 1596.65,
+              "stddev_tps": 0.68,
+              "samples_tps": [
+                1597.49,
+                1595.75,
+                1596.24,
+                1597.04,
+                1596.72
+              ]
+            },
+            "model_size_bytes": 799862912,
+            "model_n_params": 1235814432,
+            "build_commit": "b001d7b",
+            "tg128": {
+              "median_tps": 107.51,
+              "avg_tps": 107.43,
+              "stddev_tps": 0.13,
+              "samples_tps": [
+                107.55,
+                107.51,
+                107.26,
+                107.33,
+                107.51
+              ]
+            },
+            "effective_decode_bw_gbs": 85.99,
+            "stream_read_bw_util_pct": 80.4
+          },
+          "e2e_greedy": {
+            "generated_sha256": "12c6503bcbb39e695cb2dc9af8713ca8bf555596004d3714cc1ac7d5e2b54781",
+            "generated_preview": "This paper presents a detailed analysis of the trade-offs between prefill and decode phases, and proposes a novel hybrid approach that balances the benefits of",
+            "load_ms": 288.59,
+            "prompt_eval_ms": 288.04,
+            "prompt_tokens": 290,
+            "prompt_tps": 1006.82,
+            "eval_ms": 297.92,
+            "eval_runs": 31,
+            "eval_tps": 104.05,
+            "max_rss_mib": 981.5,
+            "peak_footprint_mib": 190.86
+          },
+          "thermal": {
+            "macos_thermal_state": "nominal"
+          }
+        }
+      },
+      "model_size_bytes": 799862912,
+      "model_n_params": 1235814432,
+      "llama_cpp_commit": "b001d7b"
+    },
+    {
+      "filename": "Qwen3.5-0.8B-Q4_0.gguf",
+      "file_bytes": 507154688,
+      "file_mib": 483.66,
+      "sha256": "444406ddd926550c724ec18d5120a9d40ded44908a063b0e66e9a7e5464c652c",
+      "modes": {
+        "cpu_norepack": {
+          "threads": 4,
+          "bench": {
+            "pp512": {
+              "median_tps": 345.09,
+              "avg_tps": 345.04,
+              "stddev_tps": 0.45,
+              "samples_tps": [
+                345.07,
+                345.1,
+                345.62,
+                344.35,
+                345.09
+              ]
+            },
+            "model_size_bytes": 496192768,
+            "model_n_params": 752393024,
+            "build_commit": "b001d7b",
+            "tg128": {
+              "median_tps": 108.01,
+              "avg_tps": 107.96,
+              "stddev_tps": 0.08,
+              "samples_tps": [
+                108.04,
+                107.88,
+                107.86,
+                108.01,
+                108.01
+              ]
+            },
+            "effective_decode_bw_gbs": 53.59,
+            "stream_read_bw_util_pct": 50.1
+          },
+          "e2e_greedy": {
+            "generated_sha256": "35915184945afd634a41e242e4d2d43a80dc7c9e0af3b3f42813311ff89e5cf3",
+            "generated_preview": "The paper introduces a novel architecture for a hybrid autoregressive language model inference engine that integrates a Gated DeltaNet with a short-convolutio",
+            "load_ms": 1054.49,
+            "prompt_eval_ms": 1053.74,
+            "prompt_tokens": 291,
+            "prompt_tps": 276.16,
+            "eval_ms": 1200.85,
+            "eval_runs": 127,
+            "eval_tps": 105.76,
+            "max_rss_mib": 632.55,
+            "peak_footprint_mib": 132.63
+          },
+          "thermal": {
+            "macos_thermal_state": "nominal"
+          }
+        },
+        "cpu_kleidiai": {
+          "threads": 4,
+          "bench": {
+            "pp512": {
+              "median_tps": 741.04,
+              "avg_tps": 741.27,
+              "stddev_tps": 0.98,
+              "samples_tps": [
+                742.73,
+                741.04,
+                741.03,
+                740.03,
+                741.54
+              ]
+            },
+            "model_size_bytes": 496192768,
+            "model_n_params": 752393024,
+            "build_commit": "b001d7b",
+            "tg128": {
+              "median_tps": 105.23,
+              "avg_tps": 104.96,
+              "stddev_tps": 0.91,
+              "samples_tps": [
+                105.61,
+                105.23,
+                105.79,
+                104.66,
+                103.53
+              ]
+            },
+            "effective_decode_bw_gbs": 52.21,
+            "stream_read_bw_util_pct": 48.8
+          },
+          "e2e_greedy": {
+            "generated_sha256": "67ef027c8ff79cd49994f816d72dacb7e743af2c459a564a36c42433b4a5f8fb",
+            "generated_preview": "The paper introduces a novel architecture for a hybrid autoregressive language model inference engine. The architecture is designed to be compatible with both",
+            "load_ms": 402.91,
+            "prompt_eval_ms": 402.11,
+            "prompt_tokens": 291,
+            "prompt_tps": 723.68,
+            "eval_ms": 1237.48,
+            "eval_runs": 127,
+            "eval_tps": 102.63,
+            "max_rss_mib": 1876.97,
+            "peak_footprint_mib": 1377.58
+          },
+          "thermal": {
+            "macos_thermal_state": "nominal"
+          }
+        },
+        "metal": {
+          "ngl": 99,
+          "flash_attn": true,
+          "bench": {
+            "pp512": {
+              "median_tps": 2287.67,
+              "avg_tps": 2286.46,
+              "stddev_tps": 2.76,
+              "samples_tps": [
+                2287.67,
+                2288.92,
+                2288.26,
+                2285.24,
+                2282.19
+              ]
+            },
+            "model_size_bytes": 496192768,
+            "model_n_params": 752393024,
+            "build_commit": "b001d7b",
+            "tg128": {
+              "median_tps": 128.0,
+              "avg_tps": 127.47,
+              "stddev_tps": 1.2,
+              "samples_tps": [
+                128.09,
+                128.0,
+                125.34,
+                127.88,
+                128.06
+              ]
+            },
+            "effective_decode_bw_gbs": 63.51,
+            "stream_read_bw_util_pct": 59.4
+          },
+          "e2e_greedy": {
+            "generated_sha256": "0f95c2ea4fdf59802fd43d04612c1921b4f5b2f42d807f8477f593cf08f1d7e3",
+            "generated_preview": "The following is the complete source text.\n\n<think>\n\n</think>\n\nHere is the complete source text, formatted for readability and context:\n\n**The Autoregressive",
+            "load_ms": 304.52,
+            "prompt_eval_ms": 303.73,
+            "prompt_tokens": 291,
+            "prompt_tps": 958.09,
+            "eval_ms": 994.54,
+            "eval_runs": 127,
+            "eval_tps": 127.7,
+            "max_rss_mib": 686.97,
+            "peak_footprint_mib": 190.14
+          },
+          "thermal": {
+            "macos_thermal_state": "nominal"
+          }
+        }
+      },
+      "model_size_bytes": 496192768,
+      "model_n_params": 752393024,
+      "llama_cpp_commit": "b001d7b"
+    },
+    {
+      "filename": "Qwen3.5-0.8B-Q4_K_M.gguf",
+      "file_bytes": 532517120,
+      "file_mib": 507.85,
+      "sha256": "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517",
+      "modes": {
+        "cpu_norepack": {
+          "threads": 4,
+          "bench": {
+            "pp512": {
+              "median_tps": 309.28,
+              "avg_tps": 309.12,
+              "stddev_tps": 1.17,
+              "samples_tps": [
+                310.17,
+                309.78,
+                307.14,
+                309.23,
+                309.28
+              ]
+            },
+            "model_size_bytes": 521555200,
+            "model_n_params": 752393024,
+            "build_commit": "b001d7b",
+            "tg128": {
+              "median_tps": 106.23,
+              "avg_tps": 106.24,
+              "stddev_tps": 0.1,
+              "samples_tps": [
+                106.23,
+                106.1,
+                106.38,
+                106.29,
+                106.21
+              ]
+            },
+            "effective_decode_bw_gbs": 55.4,
+            "stream_read_bw_util_pct": 51.8
+          },
+          "e2e_greedy": {
+            "generated_sha256": "d0b31bb46b35a24e53c09e101f91c5db9b1f1823d6946aff62ff1d4829012f4b",
+            "generated_preview": "The following is a list of the top 1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "load_ms": 1016.44,
+            "prompt_eval_ms": 1015.68,
+            "prompt_tokens": 291,
+            "prompt_tps": 286.51,
+            "eval_ms": 1231.74,
+            "eval_runs": 127,
+            "eval_tps": 103.11,
+            "max_rss_mib": 656.8,
+            "peak_footprint_mib": 132.7
+          },
+          "thermal": {
+            "macos_thermal_state": "nominal"
+          }
+        },
+        "cpu_kleidiai": {
+          "threads": 4,
+          "bench": {
+            "pp512": {
+              "median_tps": 492.25,
+              "avg_tps": 494.1,
+              "stddev_tps": 7.59,
+              "samples_tps": [
+                486.74,
+                487.43,
+                492.25,
+                503.17,
+                500.9
+              ]
+            },
+            "model_size_bytes": 521555200,
+            "model_n_params": 752393024,
+            "build_commit": "b001d7b",
+            "tg128": {
+              "median_tps": 93.01,
+              "avg_tps": 92.97,
+              "stddev_tps": 0.18,
+              "samples_tps": [
+                93.01,
+                92.65,
+                92.98,
+                93.12,
+                93.07
+              ]
+            },
+            "effective_decode_bw_gbs": 48.51,
+            "stream_read_bw_util_pct": 45.3
+          },
+          "e2e_greedy": {
+            "generated_sha256": "d0b31bb46b35a24e53c09e101f91c5db9b1f1823d6946aff62ff1d4829012f4b",
+            "generated_preview": "The following is a list of the top 1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "load_ms": 547.97,
+            "prompt_eval_ms": 547.2,
+            "prompt_tokens": 291,
+            "prompt_tps": 531.8,
+            "eval_ms": 1395.22,
+            "eval_runs": 127,
+            "eval_tps": 91.02,
+            "max_rss_mib": 1763.98,
+            "peak_footprint_mib": 1240.36
+          },
+          "thermal": {
+            "macos_thermal_state": "nominal"
+          }
+        },
+        "metal": {
+          "ngl": 99,
+          "flash_attn": true,
+          "bench": {
+            "pp512": {
+              "median_tps": 2180.63,
+              "avg_tps": 2180.05,
+              "stddev_tps": 2.31,
+              "samples_tps": [
+                2180.63,
+                2180.63,
+                2181.99,
+                2176.05,
+                2180.96
+              ]
+            },
+            "model_size_bytes": 521555200,
+            "model_n_params": 752393024,
+            "build_commit": "b001d7b",
+            "tg128": {
+              "median_tps": 122.94,
+              "avg_tps": 123.06,
+              "stddev_tps": 0.31,
+              "samples_tps": [
+                123.37,
+                122.67,
+                122.92,
+                123.37,
+                122.94
+              ]
+            },
+            "effective_decode_bw_gbs": 64.12,
+            "stream_read_bw_util_pct": 59.9
+          },
+          "e2e_greedy": {
+            "generated_sha256": "d0b31bb46b35a24e53c09e101f91c5db9b1f1823d6946aff62ff1d4829012f4b",
+            "generated_preview": "The following is a list of the top 1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "load_ms": 147.92,
+            "prompt_eval_ms": 146.54,
+            "prompt_tokens": 291,
+            "prompt_tps": 1985.75,
+            "eval_ms": 1033.19,
+            "eval_runs": 127,
+            "eval_tps": 122.92,
+            "max_rss_mib": 712.42,
+            "peak_footprint_mib": 189.78
+          },
+          "thermal": {
+            "macos_thermal_state": "nominal"
+          }
+        }
+      },
+      "model_size_bytes": 521555200,
+      "model_n_params": 752393024,
+      "llama_cpp_commit": "b001d7b"
+    },
+    {
+      "filename": "Qwen3.5-2B-Q4_0.gguf",
+      "file_bytes": 1214873856,
+      "file_mib": 1158.59,
+      "sha256": "cd70221bebaee0503e0f6717e174250cd7825aa88438b3aabec9ad55731d9bb1",
+      "modes": {
+        "cpu_norepack": {
+          "threads": 4,
+          "bench": {
+            "pp512": {
+              "median_tps": 142.86,
+              "avg_tps": 142.91,
+              "stddev_tps": 0.11,
+              "samples_tps": [
+                142.85,
+                143.11,
+                142.85,
+                142.89,
+                142.86
+              ]
+            },
+            "model_size_bytes": 1203911936,
+            "model_n_params": 1881825088,
+            "build_commit": "b001d7b",
+            "tg128": {
+              "median_tps": 52.37,
+              "avg_tps": 52.36,
+              "stddev_tps": 0.05,
+              "samples_tps": [
+                52.3,
+                52.33,
+                52.39,
+                52.42,
+                52.37
+              ]
+            },
+            "effective_decode_bw_gbs": 63.05,
+            "stream_read_bw_util_pct": 58.9
+          },
+          "e2e_greedy": {
+            "generated_sha256": "4eef9a2246d531d43967b65e99d9fb34146878ddc3c17752c14ebc4eb23b8589",
+            "generated_preview": "<think>\n\n</think>\n\nThis is a well-structured technical overview of **Autoregressive Language Model (ALM) inference**, specifically tailored for **edge computi",
+            "load_ms": 2630.2,
+            "prompt_eval_ms": 2629.43,
+            "prompt_tokens": 291,
+            "prompt_tps": 110.67,
+            "eval_ms": 2462.01,
+            "eval_runs": 127,
+            "eval_tps": 51.58,
+            "max_rss_mib": 1315.33,
+            "peak_footprint_mib": 140.81
+          },
+          "thermal": {
+            "macos_thermal_state": "nominal"
+          }
+        },
+        "cpu_kleidiai": {
+          "threads": 4,
+          "bench": {
+            "pp512": {
+              "median_tps": 362.49,
+              "avg_tps": 362.16,
+              "stddev_tps": 0.56,
+              "samples_tps": [
+                361.85,
+                362.49,
+                362.62,
+                361.32,
+                362.54
+              ]
+            },
+            "model_size_bytes": 1203911936,
+            "model_n_params": 1881825088,
+            "build_commit": "b001d7b",
+            "tg128": {
+              "median_tps": 49.48,
+              "avg_tps": 49.53,
+              "stddev_tps": 0.35,
+              "samples_tps": [
+                49.84,
+                49.48,
+                49.21,
+                49.93,
+                49.17
+              ]
+            },
+            "effective_decode_bw_gbs": 59.57,
+            "stream_read_bw_util_pct": 55.7
+          },
+          "e2e_greedy": {
+            "generated_sha256": "01a73e96250221f9169857034da6700bb850e8932a5ced730780ec0664acdd23",
+            "generated_preview": "<think>\n\n</think>\n\nThis is a well-structured technical overview of **Autoregressive Language Model (ALM) inference**, specifically tailored for **edge computi",
+            "load_ms": 837.47,
+            "prompt_eval_ms": 836.71,
+            "prompt_tokens": 291,
+            "prompt_tps": 347.79,
+            "eval_ms": 2579.07,
+            "eval_runs": 127,
+            "eval_tps": 49.24,
+            "max_rss_mib": 4185.39,
+            "peak_footprint_mib": 3012.25
+          },
+          "thermal": {
+            "macos_thermal_state": "nominal"
+          }
+        },
+        "metal": {
+          "ngl": 99,
+          "flash_attn": true,
+          "bench": {
+            "pp512": {
+              "median_tps": 1053.11,
+              "avg_tps": 1052.84,
+              "stddev_tps": 0.95,
+              "samples_tps": [
+                1051.33,
+                1053.19,
+                1052.66,
+                1053.89,
+                1053.11
+              ]
+            },
+            "model_size_bytes": 1203911936,
+            "model_n_params": 1881825088,
+            "build_commit": "b001d7b",
+            "tg128": {
+              "median_tps": 65.09,
+              "avg_tps": 65.08,
+              "stddev_tps": 0.14,
+              "samples_tps": [
+                64.88,
+                65.18,
+                65.24,
+                64.99,
+                65.09
+              ]
+            },
+            "effective_decode_bw_gbs": 78.36,
+            "stream_read_bw_util_pct": 73.3
+          },
+          "e2e_greedy": {
+            "generated_sha256": "186a7df67f7c92c985097765e226421ea6783458425a60e04c9cec135d4fa257",
+            "generated_preview": "<think>\n\n</think>\n\nThis is a well-structured technical overview of **Autoregressive Language Model (ALM) inference**, specifically tailored for **edge computi",
+            "load_ms": 304.31,
+            "prompt_eval_ms": 303.52,
+            "prompt_tokens": 291,
+            "prompt_tps": 958.74,
+            "eval_ms": 1959.4,
+            "eval_runs": 127,
+            "eval_tps": 64.82,
+            "max_rss_mib": 1364.78,
+            "peak_footprint_mib": 192.24
+          },
+          "thermal": {
+            "macos_thermal_state": "nominal"
+          }
+        }
+      },
+      "model_size_bytes": 1203911936,
+      "model_n_params": 1881825088,
+      "llama_cpp_commit": "b001d7b"
+    },
+    {
+      "filename": "SmolLM2-360M-Instruct-Q4_0.gguf",
+      "file_bytes": 229733280,
+      "file_mib": 219.09,
+      "sha256": "c3608933eb6e5763b87f769bda40c204dc158333668c7af214644fe39da58627",
+      "modes": {
+        "cpu_norepack": {
+          "threads": 4,
+          "bench": {
+            "pp512": {
+              "median_tps": 603.69,
+              "avg_tps": 603.65,
+              "stddev_tps": 0.37,
+              "samples_tps": [
+                604.12,
+                603.29,
+                603.88,
+                603.28,
+                603.69
+              ]
+            },
+            "model_size_bytes": 227946240,
+            "model_n_params": 361821120,
+            "build_commit": "b001d7b",
+            "tg128": {
+              "median_tps": 254.43,
+              "avg_tps": 254.34,
+              "stddev_tps": 0.18,
+              "samples_tps": [
+                254.26,
+                254.47,
+                254.06,
+                254.46,
+                254.43
+              ]
+            },
+            "effective_decode_bw_gbs": 58.0,
+            "stream_read_bw_util_pct": 54.2
+          },
+          "e2e_greedy": {
+            "generated_sha256": "4df59678149be62c8703e4ae4692a85152173ba3e30fbf74d3fb344d88de0ecc",
+            "generated_preview": "The paper presents a comprehensive analysis of the performance of the proposed model, including the impact of the model’s architecture, the model’s training a",
+            "load_ms": 501.39,
+            "prompt_eval_ms": 500.76,
+            "prompt_tokens": 308,
+            "prompt_tps": 615.07,
+            "eval_ms": 614.16,
+            "eval_runs": 127,
+            "eval_tps": 206.79,
+            "max_rss_mib": 342.42,
+            "peak_footprint_mib": 116.52
+          },
+          "thermal": {
+            "macos_thermal_state": "nominal"
+          }
+        },
+        "cpu_kleidiai": {
+          "threads": 4,
+          "bench": {
+            "pp512": {
+              "median_tps": 1298.81,
+              "avg_tps": 1297.61,
+              "stddev_tps": 4.9,
+              "samples_tps": [
+                1298.81,
+                1291.68,
+                1294.16,
+                1299.09,
+                1304.33
+              ]
+            },
+            "model_size_bytes": 227946240,
+            "model_n_params": 361821120,
+            "build_commit": "b001d7b",
+            "tg128": {
+              "median_tps": 257.11,
+              "avg_tps": 257.13,
+              "stddev_tps": 0.36,
+              "samples_tps": [
+                257.05,
+                257.62,
+                256.62,
+                257.24,
+                257.11
+              ]
+            },
+            "effective_decode_bw_gbs": 58.61,
+            "stream_read_bw_util_pct": 54.8
+          },
+          "e2e_greedy": {
+            "generated_sha256": "9f72173a1273c263e0613155d213be2d858e1fe8561725c6c846db0158ab03d7",
+            "generated_preview": "The paper presents a comprehensive analysis of the performance and memory profile of the Gated DeltaNet model, which is the first to be evaluated on a large,",
+            "load_ms": 231.52,
+            "prompt_eval_ms": 230.8,
+            "prompt_tokens": 308,
+            "prompt_tps": 1334.48,
+            "eval_ms": 610.2,
+            "eval_runs": 127,
+            "eval_tps": 208.13,
+            "max_rss_mib": 807.17,
+            "peak_footprint_mib": 581.49
+          },
+          "thermal": {
+            "macos_thermal_state": "nominal"
+          }
+        },
+        "metal": {
+          "ngl": 99,
+          "flash_attn": true,
+          "bench": {
+            "pp512": {
+              "median_tps": 4366.41,
+              "avg_tps": 4366.72,
+              "stddev_tps": 2.4,
+              "samples_tps": [
+                4365.02,
+                4364.08,
+                4366.41,
+                4367.96,
+                4370.13
+              ]
+            },
+            "model_size_bytes": 227946240,
+            "model_n_params": 361821120,
+            "build_commit": "b001d7b",
+            "tg128": {
+              "median_tps": 231.63,
+              "avg_tps": 228.34,
+              "stddev_tps": 4.77,
+              "samples_tps": [
+                221.91,
+                231.81,
+                224.52,
+                231.82,
+                231.63
+              ]
+            },
+            "effective_decode_bw_gbs": 52.8,
+            "stream_read_bw_util_pct": 49.4
+          },
+          "e2e_greedy": {
+            "generated_sha256": "4df59678149be62c8703e4ae4692a85152173ba3e30fbf74d3fb344d88de0ecc",
+            "generated_preview": "The paper presents a comprehensive analysis of the performance of the proposed model, including the impact of the model’s architecture, the model’s training a",
+            "load_ms": 159.97,
+            "prompt_eval_ms": 159.11,
+            "prompt_tokens": 308,
+            "prompt_tps": 1935.77,
+            "eval_ms": 535.77,
+            "eval_runs": 127,
+            "eval_tps": 237.04,
+            "max_rss_mib": 408.81,
+            "peak_footprint_mib": 186.7
+          },
+          "thermal": {
+            "macos_thermal_state": "nominal"
+          }
+        }
+      },
+      "model_size_bytes": 227946240,
+      "model_n_params": 361821120,
+      "llama_cpp_commit": "b001d7b"
+    },
+    {
+      "filename": "gemma-4-E2B-it-Q4_0.gguf",
+      "file_bytes": 2841481184,
+      "file_mib": 2709.85,
+      "sha256": "8e30dff3ac4c8434c49a7036fa15564bdbb6044e42bf04550bf1a096ad7e6a52",
+      "modes": {
+        "cpu_norepack": {
+          "threads": 4,
+          "bench": {
+            "pp512": {
+              "median_tps": 210.76,
+              "avg_tps": 210.74,
+              "stddev_tps": 0.21,
+              "samples_tps": [
+                210.95,
+                210.76,
+                210.66,
+                210.43,
+                210.92
+              ]
+            },
+            "model_size_bytes": 2825664652,
+            "model_n_params": 4628569635,
+            "build_commit": "b001d7b",
+            "tg128": {
+              "median_tps": 39.81,
+              "avg_tps": 39.79,
+              "stddev_tps": 0.18,
+              "samples_tps": [
+                39.81,
+                39.75,
+                39.51,
+                39.87,
+                40.0
+              ]
+            },
+            "effective_decode_bw_gbs": 112.49,
+            "stream_read_bw_util_pct": 105.2
+          },
+          "e2e_greedy": {
+            "generated_sha256": "ef9ea7f6620ab14103f8da54b436115262606a0d462faea70dd1661d3d554df8",
+            "generated_preview": "[end of text]",
+            "load_ms": 1694.17,
+            "prompt_eval_ms": 1693.18,
+            "prompt_tokens": 295,
+            "prompt_tps": 174.23,
+            "max_rss_mib": 2902.02,
+            "peak_footprint_mib": 146.14
+          },
+          "thermal": {
+            "macos_thermal_state": "nominal"
+          }
+        },
+        "cpu_kleidiai": {
+          "threads": 4,
+          "bench": {
+            "pp512": {
+              "median_tps": 335.01,
+              "avg_tps": 334.03,
+              "stddev_tps": 3.01,
+              "samples_tps": [
+                328.69,
+                335.73,
+                334.96,
+                335.01,
+                335.75
+              ]
+            },
+            "model_size_bytes": 2825664652,
+            "model_n_params": 4628569635,
+            "build_commit": "b001d7b",
+            "tg128": {
+              "median_tps": 40.88,
+              "avg_tps": 40.91,
+              "stddev_tps": 0.1,
+              "samples_tps": [
+                40.79,
+                40.96,
+                40.85,
+                40.88,
+                41.04
+              ]
+            },
+            "effective_decode_bw_gbs": 115.51,
+            "stream_read_bw_util_pct": 108.0
+          },
+          "e2e_greedy": {
+            "generated_sha256": "ef9ea7f6620ab14103f8da54b436115262606a0d462faea70dd1661d3d554df8",
+            "generated_preview": "[end of text]",
+            "load_ms": 995.62,
+            "prompt_eval_ms": 993.61,
+            "prompt_tokens": 295,
+            "prompt_tps": 296.9,
+            "max_rss_mib": 4862.5,
+            "peak_footprint_mib": 3101.44
+          },
+          "thermal": {
+            "macos_thermal_state": "nominal"
+          }
+        },
+        "metal": {
+          "ngl": 99,
+          "flash_attn": true,
+          "bench": {
+            "pp512": {
+              "median_tps": 2319.63,
+              "avg_tps": 2318.52,
+              "stddev_tps": 3.6,
+              "samples_tps": [
+                2312.34,
+                2319.63,
+                2318.74,
+                2321.46,
+                2320.44
+              ]
+            },
+            "model_size_bytes": 2825664652,
+            "model_n_params": 4628569635,
+            "build_commit": "b001d7b",
+            "tg128": {
+              "median_tps": 54.04,
+              "avg_tps": 54.02,
+              "stddev_tps": 0.56,
+              "samples_tps": [
+                53.45,
+                54.61,
+                54.54,
+                54.04,
+                53.45
+              ]
+            },
+            "effective_decode_bw_gbs": 152.7,
+            "stream_read_bw_util_pct": 142.7
+          },
+          "e2e_greedy": {
+            "generated_sha256": "ef9ea7f6620ab14103f8da54b436115262606a0d462faea70dd1661d3d554df8",
+            "generated_preview": "[end of text]",
+            "load_ms": 411.69,
+            "prompt_eval_ms": 408.92,
+            "prompt_tokens": 295,
+            "prompt_tps": 721.42,
+            "max_rss_mib": 2949.77,
+            "peak_footprint_mib": 190.16
+          },
+          "thermal": {
+            "macos_thermal_state": "nominal"
+          }
+        }
+      },
+      "model_size_bytes": 2825664652,
+      "model_n_params": 4628569635,
+      "llama_cpp_commit": "b001d7b"
+    }
+  ]
+}

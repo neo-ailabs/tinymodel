@@ -1,0 +1,14 @@
+{
+  "protocol_id": "tinymodel-m0-v1",
+  "schema_version": 1,
+  "files": {
+    "prompt_medium.txt": {
+      "bytes": 2160,
+      "sha256": "00baeb7d82880c1e01636f777212586e2953cfe114e01ef00e0852c70d720cc3"
+    },
+    "prompt_short.txt": {
+      "bytes": 1605,
+      "sha256": "cd8eae7de951bce7fb11fd7d755856a76cb25f2a75850e6528faaa9fe8944d71"
+    }
+  }
+}

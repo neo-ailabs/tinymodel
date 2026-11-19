@@ -4,7 +4,7 @@
 
 | 阶段 | 内容 | 验收标准 | 状态 |
 |---|---|---|---|
-| **M0 基线** | 在 M4 和 Pi 5 上用 llama.cpp 测量基准模型集的 pp、tg、内存峰值、温度和频率 | 有可复现的基线表格，存入 `bench/baselines/` | ⬜ |
+| **M0 基线** | 在 M4 和 Pi 5 上用 llama.cpp 测量基准模型集的 pp、tg、内存峰值、温度和频率 | 有可复现的基线表格，存入 `bench/baselines/` | 🟡 M4 已完成（2026-11-19），Pi 5 待测 |
 | **PoC** | ① 用 Rust 写 Q4_0×Q8_0 GEMV（NEON dotprod + i8mm `asm!`），以 `Strata/src/quant/arm/arm_dots.inc` 为蓝本；② 交叉编译 aarch64-musl，在 Pi 5 和 Zero 2W 上运行；③ objc2-metal 量化 GEMV；④ 内核对齐和 bench 测试框架 | ① 在 M4 上 ≥95% ggml；② 二进制 <2MB，Pi 5 带宽利用率 ≥80%；③ ≥90% llama.cpp Metal | ⬜ |
 | **M1 最小可用** | Cargo workspace 骨架；tm-core / tm-gguf（张量表校验）/ tm-cpu（generic + NEON + dotprod + AVX2）/ 线程池；Llama + Qwen3 的 forward；tokenizer；采样；CLI `run` / `bench` | 贪心解码输出和 llama.cpp 逐 token 一致；Pi 5 decode ≥95% llama.cpp | ⬜ |
 | **M2 新结构 + Metal** | Qwen3.5（GDN，按 `GDN_CONTRACT` 实现）、Gemma 4（PLE、滑动窗口）、LFM2；LayerState；前缀缓存；**Metal 后端** | 多 token logits 的 KL 低于阈值；M4 Metal decode ≥90% MLX | ⬜ |

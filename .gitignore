@@ -1,5 +1,6 @@
-# Third-party reference project (MIT, read-only; not part of this repo)
+# Third-party reference project and baseline tools (not part of this repo)
 /Strata/
+/third_party/
 
 # Rust
 /target/
