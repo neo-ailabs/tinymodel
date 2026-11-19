@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/tm-core",
     "crates/tm-cpu",
+    "crates/tm-metal",
 ]
 
 [workspace.package]
