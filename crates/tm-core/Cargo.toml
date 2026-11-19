@@ -1,0 +1,10 @@
+[package]
+name = "tm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Core dtypes, quantization block formats, tensor views, and arena for tinymodel (zero external dependencies)"
+
+[dependencies]

@@ -1,0 +1,11 @@
+[package]
+name = "tm-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "CPU compute kernels (generic, aarch64 NEON/dotprod/i8mm, x86_64) and thread pool for tinymodel"
+
+[dependencies]
+tm-core = { path = "../tm-core" }
