@@ -1,0 +1,26 @@
+# Third-party reference project (MIT, read-only; not part of this repo)
+/Strata/
+
+# Rust
+/target/
+**/*.rs.bk
+
+# Models & large artifacts (never commit weights)
+*.gguf
+*.safetensors
+*.bin
+/models/
+
+# Benchmark scratch (frozen corpora and committed results live under bench/ explicitly)
+/bench/tmp/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
