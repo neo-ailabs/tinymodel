@@ -1,10 +1,14 @@
-//! Llama / SmolLM2 / Qwen3-style GQA Transformer forward pass.
+//! Llama / SmolLM2 / Qwen3 GQA Transformer forward pass.
+//!
+//! Supports both `llama` (Norm RoPE, optional `rope_freqs.weight`) and
+//! `qwen3` (NeoX RoPE + per-head QK-Norm `attn_q_norm` / `attn_k_norm`).
 
 use thiserror::Error;
 use tm_core::{DType, dequantize_row_bytes, f32_to_f16};
 use tm_cpu::{
-    KernelTable, MatvecScratch, RopeType, ThreadPool, gqa_attention_f16_kv, matvec_f32, rms_norm,
-    rope_inplace, swiglu_inplace,
+    KernelTable, MatvecScratch, RopeType, ThreadPool, gqa_attention_f16_kv_parallel, matvec_f32,
+    matvec_pair_f32, matvec_triple_f32, rms_norm, rope_compute_cos_sin, rope_inplace_tables,
+    swiglu_inplace,
 };
 use tm_gguf::{GgufError, GgufFile};
 
@@ -12,7 +16,7 @@ use tm_gguf::{GgufError, GgufFile};
 pub enum ModelError {
     #[error(transparent)]
     Gguf(#[from] GgufError),
-    #[error("unsupported model architecture '{0}' (M1 supports 'llama')")]
+    #[error("unsupported model architecture '{0}' (M1 supports 'llama' and 'qwen3')")]
     UnsupportedArch(String),
     #[error("position {pos} exceeds configured max_ctx {max_ctx}")]
     ContextOverflow { pos: usize, max_ctx: usize },
@@ -50,6 +54,8 @@ struct MatView<'a> {
 struct LayerWeights<'a> {
     attn_norm: Vec<f32>,
     ffn_norm: Vec<f32>,
+    q_norm: Option<Vec<f32>>,
+    k_norm: Option<Vec<f32>>,
     wq: MatView<'a>,
     wk: MatView<'a>,
     wv: MatView<'a>,
@@ -59,13 +65,14 @@ struct LayerWeights<'a> {
     w_down: MatView<'a>,
 }
 
-/// Loaded Llama-family model borrowing quantized weight slices directly from `GgufFile`.
+/// Loaded Llama / Qwen3 model borrowing quantized weight slices directly from `GgufFile`.
 pub struct LlamaModel<'a> {
     pub cfg: LlamaConfig,
     token_embd: MatView<'a>,
     output: MatView<'a>,
     output_norm: Vec<f32>,
-    rope_freqs: Option<Vec<f32>>,
+    /// Precomputed `freq_base^(-2i / rope_dim) / rope_freqs[i]` for `i in 0..rope_dim/2`.
+    rope_inv_freqs: Vec<f64>,
     layers: Vec<LayerWeights<'a>>,
 }
 
@@ -85,6 +92,8 @@ pub struct LlamaState {
     v: Vec<f32>,
     hb: Vec<f32>,
     hb2: Vec<f32>,
+    rope_cos: Vec<f32>,
+    rope_sin: Vec<f32>,
     scores: Vec<f32>,
     logits: Vec<f32>,
     mv_scratch: MatvecScratch,
@@ -94,27 +103,30 @@ impl LlamaState {
     /// Allocates KV cache and all working buffers up front for `max_ctx` tokens.
     pub fn new(cfg: &LlamaConfig, max_ctx: usize) -> Self {
         let kv_dim = cfg.n_head_kv * cfg.head_dim;
+        let q_dim = cfg.n_head * cfg.head_dim;
         let k_cache = (0..cfg.n_layers)
             .map(|_| vec![0u16; max_ctx * kv_dim])
             .collect();
         let v_cache = (0..cfg.n_layers)
             .map(|_| vec![0u16; max_ctx * kv_dim])
             .collect();
-        let max_cols = cfg.n_embd.max(cfg.n_ff).max(cfg.n_head * cfg.head_dim);
+        let max_cols = cfg.n_embd.max(cfg.n_ff).max(q_dim);
 
         Self {
             max_ctx,
             k_cache,
             v_cache,
             x: vec![0.0; cfg.n_embd],
-            xb: vec![0.0; cfg.n_embd],
+            xb: vec![0.0; cfg.n_embd.max(q_dim)],
             xb2: vec![0.0; cfg.n_embd],
-            q: vec![0.0; cfg.n_head * cfg.head_dim],
+            q: vec![0.0; q_dim],
             k: vec![0.0; kv_dim],
             v: vec![0.0; kv_dim],
             hb: vec![0.0; cfg.n_ff],
             hb2: vec![0.0; cfg.n_ff],
-            scores: vec![0.0; max_ctx],
+            rope_cos: vec![0.0; cfg.rope_dim / 2],
+            rope_sin: vec![0.0; cfg.rope_dim / 2],
+            scores: vec![0.0; cfg.n_head * max_ctx],
             logits: vec![0.0; cfg.vocab_size],
             mv_scratch: MatvecScratch::new(max_cols),
         }
@@ -155,41 +167,47 @@ fn load_mat<'a>(
 }
 
 impl<'a> LlamaModel<'a> {
-    /// Loads and strictly validates a Llama-architecture GGUF model (zero-copy weight views).
+    /// Loads and strictly validates a `llama` or `qwen3` GGUF model (zero-copy weight views).
     pub fn from_gguf(gguf: &'a GgufFile) -> Result<Self, ModelError> {
         let arch = gguf.req_str("general.architecture")?.to_string();
-        if arch != "llama" {
+        if arch != "llama" && arch != "qwen3" {
             return Err(ModelError::UnsupportedArch(arch));
         }
 
-        let n_layers = gguf.req_usize("llama.block_count")?;
-        let n_embd = gguf.req_usize("llama.embedding_length")?;
-        let n_ff = gguf.req_usize("llama.feed_forward_length")?;
-        let n_head = gguf.req_usize("llama.attention.head_count")?;
+        let pfx = arch.as_str();
+        let n_layers = gguf.req_usize(&format!("{pfx}.block_count"))?;
+        let n_embd = gguf.req_usize(&format!("{pfx}.embedding_length"))?;
+        let n_ff = gguf.req_usize(&format!("{pfx}.feed_forward_length"))?;
+        let n_head = gguf.req_usize(&format!("{pfx}.attention.head_count"))?;
         let n_head_kv = gguf
-            .get_meta("llama.attention.head_count_kv")
+            .get_meta(&format!("{pfx}.attention.head_count_kv"))
             .and_then(|v| v.as_usize())
             .unwrap_or(n_head);
         let head_dim = gguf
-            .get_meta("llama.attention.key_length")
+            .get_meta(&format!("{pfx}.attention.key_length"))
             .and_then(|v| v.as_usize())
             .unwrap_or(n_embd / n_head);
         let rope_dim = gguf
-            .get_meta("llama.rope.dimension_count")
+            .get_meta(&format!("{pfx}.rope.dimension_count"))
             .and_then(|v| v.as_usize())
             .unwrap_or(head_dim);
         let max_ctx_train = gguf
-            .get_meta("llama.context_length")
+            .get_meta(&format!("{pfx}.context_length"))
             .and_then(|v| v.as_usize())
             .unwrap_or(2048);
         let rope_freq_base = gguf
-            .get_meta("llama.rope.freq_base")
+            .get_meta(&format!("{pfx}.rope.freq_base"))
             .and_then(|v| v.as_f32())
-            .unwrap_or(10000.0);
+            .unwrap_or(if pfx == "qwen3" { 1_000_000.0 } else { 10000.0 });
         let rms_eps = gguf
-            .get_meta("llama.attention.layer_norm_rms_epsilon")
+            .get_meta(&format!("{pfx}.attention.layer_norm_rms_epsilon"))
             .and_then(|v| v.as_f32())
-            .unwrap_or(1e-5);
+            .unwrap_or(if pfx == "qwen3" { 1e-6 } else { 1e-5 });
+        let rope_type = if pfx == "qwen3" {
+            RopeType::Neox
+        } else {
+            RopeType::Norm
+        };
 
         let embd_info =
             gguf.tensor_info("token_embd.weight")
@@ -199,7 +217,7 @@ impl<'a> LlamaModel<'a> {
                     layer: "global".to_string(),
                 })?;
         let vocab_size = gguf
-            .get_meta("llama.vocab_size")
+            .get_meta(&format!("{pfx}.vocab_size"))
             .and_then(|v| v.as_usize())
             .unwrap_or_else(|| embd_info.dims.get(1).copied().unwrap_or(0));
 
@@ -216,14 +234,13 @@ impl<'a> LlamaModel<'a> {
             max_ctx_train,
             rope_freq_base,
             rms_eps,
-            rope_type: RopeType::Norm,
+            rope_type,
         };
 
         let token_embd = load_mat(gguf, "token_embd.weight", "global", n_embd, vocab_size)?;
         let output = if gguf.tensor_info("output.weight").is_some() {
             load_mat(gguf, "output.weight", "global", n_embd, vocab_size)?
         } else {
-            // Tied input/output embeddings (e.g. SmolLM2, Llama-3.2-1B)
             token_embd
         };
         let output_norm = load_f32_vec(gguf, "output_norm.weight", "global", n_embd)?;
@@ -238,15 +255,43 @@ impl<'a> LlamaModel<'a> {
             None
         };
 
+        // Precompute RoPE inverse frequencies once at load time (eliminates powf() per token).
+        let half = rope_dim / 2;
+        let base_f = rope_freq_base as f64;
+        let dim_f = rope_dim as f64;
+        let mut rope_inv_freqs = Vec::with_capacity(half);
+        for i in 0..half {
+            let mut freq = base_f.powf(-2.0 * (i as f64) / dim_f);
+            if let Some(ref factors) = rope_freqs {
+                freq /= factors[i] as f64;
+            }
+            rope_inv_freqs.push(freq);
+        }
+
         let q_dim = n_head * head_dim;
         let kv_dim = n_head_kv * head_dim;
         let mut layers = Vec::with_capacity(n_layers);
 
         for l in 0..n_layers {
             let ltag = format!("blk.{l}");
+            let qn_name = format!("{ltag}.attn_q_norm.weight");
+            let kn_name = format!("{ltag}.attn_k_norm.weight");
+            let q_norm = if gguf.tensor_info(&qn_name).is_some() {
+                Some(load_f32_vec(gguf, &qn_name, &ltag, head_dim)?)
+            } else {
+                None
+            };
+            let k_norm = if gguf.tensor_info(&kn_name).is_some() {
+                Some(load_f32_vec(gguf, &kn_name, &ltag, head_dim)?)
+            } else {
+                None
+            };
+
             layers.push(LayerWeights {
                 attn_norm: load_f32_vec(gguf, &format!("{ltag}.attn_norm.weight"), &ltag, n_embd)?,
                 ffn_norm: load_f32_vec(gguf, &format!("{ltag}.ffn_norm.weight"), &ltag, n_embd)?,
+                q_norm,
+                k_norm,
                 wq: load_mat(gguf, &format!("{ltag}.attn_q.weight"), &ltag, n_embd, q_dim)?,
                 wk: load_mat(
                     gguf,
@@ -292,7 +337,7 @@ impl<'a> LlamaModel<'a> {
             token_embd,
             output,
             output_norm,
-            rope_freqs,
+            rope_inv_freqs,
             layers,
         })
     }
@@ -325,7 +370,16 @@ impl<'a> LlamaModel<'a> {
         }
 
         let n_embd = self.cfg.n_embd;
+        let q_dim = self.cfg.n_head * self.cfg.head_dim;
         let kv_dim = self.cfg.n_head_kv * self.cfg.head_dim;
+
+        // Precompute RoPE cos/sin once for this position across all layers & heads.
+        rope_compute_cos_sin(
+            &self.rope_inv_freqs,
+            pos,
+            &mut state.rope_cos,
+            &mut state.rope_sin,
+        );
 
         // 1. Token embedding lookup (zero-copy row slice -> f32)
         let row_bytes = self.token_embd.dtype.row_bytes(n_embd);
@@ -334,60 +388,67 @@ impl<'a> LlamaModel<'a> {
 
         // 2. Transformer layers
         for (l, layer) in self.layers.iter().enumerate() {
-            rms_norm(&mut state.xb, &state.x, &layer.attn_norm, self.cfg.rms_eps);
+            rms_norm(
+                &mut state.xb[..n_embd],
+                &state.x,
+                &layer.attn_norm,
+                self.cfg.rms_eps,
+            );
 
-            matvec_f32(
+            matvec_triple_f32(
                 pool,
                 kt,
                 layer.wq.dtype,
                 layer.wq.bytes,
-                &state.xb,
-                &mut state.mv_scratch,
-                &mut state.q,
                 layer.wq.rows,
-                layer.wq.cols,
-            );
-            matvec_f32(
-                pool,
-                kt,
+                &mut state.q,
                 layer.wk.dtype,
                 layer.wk.bytes,
-                &state.xb,
-                &mut state.mv_scratch,
-                &mut state.k,
                 layer.wk.rows,
-                layer.wk.cols,
-            );
-            matvec_f32(
-                pool,
-                kt,
+                &mut state.k,
                 layer.wv.dtype,
                 layer.wv.bytes,
-                &state.xb,
-                &mut state.mv_scratch,
-                &mut state.v,
                 layer.wv.rows,
-                layer.wv.cols,
+                &mut state.v,
+                &state.xb[..n_embd],
+                &mut state.mv_scratch,
+                n_embd,
             );
 
-            rope_inplace(
+            // Optional per-head QK-Norm (Qwen3) applied before RoPE
+            if let Some(ref qn) = layer.q_norm {
+                for h in 0..self.cfg.n_head {
+                    let s = h * self.cfg.head_dim;
+                    let e = s + self.cfg.head_dim;
+                    rms_norm(&mut state.xb[s..e], &state.q[s..e], qn, self.cfg.rms_eps);
+                    state.q[s..e].copy_from_slice(&state.xb[s..e]);
+                }
+            }
+            if let Some(ref kn) = layer.k_norm {
+                for h in 0..self.cfg.n_head_kv {
+                    let s = h * self.cfg.head_dim;
+                    let e = s + self.cfg.head_dim;
+                    rms_norm(&mut state.xb[s..e], &state.k[s..e], kn, self.cfg.rms_eps);
+                    state.k[s..e].copy_from_slice(&state.xb[s..e]);
+                }
+            }
+
+            rope_inplace_tables(
                 &mut state.q,
                 self.cfg.n_head,
                 self.cfg.head_dim,
                 self.cfg.rope_dim,
-                pos,
-                self.cfg.rope_freq_base,
-                self.rope_freqs.as_deref(),
+                &state.rope_cos,
+                &state.rope_sin,
                 self.cfg.rope_type,
             );
-            rope_inplace(
+            rope_inplace_tables(
                 &mut state.k,
                 self.cfg.n_head_kv,
                 self.cfg.head_dim,
                 self.cfg.rope_dim,
-                pos,
-                self.cfg.rope_freq_base,
-                self.rope_freqs.as_deref(),
+                &state.rope_cos,
+                &state.rope_sin,
                 self.cfg.rope_type,
             );
 
@@ -400,9 +461,10 @@ impl<'a> LlamaModel<'a> {
                 v_dst[i] = f32_to_f16(state.v[i]);
             }
 
-            // GQA attention over 0..=pos
-            gqa_attention_f16_kv(
-                &mut state.xb,
+            // GQA attention over 0..=pos (parallel across heads for long contexts)
+            gqa_attention_f16_kv_parallel(
+                pool,
+                &mut state.xb[..q_dim],
                 &state.q,
                 &state.k_cache[l],
                 &state.v_cache[l],
@@ -410,6 +472,7 @@ impl<'a> LlamaModel<'a> {
                 self.cfg.n_head_kv,
                 self.cfg.head_dim,
                 pos + 1,
+                state.max_ctx,
                 &mut state.scores,
             );
 
@@ -419,7 +482,7 @@ impl<'a> LlamaModel<'a> {
                 kt,
                 layer.wo.dtype,
                 layer.wo.bytes,
-                &state.xb,
+                &state.xb[..q_dim],
                 &mut state.mv_scratch,
                 &mut state.xb2,
                 layer.wo.rows,
@@ -430,28 +493,26 @@ impl<'a> LlamaModel<'a> {
             }
 
             // FFN (SwiGLU)
-            rms_norm(&mut state.xb, &state.x, &layer.ffn_norm, self.cfg.rms_eps);
-            matvec_f32(
+            rms_norm(
+                &mut state.xb[..n_embd],
+                &state.x,
+                &layer.ffn_norm,
+                self.cfg.rms_eps,
+            );
+            matvec_pair_f32(
                 pool,
                 kt,
                 layer.w_gate.dtype,
                 layer.w_gate.bytes,
-                &state.xb,
-                &mut state.mv_scratch,
-                &mut state.hb,
                 layer.w_gate.rows,
-                layer.w_gate.cols,
-            );
-            matvec_f32(
-                pool,
-                kt,
+                &mut state.hb,
                 layer.w_up.dtype,
                 layer.w_up.bytes,
-                &state.xb,
-                &mut state.mv_scratch,
-                &mut state.hb2,
                 layer.w_up.rows,
-                layer.w_up.cols,
+                &mut state.hb2,
+                &state.xb[..n_embd],
+                &mut state.mv_scratch,
+                n_embd,
             );
             swiglu_inplace(&mut state.hb, &state.hb2);
             matvec_f32(
@@ -472,13 +533,18 @@ impl<'a> LlamaModel<'a> {
 
         // 3. Final norm + LM head
         if compute_logits {
-            rms_norm(&mut state.xb, &state.x, &self.output_norm, self.cfg.rms_eps);
+            rms_norm(
+                &mut state.xb[..n_embd],
+                &state.x,
+                &self.output_norm,
+                self.cfg.rms_eps,
+            );
             matvec_f32(
                 pool,
                 kt,
                 self.output.dtype,
                 self.output.bytes,
-                &state.xb,
+                &state.xb[..n_embd],
                 &mut state.mv_scratch,
                 &mut state.logits,
                 self.output.rows,
@@ -488,17 +554,4 @@ impl<'a> LlamaModel<'a> {
 
         Ok(())
     }
-}
-
-/// Greedy argmax over logits.
-pub fn argmax(logits: &[f32]) -> u32 {
-    let mut best_idx = 0usize;
-    let mut best_val = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_val {
-            best_val = v;
-            best_idx = i;
-        }
-    }
-    best_idx as u32
 }

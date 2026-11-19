@@ -4,5 +4,7 @@
 //! and zero heap allocations on the token generation path.
 
 pub mod llama;
+pub mod sampler;
 
-pub use llama::{LlamaConfig, LlamaModel, LlamaState, ModelError, argmax};
+pub use llama::{LlamaConfig, LlamaModel, LlamaState, ModelError};
+pub use sampler::{Sampler, SamplerConfig, argmax};

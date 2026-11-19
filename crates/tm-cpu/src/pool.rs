@@ -6,6 +6,8 @@
 //!   avoids lock-free ring overhead.
 //! - Monotonic `epoch` prevents late-waking workers from claiming work from a
 //!   subsequent batch.
+//! - Fast path is 100% lock-free when workers are spinning (`parked_workers == 0`),
+//!   eliminating per-op mutex/condvar syscalls during active token generation.
 //! - Calling thread participates directly (`n_threads == 1` has zero sync cost).
 
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
@@ -21,6 +23,7 @@ struct Shared {
     chunk: AtomicUsize,
     next_idx: AtomicUsize,
     done_workers: AtomicUsize,
+    parked_workers: AtomicUsize,
     work_fn: AtomicPtr<()>,
     work_ctx: AtomicPtr<()>,
     wake_mu: Mutex<u64>,
@@ -45,6 +48,7 @@ impl ThreadPool {
             chunk: AtomicUsize::new(1),
             next_idx: AtomicUsize::new(0),
             done_workers: AtomicUsize::new(0),
+            parked_workers: AtomicUsize::new(0),
             work_fn: AtomicPtr::new(core::ptr::null_mut()),
             work_ctx: AtomicPtr::new(core::ptr::null_mut()),
             wake_mu: Mutex::new(0),
@@ -103,10 +107,13 @@ impl ThreadPool {
         s.done_workers.store(0, Ordering::Relaxed);
 
         let next_epoch = s.epoch.load(Ordering::Relaxed) + 1;
-        {
+        // Publish work lock-free with SeqCst so it pairs cleanly with `parked_workers`.
+        s.epoch.store(next_epoch, Ordering::SeqCst);
+
+        // Only take the mutex + condvar syscall if at least one worker actually parked.
+        if s.parked_workers.load(Ordering::SeqCst) > 0 {
             let mut guard = s.wake_mu.lock().unwrap_or_else(|e| e.into_inner());
             *guard = next_epoch;
-            s.epoch.store(next_epoch, Ordering::Release);
             s.wake_cv.notify_all();
         }
 
@@ -132,10 +139,10 @@ fn worker_loop(s: Arc<Shared>) {
     let mut seen_epoch = 0u64;
 
     loop {
-        // Brief spin before parking on Condvar to minimize layer-barrier latency.
+        // Spin across consecutive layer ops (~0.5ms) so active decode stays 100% lock-free.
         let mut cur_epoch = s.epoch.load(Ordering::Acquire);
         if cur_epoch == seen_epoch {
-            for _ in 0..4000 {
+            for _ in 0..80_000 {
                 if s.shutdown.load(Ordering::Acquire) {
                     return;
                 }
@@ -148,10 +155,18 @@ fn worker_loop(s: Arc<Shared>) {
         }
 
         if cur_epoch == seen_epoch {
-            let mut guard = s.wake_mu.lock().unwrap_or_else(|e| e.into_inner());
-            while *guard == seen_epoch && !s.shutdown.load(Ordering::Acquire) {
-                guard = s.wake_cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+            // Announce parking with SeqCst before re-checking `epoch` to prevent lost wakeups.
+            s.parked_workers.fetch_add(1, Ordering::SeqCst);
+            cur_epoch = s.epoch.load(Ordering::SeqCst);
+            if cur_epoch == seen_epoch && !s.shutdown.load(Ordering::Acquire) {
+                let mut guard = s.wake_mu.lock().unwrap_or_else(|e| e.into_inner());
+                while s.epoch.load(Ordering::Acquire) == seen_epoch
+                    && !s.shutdown.load(Ordering::Acquire)
+                {
+                    guard = s.wake_cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+                }
             }
+            s.parked_workers.fetch_sub(1, Ordering::SeqCst);
             if s.shutdown.load(Ordering::Acquire) {
                 return;
             }
@@ -170,7 +185,7 @@ fn worker_loop(s: Arc<Shared>) {
         let ctx = s.work_ctx.load(Ordering::Relaxed) as *const ();
 
         // SAFETY: `fn_raw` was stored by `parallel_for` as a valid `Trampoline`
-        // before the Release store to `epoch` that we just observed with Acquire.
+        // before the SeqCst store to `epoch` that we just observed with Acquire.
         let func: Trampoline = unsafe { core::mem::transmute(fn_raw) };
 
         loop {
@@ -191,7 +206,7 @@ fn worker_loop(s: Arc<Shared>) {
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
-        self.shared.shutdown.store(true, Ordering::Release);
+        self.shared.shutdown.store(true, Ordering::SeqCst);
         {
             let _guard = self
                 .shared

@@ -422,4 +422,34 @@ fn l1_parity_q4_1_q8_0_q6_k_pow2_bit_exact() {
             isa.name()
         );
     }
+
+    // 4. Multi-row GEMV parity for Q8_0 (rows=7) and Q6_K (rows=5)
+    let w80 = gen_q8_blocks(&mut rng, 7 * nb32, true);
+    let mut ref_g80 = vec![0.0f32; 7];
+    generic::gemv_q8_0_q8_0(&w80, &y80, &mut ref_g80, 7, nb32);
+
+    let w6k: Vec<BlockQ6K> = (0..5 * nb256).map(|i| x6k[i % nb256]).collect();
+    let mut ref_g6k = vec![0.0f32; 5];
+    generic::gemv_q6_k_q8_k(&w6k, &y8k, &mut ref_g6k, 5, nb256);
+
+    for &isa in &isas {
+        let kt = select_kernels(isa);
+        let mut got_g80 = vec![0.0f32; 7];
+        (kt.gemv_q8_0_q8_0)(&w80, &y80, &mut got_g80, 7, nb32);
+        assert_eq!(
+            got_g80.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            ref_g80.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "gemv Q8_0 bit mismatch for isa={}",
+            isa.name()
+        );
+
+        let mut got_g6k = vec![0.0f32; 5];
+        (kt.gemv_q6_k_q8_k)(&w6k, &y8k, &mut got_g6k, 5, nb256);
+        assert_eq!(
+            got_g6k.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            ref_g6k.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "gemv Q6_K bit mismatch for isa={}",
+            isa.name()
+        );
+    }
 }

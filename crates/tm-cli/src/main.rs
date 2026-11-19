@@ -7,7 +7,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use tm_cpu::{ThreadPool, active_kernels};
 use tm_gguf::GgufFile;
-use tm_models::{LlamaModel, LlamaState, argmax};
+use tm_models::{LlamaModel, LlamaState, Sampler, SamplerConfig, argmax};
 use tm_tokenizer::Tokenizer;
 
 fn print_usage() {
@@ -52,6 +52,7 @@ struct RunOpts {
     n_predict: usize,
     threads: usize,
     max_ctx: usize,
+    sampler: SamplerConfig,
 }
 
 fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
@@ -61,6 +62,7 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
     let mut n_predict = 64usize;
     let mut threads = 4usize;
     let mut max_ctx = 2048usize;
+    let mut sampler = SamplerConfig::default();
 
     let mut i = 0;
     while i < args.len() {
@@ -109,6 +111,46 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
                     .parse()
                     .context("invalid -c")?;
             }
+            "--temp" => {
+                i += 1;
+                sampler.temperature = args
+                    .get(i)
+                    .context("missing value for --temp")?
+                    .parse()
+                    .context("invalid --temp")?;
+            }
+            "--top-k" => {
+                i += 1;
+                sampler.top_k = args
+                    .get(i)
+                    .context("missing value for --top-k")?
+                    .parse()
+                    .context("invalid --top-k")?;
+            }
+            "--top-p" => {
+                i += 1;
+                sampler.top_p = args
+                    .get(i)
+                    .context("missing value for --top-p")?
+                    .parse()
+                    .context("invalid --top-p")?;
+            }
+            "--repeat-penalty" => {
+                i += 1;
+                sampler.repeat_penalty = args
+                    .get(i)
+                    .context("missing value for --repeat-penalty")?
+                    .parse()
+                    .context("invalid --repeat-penalty")?;
+            }
+            "-s" | "--seed" => {
+                i += 1;
+                sampler.seed = args
+                    .get(i)
+                    .context("missing value for --seed")?
+                    .parse()
+                    .context("invalid --seed")?;
+            }
             other => bail!("unknown argument: {other}"),
         }
         i += 1;
@@ -122,6 +164,7 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
         n_predict,
         threads,
         max_ctx,
+        sampler,
     })
 }
 
@@ -165,9 +208,11 @@ fn cmd_run(opts: RunOpts) -> Result<()> {
     }
     let pp_sec = t_pp.elapsed().as_secs_f64();
 
-    // Greedy decode
+    // Decode with Sampler (temp=0 is greedy argmax fast path)
     let mut stdout = io::stdout().lock();
-    let mut next_id = argmax(state.logits());
+    let mut sampler = Sampler::new(opts.sampler, model.cfg.vocab_size);
+    let mut history = prompt_ids.clone();
+    let mut next_id = sampler.sample(state.logits(), &history);
     let mut pos = prompt_ids.len();
     let mut generated = 0usize;
 
@@ -179,13 +224,14 @@ fn cmd_run(opts: RunOpts) -> Result<()> {
         let bytes = tok.decode_token_bytes(next_id);
         stdout.write_all(&bytes)?;
         stdout.flush()?;
+        history.push(next_id);
         generated += 1;
 
         if generated >= opts.n_predict {
             break;
         }
         model.forward_token(&mut state, &pool, kt, next_id, pos, true)?;
-        next_id = argmax(state.logits());
+        next_id = sampler.sample(state.logits(), &history);
         pos += 1;
     }
     let gen_sec = t_gen.elapsed().as_secs_f64();

@@ -169,3 +169,35 @@ pub fn vec_dot_f32(x: &[f32], y: &[f32]) -> f32 {
     }
     sum
 }
+
+/// Scalar GEMV for `Q8_0 x Q8_0`.
+pub fn gemv_q8_0_q8_0(
+    w: &[BlockQ8_0],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), cols_blocks);
+    assert_eq!(out.len(), rows);
+    for r in 0..rows {
+        out[r] = vec_dot_q8_0_q8_0(&w[r * cols_blocks..(r + 1) * cols_blocks], x);
+    }
+}
+
+/// Scalar GEMV for `Q6_K x Q8_K`.
+pub fn gemv_q6_k_q8_k(
+    w: &[BlockQ6K],
+    x: &[BlockQ8K],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), cols_blocks);
+    assert_eq!(out.len(), rows);
+    for r in 0..rows {
+        out[r] = vec_dot_q6_k_q8_k(&w[r * cols_blocks..(r + 1) * cols_blocks], x);
+    }
+}
