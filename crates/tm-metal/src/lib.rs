@@ -35,13 +35,23 @@ pub enum MetalError {
     },
     #[error("invalid dimensions: {0}")]
     InvalidDimensions(String),
+    #[error("GGUF error: {0}")]
+    Gguf(#[from] tm_gguf::GgufError),
+    #[error("unsupported Metal weight dtype {0:?}")]
+    UnsupportedDType(tm_core::DType),
+    #[error("unsupported model architecture '{0}'")]
+    UnsupportedArch(String),
 }
 
 #[cfg(target_vendor = "apple")]
 mod apple;
+#[cfg(target_vendor = "apple")]
+pub mod llama_runner;
 
 #[cfg(target_vendor = "apple")]
 pub use apple::{MetalBuffer, MetalContext};
+#[cfg(target_vendor = "apple")]
+pub use llama_runner::{LlamaMetalConfig, LlamaMetalRunner};
 
 #[cfg(not(target_vendor = "apple"))]
 pub struct MetalContext;

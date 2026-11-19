@@ -52,6 +52,7 @@ struct RunOpts {
     n_predict: usize,
     threads: usize,
     max_ctx: usize,
+    use_metal: bool,
     sampler: SamplerConfig,
 }
 
@@ -62,6 +63,7 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
     let mut n_predict = 64usize;
     let mut threads = 4usize;
     let mut max_ctx = 2048usize;
+    let mut use_metal = false;
     let mut sampler = SamplerConfig::default();
 
     let mut i = 0;
@@ -151,6 +153,9 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
                     .parse()
                     .context("invalid --seed")?;
             }
+            "--metal" => {
+                use_metal = true;
+            }
             other => bail!("unknown argument: {other}"),
         }
         i += 1;
@@ -164,11 +169,133 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
         n_predict,
         threads,
         max_ctx,
+        use_metal,
         sampler,
     })
 }
 
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+fn cmd_run_metal(opts: RunOpts) -> Result<()> {
+    let t_load = Instant::now();
+    let gguf = GgufFile::open(&opts.model)?;
+    let tok = Tokenizer::from_gguf(&gguf)?;
+    let mut runner = tm_metal::LlamaMetalRunner::from_gguf(&gguf, opts.max_ctx)?;
+    let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
+
+    let prompt_text = if let Some(ref fpath) = opts.prompt_file {
+        std::fs::read_to_string(fpath)
+            .with_context(|| format!("failed to read prompt file '{}'", fpath.display()))?
+    } else {
+        opts.prompt.unwrap_or_else(|| "Hello".to_string())
+    };
+    let prompt_ids = tok.encode(&prompt_text, tok.add_bos);
+    if prompt_ids.is_empty() {
+        bail!("prompt encoded to 0 tokens");
+    }
+
+    eprintln!(
+        "[tinymodel] backend=metal ({}) load={:.1}ms prompt_tokens={} vocab={} layers={}",
+        runner.device_name(),
+        load_ms,
+        prompt_ids.len(),
+        runner.cfg.vocab_size,
+        runner.cfg.n_layers
+    );
+
+    let mut sampler = Sampler::new(opts.sampler, runner.cfg.vocab_size);
+    let mut history = prompt_ids.clone();
+
+    let t_pp = Instant::now();
+    for (idx, &id) in prompt_ids[..prompt_ids.len() - 1].iter().enumerate() {
+        runner.forward_token(id, idx, false)?;
+    }
+    let last_prompt_id = prompt_ids[prompt_ids.len() - 1];
+    let logits = runner.forward_token(last_prompt_id, prompt_ids.len() - 1, true)?;
+    let mut next_id = sampler.sample(logits, &history);
+    let pp_sec = t_pp.elapsed().as_secs_f64();
+
+    let mut stdout = io::stdout().lock();
+    let mut pos = prompt_ids.len();
+    let mut generated = 0usize;
+
+    let t_gen = Instant::now();
+    while generated < opts.n_predict {
+        if tok.eos_id == Some(next_id) {
+            break;
+        }
+        stdout.write_all(&tok.decode_token_bytes(next_id))?;
+        stdout.flush()?;
+        history.push(next_id);
+        generated += 1;
+
+        if generated >= opts.n_predict {
+            break;
+        }
+        let logits = runner.forward_token(next_id, pos, true)?;
+        next_id = sampler.sample(logits, &history);
+        pos += 1;
+    }
+    let gen_sec = t_gen.elapsed().as_secs_f64();
+
+    writeln!(stdout)?;
+    let pp_tps = (prompt_ids.len() as f64) / pp_sec.max(1e-9);
+    let tg_runs = generated.saturating_sub(1);
+    let tg_tps = if tg_runs > 0 {
+        (tg_runs as f64) / gen_sec.max(1e-9)
+    } else {
+        0.0
+    };
+    eprintln!(
+        "[tinymodel] prompt: {:.2} ms / {} tok ({:.2} tok/s) | eval: {:.2} ms / {} runs ({:.2} tok/s)",
+        pp_sec * 1e3,
+        prompt_ids.len(),
+        pp_tps,
+        gen_sec * 1e3,
+        tg_runs,
+        tg_tps
+    );
+    Ok(())
+}
+
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+fn cmd_bench_metal(opts: RunOpts) -> Result<()> {
+    let gguf = GgufFile::open(&opts.model)?;
+    let mut runner = tm_metal::LlamaMetalRunner::from_gguf(&gguf, opts.max_ctx)?;
+
+    // Warmup 2 tokens
+    let logits = runner.forward_token(1, 0, true)?;
+    let mut tok = argmax(logits);
+
+    let n_gen = opts.n_predict;
+    let t0 = Instant::now();
+    for step in 0..n_gen {
+        let logits = runner.forward_token(tok, step + 1, true)?;
+        tok = argmax(logits);
+    }
+    let sec = t0.elapsed().as_secs_f64();
+    let tps = (n_gen as f64) / sec.max(1e-9);
+    println!(
+        "bench: model={} backend=metal ({}) tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
+        opts.model
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?"),
+        runner.device_name(),
+        n_gen,
+        tps,
+        (sec * 1e3) / (n_gen as f64),
+        tok
+    );
+    Ok(())
+}
+
 fn cmd_run(opts: RunOpts) -> Result<()> {
+    if opts.use_metal {
+        #[cfg(all(feature = "metal", target_vendor = "apple"))]
+        return cmd_run_metal(opts);
+        #[cfg(not(all(feature = "metal", target_vendor = "apple")))]
+        bail!("--metal requires compiling with feature 'metal' on Apple Silicon");
+    }
     let t_load = Instant::now();
     let gguf = GgufFile::open(&opts.model)?;
     let tok = Tokenizer::from_gguf(&gguf)?;
@@ -258,6 +385,12 @@ fn cmd_run(opts: RunOpts) -> Result<()> {
 }
 
 fn cmd_bench(opts: RunOpts) -> Result<()> {
+    if opts.use_metal {
+        #[cfg(all(feature = "metal", target_vendor = "apple"))]
+        return cmd_bench_metal(opts);
+        #[cfg(not(all(feature = "metal", target_vendor = "apple")))]
+        bail!("--metal requires compiling with feature 'metal' on Apple Silicon");
+    }
     let gguf = GgufFile::open(&opts.model)?;
     let model = LlamaModel::from_gguf(&gguf)?;
     let mut state = LlamaState::new(&model.cfg, opts.max_ctx);

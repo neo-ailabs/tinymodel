@@ -158,6 +158,7 @@ dependencies = [
  "tm-core",
  "tm-cpu",
  "tm-gguf",
+ "tm-metal",
  "tm-models",
  "tm-tokenizer",
 ]
@@ -191,6 +192,7 @@ dependencies = [
  "objc2-metal",
  "thiserror",
  "tm-core",
+ "tm-gguf",
 ]
 
 [[package]]

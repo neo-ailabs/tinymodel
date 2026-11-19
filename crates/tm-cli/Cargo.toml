@@ -12,14 +12,16 @@ name = "tinymodel"
 path = "src/main.rs"
 
 [features]
-default = ["edge"]
+default = ["edge", "metal"]
 micro = ["tm-cpu/micro"]
 edge = ["tm-cpu/edge"]
+metal = ["dep:tm-metal"]
 
 [dependencies]
 anyhow = "1"
 tm-core = { path = "../tm-core" }
 tm-cpu = { path = "../tm-cpu", default-features = false }
 tm-gguf = { path = "../tm-gguf" }
+tm-metal = { path = "../tm-metal", optional = true }
 tm-models = { path = "../tm-models" }
 tm-tokenizer = { path = "../tm-tokenizer" }
