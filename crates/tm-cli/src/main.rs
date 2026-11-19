@@ -177,9 +177,9 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn cmd_run_metal(opts: RunOpts) -> Result<()> {
     let t_load = Instant::now();
-    let gguf = GgufFile::open(&opts.model)?;
+    let gguf = std::sync::Arc::new(GgufFile::open(&opts.model)?);
     let tok = Tokenizer::from_gguf(&gguf)?;
-    let mut runner = tm_metal::LlamaMetalRunner::from_gguf(&gguf, opts.max_ctx)?;
+    let mut runner = tm_metal::LlamaMetalRunner::from_gguf(gguf, opts.max_ctx)?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
     let prompt_text = if let Some(ref fpath) = opts.prompt_file {
@@ -194,8 +194,13 @@ fn cmd_run_metal(opts: RunOpts) -> Result<()> {
     }
 
     eprintln!(
-        "[tinymodel] backend=metal ({}) load={:.1}ms prompt_tokens={} vocab={} layers={}",
+        "[tinymodel] backend=metal ({}) weights={} load={:.1}ms prompt_tokens={} vocab={} layers={}",
         runner.device_name(),
+        if runner.is_zero_copy() {
+            "zero-copy"
+        } else {
+            "copied"
+        },
         load_ms,
         prompt_ids.len(),
         runner.cfg.vocab_size,
@@ -206,11 +211,7 @@ fn cmd_run_metal(opts: RunOpts) -> Result<()> {
     let mut history = prompt_ids.clone();
 
     let t_pp = Instant::now();
-    for (idx, &id) in prompt_ids[..prompt_ids.len() - 1].iter().enumerate() {
-        runner.forward_token(id, idx, false)?;
-    }
-    let last_prompt_id = prompt_ids[prompt_ids.len() - 1];
-    let logits = runner.forward_token(last_prompt_id, prompt_ids.len() - 1, true)?;
+    let logits = runner.forward_batch(&prompt_ids, 0, true)?;
     let mut next_id = sampler.sample(logits, &history);
     let pp_sec = t_pp.elapsed().as_secs_f64();
 
@@ -259,13 +260,27 @@ fn cmd_run_metal(opts: RunOpts) -> Result<()> {
 
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn cmd_bench_metal(opts: RunOpts) -> Result<()> {
-    let gguf = GgufFile::open(&opts.model)?;
-    let mut runner = tm_metal::LlamaMetalRunner::from_gguf(&gguf, opts.max_ctx)?;
+    let t_load = Instant::now();
+    let gguf = std::sync::Arc::new(GgufFile::open(&opts.model)?);
+    let mut runner = tm_metal::LlamaMetalRunner::from_gguf(gguf, opts.max_ctx)?;
+    let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
-    // Warmup 2 tokens
+    // Warmup 1 token + 1 small batch
+    let _ = runner.forward_token(1, 0, true)?;
+    let warmup_ids = [1u32; 8];
+    let _ = runner.forward_batch(&warmup_ids, 0, false)?;
+
+    // Measure pp512 (or max_ctx - n_predict - 2 if smaller)
+    let n_pp = 512usize.min(opts.max_ctx.saturating_sub(opts.n_predict + 2));
+    let pp_ids: Vec<u32> = (0..n_pp).map(|i| ((i % 1000) + 1) as u32).collect();
+    let t_pp = Instant::now();
+    let _ = runner.forward_batch(&pp_ids, 0, false)?;
+    let pp_sec = t_pp.elapsed().as_secs_f64();
+    let pp_tps = (n_pp as f64) / pp_sec.max(1e-9);
+
+    // Measure tgN starting from pos 0
     let logits = runner.forward_token(1, 0, true)?;
     let mut tok = argmax(logits);
-
     let n_gen = opts.n_predict;
     let t0 = Instant::now();
     for step in 0..n_gen {
@@ -275,12 +290,20 @@ fn cmd_bench_metal(opts: RunOpts) -> Result<()> {
     let sec = t0.elapsed().as_secs_f64();
     let tps = (n_gen as f64) / sec.max(1e-9);
     println!(
-        "bench: model={} backend=metal ({}) tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
+        "bench: model={} backend=metal ({}) weights={} load={:.1}ms pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
         opts.model
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("?"),
         runner.device_name(),
+        if runner.is_zero_copy() {
+            "zero-copy"
+        } else {
+            "copied"
+        },
+        load_ms,
+        n_pp,
+        pp_tps,
         n_gen,
         tps,
         (sec * 1e3) / (n_gen as f64),

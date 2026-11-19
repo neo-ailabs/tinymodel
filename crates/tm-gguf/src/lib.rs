@@ -413,6 +413,21 @@ impl GgufFile {
         self.alignment
     }
 
+    /// Byte offset where the tensor data section begins in the file.
+    pub fn data_offset(&self) -> usize {
+        self.data_offset
+    }
+
+    /// Raw read-only view of the entire memory-mapped GGUF file.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.backing.as_slice()
+    }
+
+    /// Absolute byte offset of a tensor from the start of the GGUF file.
+    pub fn tensor_file_offset(&self, info: &TensorInfo) -> usize {
+        self.data_offset + info.offset
+    }
+
     pub fn metadata(&self) -> &HashMap<String, MetadataValue> {
         &self.metadata
     }
