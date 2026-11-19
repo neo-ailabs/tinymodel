@@ -410,6 +410,137 @@ pub unsafe fn vec_dot_q4_1_q8_1(x: &[BlockQ4_1], y: &[BlockQ8_1]) -> f32 {
     }
 }
 
+/// 4-row unrolled ARMv8.2 `dotprod` `gemv_q4_1_q8_1` (shares `y` loads across 4 weight rows).
+///
+/// # Safety
+/// Caller must ensure CPU supports `dotprod` and buffer lengths match dimensions.
+#[target_feature(enable = "neon,dotprod")]
+pub unsafe fn gemv_q4_1_q8_1(
+    w: &[BlockQ4_1],
+    x: &[BlockQ8_1],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), cols_blocks);
+    assert_eq!(out.len(), rows);
+
+    // SAFETY: All row/block indices are strictly bounded by `rows` and `cols_blocks`.
+    unsafe {
+        let m4b = vdupq_n_u8(0x0F);
+        let zero = vdupq_n_s32(0);
+
+        let mut r = 0usize;
+        while r + 4 <= rows {
+            let r0 = &w[r * cols_blocks..(r + 1) * cols_blocks];
+            let r1 = &w[(r + 1) * cols_blocks..(r + 2) * cols_blocks];
+            let r2 = &w[(r + 2) * cols_blocks..(r + 3) * cols_blocks];
+            let r3 = &w[(r + 3) * cols_blocks..(r + 4) * cols_blocks];
+
+            let mut sv0a = vdupq_n_f32(0.0);
+            let mut sv0b = vdupq_n_f32(0.0);
+            let mut sv1a = vdupq_n_f32(0.0);
+            let mut sv1b = vdupq_n_f32(0.0);
+            let mut sv2a = vdupq_n_f32(0.0);
+            let mut sv2b = vdupq_n_f32(0.0);
+            let mut sv3a = vdupq_n_f32(0.0);
+            let mut sv3b = vdupq_n_f32(0.0);
+
+            let mut sms0a = 0.0f32;
+            let mut sms0b = 0.0f32;
+            let mut sms1a = 0.0f32;
+            let mut sms1b = 0.0f32;
+            let mut sms2a = 0.0f32;
+            let mut sms2b = 0.0f32;
+            let mut sms3a = 0.0f32;
+            let mut sms3b = 0.0f32;
+
+            let mut ib = 0usize;
+            while ib + 1 < cols_blocks {
+                let ya = x.get_unchecked(ib);
+                let yb = x.get_unchecked(ib + 1);
+                let yal = vld1q_s8(ya.qs.as_ptr());
+                let yah = vld1q_s8(ya.qs.as_ptr().add(16));
+                let ybl = vld1q_s8(yb.qs.as_ptr());
+                let ybh = vld1q_s8(yb.qs.as_ptr().add(16));
+                let dya = f16_to_f32_hw(ya.d);
+                let dyb = f16_to_f32_hw(yb.d);
+                let sya = f16_to_f32_hw(ya.s);
+                let syb = f16_to_f32_hw(yb.s);
+
+                macro_rules! step_row {
+                    ($row:expr, $sva:expr, $svb:expr, $smsa:expr, $smsb:expr) => {{
+                        let ba = $row.get_unchecked(ib);
+                        let bb = $row.get_unchecked(ib + 1);
+                        let va = vld1q_u8(ba.qs.as_ptr());
+                        let vb = vld1q_u8(bb.qs.as_ptr());
+                        let xal = vreinterpretq_s8_u8(vandq_u8(va, m4b));
+                        let xah = vreinterpretq_s8_u8(vshrq_n_u8::<4>(va));
+                        let xbl = vreinterpretq_s8_u8(vandq_u8(vb, m4b));
+                        let xbh = vreinterpretq_s8_u8(vshrq_n_u8::<4>(vb));
+                        let pa = vdotq_s32(vdotq_s32(zero, xal, yal), xah, yah);
+                        let pb = vdotq_s32(vdotq_s32(zero, xbl, ybl), xbh, ybh);
+                        $sva = vmlaq_n_f32($sva, vcvtq_f32_s32(pa), f16_to_f32_hw(ba.d) * dya);
+                        $svb = vmlaq_n_f32($svb, vcvtq_f32_s32(pb), f16_to_f32_hw(bb.d) * dyb);
+                        $smsa += f16_to_f32_hw(ba.m) * sya;
+                        $smsb += f16_to_f32_hw(bb.m) * syb;
+                    }};
+                }
+
+                step_row!(r0, sv0a, sv0b, sms0a, sms0b);
+                step_row!(r1, sv1a, sv1b, sms1a, sms1b);
+                step_row!(r2, sv2a, sv2b, sms2a, sms2b);
+                step_row!(r3, sv3a, sv3b, sms3a, sms3b);
+
+                ib += 2;
+            }
+
+            let mut o0 = vaddvq_f32(sv0a) + vaddvq_f32(sv0b) + sms0a + sms0b;
+            let mut o1 = vaddvq_f32(sv1a) + vaddvq_f32(sv1b) + sms1a + sms1b;
+            let mut o2 = vaddvq_f32(sv2a) + vaddvq_f32(sv2b) + sms2a + sms2b;
+            let mut o3 = vaddvq_f32(sv3a) + vaddvq_f32(sv3b) + sms3a + sms3b;
+
+            if ib < cols_blocks {
+                let ya = x.get_unchecked(ib);
+                let yal = vld1q_s8(ya.qs.as_ptr());
+                let yah = vld1q_s8(ya.qs.as_ptr().add(16));
+                let dya = f16_to_f32_hw(ya.d);
+                let sya = f16_to_f32_hw(ya.s);
+
+                macro_rules! tail_row {
+                    ($row:expr, $acc:expr) => {{
+                        let ba = $row.get_unchecked(ib);
+                        let va = vld1q_u8(ba.qs.as_ptr());
+                        let xal = vreinterpretq_s8_u8(vandq_u8(va, m4b));
+                        let xah = vreinterpretq_s8_u8(vshrq_n_u8::<4>(va));
+                        let pa = vdotq_s32(vdotq_s32(zero, xal, yal), xah, yah);
+                        $acc += (vaddvq_s32(pa) as f32) * (f16_to_f32_hw(ba.d) * dya)
+                            + f16_to_f32_hw(ba.m) * sya;
+                    }};
+                }
+
+                tail_row!(r0, o0);
+                tail_row!(r1, o1);
+                tail_row!(r2, o2);
+                tail_row!(r3, o3);
+            }
+
+            *out.get_unchecked_mut(r) = o0;
+            *out.get_unchecked_mut(r + 1) = o1;
+            *out.get_unchecked_mut(r + 2) = o2;
+            *out.get_unchecked_mut(r + 3) = o3;
+            r += 4;
+        }
+
+        while r < rows {
+            *out.get_unchecked_mut(r) =
+                vec_dot_q4_1_q8_1(&w[r * cols_blocks..(r + 1) * cols_blocks], x);
+            r += 1;
+        }
+    }
+}
+
 /// ARMv8.2 `dotprod` `vec_dot_q8_0_q8_0` (2-block unrolled).
 ///
 /// # Safety

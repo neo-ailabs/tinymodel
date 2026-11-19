@@ -78,6 +78,26 @@ struct AttnArgs {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct FlashAttnArgs {
+    n_head: u32,
+    n_head_kv: u32,
+    head_dim: u32,
+    seq_len: u32,
+    n_tok: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct QkvGemvArgs {
+    n_in: u32,
+    q_rows: u32,
+    k_rows: u32,
+    v_rows: u32,
+    row_bytes: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct EmbedArgs {
     token_id: u32,
     n_embd: u32,
@@ -141,10 +161,12 @@ struct Pipelines {
     rope_kv: MtlPipe,
     gqa_attn: MtlPipe,
     gemv_q4_0: MtlPipe,
+    gemv_qkv_q4_0: MtlPipe,
     gemv_pair_silu_q4_0: MtlPipe,
     gemv_q4_1: MtlPipe,
     gemv_q8_0: MtlPipe,
     gemv_q6_k: MtlPipe,
+    argmax: MtlPipe,
     // Batched prefill pipelines
     embed_q4_0_batch: MtlPipe,
     embed_q8_0_batch: MtlPipe,
@@ -154,6 +176,7 @@ struct Pipelines {
     qk_norm_batch: MtlPipe,
     rope_kv_batch: MtlPipe,
     gqa_attn_batch: MtlPipe,
+    fa_gqa_batch: MtlPipe,
     gemm_q4_0: MtlPipe,
     silu_mul: MtlPipe,
     gemm_q4_1: MtlPipe,
@@ -176,6 +199,7 @@ pub struct LlamaMetalRunner {
     layers: Vec<GpuLayer>,
     // Pre-allocated activation buffers (sized for MAX_BATCH, zero allocation during inference)
     token_ids_buf: MtlBuf,
+    argmax_buf: MtlBuf,
     x: MtlBuf,
     xb: MtlBuf,
     q: MtlBuf,
@@ -193,18 +217,23 @@ pub struct LlamaMetalRunner {
 fn build_pipe(
     device: &ProtocolObject<dyn MTLDevice>,
     lib: &ProtocolObject<dyn MTLLibrary>,
-    name: &str,
+    name: &'static str,
+    max_tg: usize,
 ) -> Result<MtlPipe, MetalError> {
     let ns = NSString::from_str(name);
     let func = lib
         .newFunctionWithName(&ns)
         .ok_or_else(|| MetalError::FunctionNotFound(name.to_string()))?;
-    device
+    let pipe = device
         .newComputePipelineStateWithFunction_error(&func)
         .map_err(|e| MetalError::PipelineCreation {
             name: name.to_string(),
             reason: e.localizedDescription().to_string(),
-        })
+        })?;
+    // Verify `maxTotalThreadsPerThreadgroup` up front (`AGENTS.md` rule #9) so
+    // dispatches never silently no-op AND hot-path encoding makes zero ObjC queries.
+    require_fit(&pipe, name, max_tg)?;
+    Ok(pipe)
 }
 
 fn upload_bytes(
@@ -400,32 +429,35 @@ impl LlamaMetalRunner {
             .map_err(|e| MetalError::ShaderCompile(e.localizedDescription().to_string()))?;
 
         let pipes = Pipelines {
-            embed_q4_0: build_pipe(&device, &lib, "embed_q4_0")?,
-            embed_q8_0: build_pipe(&device, &lib, "embed_q8_0")?,
-            embed_q6_k: build_pipe(&device, &lib, "embed_q6_k")?,
-            embed_f32: build_pipe(&device, &lib, "embed_f32")?,
-            rms_norm: build_pipe(&device, &lib, "rms_norm_f32")?,
-            qk_norm: build_pipe(&device, &lib, "qk_norm_f32")?,
-            rope_kv: build_pipe(&device, &lib, "rope_and_kv_store_f16")?,
-            gqa_attn: build_pipe(&device, &lib, "gqa_attn_f16_kv")?,
-            gemv_q4_0: build_pipe(&device, &lib, "gemv_q4_0_res")?,
-            gemv_pair_silu_q4_0: build_pipe(&device, &lib, "gemv_pair_silu_q4_0")?,
-            gemv_q4_1: build_pipe(&device, &lib, "gemv_q4_1_res")?,
-            gemv_q8_0: build_pipe(&device, &lib, "gemv_q8_0_res")?,
-            gemv_q6_k: build_pipe(&device, &lib, "gemv_q6_k_res")?,
-            embed_q4_0_batch: build_pipe(&device, &lib, "embed_q4_0_batch")?,
-            embed_q8_0_batch: build_pipe(&device, &lib, "embed_q8_0_batch")?,
-            embed_q6_k_batch: build_pipe(&device, &lib, "embed_q6_k_batch")?,
-            embed_f32_batch: build_pipe(&device, &lib, "embed_f32_batch")?,
-            rms_norm_batch: build_pipe(&device, &lib, "rms_norm_f32_batch")?,
-            qk_norm_batch: build_pipe(&device, &lib, "qk_norm_f32_batch")?,
-            rope_kv_batch: build_pipe(&device, &lib, "rope_and_kv_store_f16_batch")?,
-            gqa_attn_batch: build_pipe(&device, &lib, "gqa_attn_f16_kv_batch")?,
-            gemm_q4_0: build_pipe(&device, &lib, "gemm_q4_0_res")?,
-            silu_mul: build_pipe(&device, &lib, "silu_mul_f32")?,
-            gemm_q4_1: build_pipe(&device, &lib, "gemm_q4_1_res")?,
-            gemm_q8_0: build_pipe(&device, &lib, "gemm_q8_0_res")?,
-            gemm_q6_k: build_pipe(&device, &lib, "gemm_q6_k_res")?,
+            embed_q4_0: build_pipe(&device, &lib, "embed_q4_0", 64)?,
+            embed_q8_0: build_pipe(&device, &lib, "embed_q8_0", 64)?,
+            embed_q6_k: build_pipe(&device, &lib, "embed_q6_k", 64)?,
+            embed_f32: build_pipe(&device, &lib, "embed_f32", 64)?,
+            rms_norm: build_pipe(&device, &lib, "rms_norm_f32", 256)?,
+            qk_norm: build_pipe(&device, &lib, "qk_norm_f32", 32)?,
+            rope_kv: build_pipe(&device, &lib, "rope_and_kv_store_f16", 64)?,
+            gqa_attn: build_pipe(&device, &lib, "gqa_attn_f16_kv", 128)?,
+            gemv_q4_0: build_pipe(&device, &lib, "gemv_q4_0_res", 128)?,
+            gemv_qkv_q4_0: build_pipe(&device, &lib, "gemv_qkv_q4_0", 128)?,
+            gemv_pair_silu_q4_0: build_pipe(&device, &lib, "gemv_pair_silu_q4_0", 128)?,
+            gemv_q4_1: build_pipe(&device, &lib, "gemv_q4_1_res", 128)?,
+            gemv_q8_0: build_pipe(&device, &lib, "gemv_q8_0_res", 128)?,
+            gemv_q6_k: build_pipe(&device, &lib, "gemv_q6_k_res", 128)?,
+            argmax: build_pipe(&device, &lib, "argmax_f32", 256)?,
+            embed_q4_0_batch: build_pipe(&device, &lib, "embed_q4_0_batch", 64)?,
+            embed_q8_0_batch: build_pipe(&device, &lib, "embed_q8_0_batch", 64)?,
+            embed_q6_k_batch: build_pipe(&device, &lib, "embed_q6_k_batch", 64)?,
+            embed_f32_batch: build_pipe(&device, &lib, "embed_f32_batch", 64)?,
+            rms_norm_batch: build_pipe(&device, &lib, "rms_norm_f32_batch", 256)?,
+            qk_norm_batch: build_pipe(&device, &lib, "qk_norm_f32_batch", 32)?,
+            rope_kv_batch: build_pipe(&device, &lib, "rope_and_kv_store_f16_batch", 64)?,
+            gqa_attn_batch: build_pipe(&device, &lib, "gqa_attn_f16_kv_batch", 128)?,
+            fa_gqa_batch: build_pipe(&device, &lib, "fa_gqa_f16_kv_batch", 128)?,
+            gemm_q4_0: build_pipe(&device, &lib, "gemm_q4_0_res", 128)?,
+            silu_mul: build_pipe(&device, &lib, "silu_mul_f32", 256)?,
+            gemm_q4_1: build_pipe(&device, &lib, "gemm_q4_1_res", 128)?,
+            gemm_q8_0: build_pipe(&device, &lib, "gemm_q8_0_res", 128)?,
+            gemm_q6_k: build_pipe(&device, &lib, "gemm_q6_k_res", 128)?,
         };
 
         let shared_weights = try_zero_copy_gguf_buf(&device, gguf_ref);
@@ -585,6 +617,7 @@ impl LlamaMetalRunner {
 
         let f32_sz = core::mem::size_of::<f32>();
         let token_ids_buf = alloc_buf(&device, MAX_BATCH * core::mem::size_of::<u32>())?;
+        let argmax_buf = alloc_buf(&device, 16)?;
         let x = alloc_buf(&device, MAX_BATCH * n_embd * f32_sz)?;
         let xb = alloc_buf(&device, MAX_BATCH * n_embd.max(q_dim) * f32_sz)?;
         let q = alloc_buf(&device, MAX_BATCH * q_dim * f32_sz)?;
@@ -621,6 +654,7 @@ impl LlamaMetalRunner {
             has_rope_freqs,
             layers,
             token_ids_buf,
+            argmax_buf,
             x,
             xb,
             q,
@@ -652,17 +686,15 @@ impl LlamaMetalRunner {
         y_buf: &ProtocolObject<dyn MTLBuffer>,
         add_residual: bool,
     ) -> Result<(), MetalError> {
-        let (pipe, name, rows_per_tg): (&MtlPipe, &'static str, usize) = match mat.dtype {
-            DType::Q4_0 => (&self.pipes.gemv_q4_0, "gemv_q4_0_res", 32),
-            DType::Q4_1 => (&self.pipes.gemv_q4_1, "gemv_q4_1_res", 32),
-            DType::Q8_0 => (&self.pipes.gemv_q8_0, "gemv_q8_0_res", 16),
-            DType::Q6K => (&self.pipes.gemv_q6_k, "gemv_q6_k_res", 16),
+        let (pipe, rows_per_tg): (&MtlPipe, usize) = match mat.dtype {
+            DType::Q4_0 => (&self.pipes.gemv_q4_0, 32),
+            DType::Q4_1 => (&self.pipes.gemv_q4_1, 32),
+            DType::Q8_0 => (&self.pipes.gemv_q8_0, 16),
+            DType::Q6K => (&self.pipes.gemv_q6_k, 16),
             other => return Err(MetalError::UnsupportedDType(other)),
         };
 
         const THREADS: usize = 128;
-        require_fit(pipe, name, THREADS)?;
-
         let args = GemvArgs {
             n_in: mat.cols as u32,
             n_out: mat.rows as u32,
@@ -697,6 +729,180 @@ impl LlamaMetalRunner {
         Ok(())
     }
 
+    fn encode_qkv_gemv(
+        &self,
+        enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        layer: &GpuLayer,
+    ) -> Result<(), MetalError> {
+        if layer.wq.dtype == DType::Q4_0
+            && layer.wk.dtype == DType::Q4_0
+            && layer.wv.dtype == DType::Q4_0
+            && layer.wq.rows.is_multiple_of(32)
+            && layer.wk.rows.is_multiple_of(32)
+        {
+            const THREADS: usize = 128;
+            const ROWS_PER_TG: usize = 32;
+            let total_rows = layer.wq.rows + layer.wk.rows + layer.wv.rows;
+            let qargs = QkvGemvArgs {
+                n_in: layer.wq.cols as u32,
+                q_rows: layer.wq.rows as u32,
+                k_rows: layer.wk.rows as u32,
+                v_rows: layer.wv.rows as u32,
+                row_bytes: layer.wq.row_bytes as u32,
+            };
+            enc.setComputePipelineState(&self.pipes.gemv_qkv_q4_0);
+            // SAFETY: All buffers live on `self` for the full command buffer lifetime.
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&layer.wq.buf), layer.wq.offset, 0);
+                enc.setBuffer_offset_atIndex(Some(&layer.wk.buf), layer.wk.offset, 1);
+                enc.setBuffer_offset_atIndex(Some(&layer.wv.buf), layer.wv.offset, 2);
+                enc.setBuffer_offset_atIndex(Some(&self.xb), 0, 3);
+                enc.setBuffer_offset_atIndex(Some(&self.q), 0, 4);
+                enc.setBuffer_offset_atIndex(Some(&self.k), 0, 5);
+                enc.setBuffer_offset_atIndex(Some(&self.v), 0, 6);
+                enc.setBytes_length_atIndex(
+                    NonNull::from(&qargs).cast::<c_void>(),
+                    core::mem::size_of::<QkvGemvArgs>(),
+                    7,
+                );
+            }
+            enc.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: total_rows.div_ceil(ROWS_PER_TG),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: THREADS,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            Ok(())
+        } else {
+            self.encode_gemv(enc, &layer.wq, &self.xb, &self.q, false)?;
+            self.encode_gemv(enc, &layer.wk, &self.xb, &self.k, false)?;
+            self.encode_gemv(enc, &layer.wv, &self.xb, &self.v, false)?;
+            Ok(())
+        }
+    }
+
+    fn encode_decode_attn(
+        &self,
+        enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        layer: &GpuLayer,
+        seq_len: usize,
+    ) {
+        let aargs = AttnArgs {
+            n_head: self.cfg.n_head as u32,
+            n_head_kv: self.cfg.n_head_kv as u32,
+            head_dim: self.cfg.head_dim as u32,
+            seq_len: seq_len as u32,
+        };
+        enc.setComputePipelineState(&self.pipes.gqa_attn);
+        // SAFETY: Buffers remain alive until `waitUntilCompleted`.
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&self.q), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(&layer.k_cache), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(&layer.v_cache), 0, 2);
+            enc.setBuffer_offset_atIndex(Some(&self.xb), 0, 3);
+            enc.setBytes_length_atIndex(
+                NonNull::from(&aargs).cast::<c_void>(),
+                core::mem::size_of::<AttnArgs>(),
+                4,
+            );
+        }
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: self.cfg.n_head,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+
+    fn encode_prefill_attn(
+        &self,
+        enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        layer: &GpuLayer,
+        chunk_pos: usize,
+        b: usize,
+    ) {
+        const TG: usize = 128;
+        if self.cfg.head_dim <= 128 && self.cfg.head_dim.is_multiple_of(8) {
+            const BQ: usize = 32;
+            let fa = FlashAttnArgs {
+                n_head: self.cfg.n_head as u32,
+                n_head_kv: self.cfg.n_head_kv as u32,
+                head_dim: self.cfg.head_dim as u32,
+                seq_len: (chunk_pos + 1) as u32,
+                n_tok: b as u32,
+            };
+            enc.setComputePipelineState(&self.pipes.fa_gqa_batch);
+            // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&self.q), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(&layer.k_cache), 0, 1);
+                enc.setBuffer_offset_atIndex(Some(&layer.v_cache), 0, 2);
+                enc.setBuffer_offset_atIndex(Some(&self.xb), 0, 3);
+                enc.setBytes_length_atIndex(
+                    NonNull::from(&fa).cast::<c_void>(),
+                    core::mem::size_of::<FlashAttnArgs>(),
+                    4,
+                );
+            }
+            enc.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: self.cfg.n_head,
+                    height: b.div_ceil(BQ),
+                    depth: 1,
+                },
+                MTLSize {
+                    width: TG,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        } else {
+            let aargs = AttnArgs {
+                n_head: self.cfg.n_head as u32,
+                n_head_kv: self.cfg.n_head_kv as u32,
+                head_dim: self.cfg.head_dim as u32,
+                seq_len: (chunk_pos + 1) as u32,
+            };
+            enc.setComputePipelineState(&self.pipes.gqa_attn_batch);
+            // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&self.q), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(&layer.k_cache), 0, 1);
+                enc.setBuffer_offset_atIndex(Some(&layer.v_cache), 0, 2);
+                enc.setBuffer_offset_atIndex(Some(&self.xb), 0, 3);
+                enc.setBytes_length_atIndex(
+                    NonNull::from(&aargs).cast::<c_void>(),
+                    core::mem::size_of::<AttnArgs>(),
+                    4,
+                );
+            }
+            enc.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: self.cfg.n_head,
+                    height: b,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: TG,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+    }
+
     fn encode_gemm(
         &self,
         enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -706,18 +912,15 @@ impl LlamaMetalRunner {
         n_tok: usize,
         add_residual: bool,
     ) -> Result<(), MetalError> {
-        let (pipe, name, rows_per_tg, toks_per_tg): (&MtlPipe, &'static str, usize, usize) =
-            match mat.dtype {
-                DType::Q4_0 => (&self.pipes.gemm_q4_0, "gemm_q4_0_res", 32, 32),
-                DType::Q4_1 => (&self.pipes.gemm_q4_1, "gemm_q4_1_res", 32, 32),
-                DType::Q8_0 => (&self.pipes.gemm_q8_0, "gemm_q8_0_res", 4, 8),
-                DType::Q6K => (&self.pipes.gemm_q6_k, "gemm_q6_k_res", 4, 8),
-                other => return Err(MetalError::UnsupportedDType(other)),
-            };
+        let (pipe, rows_per_tg, toks_per_tg): (&MtlPipe, usize, usize) = match mat.dtype {
+            DType::Q4_0 => (&self.pipes.gemm_q4_0, 32, 32),
+            DType::Q4_1 => (&self.pipes.gemm_q4_1, 32, 32),
+            DType::Q8_0 => (&self.pipes.gemm_q8_0, 4, 8),
+            DType::Q6K => (&self.pipes.gemm_q6_k, 4, 8),
+            other => return Err(MetalError::UnsupportedDType(other)),
+        };
 
         const THREADS: usize = 128;
-        require_fit(pipe, name, THREADS)?;
-
         let args = GemmArgs {
             n_in: mat.cols as u32,
             n_out: mat.rows as u32,
@@ -763,7 +966,6 @@ impl LlamaMetalRunner {
         n: usize,
     ) -> Result<(), MetalError> {
         const THREADS: usize = 256;
-        require_fit(&self.pipes.rms_norm, "rms_norm_f32", THREADS)?;
         let args = NormArgs {
             n: n as u32,
             eps: self.cfg.rms_eps,
@@ -816,7 +1018,6 @@ impl LlamaMetalRunner {
         n_tok: usize,
     ) -> Result<(), MetalError> {
         const THREADS: usize = 256;
-        require_fit(&self.pipes.rms_norm_batch, "rms_norm_f32_batch", THREADS)?;
         let args = NormArgs {
             n: n as u32,
             eps: self.cfg.rms_eps,
@@ -876,270 +1077,7 @@ impl LlamaMetalRunner {
             .computeCommandEncoder()
             .ok_or(MetalError::CommandEncodeFailed)?;
 
-        // 1. Embedding lookup on GPU
-        {
-            let (pipe, name, n_items): (&MtlPipe, &'static str, usize) = match self.token_embd.dtype
-            {
-                DType::Q4_0 => (&self.pipes.embed_q4_0, "embed_q4_0", self.cfg.n_embd / 32),
-                DType::Q8_0 => (&self.pipes.embed_q8_0, "embed_q8_0", self.cfg.n_embd / 32),
-                DType::Q6K => (&self.pipes.embed_q6_k, "embed_q6_k", self.cfg.n_embd / 256),
-                DType::F32 => (&self.pipes.embed_f32, "embed_f32", self.cfg.n_embd),
-                other => return Err(MetalError::UnsupportedDType(other)),
-            };
-            let tg_w = n_items.clamp(1, 64);
-            require_fit(pipe, name, tg_w)?;
-            let eargs = EmbedArgs {
-                token_id,
-                n_embd: self.cfg.n_embd as u32,
-                row_bytes: self.token_embd.row_bytes as u32,
-            };
-            enc.setComputePipelineState(pipe);
-            // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
-            unsafe {
-                enc.setBuffer_offset_atIndex(Some(&self.token_embd.buf), self.token_embd.offset, 0);
-                enc.setBuffer_offset_atIndex(Some(&self.x), 0, 1);
-                enc.setBytes_length_atIndex(
-                    NonNull::from(&eargs).cast::<c_void>(),
-                    core::mem::size_of::<EmbedArgs>(),
-                    2,
-                );
-            }
-            enc.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
-                    width: n_items.div_ceil(tg_w),
-                    height: 1,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: tg_w,
-                    height: 1,
-                    depth: 1,
-                },
-            );
-        }
-
-        // 2. Transformer layers (all in the same command buffer!)
-        let half_rope = self.cfg.rope_dim / 2;
-        let rope_threads = (self.cfg.n_head + self.cfg.n_head_kv) * half_rope;
-        let kv_dim = self.cfg.n_head_kv * self.cfg.head_dim;
-        let rope_total = rope_threads.max(kv_dim);
-
-        for layer in &self.layers {
-            self.encode_rms_norm(&enc, &self.x, &layer.attn_norm, &self.xb, self.cfg.n_embd)?;
-
-            self.encode_gemv(&enc, &layer.wq, &self.xb, &self.q, false)?;
-            self.encode_gemv(&enc, &layer.wk, &self.xb, &self.k, false)?;
-            self.encode_gemv(&enc, &layer.wv, &self.xb, &self.v, false)?;
-
-            // Optional Qwen3 per-head QK-Norm
-            if let Some(ref qn) = layer.q_norm {
-                require_fit(&self.pipes.qk_norm, "qk_norm_f32", 32)?;
-                let na = NormArgs {
-                    n: self.cfg.head_dim as u32,
-                    eps: self.cfg.rms_eps,
-                };
-                enc.setComputePipelineState(&self.pipes.qk_norm);
-                // SAFETY: Buffers remain alive until `waitUntilCompleted`.
-                unsafe {
-                    enc.setBuffer_offset_atIndex(Some(&self.q), 0, 0);
-                    enc.setBuffer_offset_atIndex(Some(qn), 0, 1);
-                    enc.setBytes_length_atIndex(
-                        NonNull::from(&na).cast::<c_void>(),
-                        core::mem::size_of::<NormArgs>(),
-                        2,
-                    );
-                }
-                enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize {
-                        width: self.cfg.n_head,
-                        height: 1,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: 32,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-            }
-            if let Some(ref kn) = layer.k_norm {
-                require_fit(&self.pipes.qk_norm, "qk_norm_f32", 32)?;
-                let na = NormArgs {
-                    n: self.cfg.head_dim as u32,
-                    eps: self.cfg.rms_eps,
-                };
-                enc.setComputePipelineState(&self.pipes.qk_norm);
-                // SAFETY: Buffers remain alive until `waitUntilCompleted`.
-                unsafe {
-                    enc.setBuffer_offset_atIndex(Some(&self.k), 0, 0);
-                    enc.setBuffer_offset_atIndex(Some(kn), 0, 1);
-                    enc.setBytes_length_atIndex(
-                        NonNull::from(&na).cast::<c_void>(),
-                        core::mem::size_of::<NormArgs>(),
-                        2,
-                    );
-                }
-                enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize {
-                        width: self.cfg.n_head_kv,
-                        height: 1,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: 32,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-            }
-
-            // Fused RoPE + F16 KV store
-            {
-                const TG: usize = 64;
-                require_fit(&self.pipes.rope_kv, "rope_and_kv_store_f16", TG)?;
-                let rargs = RopeKvArgs {
-                    n_head: self.cfg.n_head as u32,
-                    n_head_kv: self.cfg.n_head_kv as u32,
-                    head_dim: self.cfg.head_dim as u32,
-                    rope_dim: self.cfg.rope_dim as u32,
-                    pos: pos as u32,
-                    rope_type: self.cfg.rope_type,
-                    has_freq_factors: u32::from(self.has_rope_freqs),
-                    freq_base: self.cfg.rope_freq_base,
-                };
-                enc.setComputePipelineState(&self.pipes.rope_kv);
-                // SAFETY: Buffers remain alive until `waitUntilCompleted`.
-                unsafe {
-                    enc.setBuffer_offset_atIndex(Some(&self.q), 0, 0);
-                    enc.setBuffer_offset_atIndex(Some(&self.k), 0, 1);
-                    enc.setBuffer_offset_atIndex(Some(&self.v), 0, 2);
-                    enc.setBuffer_offset_atIndex(Some(&layer.k_cache), 0, 3);
-                    enc.setBuffer_offset_atIndex(Some(&layer.v_cache), 0, 4);
-                    enc.setBuffer_offset_atIndex(Some(&self.rope_freqs), 0, 5);
-                    enc.setBytes_length_atIndex(
-                        NonNull::from(&rargs).cast::<c_void>(),
-                        core::mem::size_of::<RopeKvArgs>(),
-                        6,
-                    );
-                }
-                enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize {
-                        width: rope_total.div_ceil(TG),
-                        height: 1,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: TG,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-            }
-
-            // GQA attention over F16 KV cache
-            {
-                const TG: usize = 128;
-                require_fit(&self.pipes.gqa_attn, "gqa_attn_f16_kv", TG)?;
-                let aargs = AttnArgs {
-                    n_head: self.cfg.n_head as u32,
-                    n_head_kv: self.cfg.n_head_kv as u32,
-                    head_dim: self.cfg.head_dim as u32,
-                    seq_len: (pos + 1) as u32,
-                };
-                enc.setComputePipelineState(&self.pipes.gqa_attn);
-                // SAFETY: Buffers remain alive until `waitUntilCompleted`.
-                unsafe {
-                    enc.setBuffer_offset_atIndex(Some(&self.q), 0, 0);
-                    enc.setBuffer_offset_atIndex(Some(&layer.k_cache), 0, 1);
-                    enc.setBuffer_offset_atIndex(Some(&layer.v_cache), 0, 2);
-                    enc.setBuffer_offset_atIndex(Some(&self.xb), 0, 3);
-                    enc.setBytes_length_atIndex(
-                        NonNull::from(&aargs).cast::<c_void>(),
-                        core::mem::size_of::<AttnArgs>(),
-                        4,
-                    );
-                }
-                enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize {
-                        width: self.cfg.n_head,
-                        height: 1,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: TG,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-            }
-
-            // Wo + residual add directly into `self.x`
-            self.encode_gemv(&enc, &layer.wo, &self.xb, &self.x, true)?;
-
-            // FFN RMSNorm
-            self.encode_rms_norm(&enc, &self.x, &layer.ffn_norm, &self.xb, self.cfg.n_embd)?;
-
-            // Fused Gate + Up + SwiGLU (single dispatch when both are Q4_0!)
-            if layer.w_gate.dtype == DType::Q4_0 && layer.w_up.dtype == DType::Q4_0 {
-                const THREADS: usize = 128;
-                const ROWS_PER_TG: usize = 16;
-                require_fit(
-                    &self.pipes.gemv_pair_silu_q4_0,
-                    "gemv_pair_silu_q4_0",
-                    THREADS,
-                )?;
-                let gargs = GemvArgs {
-                    n_in: layer.w_gate.cols as u32,
-                    n_out: layer.w_gate.rows as u32,
-                    add_residual: 0,
-                    row_bytes: layer.w_gate.row_bytes as u32,
-                };
-                enc.setComputePipelineState(&self.pipes.gemv_pair_silu_q4_0);
-                // SAFETY: Buffers remain alive until `waitUntilCompleted`.
-                unsafe {
-                    enc.setBuffer_offset_atIndex(Some(&layer.w_gate.buf), layer.w_gate.offset, 0);
-                    enc.setBuffer_offset_atIndex(Some(&layer.w_up.buf), layer.w_up.offset, 1);
-                    enc.setBuffer_offset_atIndex(Some(&self.xb), 0, 2);
-                    enc.setBuffer_offset_atIndex(Some(&self.hb), 0, 3);
-                    enc.setBytes_length_atIndex(
-                        NonNull::from(&gargs).cast::<c_void>(),
-                        core::mem::size_of::<GemvArgs>(),
-                        4,
-                    );
-                }
-                enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize {
-                        width: layer.w_gate.rows.div_ceil(ROWS_PER_TG),
-                        height: 1,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: THREADS,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-            } else {
-                self.encode_gemv(&enc, &layer.w_gate, &self.xb, &self.hb, false)?;
-                self.encode_gemv(&enc, &layer.w_up, &self.xb, &self.hb2, false)?;
-                // Fallback if gate/up are non-Q4_0 (not needed for Q4_0 models)
-                return Err(MetalError::UnsupportedDType(layer.w_gate.dtype));
-            }
-
-            // W_down + residual add directly into `self.x`
-            self.encode_gemv(&enc, &layer.w_down, &self.hb, &self.x, true)?;
-        }
-
-        // 3. Output norm + LM head
-        if compute_logits {
-            self.encode_rms_norm(&enc, &self.x, &self.output_norm, &self.xb, self.cfg.n_embd)?;
-            let out_mat = if self.output_tied {
-                &self.token_embd
-            } else {
-                self.output_separate.as_ref().unwrap_or(&self.token_embd)
-            };
-            self.encode_gemv(&enc, out_mat, &self.xb, &self.logits, false)?;
-        }
+        self.encode_single_token_into(&enc, token_id, pos, compute_logits)?;
 
         enc.endEncoding();
         cmd.commit();
@@ -1149,6 +1087,66 @@ impl LlamaMetalRunner {
         // SAFETY: `waitUntilCompleted` finished; `self.logits` is `StorageModeShared`
         // and holds `self.cfg.vocab_size` `f32` values.
         Ok(unsafe { core::slice::from_raw_parts(ptr, self.cfg.vocab_size) })
+    }
+
+    /// Executes a single-token forward pass AND greedy argmax in ONE Metal command buffer,
+    /// reading back only the 4-byte winning token ID instead of scanning `vocab_size` floats on CPU.
+    pub fn forward_token_greedy(&mut self, token_id: u32, pos: usize) -> Result<u32, MetalError> {
+        if pos >= self.cfg.max_ctx {
+            return Err(MetalError::InvalidDimensions(format!(
+                "pos {pos} >= max_ctx {}",
+                self.cfg.max_ctx
+            )));
+        }
+        if (token_id as usize) >= self.cfg.vocab_size {
+            return Err(MetalError::InvalidDimensions(format!(
+                "token_id {token_id} >= vocab_size {}",
+                self.cfg.vocab_size
+            )));
+        }
+
+        let cmd = self
+            .queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandEncodeFailed)?;
+        let enc = cmd
+            .computeCommandEncoder()
+            .ok_or(MetalError::CommandEncodeFailed)?;
+
+        self.encode_single_token_into(&enc, token_id, pos, true)?;
+
+        let vocab_u32 = self.cfg.vocab_size as u32;
+        enc.setComputePipelineState(&self.pipes.argmax);
+        // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&self.logits), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(&self.argmax_buf), 0, 1);
+            enc.setBytes_length_atIndex(
+                NonNull::from(&vocab_u32).cast::<c_void>(),
+                core::mem::size_of::<u32>(),
+                2,
+            );
+        }
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+
+        let ptr = self.argmax_buf.contents().as_ptr() as *const u32;
+        // SAFETY: `waitUntilCompleted` finished; `argmax_buf` holds at least one `u32`.
+        Ok(unsafe { *ptr })
     }
 
     /// Executes a batched prompt prefill on Metal GPU in chunks of up to `MAX_BATCH` tokens,
@@ -1401,42 +1399,8 @@ impl LlamaMetalRunner {
                     );
                 }
 
-                // Batched causal GQA attention
-                {
-                    const TG: usize = 128;
-                    require_fit(&self.pipes.gqa_attn_batch, "gqa_attn_f16_kv_batch", TG)?;
-                    let aargs = AttnArgs {
-                        n_head: self.cfg.n_head as u32,
-                        n_head_kv: self.cfg.n_head_kv as u32,
-                        head_dim: self.cfg.head_dim as u32,
-                        seq_len: (chunk_pos + 1) as u32,
-                    };
-                    enc.setComputePipelineState(&self.pipes.gqa_attn_batch);
-                    // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
-                    unsafe {
-                        enc.setBuffer_offset_atIndex(Some(&self.q), 0, 0);
-                        enc.setBuffer_offset_atIndex(Some(&layer.k_cache), 0, 1);
-                        enc.setBuffer_offset_atIndex(Some(&layer.v_cache), 0, 2);
-                        enc.setBuffer_offset_atIndex(Some(&self.xb), 0, 3);
-                        enc.setBytes_length_atIndex(
-                            NonNull::from(&aargs).cast::<c_void>(),
-                            core::mem::size_of::<AttnArgs>(),
-                            4,
-                        );
-                    }
-                    enc.dispatchThreadgroups_threadsPerThreadgroup(
-                        MTLSize {
-                            width: self.cfg.n_head,
-                            height: b,
-                            depth: 1,
-                        },
-                        MTLSize {
-                            width: TG,
-                            height: 1,
-                            depth: 1,
-                        },
-                    );
-                }
+                // Batched causal FlashAttention (`simdgroup_mma` tiled)
+                self.encode_prefill_attn(&enc, layer, chunk_pos, b);
 
                 // Wo + residual add
                 self.encode_gemm(&enc, &layer.wo, &self.xb, &self.x, b, true)?;
@@ -1456,7 +1420,6 @@ impl LlamaMetalRunner {
                 self.encode_gemm(&enc, &layer.w_up, &self.xb, &self.hb2, b, false)?;
                 {
                     const TG: usize = 256;
-                    require_fit(&self.pipes.silu_mul, "silu_mul_f32", TG)?;
                     let total_ff = (b * self.cfg.n_ff) as u32;
                     enc.setComputePipelineState(&self.pipes.silu_mul);
                     // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
@@ -1551,16 +1514,14 @@ impl LlamaMetalRunner {
     ) -> Result<(), MetalError> {
         // 1. Embedding
         {
-            let (pipe, name, n_items): (&MtlPipe, &'static str, usize) = match self.token_embd.dtype
-            {
-                DType::Q4_0 => (&self.pipes.embed_q4_0, "embed_q4_0", self.cfg.n_embd / 32),
-                DType::Q8_0 => (&self.pipes.embed_q8_0, "embed_q8_0", self.cfg.n_embd / 32),
-                DType::Q6K => (&self.pipes.embed_q6_k, "embed_q6_k", self.cfg.n_embd / 256),
-                DType::F32 => (&self.pipes.embed_f32, "embed_f32", self.cfg.n_embd),
+            let (pipe, n_items): (&MtlPipe, usize) = match self.token_embd.dtype {
+                DType::Q4_0 => (&self.pipes.embed_q4_0, self.cfg.n_embd / 32),
+                DType::Q8_0 => (&self.pipes.embed_q8_0, self.cfg.n_embd / 32),
+                DType::Q6K => (&self.pipes.embed_q6_k, self.cfg.n_embd / 256),
+                DType::F32 => (&self.pipes.embed_f32, self.cfg.n_embd),
                 other => return Err(MetalError::UnsupportedDType(other)),
             };
             let tg_w = n_items.clamp(1, 64);
-            require_fit(pipe, name, tg_w)?;
             let eargs = EmbedArgs {
                 token_id,
                 n_embd: self.cfg.n_embd as u32,
@@ -1598,12 +1559,9 @@ impl LlamaMetalRunner {
 
         for layer in &self.layers {
             self.encode_rms_norm(enc, &self.x, &layer.attn_norm, &self.xb, self.cfg.n_embd)?;
-            self.encode_gemv(enc, &layer.wq, &self.xb, &self.q, false)?;
-            self.encode_gemv(enc, &layer.wk, &self.xb, &self.k, false)?;
-            self.encode_gemv(enc, &layer.wv, &self.xb, &self.v, false)?;
+            self.encode_qkv_gemv(enc, layer)?;
 
             if let Some(ref qn) = layer.q_norm {
-                require_fit(&self.pipes.qk_norm, "qk_norm_f32", 32)?;
                 let na = NormArgs {
                     n: self.cfg.head_dim as u32,
                     eps: self.cfg.rms_eps,
@@ -1633,7 +1591,6 @@ impl LlamaMetalRunner {
                 );
             }
             if let Some(ref kn) = layer.k_norm {
-                require_fit(&self.pipes.qk_norm, "qk_norm_f32", 32)?;
                 let na = NormArgs {
                     n: self.cfg.head_dim as u32,
                     eps: self.cfg.rms_eps,
@@ -1665,7 +1622,6 @@ impl LlamaMetalRunner {
 
             {
                 const TG: usize = 64;
-                require_fit(&self.pipes.rope_kv, "rope_and_kv_store_f16", TG)?;
                 let rargs = RopeKvArgs {
                     n_head: self.cfg.n_head as u32,
                     n_head_kv: self.cfg.n_head_kv as u32,
@@ -1705,41 +1661,7 @@ impl LlamaMetalRunner {
                 );
             }
 
-            {
-                const TG: usize = 128;
-                require_fit(&self.pipes.gqa_attn, "gqa_attn_f16_kv", TG)?;
-                let aargs = AttnArgs {
-                    n_head: self.cfg.n_head as u32,
-                    n_head_kv: self.cfg.n_head_kv as u32,
-                    head_dim: self.cfg.head_dim as u32,
-                    seq_len: (pos + 1) as u32,
-                };
-                enc.setComputePipelineState(&self.pipes.gqa_attn);
-                // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
-                unsafe {
-                    enc.setBuffer_offset_atIndex(Some(&self.q), 0, 0);
-                    enc.setBuffer_offset_atIndex(Some(&layer.k_cache), 0, 1);
-                    enc.setBuffer_offset_atIndex(Some(&layer.v_cache), 0, 2);
-                    enc.setBuffer_offset_atIndex(Some(&self.xb), 0, 3);
-                    enc.setBytes_length_atIndex(
-                        NonNull::from(&aargs).cast::<c_void>(),
-                        core::mem::size_of::<AttnArgs>(),
-                        4,
-                    );
-                }
-                enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize {
-                        width: self.cfg.n_head,
-                        height: 1,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: TG,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-            }
+            self.encode_decode_attn(enc, layer, pos + 1);
 
             self.encode_gemv(enc, &layer.wo, &self.xb, &self.x, true)?;
             self.encode_rms_norm(enc, &self.x, &layer.ffn_norm, &self.xb, self.cfg.n_embd)?;
@@ -1747,11 +1669,6 @@ impl LlamaMetalRunner {
             if layer.w_gate.dtype == DType::Q4_0 && layer.w_up.dtype == DType::Q4_0 {
                 const THREADS: usize = 128;
                 const ROWS_PER_TG: usize = 16;
-                require_fit(
-                    &self.pipes.gemv_pair_silu_q4_0,
-                    "gemv_pair_silu_q4_0",
-                    THREADS,
-                )?;
                 let gargs = GemvArgs {
                     n_in: layer.w_gate.cols as u32,
                     n_out: layer.w_gate.rows as u32,
@@ -1838,7 +1755,7 @@ impl LlamaMetalRunner {
         let dec_names: [&'static str; N_DEC_STAGES] = [
             "embed",
             "attn_norm",
-            "attn_wq",
+            "attn_qkv",
             "attn_wk",
             "attn_wv",
             "qk_norm",
@@ -1870,12 +1787,12 @@ impl LlamaMetalRunner {
         dec_bytes[0] = (self.token_embd.row_bytes + n_embd * 4) as u64;
         dec_bytes[1] = (self.cfg.n_layers * n_embd * 12) as u64;
         for l in &self.layers {
-            dec_bytes[2] += (l.wq.row_bytes * l.wq.rows) as u64;
-            dec_flops[2] += (2 * l.wq.rows * l.wq.cols) as u64;
-            dec_bytes[3] += (l.wk.row_bytes * l.wk.rows) as u64;
-            dec_flops[3] += (2 * l.wk.rows * l.wk.cols) as u64;
-            dec_bytes[4] += (l.wv.row_bytes * l.wv.rows) as u64;
-            dec_flops[4] += (2 * l.wv.rows * l.wv.cols) as u64;
+            dec_bytes[2] += (l.wq.row_bytes * l.wq.rows
+                + l.wk.row_bytes * l.wk.rows
+                + l.wv.row_bytes * l.wv.rows) as u64;
+            dec_flops[2] += (2
+                * (l.wq.rows * l.wq.cols + l.wk.rows * l.wk.cols + l.wv.rows * l.wv.cols))
+                as u64;
             dec_bytes[8] += (l.wo.row_bytes * l.wo.rows) as u64;
             dec_flops[8] += (2 * l.wo.rows * l.wo.cols) as u64;
             dec_bytes[10] +=
@@ -1974,22 +1891,18 @@ impl LlamaMetalRunner {
                     cb.commit();
                     pending.push((1, cb));
                 }
-                // 2, 3, 4: wq, wk, wv
-                for (st, mat, out_b) in [
-                    (2usize, &layer.wq, &self.q),
-                    (3usize, &layer.wk, &self.k),
-                    (4usize, &layer.wv, &self.v),
-                ] {
+                // 2: fused attn_qkv
+                {
                     let cb = pqueue
                         .commandBuffer()
                         .ok_or(MetalError::CommandEncodeFailed)?;
                     let enc = cb
                         .computeCommandEncoder()
                         .ok_or(MetalError::CommandEncodeFailed)?;
-                    self.encode_gemv(&enc, mat, &self.xb, out_b, false)?;
+                    self.encode_qkv_gemv(&enc, layer)?;
                     enc.endEncoding();
                     cb.commit();
-                    pending.push((st, cb));
+                    pending.push((2, cb));
                 }
                 // 5: qk_norm (optional)
                 if layer.q_norm.is_some() || layer.k_norm.is_some() {
@@ -2115,38 +2028,7 @@ impl LlamaMetalRunner {
                     let enc = cb
                         .computeCommandEncoder()
                         .ok_or(MetalError::CommandEncodeFailed)?;
-                    const TG: usize = 128;
-                    let aargs = AttnArgs {
-                        n_head: self.cfg.n_head as u32,
-                        n_head_kv: self.cfg.n_head_kv as u32,
-                        head_dim: self.cfg.head_dim as u32,
-                        seq_len: (pos + 1) as u32,
-                    };
-                    enc.setComputePipelineState(&self.pipes.gqa_attn);
-                    // SAFETY: Buffers live until `drain`.
-                    unsafe {
-                        enc.setBuffer_offset_atIndex(Some(&self.q), 0, 0);
-                        enc.setBuffer_offset_atIndex(Some(&layer.k_cache), 0, 1);
-                        enc.setBuffer_offset_atIndex(Some(&layer.v_cache), 0, 2);
-                        enc.setBuffer_offset_atIndex(Some(&self.xb), 0, 3);
-                        enc.setBytes_length_atIndex(
-                            NonNull::from(&aargs).cast::<c_void>(),
-                            core::mem::size_of::<AttnArgs>(),
-                            4,
-                        );
-                    }
-                    enc.dispatchThreadgroups_threadsPerThreadgroup(
-                        MTLSize {
-                            width: self.cfg.n_head,
-                            height: 1,
-                            depth: 1,
-                        },
-                        MTLSize {
-                            width: TG,
-                            height: 1,
-                            depth: 1,
-                        },
-                    );
+                    self.encode_decode_attn(&enc, layer, pos + 1);
                     enc.endEncoding();
                     cb.commit();
                     pending.push((7, cb));
@@ -2326,7 +2208,12 @@ impl LlamaMetalRunner {
         let avg_seq = chunk_pos + b / 2;
         pp_flops[6] =
             (self.cfg.n_layers * b * self.cfg.n_head * avg_seq * self.cfg.head_dim * 4) as u64;
-        pp_bytes[6] = (self.cfg.n_layers * b * avg_seq * kv_dim * 4) as u64;
+        pp_bytes[6] = (self.cfg.n_layers
+            * b.div_ceil(32)
+            * self.cfg.n_head
+            * avg_seq
+            * self.cfg.head_dim
+            * 4) as u64;
 
         let mut pp_pending: Vec<(usize, Retained<ProtocolObject<dyn MTLCommandBuffer>>)> =
             Vec::with_capacity(64);
@@ -2498,7 +2385,7 @@ impl LlamaMetalRunner {
                     cb.commit();
                     pp_pending.push((5, cb));
                 }
-                // 6: gqa_attn_batch
+                // 6: fa_gqa_batch (tiled FlashAttention)
                 {
                     let cb = pqueue
                         .commandBuffer()
@@ -2506,38 +2393,7 @@ impl LlamaMetalRunner {
                     let enc = cb
                         .computeCommandEncoder()
                         .ok_or(MetalError::CommandEncodeFailed)?;
-                    const TG: usize = 128;
-                    let aargs = AttnArgs {
-                        n_head: self.cfg.n_head as u32,
-                        n_head_kv: self.cfg.n_head_kv as u32,
-                        head_dim: self.cfg.head_dim as u32,
-                        seq_len: (chunk_pos + 1) as u32,
-                    };
-                    enc.setComputePipelineState(&self.pipes.gqa_attn_batch);
-                    // SAFETY: Buffers live until `drain_pp`.
-                    unsafe {
-                        enc.setBuffer_offset_atIndex(Some(&self.q), 0, 0);
-                        enc.setBuffer_offset_atIndex(Some(&layer.k_cache), 0, 1);
-                        enc.setBuffer_offset_atIndex(Some(&layer.v_cache), 0, 2);
-                        enc.setBuffer_offset_atIndex(Some(&self.xb), 0, 3);
-                        enc.setBytes_length_atIndex(
-                            NonNull::from(&aargs).cast::<c_void>(),
-                            core::mem::size_of::<AttnArgs>(),
-                            4,
-                        );
-                    }
-                    enc.dispatchThreadgroups_threadsPerThreadgroup(
-                        MTLSize {
-                            width: self.cfg.n_head,
-                            height: b,
-                            depth: 1,
-                        },
-                        MTLSize {
-                            width: TG,
-                            height: 1,
-                            depth: 1,
-                        },
-                    );
+                    self.encode_prefill_attn(&enc, layer, chunk_pos, b);
                     enc.endEncoding();
                     cb.commit();
                     pp_pending.push((6, cb));

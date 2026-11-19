@@ -6,10 +6,13 @@
 
 use tm_core::{
     BlockQ4_0, BlockQ4_1, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, DType, QK_K, QK4_0, QK4_1,
-    QK8_0, f16_to_f32, quantize_row_q8_0, quantize_row_q8_1, quantize_row_q8_k,
+    QK8_0, f16_to_f32, quantize_row_q8_k,
 };
 
 use crate::{KernelTable, ThreadPool, generic};
+
+/// Maximum batch size per CPU prefill chunk (kept compact so L2 tiles + scratch stay < 300 KB).
+pub const MAX_CPU_BATCH: usize = 32;
 
 /// Rotary Position Embedding pairing convention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +23,7 @@ pub enum RopeType {
     Neox,
 }
 
-/// Pre-allocated activation quantization scratch buffers (reused across every matvec).
+/// Pre-allocated activation quantization scratch buffers (reused across every matvec / matmul).
 pub struct MatvecScratch {
     pub q8_0: Vec<BlockQ8_0>,
     pub q8_1: Vec<BlockQ8_1>,
@@ -28,10 +31,11 @@ pub struct MatvecScratch {
 }
 
 impl MatvecScratch {
-    /// Allocates scratch space large enough for vectors up to `max_cols` elements.
+    /// Allocates scratch space large enough for vectors up to `max_cols` elements
+    /// and batches up to `MAX_CPU_BATCH` tokens.
     pub fn new(max_cols: usize) -> Self {
-        let nb32 = max_cols.div_ceil(QK8_0);
-        let nb256 = max_cols.div_ceil(QK_K);
+        let nb32 = max_cols.div_ceil(QK8_0) * MAX_CPU_BATCH;
+        let nb256 = max_cols.div_ceil(QK_K) * MAX_CPU_BATCH;
         Self {
             q8_0: vec![BlockQ8_0 { d: 0, qs: [0; 32] }; nb32],
             q8_1: vec![
@@ -82,7 +86,7 @@ pub fn matvec_f32(
         DType::Q4_0 => {
             let cols_blocks = cols / QK4_0;
             let xq = &mut scratch.q8_0[..cols_blocks];
-            quantize_row_q8_0(x, xq);
+            (kt.quantize_q8_0)(x, xq);
             let xq_ref: &[BlockQ8_0] = xq;
             assert!(
                 (w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockQ4_0>()),
@@ -112,7 +116,7 @@ pub fn matvec_f32(
         DType::Q4_1 => {
             let cols_blocks = cols / QK4_1;
             let xq = &mut scratch.q8_1[..cols_blocks];
-            quantize_row_q8_1(x, xq);
+            (kt.quantize_q8_1)(x, xq);
             let xq_ref: &[BlockQ8_1] = xq;
             assert!(
                 (w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockQ4_1>()),
@@ -130,16 +134,19 @@ pub fn matvec_f32(
                 // SAFETY: Disjoint `[r0..r1)` output ranges per parallel chunk.
                 let o =
                     unsafe { core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(r0), len) };
-                for i in 0..len {
-                    let row = &w[(r0 + i) * cols_blocks..(r0 + i + 1) * cols_blocks];
-                    o[i] = (kt.vec_dot_q4_1_q8_1)(row, xq_ref);
-                }
+                (kt.gemv_q4_1_q8_1)(
+                    &w[r0 * cols_blocks..r1 * cols_blocks],
+                    xq_ref,
+                    o,
+                    len,
+                    cols_blocks,
+                );
             });
         }
         DType::Q8_0 => {
             let cols_blocks = cols / QK8_0;
             let xq = &mut scratch.q8_0[..cols_blocks];
-            quantize_row_q8_0(x, xq);
+            (kt.quantize_q8_0)(x, xq);
             let xq_ref: &[BlockQ8_0] = xq;
             assert!(
                 (w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockQ8_0>()),
@@ -345,6 +352,7 @@ pub fn softmax_inplace(x: &mut [f32]) {
 /// Single-token GQA attention against F16 KV cache (layout: `[seq, n_kv_heads * head_dim]`).
 #[allow(clippy::too_many_arguments)]
 pub fn gqa_attention_f16_kv(
+    kt: &KernelTable,
     out: &mut [f32],
     q: &[f32],
     k_cache: &[u16],
@@ -367,11 +375,7 @@ pub fn gqa_attention_f16_kv(
         for (t, s_slot) in sc.iter_mut().enumerate() {
             let k_off = t * kv_dim + kv_h * head_dim;
             let kh = &k_cache[k_off..k_off + head_dim];
-            let mut dot = 0.0f32;
-            for d in 0..head_dim {
-                dot += qh[d] * f16_to_f32(kh[d]);
-            }
-            *s_slot = dot * scale;
+            *s_slot = (kt.dot_f32_f16)(qh, kh) * scale;
         }
 
         softmax_inplace(sc);
@@ -381,9 +385,7 @@ pub fn gqa_attention_f16_kv(
         for (t, &w) in sc.iter().enumerate() {
             let v_off = t * kv_dim + kv_h * head_dim;
             let vh = &v_cache[v_off..v_off + head_dim];
-            for d in 0..head_dim {
-                oh[d] += w * f16_to_f32(vh[d]);
-            }
+            (kt.axpy_f32_f16)(oh, w, vh);
         }
     }
 }
@@ -450,6 +452,7 @@ pub fn rope_inplace_tables(
 #[allow(clippy::too_many_arguments)]
 pub fn gqa_attention_f16_kv_parallel(
     pool: &ThreadPool,
+    kt: &KernelTable,
     out: &mut [f32],
     q: &[f32],
     k_cache: &[u16],
@@ -461,10 +464,10 @@ pub fn gqa_attention_f16_kv_parallel(
     max_ctx: usize,
     scores: &mut [f32],
 ) {
-    // For short contexts or single thread, run inline to avoid any pool dispatch.
-    if pool.num_threads() == 1 || seq_len < 32 {
+    // Below 24 tokens run inline to avoid waking threads; above 24 parallelize across all cores.
+    if pool.num_threads() == 1 || seq_len < 24 {
         gqa_attention_f16_kv(
-            out, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim, seq_len, scores,
+            kt, out, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim, seq_len, scores,
         );
         return;
     }
@@ -488,11 +491,7 @@ pub fn gqa_attention_f16_kv_parallel(
             for (t, s_slot) in sc.iter_mut().enumerate() {
                 let k_off = t * kv_dim + kv_h * head_dim;
                 let kh = &k_cache[k_off..k_off + head_dim];
-                let mut dot = 0.0f32;
-                for d in 0..head_dim {
-                    dot += qh[d] * f16_to_f32(kh[d]);
-                }
-                *s_slot = dot * scale;
+                *s_slot = (kt.dot_f32_f16)(qh, kh) * scale;
             }
 
             softmax_inplace(sc);
@@ -505,9 +504,7 @@ pub fn gqa_attention_f16_kv_parallel(
             for (t, &w) in sc.iter().enumerate() {
                 let v_off = t * kv_dim + kv_h * head_dim;
                 let vh = &v_cache[v_off..v_off + head_dim];
-                for d in 0..head_dim {
-                    oh[d] += w * f16_to_f32(vh[d]);
-                }
+                (kt.axpy_f32_f16)(oh, w, vh);
             }
         }
     });
@@ -535,7 +532,7 @@ pub fn matvec_pair_f32(
     if dtype_a == DType::Q4_0 && dtype_b == DType::Q4_0 {
         let cols_blocks = cols / QK4_0;
         let xq = &mut scratch.q8_0[..cols_blocks];
-        quantize_row_q8_0(x, xq);
+        (kt.quantize_q8_0)(x, xq);
         let xq_ref: &[BlockQ8_0] = xq;
 
         assert!(
@@ -621,7 +618,7 @@ pub fn matvec_triple_f32(
     if dtype_a == DType::Q4_0 && dtype_b == DType::Q4_0 && dtype_c == DType::Q4_0 {
         let cols_blocks = cols / QK4_0;
         let xq = &mut scratch.q8_0[..cols_blocks];
-        quantize_row_q8_0(x, xq);
+        (kt.quantize_q8_0)(x, xq);
         let xq_ref: &[BlockQ8_0] = xq;
 
         assert!(
@@ -702,4 +699,296 @@ pub fn matvec_triple_f32(
     matvec_f32(pool, kt, dtype_a, wa_bytes, x, scratch, out_a, rows_a, cols);
     matvec_f32(pool, kt, dtype_b, wb_bytes, x, scratch, out_b, rows_b, cols);
     matvec_f32(pool, kt, dtype_c, wc_bytes, x, scratch, out_c, rows_c, cols);
+}
+
+/// Batched quantized matrix multiplication `out[n_tok, rows] = x[n_tok, cols] * W^T[rows, cols]`
+/// across `pool`, using L2-cached weight tiles and ISA-dispatched `gemm_q4_0_q8_0` (`smmla`/`sdot`).
+///
+/// Zero heap allocations: uses pre-allocated `scratch` (`n_tok <= MAX_CPU_BATCH`).
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_f32(
+    pool: &ThreadPool,
+    kt: &KernelTable,
+    dtype: DType,
+    w_bytes: &[u8],
+    x: &[f32],
+    scratch: &mut MatvecScratch,
+    out: &mut [f32],
+    rows: usize,
+    cols: usize,
+    n_tok: usize,
+) {
+    assert!((1..=MAX_CPU_BATCH).contains(&n_tok));
+    assert_eq!(x.len(), n_tok * cols);
+    assert_eq!(out.len(), n_tok * rows);
+    if n_tok == 1 {
+        matvec_f32(pool, kt, dtype, w_bytes, x, scratch, out, rows, cols);
+        return;
+    }
+
+    let n_thr = pool.num_threads();
+    let chunk = rows.div_ceil(n_thr).next_multiple_of(4).max(4);
+    let out_ptr = out.as_mut_ptr() as usize;
+
+    match dtype {
+        DType::Q4_0 => {
+            let cols_blocks = cols / QK4_0;
+            let xq = &mut scratch.q8_0[..n_tok * cols_blocks];
+            for t in 0..n_tok {
+                (kt.quantize_q8_0)(
+                    &x[t * cols..(t + 1) * cols],
+                    &mut xq[t * cols_blocks..(t + 1) * cols_blocks],
+                );
+            }
+            let xq_ref: &[BlockQ8_0] = xq;
+            assert!((w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockQ4_0>()));
+            // SAFETY: Alignment and length verified; `BlockQ4_0` is `#[repr(C)]` POD.
+            let w: &[BlockQ4_0] = unsafe {
+                core::slice::from_raw_parts(
+                    w_bytes.as_ptr() as *const BlockQ4_0,
+                    rows * cols_blocks,
+                )
+            };
+            // Tile by 4 rows (<= 9 KB, stays in L1D cache) using ISA-dispatched `gemm_q4_0_q8_0`
+            // (`smmla` 2x2 on `i8mm`, 4-token `sdot` on `dotprod`, NEON on `micro`).
+            pool.parallel_for(rows, chunk, |r0, r1| {
+                let mut r = r0;
+                let mut tile = [0.0f32; 4 * MAX_CPU_BATCH];
+                while r + 4 <= r1 {
+                    let w4 = &w[r * cols_blocks..(r + 4) * cols_blocks];
+                    (kt.gemm_q4_0_q8_0)(w4, xq_ref, &mut tile[..4 * n_tok], 4, cols_blocks, n_tok);
+                    for t in 0..n_tok {
+                        // SAFETY: Disjoint `[t * rows + r .. t * rows + r + 4)` per worker.
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                (out_ptr as *mut f32).add(t * rows + r),
+                                4,
+                            )
+                        };
+                        dst.copy_from_slice(&tile[t * 4..(t + 1) * 4]);
+                    }
+                    r += 4;
+                }
+                if r < r1 {
+                    let rem = r1 - r;
+                    let wr = &w[r * cols_blocks..r1 * cols_blocks];
+                    (kt.gemm_q4_0_q8_0)(
+                        wr,
+                        xq_ref,
+                        &mut tile[..rem * n_tok],
+                        rem,
+                        cols_blocks,
+                        n_tok,
+                    );
+                    for t in 0..n_tok {
+                        // SAFETY: Disjoint `[t * rows + r .. t * rows + r1)` per worker.
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                (out_ptr as *mut f32).add(t * rows + r),
+                                rem,
+                            )
+                        };
+                        dst.copy_from_slice(&tile[t * rem..(t + 1) * rem]);
+                    }
+                }
+            });
+        }
+        DType::Q4_1 => {
+            let cols_blocks = cols / QK4_1;
+            let xq = &mut scratch.q8_1[..n_tok * cols_blocks];
+            for t in 0..n_tok {
+                (kt.quantize_q8_1)(
+                    &x[t * cols..(t + 1) * cols],
+                    &mut xq[t * cols_blocks..(t + 1) * cols_blocks],
+                );
+            }
+            let xq_ref: &[BlockQ8_1] = xq;
+            assert!((w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockQ4_1>()));
+            // SAFETY: Alignment and length verified; `BlockQ4_1` is `#[repr(C)]` POD.
+            let w: &[BlockQ4_1] = unsafe {
+                core::slice::from_raw_parts(
+                    w_bytes.as_ptr() as *const BlockQ4_1,
+                    rows * cols_blocks,
+                )
+            };
+            pool.parallel_for(rows, chunk, |r0, r1| {
+                let mut r = r0;
+                while r + 4 <= r1 {
+                    let w4 = &w[r * cols_blocks..(r + 4) * cols_blocks];
+                    for t in 0..n_tok {
+                        // SAFETY: Disjoint `[t * rows + r .. t * rows + r + 4)` per worker.
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                (out_ptr as *mut f32).add(t * rows + r),
+                                4,
+                            )
+                        };
+                        (kt.gemv_q4_1_q8_1)(
+                            w4,
+                            &xq_ref[t * cols_blocks..(t + 1) * cols_blocks],
+                            dst,
+                            4,
+                            cols_blocks,
+                        );
+                    }
+                    r += 4;
+                }
+                if r < r1 {
+                    let rem = r1 - r;
+                    let wr = &w[r * cols_blocks..r1 * cols_blocks];
+                    for t in 0..n_tok {
+                        // SAFETY: Disjoint `[t * rows + r .. t * rows + r1)` per worker.
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                (out_ptr as *mut f32).add(t * rows + r),
+                                rem,
+                            )
+                        };
+                        (kt.gemv_q4_1_q8_1)(
+                            wr,
+                            &xq_ref[t * cols_blocks..(t + 1) * cols_blocks],
+                            dst,
+                            rem,
+                            cols_blocks,
+                        );
+                    }
+                }
+            });
+        }
+        DType::Q8_0 => {
+            let cols_blocks = cols / QK8_0;
+            let xq = &mut scratch.q8_0[..n_tok * cols_blocks];
+            for t in 0..n_tok {
+                (kt.quantize_q8_0)(
+                    &x[t * cols..(t + 1) * cols],
+                    &mut xq[t * cols_blocks..(t + 1) * cols_blocks],
+                );
+            }
+            let xq_ref: &[BlockQ8_0] = xq;
+            assert!((w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockQ8_0>()));
+            // SAFETY: Alignment and length verified; `BlockQ8_0` is `#[repr(C)]` POD.
+            let w: &[BlockQ8_0] = unsafe {
+                core::slice::from_raw_parts(
+                    w_bytes.as_ptr() as *const BlockQ8_0,
+                    rows * cols_blocks,
+                )
+            };
+            pool.parallel_for(rows, chunk, |r0, r1| {
+                let mut r = r0;
+                while r + 4 <= r1 {
+                    let w4 = &w[r * cols_blocks..(r + 4) * cols_blocks];
+                    for t in 0..n_tok {
+                        // SAFETY: Disjoint `[t * rows + r .. t * rows + r + 4)` per worker.
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                (out_ptr as *mut f32).add(t * rows + r),
+                                4,
+                            )
+                        };
+                        (kt.gemv_q8_0_q8_0)(
+                            w4,
+                            &xq_ref[t * cols_blocks..(t + 1) * cols_blocks],
+                            dst,
+                            4,
+                            cols_blocks,
+                        );
+                    }
+                    r += 4;
+                }
+                if r < r1 {
+                    let rem = r1 - r;
+                    let wr = &w[r * cols_blocks..r1 * cols_blocks];
+                    for t in 0..n_tok {
+                        // SAFETY: Disjoint `[t * rows + r .. t * rows + r1)` per worker.
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                (out_ptr as *mut f32).add(t * rows + r),
+                                rem,
+                            )
+                        };
+                        (kt.gemv_q8_0_q8_0)(
+                            wr,
+                            &xq_ref[t * cols_blocks..(t + 1) * cols_blocks],
+                            dst,
+                            rem,
+                            cols_blocks,
+                        );
+                    }
+                }
+            });
+        }
+        DType::Q6K => {
+            let cols_blocks = cols / QK_K;
+            let xq = &mut scratch.q8_k[..n_tok * cols_blocks];
+            for t in 0..n_tok {
+                quantize_row_q8_k(
+                    &x[t * cols..(t + 1) * cols],
+                    &mut xq[t * cols_blocks..(t + 1) * cols_blocks],
+                );
+            }
+            let xq_ref: &[BlockQ8K] = xq;
+            assert!((w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockQ6K>()));
+            // SAFETY: Alignment and length verified; `BlockQ6K` is `#[repr(C)]` POD.
+            let w: &[BlockQ6K] = unsafe {
+                core::slice::from_raw_parts(w_bytes.as_ptr() as *const BlockQ6K, rows * cols_blocks)
+            };
+            pool.parallel_for(rows, chunk, |r0, r1| {
+                let mut r = r0;
+                while r + 2 <= r1 {
+                    let w2 = &w[r * cols_blocks..(r + 2) * cols_blocks];
+                    for t in 0..n_tok {
+                        // SAFETY: Disjoint `[t * rows + r .. t * rows + r + 2)` per worker.
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                (out_ptr as *mut f32).add(t * rows + r),
+                                2,
+                            )
+                        };
+                        (kt.gemv_q6_k_q8_k)(
+                            w2,
+                            &xq_ref[t * cols_blocks..(t + 1) * cols_blocks],
+                            dst,
+                            2,
+                            cols_blocks,
+                        );
+                    }
+                    r += 2;
+                }
+                if r < r1 {
+                    let wr = &w[r * cols_blocks..r1 * cols_blocks];
+                    for t in 0..n_tok {
+                        // SAFETY: Disjoint `[t * rows + r]` per worker.
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                (out_ptr as *mut f32).add(t * rows + r),
+                                1,
+                            )
+                        };
+                        (kt.gemv_q6_k_q8_k)(
+                            wr,
+                            &xq_ref[t * cols_blocks..(t + 1) * cols_blocks],
+                            dst,
+                            1,
+                            cols_blocks,
+                        );
+                    }
+                }
+            });
+        }
+        _ => {
+            for t in 0..n_tok {
+                matvec_f32(
+                    pool,
+                    kt,
+                    dtype,
+                    w_bytes,
+                    &x[t * cols..(t + 1) * cols],
+                    scratch,
+                    &mut out[t * rows..(t + 1) * rows],
+                    rows,
+                    cols,
+                );
+            }
+        }
+    }
 }

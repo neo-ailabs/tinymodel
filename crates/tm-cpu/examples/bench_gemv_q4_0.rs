@@ -151,4 +151,33 @@ fn main() {
         }
         println!();
     }
+
+    // Also benchmark F16 KV dot + Q8_0 activation quantization + Q4_1 GEMV across ISAs
+    let src_f32: Vec<f32> = (0..8192).map(|i| ((i as f32) - 4096.0) * 0.001).collect();
+    let mut dst_q80 = vec![BlockQ8_0 { d: 0, qs: [0; 32] }; 256];
+    let mut kv_f16 = vec![f32_to_f16(0.5); 64 * 1024];
+    println!("--- Auxiliary CPU Kernel Microbench (1 thread) ---");
+    for &isa in &isas {
+        let kt = select_kernels(isa);
+        (kt.f32_to_f16_slice)(&src_f32[..1024], &mut kv_f16[..1024]);
+        let t_q = Instant::now();
+        for _ in 0..1000 {
+            (kt.quantize_q8_0)(&src_f32, &mut dst_q80);
+        }
+        let q_us = t_q.elapsed().as_secs_f64() * 1e6 / 1000.0;
+
+        let t_kv = Instant::now();
+        let mut acc = 0.0f32;
+        for step in 0..1024 {
+            acc += (kt.dot_f32_f16)(&src_f32[..64], &kv_f16[step * 64..(step + 1) * 64]);
+        }
+        let kv_us = t_kv.elapsed().as_secs_f64() * 1e6;
+        println!(
+            "{:<10} quantize_q8_0(8192)={:.2} us | dot_f32_f16(1024x64)={:.2} us (acc={:.1})",
+            isa.name(),
+            q_us,
+            kv_us,
+            acc
+        );
+    }
 }

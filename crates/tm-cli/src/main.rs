@@ -220,6 +220,8 @@ fn cmd_run_metal(opts: RunOpts) -> Result<()> {
     let mut pos = prompt_ids.len();
     let mut generated = 0usize;
 
+    let is_pure_greedy =
+        opts.sampler.temperature <= 0.0 && (opts.sampler.repeat_penalty - 1.0).abs() < 1e-6;
     let t_gen = Instant::now();
     while generated < opts.n_predict {
         if tok.eos_id == Some(next_id) {
@@ -233,8 +235,12 @@ fn cmd_run_metal(opts: RunOpts) -> Result<()> {
         if generated >= opts.n_predict {
             break;
         }
-        let logits = runner.forward_token(next_id, pos, true)?;
-        next_id = sampler.sample(logits, &history);
+        if is_pure_greedy {
+            next_id = runner.forward_token_greedy(next_id, pos)?;
+        } else {
+            let logits = runner.forward_token(next_id, pos, true)?;
+            next_id = sampler.sample(logits, &history);
+        }
         pos += 1;
     }
     let gen_sec = t_gen.elapsed().as_secs_f64();
@@ -279,14 +285,12 @@ fn cmd_bench_metal(opts: RunOpts) -> Result<()> {
     let pp_sec = t_pp.elapsed().as_secs_f64();
     let pp_tps = (n_pp as f64) / pp_sec.max(1e-9);
 
-    // Measure tgN starting from pos 0
-    let logits = runner.forward_token(1, 0, true)?;
-    let mut tok = argmax(logits);
+    // Measure tgN starting from pos 0 using GPU-side greedy argmax
+    let mut tok = runner.forward_token_greedy(1, 0)?;
     let n_gen = opts.n_predict;
     let t0 = Instant::now();
     for step in 0..n_gen {
-        let logits = runner.forward_token(tok, step + 1, true)?;
-        tok = argmax(logits);
+        tok = runner.forward_token_greedy(tok, step + 1)?;
     }
     let sec = t0.elapsed().as_secs_f64();
     let tps = (n_gen as f64) / sec.max(1e-9);
@@ -351,12 +355,9 @@ fn cmd_run(opts: RunOpts) -> Result<()> {
         model.cfg.n_layers
     );
 
-    // Prefill prompt tokens
+    // Prefill prompt tokens via batched GEMM
     let t_pp = Instant::now();
-    for (idx, &id) in prompt_ids.iter().enumerate() {
-        let is_last = idx + 1 == prompt_ids.len();
-        model.forward_token(&mut state, &pool, kt, id, idx, is_last)?;
-    }
+    model.forward_batch(&mut state, &pool, kt, &prompt_ids, 0, true)?;
     let pp_sec = t_pp.elapsed().as_secs_f64();
 
     // Decode with Sampler (temp=0 is greedy argmax fast path)
@@ -421,7 +422,19 @@ fn cmd_bench(opts: RunOpts) -> Result<()> {
     let pool = ThreadPool::new(opts.threads);
     let kt = active_kernels();
 
-    // Warmup 2 tokens
+    // Warmup 1 token + 1 small batch
+    model.forward_token(&mut state, &pool, kt, 1, 0, true)?;
+    let warm_ids = [1u32; 8];
+    model.forward_batch(&mut state, &pool, kt, &warm_ids, 0, false)?;
+
+    // Measure pp512
+    let n_pp = 512usize.min(opts.max_ctx.saturating_sub(opts.n_predict + 2));
+    let pp_ids: Vec<u32> = (0..n_pp).map(|i| ((i % 1000) + 1) as u32).collect();
+    let t_pp = Instant::now();
+    model.forward_batch(&mut state, &pool, kt, &pp_ids, 0, false)?;
+    let pp_tps = (n_pp as f64) / t_pp.elapsed().as_secs_f64().max(1e-9);
+
+    // Measure tgN starting from pos 0
     model.forward_token(&mut state, &pool, kt, 1, 0, true)?;
     let mut tok = argmax(state.logits());
 
@@ -434,13 +447,15 @@ fn cmd_bench(opts: RunOpts) -> Result<()> {
     let sec = t0.elapsed().as_secs_f64();
     let tps = (n_gen as f64) / sec.max(1e-9);
     println!(
-        "bench: model={} isa={} threads={} tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
+        "bench: model={} isa={} threads={} pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
         opts.model
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("?"),
         kt.isa.name(),
         pool.num_threads(),
+        n_pp,
+        pp_tps,
         n_gen,
         tps,
         (sec * 1e3) / (n_gen as f64),
@@ -578,12 +593,11 @@ fn cmd_profile(opts: RunOpts) -> Result<()> {
         model.forward_token(&mut state, &pool, kt, 1, i, true)?;
     }
 
-    // Measure CPU prefill (64 tokens, no logits except last)
+    // Measure CPU batched prefill (64 tokens, compute last logits)
     let n_pp = 64usize.min(opts.max_ctx / 2);
+    let pp_ids = vec![1u32; n_pp];
     let t_pp = Instant::now();
-    for i in 0..n_pp {
-        model.forward_token(&mut state, &pool, kt, 1, i, i + 1 == n_pp)?;
-    }
+    model.forward_batch(&mut state, &pool, kt, &pp_ids, 0, true)?;
     let pp_ms = t_pp.elapsed().as_secs_f64() * 1e3;
     let pp_tps = (n_pp as f64) / (pp_ms * 1e-3).max(1e-9);
 

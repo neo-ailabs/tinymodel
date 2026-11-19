@@ -81,3 +81,25 @@
 | **P3** | **CPU 批量 Prefill (`forward_batch` + `smmla`/`sdot` M×N GEMM 微内核)** | CPU Prefill | CPU `pp512` 提升 **5×–7×**（`Llama-1B` `102 -> ~650+ tok/s`），同时为投机解码多 token 校验打底 |
 | **P4** | **Metal Decode 融合 QKV 单次 Dispatch + GPU 侧 Greedy Argmax + 预检 `require_fit`** | Metal Decode | 消除 `wk`/`wv` 低带宽尾波（`22 GB/s -> 80+ GB/s`）及 ~250 us 主机同步开销：`Llama-1B` `108.2 -> ~116+ tok/s`、`SmolLM2` `226.4 -> ~250+ tok/s`（**全面反超 `llama.cpp` Metal**） |
 | **P5** | **Metal 残差加 + `RMSNorm` 融合（`NORM_MUL_ADD`）+ 短序列 1-simdgroup GQA** | Metal Decode | 32 层小模型每 token 减少 64 次屏障，再省 `~250 us/tok` |
+
+
+---
+
+## 5. 优化落地与前后实测对比（2026-11-20）
+
+本轮按上表落地了 **P0–P4**：
+1. **Metal Tiled FlashAttention (`fa_gqa_f16_kv_batch`, `simdgroup_mma`, `BQ=32, BK=16`, 12 KB TG 内存)**：`gqa_attn_batch` 从 `47.6–49.5 ms` 降至 **`6.46–6.62 ms`**（**7.2×–7.7× 提速**，算力从 `150 GFLOP/s` 升至 `1.16 TFLOP/s`）。
+2. **Metal 融合单次 Dispatch `gemv_qkv_q4_0` + 预检 `require_fit` + GPU `argmax_f32`**：`Llama-1B` 的 QKV 耗时从 `1,173.3 us`（48 GB/s）降至 **`720.5 us`（78.6 GB/s，1.63×）**，`SmolLM2` 从 `791.9 us` 降至 **`451.5 us`（1.75×）**。
+3. **CPU 基础 ARMv8.0 NEON `fcvtl`/`fcvtn` F16 注意力 + NEON `quantize_q8_{0,1}` + 4 行 `gemv_q4_1_q8_1`**：微基准单线程 `dot_f32_f16` 提速 **11.7×**（`48.12 -> 4.12 us`）、`quantize_q8_0` 提速 **3.8×**（`3.93 -> 1.04 us`）；端到端 CPU `gqa_attn` 从 `1,059.6 / 978.3 us` 降至 **`261.3 / 229.7 us`（4.1×–4.3×）**。
+4. **CPU `forward_batch` + 4×8 `smmla` (`i8mm`) 寄存器分块 GEMM**：CPU `pp512` 提速 **2.05×–2.41×**。
+
+| 后端 | 模型 | 指标 | 优化前 | 优化后 | 对比 `llama.cpp` |
+|---|---|---|---|---|---|
+| **Metal GPU** | `SmolLM2-360M-Q4_0` | `pp512` | 2,133.2 tok/s | **3,500.0 tok/s** (**+64.1%**) | 80.2% |
+| | | `tg128` | 223.4 tok/s | **229.8 tok/s** | **99.2%** |
+| **Metal GPU** | `Llama-3.2-1B-Q4_0` | `pp512` | 1,072.6 tok/s | **1,351.3 tok/s** (**+26.0%**) | 80.6% |
+| | | `tg128` | 106.0 tok/s | **107.5 tok/s** | **95.6%** |
+| **CPU (4T)** | `SmolLM2-360M-Q4_0` | `pp512` | 287.7 tok/s | **588.8 tok/s** (**2.05×**) | 32.9% |
+| | | `tg128` | 224.8 tok/s | **270.5 tok/s** (**+20.3%**) | **106.3% (`--no-repack`) / 116.1% (默认)** ✅ |
+| **CPU (4T)** | `Llama-3.2-1B-Q4_0` | `pp512` | 102.2 tok/s | **246.6 tok/s** (**2.41×**) | 28.9% |
+| | | `tg128` | 79.9 tok/s | **84.9 tok/s** (**+6.3%**) | **96.4% (`--no-repack`)** ✅ |

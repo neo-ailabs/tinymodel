@@ -452,4 +452,89 @@ fn l1_parity_q4_1_q8_0_q6_k_pow2_bit_exact() {
             isa.name()
         );
     }
+
+    // 5. Multi-row GEMV parity for Q4_1 (rows=7 -> tests 4-row loop + 3-row tail)
+    let w41: Vec<BlockQ4_1> = (0..7 * nb32).map(|i| x41[i % nb32]).collect();
+    let mut ref_g41 = vec![0.0f32; 7];
+    generic::gemv_q4_1_q8_1(&w41, &y81, &mut ref_g41, 7, nb32);
+    for &isa in &isas {
+        let kt = select_kernels(isa);
+        let mut got_g41 = vec![0.0f32; 7];
+        (kt.gemv_q4_1_q8_1)(&w41, &y81, &mut got_g41, 7, nb32);
+        assert_eq!(
+            got_g41.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            ref_g41.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "gemv Q4_1 bit mismatch for isa={}",
+            isa.name()
+        );
+    }
+
+    // 6. Bit-exact parity for NEON quantize_q8_0, quantize_q8_1, f32_to_f16_slice,
+    //    and power-of-two bit-exact parity for dot_f32_f16 & axpy_f32_f16
+    let src_f32: Vec<f32> = (0..256).map(|i| ((i - 128) as f32) * 0.03125).collect();
+    let mut ref_q80 = vec![BlockQ8_0 { d: 0, qs: [0; 32] }; 8];
+    let mut ref_q81 = vec![
+        BlockQ8_1 {
+            d: 0,
+            s: 0,
+            qs: [0; 32]
+        };
+        8
+    ];
+    generic::quantize_q8_0(&src_f32, &mut ref_q80);
+    generic::quantize_q8_1(&src_f32, &mut ref_q81);
+
+    let mut ref_f16 = vec![0u16; 67];
+    generic::f32_to_f16_slice(&src_f32[..67], &mut ref_f16);
+    let ref_dot16 = generic::dot_f32_f16(&src_f32[..67], &ref_f16);
+    let mut ref_axpy = vec![0.25f32; 67];
+    generic::axpy_f32_f16(&mut ref_axpy, 0.5, &ref_f16);
+
+    for &isa in &isas {
+        let kt = select_kernels(isa);
+        let mut got_q80 = vec![BlockQ8_0 { d: 0, qs: [0; 32] }; 8];
+        let mut got_q81 = vec![
+            BlockQ8_1 {
+                d: 0,
+                s: 0,
+                qs: [0; 32]
+            };
+            8
+        ];
+        (kt.quantize_q8_0)(&src_f32, &mut got_q80);
+        (kt.quantize_q8_1)(&src_f32, &mut got_q81);
+        for b in 0..8 {
+            assert_eq!(got_q80[b].d, ref_q80[b].d);
+            assert_eq!(got_q80[b].qs, ref_q80[b].qs);
+            assert_eq!(got_q81[b].d, ref_q81[b].d);
+            assert_eq!(got_q81[b].s, ref_q81[b].s);
+            assert_eq!(got_q81[b].qs, ref_q81[b].qs);
+        }
+
+        let mut got_f16 = vec![0u16; 67];
+        (kt.f32_to_f16_slice)(&src_f32[..67], &mut got_f16);
+        assert_eq!(
+            got_f16,
+            ref_f16,
+            "f32_to_f16_slice mismatch for {}",
+            isa.name()
+        );
+
+        let got_dot16 = (kt.dot_f32_f16)(&src_f32[..67], &got_f16);
+        assert_eq!(
+            got_dot16.to_bits(),
+            ref_dot16.to_bits(),
+            "dot_f32_f16 pow2 bit mismatch for {}",
+            isa.name()
+        );
+
+        let mut got_axpy = vec![0.25f32; 67];
+        (kt.axpy_f32_f16)(&mut got_axpy, 0.5, &got_f16);
+        assert_eq!(
+            got_axpy.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            ref_axpy.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "axpy_f32_f16 pow2 bit mismatch for {}",
+            isa.name()
+        );
+    }
 }

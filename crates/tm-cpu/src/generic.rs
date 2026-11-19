@@ -201,3 +201,60 @@ pub fn gemv_q6_k_q8_k(
         out[r] = vec_dot_q6_k_q8_k(&w[r * cols_blocks..(r + 1) * cols_blocks], x);
     }
 }
+
+/// Scalar GEMV for `Q4_1 x Q8_1`.
+pub fn gemv_q4_1_q8_1(
+    w: &[BlockQ4_1],
+    x: &[BlockQ8_1],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), cols_blocks);
+    assert_eq!(out.len(), rows);
+    for r in 0..rows {
+        out[r] = vec_dot_q4_1_q8_1(&w[r * cols_blocks..(r + 1) * cols_blocks], x);
+    }
+}
+
+/// Scalar `f32 x f16` dot product (for F16 KV attention).
+#[inline]
+pub fn dot_f32_f16(q: &[f32], k_f16: &[u16]) -> f32 {
+    debug_assert_eq!(q.len(), k_f16.len());
+    let mut sum = 0.0f32;
+    for (&qv, &kh) in q.iter().zip(k_f16.iter()) {
+        sum += qv * f16_to_f32(kh);
+    }
+    sum
+}
+
+/// Scalar `out[d] += w * f16_to_f32(v_f16[d])` (for F16 V aggregation).
+#[inline]
+pub fn axpy_f32_f16(out: &mut [f32], w: f32, v_f16: &[u16]) {
+    debug_assert_eq!(out.len(), v_f16.len());
+    for (o, &vh) in out.iter_mut().zip(v_f16.iter()) {
+        *o += w * f16_to_f32(vh);
+    }
+}
+
+/// Scalar `f32` -> IEEE 754 `f16` (`u16`) slice conversion.
+#[inline]
+pub fn f32_to_f16_slice(src: &[f32], dst: &mut [u16]) {
+    debug_assert_eq!(src.len(), dst.len());
+    for (d, &s) in dst.iter_mut().zip(src.iter()) {
+        *d = tm_core::f32_to_f16(s);
+    }
+}
+
+/// Scalar `f32 -> Q8_0` activation quantization.
+#[inline]
+pub fn quantize_q8_0(src: &[f32], dst: &mut [BlockQ8_0]) {
+    tm_core::quantize_row_q8_0(src, dst);
+}
+
+/// Scalar `f32 -> Q8_1` activation quantization.
+#[inline]
+pub fn quantize_q8_1(src: &[f32], dst: &mut [BlockQ8_1]) {
+    tm_core::quantize_row_q8_1(src, dst);
+}

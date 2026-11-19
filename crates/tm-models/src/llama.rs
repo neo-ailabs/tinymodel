@@ -4,11 +4,11 @@
 //! `qwen3` (NeoX RoPE + per-head QK-Norm `attn_q_norm` / `attn_k_norm`).
 
 use thiserror::Error;
-use tm_core::{DType, dequantize_row_bytes, f32_to_f16};
+use tm_core::{DType, dequantize_row_bytes};
 use tm_cpu::{
-    KernelTable, MatvecScratch, RopeType, ThreadPool, gqa_attention_f16_kv_parallel, matvec_f32,
-    matvec_pair_f32, matvec_triple_f32, rms_norm, rope_compute_cos_sin, rope_inplace_tables,
-    swiglu_inplace,
+    KernelTable, MAX_CPU_BATCH, MatvecScratch, RopeType, ThreadPool, gqa_attention_f16_kv_parallel,
+    matmul_f32, matvec_f32, matvec_pair_f32, matvec_triple_f32, rms_norm, rope_compute_cos_sin,
+    rope_inplace_tables, swiglu_inplace,
 };
 use tm_gguf::{GgufError, GgufFile};
 
@@ -116,14 +116,14 @@ impl LlamaState {
             max_ctx,
             k_cache,
             v_cache,
-            x: vec![0.0; cfg.n_embd],
-            xb: vec![0.0; cfg.n_embd.max(q_dim)],
-            xb2: vec![0.0; cfg.n_embd],
-            q: vec![0.0; q_dim],
-            k: vec![0.0; kv_dim],
-            v: vec![0.0; kv_dim],
-            hb: vec![0.0; cfg.n_ff],
-            hb2: vec![0.0; cfg.n_ff],
+            x: vec![0.0; MAX_CPU_BATCH * cfg.n_embd],
+            xb: vec![0.0; MAX_CPU_BATCH * cfg.n_embd.max(q_dim)],
+            xb2: vec![0.0; MAX_CPU_BATCH * cfg.n_embd],
+            q: vec![0.0; MAX_CPU_BATCH * q_dim],
+            k: vec![0.0; MAX_CPU_BATCH * kv_dim],
+            v: vec![0.0; MAX_CPU_BATCH * kv_dim],
+            hb: vec![0.0; MAX_CPU_BATCH * cfg.n_ff],
+            hb2: vec![0.0; MAX_CPU_BATCH * cfg.n_ff],
             rope_cos: vec![0.0; cfg.rope_dim / 2],
             rope_sin: vec![0.0; cfg.rope_dim / 2],
             scores: vec![0.0; cfg.n_head * max_ctx],
@@ -370,6 +370,7 @@ impl<'a> LlamaModel<'a> {
         }
 
         let n_embd = self.cfg.n_embd;
+        let n_ff = self.cfg.n_ff;
         let q_dim = self.cfg.n_head * self.cfg.head_dim;
         let kv_dim = self.cfg.n_head_kv * self.cfg.head_dim;
 
@@ -384,13 +385,13 @@ impl<'a> LlamaModel<'a> {
         // 1. Token embedding lookup (zero-copy row slice -> f32)
         let row_bytes = self.token_embd.dtype.row_bytes(n_embd);
         let emb_row = &self.token_embd.bytes[tid * row_bytes..(tid + 1) * row_bytes];
-        dequantize_row_bytes(self.token_embd.dtype, emb_row, &mut state.x);
+        dequantize_row_bytes(self.token_embd.dtype, emb_row, &mut state.x[..n_embd]);
 
         // 2. Transformer layers
         for (l, layer) in self.layers.iter().enumerate() {
             rms_norm(
                 &mut state.xb[..n_embd],
-                &state.x,
+                &state.x[..n_embd],
                 &layer.attn_norm,
                 self.cfg.rms_eps,
             );
@@ -401,15 +402,15 @@ impl<'a> LlamaModel<'a> {
                 layer.wq.dtype,
                 layer.wq.bytes,
                 layer.wq.rows,
-                &mut state.q,
+                &mut state.q[..q_dim],
                 layer.wk.dtype,
                 layer.wk.bytes,
                 layer.wk.rows,
-                &mut state.k,
+                &mut state.k[..kv_dim],
                 layer.wv.dtype,
                 layer.wv.bytes,
                 layer.wv.rows,
-                &mut state.v,
+                &mut state.v[..kv_dim],
                 &state.xb[..n_embd],
                 &mut state.mv_scratch,
                 n_embd,
@@ -434,7 +435,7 @@ impl<'a> LlamaModel<'a> {
             }
 
             rope_inplace_tables(
-                &mut state.q,
+                &mut state.q[..q_dim],
                 self.cfg.n_head,
                 self.cfg.head_dim,
                 self.cfg.rope_dim,
@@ -443,7 +444,7 @@ impl<'a> LlamaModel<'a> {
                 self.cfg.rope_type,
             );
             rope_inplace_tables(
-                &mut state.k,
+                &mut state.k[..kv_dim],
                 self.cfg.n_head_kv,
                 self.cfg.head_dim,
                 self.cfg.rope_dim,
@@ -452,20 +453,23 @@ impl<'a> LlamaModel<'a> {
                 self.cfg.rope_type,
             );
 
-            // Store K, V into F16 KV cache at position `pos`
+            // Store K, V into F16 KV cache at position `pos` via ISA-dispatched `fcvtn`
             let kv_off = pos * kv_dim;
-            let k_dst = &mut state.k_cache[l][kv_off..kv_off + kv_dim];
-            let v_dst = &mut state.v_cache[l][kv_off..kv_off + kv_dim];
-            for i in 0..kv_dim {
-                k_dst[i] = f32_to_f16(state.k[i]);
-                v_dst[i] = f32_to_f16(state.v[i]);
-            }
+            (kt.f32_to_f16_slice)(
+                &state.k[..kv_dim],
+                &mut state.k_cache[l][kv_off..kv_off + kv_dim],
+            );
+            (kt.f32_to_f16_slice)(
+                &state.v[..kv_dim],
+                &mut state.v_cache[l][kv_off..kv_off + kv_dim],
+            );
 
-            // GQA attention over 0..=pos (parallel across heads for long contexts)
+            // GQA attention over 0..=pos (hardware NEON `fcvt` + parallel across heads for long ctx)
             gqa_attention_f16_kv_parallel(
                 pool,
+                kt,
                 &mut state.xb[..q_dim],
-                &state.q,
+                &state.q[..q_dim],
                 &state.k_cache[l],
                 &state.v_cache[l],
                 self.cfg.n_head,
@@ -484,7 +488,7 @@ impl<'a> LlamaModel<'a> {
                 layer.wo.bytes,
                 &state.xb[..q_dim],
                 &mut state.mv_scratch,
-                &mut state.xb2,
+                &mut state.xb2[..n_embd],
                 layer.wo.rows,
                 layer.wo.cols,
             );
@@ -495,7 +499,7 @@ impl<'a> LlamaModel<'a> {
             // FFN (SwiGLU)
             rms_norm(
                 &mut state.xb[..n_embd],
-                &state.x,
+                &state.x[..n_embd],
                 &layer.ffn_norm,
                 self.cfg.rms_eps,
             );
@@ -505,24 +509,24 @@ impl<'a> LlamaModel<'a> {
                 layer.w_gate.dtype,
                 layer.w_gate.bytes,
                 layer.w_gate.rows,
-                &mut state.hb,
+                &mut state.hb[..n_ff],
                 layer.w_up.dtype,
                 layer.w_up.bytes,
                 layer.w_up.rows,
-                &mut state.hb2,
+                &mut state.hb2[..n_ff],
                 &state.xb[..n_embd],
                 &mut state.mv_scratch,
                 n_embd,
             );
-            swiglu_inplace(&mut state.hb, &state.hb2);
+            swiglu_inplace(&mut state.hb[..n_ff], &state.hb2[..n_ff]);
             matvec_f32(
                 pool,
                 kt,
                 layer.w_down.dtype,
                 layer.w_down.bytes,
-                &state.hb,
+                &state.hb[..n_ff],
                 &mut state.mv_scratch,
-                &mut state.xb2,
+                &mut state.xb2[..n_embd],
                 layer.w_down.rows,
                 layer.w_down.cols,
             );
@@ -535,7 +539,7 @@ impl<'a> LlamaModel<'a> {
         if compute_logits {
             rms_norm(
                 &mut state.xb[..n_embd],
-                &state.x,
+                &state.x[..n_embd],
                 &self.output_norm,
                 self.cfg.rms_eps,
             );
@@ -550,6 +554,289 @@ impl<'a> LlamaModel<'a> {
                 self.output.rows,
                 self.output.cols,
             );
+        }
+
+        Ok(())
+    }
+
+    /// Runs a batched prompt prefill on CPU in chunks of up to `MAX_CPU_BATCH` tokens,
+    /// reusing L2-cached weight tiles and `i8mm`/`dotprod`/`neon` GEMM microkernels.
+    ///
+    /// Performs **zero heap allocations** and preserves exact batch-width invariance.
+    pub fn forward_batch(
+        &self,
+        state: &mut LlamaState,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        token_ids: &[u32],
+        start_pos: usize,
+        compute_last_logits: bool,
+    ) -> Result<(), ModelError> {
+        if token_ids.is_empty() {
+            return Ok(());
+        }
+        let end_pos = start_pos + token_ids.len() - 1;
+        if end_pos >= state.max_ctx {
+            return Err(ModelError::ContextOverflow {
+                pos: end_pos,
+                max_ctx: state.max_ctx,
+            });
+        }
+        for &tid in token_ids {
+            if (tid as usize) >= self.cfg.vocab_size {
+                return Err(ModelError::TokenOutOfRange {
+                    token_id: tid,
+                    vocab_size: self.cfg.vocab_size,
+                });
+            }
+        }
+        if token_ids.len() == 1 {
+            return self.forward_token(
+                state,
+                pool,
+                kt,
+                token_ids[0],
+                start_pos,
+                compute_last_logits,
+            );
+        }
+
+        let n_embd = self.cfg.n_embd;
+        let n_ff = self.cfg.n_ff;
+        let q_dim = self.cfg.n_head * self.cfg.head_dim;
+        let kv_dim = self.cfg.n_head_kv * self.cfg.head_dim;
+        let row_bytes = self.token_embd.dtype.row_bytes(n_embd);
+
+        let total = token_ids.len();
+        let mut offset = 0usize;
+        while offset < total {
+            let b = (total - offset).min(MAX_CPU_BATCH);
+            let chunk = &token_ids[offset..offset + b];
+            let chunk_pos = start_pos + offset;
+            let is_last = offset + b == total;
+
+            // 1. Batched embedding lookup
+            for (t, &tok) in chunk.iter().enumerate() {
+                let tid = tok as usize;
+                let emb_row = &self.token_embd.bytes[tid * row_bytes..(tid + 1) * row_bytes];
+                dequantize_row_bytes(
+                    self.token_embd.dtype,
+                    emb_row,
+                    &mut state.x[t * n_embd..(t + 1) * n_embd],
+                );
+            }
+
+            // 2. Transformer layers with multi-token GEMM
+            for (l, layer) in self.layers.iter().enumerate() {
+                for t in 0..b {
+                    rms_norm(
+                        &mut state.xb[t * n_embd..(t + 1) * n_embd],
+                        &state.x[t * n_embd..(t + 1) * n_embd],
+                        &layer.attn_norm,
+                        self.cfg.rms_eps,
+                    );
+                }
+
+                matmul_f32(
+                    pool,
+                    kt,
+                    layer.wq.dtype,
+                    layer.wq.bytes,
+                    &state.xb[..b * n_embd],
+                    &mut state.mv_scratch,
+                    &mut state.q[..b * q_dim],
+                    q_dim,
+                    n_embd,
+                    b,
+                );
+                matmul_f32(
+                    pool,
+                    kt,
+                    layer.wk.dtype,
+                    layer.wk.bytes,
+                    &state.xb[..b * n_embd],
+                    &mut state.mv_scratch,
+                    &mut state.k[..b * kv_dim],
+                    kv_dim,
+                    n_embd,
+                    b,
+                );
+                matmul_f32(
+                    pool,
+                    kt,
+                    layer.wv.dtype,
+                    layer.wv.bytes,
+                    &state.xb[..b * n_embd],
+                    &mut state.mv_scratch,
+                    &mut state.v[..b * kv_dim],
+                    kv_dim,
+                    n_embd,
+                    b,
+                );
+
+                // Per-token QK-Norm, RoPE, and F16 KV store (so all `b` keys/values are in cache)
+                for t in 0..b {
+                    let pos = chunk_pos + t;
+                    let qt = &mut state.q[t * q_dim..(t + 1) * q_dim];
+                    let kt_vec = &mut state.k[t * kv_dim..(t + 1) * kv_dim];
+                    let vt_vec = &state.v[t * kv_dim..(t + 1) * kv_dim];
+
+                    if let Some(ref qn) = layer.q_norm {
+                        for h in 0..self.cfg.n_head {
+                            let s = h * self.cfg.head_dim;
+                            let e = s + self.cfg.head_dim;
+                            rms_norm(&mut state.xb[s..e], &qt[s..e], qn, self.cfg.rms_eps);
+                            qt[s..e].copy_from_slice(&state.xb[s..e]);
+                        }
+                    }
+                    if let Some(ref kn) = layer.k_norm {
+                        for h in 0..self.cfg.n_head_kv {
+                            let s = h * self.cfg.head_dim;
+                            let e = s + self.cfg.head_dim;
+                            rms_norm(&mut state.xb[s..e], &kt_vec[s..e], kn, self.cfg.rms_eps);
+                            kt_vec[s..e].copy_from_slice(&state.xb[s..e]);
+                        }
+                    }
+
+                    rope_compute_cos_sin(
+                        &self.rope_inv_freqs,
+                        pos,
+                        &mut state.rope_cos,
+                        &mut state.rope_sin,
+                    );
+                    rope_inplace_tables(
+                        qt,
+                        self.cfg.n_head,
+                        self.cfg.head_dim,
+                        self.cfg.rope_dim,
+                        &state.rope_cos,
+                        &state.rope_sin,
+                        self.cfg.rope_type,
+                    );
+                    rope_inplace_tables(
+                        kt_vec,
+                        self.cfg.n_head_kv,
+                        self.cfg.head_dim,
+                        self.cfg.rope_dim,
+                        &state.rope_cos,
+                        &state.rope_sin,
+                        self.cfg.rope_type,
+                    );
+
+                    let kv_off = pos * kv_dim;
+                    (kt.f32_to_f16_slice)(kt_vec, &mut state.k_cache[l][kv_off..kv_off + kv_dim]);
+                    (kt.f32_to_f16_slice)(vt_vec, &mut state.v_cache[l][kv_off..kv_off + kv_dim]);
+                }
+
+                // Causal GQA attention for each token `t` in the chunk
+                for t in 0..b {
+                    let pos = chunk_pos + t;
+                    gqa_attention_f16_kv_parallel(
+                        pool,
+                        kt,
+                        &mut state.xb[t * q_dim..(t + 1) * q_dim],
+                        &state.q[t * q_dim..(t + 1) * q_dim],
+                        &state.k_cache[l],
+                        &state.v_cache[l],
+                        self.cfg.n_head,
+                        self.cfg.n_head_kv,
+                        self.cfg.head_dim,
+                        pos + 1,
+                        state.max_ctx,
+                        &mut state.scores,
+                    );
+                }
+
+                // Batched Wo + residual
+                matmul_f32(
+                    pool,
+                    kt,
+                    layer.wo.dtype,
+                    layer.wo.bytes,
+                    &state.xb[..b * q_dim],
+                    &mut state.mv_scratch,
+                    &mut state.xb2[..b * n_embd],
+                    n_embd,
+                    q_dim,
+                    b,
+                );
+                for i in 0..(b * n_embd) {
+                    state.x[i] += state.xb2[i];
+                }
+
+                // Batched FFN
+                for t in 0..b {
+                    rms_norm(
+                        &mut state.xb[t * n_embd..(t + 1) * n_embd],
+                        &state.x[t * n_embd..(t + 1) * n_embd],
+                        &layer.ffn_norm,
+                        self.cfg.rms_eps,
+                    );
+                }
+                matmul_f32(
+                    pool,
+                    kt,
+                    layer.w_gate.dtype,
+                    layer.w_gate.bytes,
+                    &state.xb[..b * n_embd],
+                    &mut state.mv_scratch,
+                    &mut state.hb[..b * n_ff],
+                    n_ff,
+                    n_embd,
+                    b,
+                );
+                matmul_f32(
+                    pool,
+                    kt,
+                    layer.w_up.dtype,
+                    layer.w_up.bytes,
+                    &state.xb[..b * n_embd],
+                    &mut state.mv_scratch,
+                    &mut state.hb2[..b * n_ff],
+                    n_ff,
+                    n_embd,
+                    b,
+                );
+                swiglu_inplace(&mut state.hb[..b * n_ff], &state.hb2[..b * n_ff]);
+                matmul_f32(
+                    pool,
+                    kt,
+                    layer.w_down.dtype,
+                    layer.w_down.bytes,
+                    &state.hb[..b * n_ff],
+                    &mut state.mv_scratch,
+                    &mut state.xb2[..b * n_embd],
+                    n_embd,
+                    n_ff,
+                    b,
+                );
+                for i in 0..(b * n_embd) {
+                    state.x[i] += state.xb2[i];
+                }
+            }
+
+            if is_last && compute_last_logits {
+                let last_x = &state.x[(b - 1) * n_embd..b * n_embd];
+                rms_norm(
+                    &mut state.xb[..n_embd],
+                    last_x,
+                    &self.output_norm,
+                    self.cfg.rms_eps,
+                );
+                matvec_f32(
+                    pool,
+                    kt,
+                    self.output.dtype,
+                    self.output.bytes,
+                    &state.xb[..n_embd],
+                    &mut state.mv_scratch,
+                    &mut state.logits,
+                    self.output.rows,
+                    self.output.cols,
+                );
+            }
+
+            offset += b;
         }
 
         Ok(())
@@ -586,6 +873,7 @@ impl<'a> LlamaModel<'a> {
 
         let t_total = Instant::now();
         let n_embd = self.cfg.n_embd;
+        let n_ff = self.cfg.n_ff;
         let q_dim = self.cfg.n_head * self.cfg.head_dim;
         let kv_dim = self.cfg.n_head_kv * self.cfg.head_dim;
 
@@ -598,7 +886,7 @@ impl<'a> LlamaModel<'a> {
         );
         let row_bytes = self.token_embd.dtype.row_bytes(n_embd);
         let emb_row = &self.token_embd.bytes[tid * row_bytes..(tid + 1) * row_bytes];
-        dequantize_row_bytes(self.token_embd.dtype, emb_row, &mut state.x);
+        dequantize_row_bytes(self.token_embd.dtype, emb_row, &mut state.x[..n_embd]);
         prof.embed_ns += t0.elapsed().as_nanos() as u64;
         prof.embed_bytes += (row_bytes + n_embd * 4) as u64;
 
@@ -606,7 +894,7 @@ impl<'a> LlamaModel<'a> {
             let t0 = Instant::now();
             rms_norm(
                 &mut state.xb[..n_embd],
-                &state.x,
+                &state.x[..n_embd],
                 &layer.attn_norm,
                 self.cfg.rms_eps,
             );
@@ -619,15 +907,15 @@ impl<'a> LlamaModel<'a> {
                 layer.wq.dtype,
                 layer.wq.bytes,
                 layer.wq.rows,
-                &mut state.q,
+                &mut state.q[..q_dim],
                 layer.wk.dtype,
                 layer.wk.bytes,
                 layer.wk.rows,
-                &mut state.k,
+                &mut state.k[..kv_dim],
                 layer.wv.dtype,
                 layer.wv.bytes,
                 layer.wv.rows,
-                &mut state.v,
+                &mut state.v[..kv_dim],
                 &state.xb[..n_embd],
                 &mut state.mv_scratch,
                 n_embd,
@@ -659,7 +947,7 @@ impl<'a> LlamaModel<'a> {
 
             let t0 = Instant::now();
             rope_inplace_tables(
-                &mut state.q,
+                &mut state.q[..q_dim],
                 self.cfg.n_head,
                 self.cfg.head_dim,
                 self.cfg.rope_dim,
@@ -668,7 +956,7 @@ impl<'a> LlamaModel<'a> {
                 self.cfg.rope_type,
             );
             rope_inplace_tables(
-                &mut state.k,
+                &mut state.k[..kv_dim],
                 self.cfg.n_head_kv,
                 self.cfg.head_dim,
                 self.cfg.rope_dim,
@@ -677,19 +965,22 @@ impl<'a> LlamaModel<'a> {
                 self.cfg.rope_type,
             );
             let kv_off = pos * kv_dim;
-            let k_dst = &mut state.k_cache[l][kv_off..kv_off + kv_dim];
-            let v_dst = &mut state.v_cache[l][kv_off..kv_off + kv_dim];
-            for i in 0..kv_dim {
-                k_dst[i] = f32_to_f16(state.k[i]);
-                v_dst[i] = f32_to_f16(state.v[i]);
-            }
+            (kt.f32_to_f16_slice)(
+                &state.k[..kv_dim],
+                &mut state.k_cache[l][kv_off..kv_off + kv_dim],
+            );
+            (kt.f32_to_f16_slice)(
+                &state.v[..kv_dim],
+                &mut state.v_cache[l][kv_off..kv_off + kv_dim],
+            );
             prof.rope_kv_ns += t0.elapsed().as_nanos() as u64;
 
             let t0 = Instant::now();
             gqa_attention_f16_kv_parallel(
                 pool,
+                kt,
                 &mut state.xb[..q_dim],
-                &state.q,
+                &state.q[..q_dim],
                 &state.k_cache[l],
                 &state.v_cache[l],
                 self.cfg.n_head,
@@ -710,7 +1001,7 @@ impl<'a> LlamaModel<'a> {
                 layer.wo.bytes,
                 &state.xb[..q_dim],
                 &mut state.mv_scratch,
-                &mut state.xb2,
+                &mut state.xb2[..n_embd],
                 layer.wo.rows,
                 layer.wo.cols,
             );
@@ -723,7 +1014,7 @@ impl<'a> LlamaModel<'a> {
             let t0 = Instant::now();
             rms_norm(
                 &mut state.xb[..n_embd],
-                &state.x,
+                &state.x[..n_embd],
                 &layer.ffn_norm,
                 self.cfg.rms_eps,
             );
@@ -736,11 +1027,11 @@ impl<'a> LlamaModel<'a> {
                 layer.w_gate.dtype,
                 layer.w_gate.bytes,
                 layer.w_gate.rows,
-                &mut state.hb,
+                &mut state.hb[..n_ff],
                 layer.w_up.dtype,
                 layer.w_up.bytes,
                 layer.w_up.rows,
-                &mut state.hb2,
+                &mut state.hb2[..n_ff],
                 &state.xb[..n_embd],
                 &mut state.mv_scratch,
                 n_embd,
@@ -749,7 +1040,7 @@ impl<'a> LlamaModel<'a> {
             prof.ffn_gate_up_bytes += (layer.w_gate.bytes.len() + layer.w_up.bytes.len()) as u64;
 
             let t0 = Instant::now();
-            swiglu_inplace(&mut state.hb, &state.hb2);
+            swiglu_inplace(&mut state.hb[..n_ff], &state.hb2[..n_ff]);
             prof.swiglu_ns += t0.elapsed().as_nanos() as u64;
 
             let t0 = Instant::now();
@@ -758,9 +1049,9 @@ impl<'a> LlamaModel<'a> {
                 kt,
                 layer.w_down.dtype,
                 layer.w_down.bytes,
-                &state.hb,
+                &state.hb[..n_ff],
                 &mut state.mv_scratch,
-                &mut state.xb2,
+                &mut state.xb2[..n_embd],
                 layer.w_down.rows,
                 layer.w_down.cols,
             );
@@ -775,7 +1066,7 @@ impl<'a> LlamaModel<'a> {
             let t0 = Instant::now();
             rms_norm(
                 &mut state.xb[..n_embd],
-                &state.x,
+                &state.x[..n_embd],
                 &self.output_norm,
                 self.cfg.rms_eps,
             );
