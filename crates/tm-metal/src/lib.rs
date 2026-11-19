@@ -51,7 +51,7 @@ pub mod llama_runner;
 #[cfg(target_vendor = "apple")]
 pub use apple::{MetalBuffer, MetalContext};
 #[cfg(target_vendor = "apple")]
-pub use llama_runner::{LlamaMetalConfig, LlamaMetalRunner};
+pub use llama_runner::{LlamaMetalConfig, LlamaMetalRunner, MetalProfileReport, MetalStageStat};
 
 #[cfg(not(target_vendor = "apple"))]
 pub struct MetalContext;

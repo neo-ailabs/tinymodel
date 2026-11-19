@@ -6,5 +6,5 @@
 pub mod llama;
 pub mod sampler;
 
-pub use llama::{LlamaConfig, LlamaModel, LlamaState, ModelError};
+pub use llama::{CpuDecodeProfile, LlamaConfig, LlamaModel, LlamaState, ModelError};
 pub use sampler::{Sampler, SamplerConfig, argmax};

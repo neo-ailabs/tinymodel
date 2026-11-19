@@ -554,4 +554,282 @@ impl<'a> LlamaModel<'a> {
 
         Ok(())
     }
+
+    /// Instrumented single-token forward pass that accumulates nanosecond timings and
+    /// exact byte counts per operator stage into `prof` (zero heap allocations).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_token_profiled(
+        &self,
+        state: &mut LlamaState,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        token_id: u32,
+        pos: usize,
+        compute_logits: bool,
+        prof: &mut CpuDecodeProfile,
+    ) -> Result<(), ModelError> {
+        use std::time::Instant;
+
+        if pos >= state.max_ctx {
+            return Err(ModelError::ContextOverflow {
+                pos,
+                max_ctx: state.max_ctx,
+            });
+        }
+        let tid = token_id as usize;
+        if tid >= self.cfg.vocab_size {
+            return Err(ModelError::TokenOutOfRange {
+                token_id,
+                vocab_size: self.cfg.vocab_size,
+            });
+        }
+
+        let t_total = Instant::now();
+        let n_embd = self.cfg.n_embd;
+        let q_dim = self.cfg.n_head * self.cfg.head_dim;
+        let kv_dim = self.cfg.n_head_kv * self.cfg.head_dim;
+
+        let t0 = Instant::now();
+        rope_compute_cos_sin(
+            &self.rope_inv_freqs,
+            pos,
+            &mut state.rope_cos,
+            &mut state.rope_sin,
+        );
+        let row_bytes = self.token_embd.dtype.row_bytes(n_embd);
+        let emb_row = &self.token_embd.bytes[tid * row_bytes..(tid + 1) * row_bytes];
+        dequantize_row_bytes(self.token_embd.dtype, emb_row, &mut state.x);
+        prof.embed_ns += t0.elapsed().as_nanos() as u64;
+        prof.embed_bytes += (row_bytes + n_embd * 4) as u64;
+
+        for (l, layer) in self.layers.iter().enumerate() {
+            let t0 = Instant::now();
+            rms_norm(
+                &mut state.xb[..n_embd],
+                &state.x,
+                &layer.attn_norm,
+                self.cfg.rms_eps,
+            );
+            prof.attn_norm_ns += t0.elapsed().as_nanos() as u64;
+
+            let t0 = Instant::now();
+            matvec_triple_f32(
+                pool,
+                kt,
+                layer.wq.dtype,
+                layer.wq.bytes,
+                layer.wq.rows,
+                &mut state.q,
+                layer.wk.dtype,
+                layer.wk.bytes,
+                layer.wk.rows,
+                &mut state.k,
+                layer.wv.dtype,
+                layer.wv.bytes,
+                layer.wv.rows,
+                &mut state.v,
+                &state.xb[..n_embd],
+                &mut state.mv_scratch,
+                n_embd,
+            );
+            prof.attn_qkv_ns += t0.elapsed().as_nanos() as u64;
+            prof.attn_qkv_bytes +=
+                (layer.wq.bytes.len() + layer.wk.bytes.len() + layer.wv.bytes.len()) as u64;
+
+            if layer.q_norm.is_some() || layer.k_norm.is_some() {
+                let t0 = Instant::now();
+                if let Some(ref qn) = layer.q_norm {
+                    for h in 0..self.cfg.n_head {
+                        let s = h * self.cfg.head_dim;
+                        let e = s + self.cfg.head_dim;
+                        rms_norm(&mut state.xb[s..e], &state.q[s..e], qn, self.cfg.rms_eps);
+                        state.q[s..e].copy_from_slice(&state.xb[s..e]);
+                    }
+                }
+                if let Some(ref kn) = layer.k_norm {
+                    for h in 0..self.cfg.n_head_kv {
+                        let s = h * self.cfg.head_dim;
+                        let e = s + self.cfg.head_dim;
+                        rms_norm(&mut state.xb[s..e], &state.k[s..e], kn, self.cfg.rms_eps);
+                        state.k[s..e].copy_from_slice(&state.xb[s..e]);
+                    }
+                }
+                prof.qk_norm_ns += t0.elapsed().as_nanos() as u64;
+            }
+
+            let t0 = Instant::now();
+            rope_inplace_tables(
+                &mut state.q,
+                self.cfg.n_head,
+                self.cfg.head_dim,
+                self.cfg.rope_dim,
+                &state.rope_cos,
+                &state.rope_sin,
+                self.cfg.rope_type,
+            );
+            rope_inplace_tables(
+                &mut state.k,
+                self.cfg.n_head_kv,
+                self.cfg.head_dim,
+                self.cfg.rope_dim,
+                &state.rope_cos,
+                &state.rope_sin,
+                self.cfg.rope_type,
+            );
+            let kv_off = pos * kv_dim;
+            let k_dst = &mut state.k_cache[l][kv_off..kv_off + kv_dim];
+            let v_dst = &mut state.v_cache[l][kv_off..kv_off + kv_dim];
+            for i in 0..kv_dim {
+                k_dst[i] = f32_to_f16(state.k[i]);
+                v_dst[i] = f32_to_f16(state.v[i]);
+            }
+            prof.rope_kv_ns += t0.elapsed().as_nanos() as u64;
+
+            let t0 = Instant::now();
+            gqa_attention_f16_kv_parallel(
+                pool,
+                &mut state.xb[..q_dim],
+                &state.q,
+                &state.k_cache[l],
+                &state.v_cache[l],
+                self.cfg.n_head,
+                self.cfg.n_head_kv,
+                self.cfg.head_dim,
+                pos + 1,
+                state.max_ctx,
+                &mut state.scores,
+            );
+            prof.gqa_attn_ns += t0.elapsed().as_nanos() as u64;
+            prof.gqa_kv_bytes += ((pos + 1) * kv_dim * 2 * 2) as u64;
+
+            let t0 = Instant::now();
+            matvec_f32(
+                pool,
+                kt,
+                layer.wo.dtype,
+                layer.wo.bytes,
+                &state.xb[..q_dim],
+                &mut state.mv_scratch,
+                &mut state.xb2,
+                layer.wo.rows,
+                layer.wo.cols,
+            );
+            for i in 0..n_embd {
+                state.x[i] += state.xb2[i];
+            }
+            prof.attn_wo_ns += t0.elapsed().as_nanos() as u64;
+            prof.attn_wo_bytes += layer.wo.bytes.len() as u64;
+
+            let t0 = Instant::now();
+            rms_norm(
+                &mut state.xb[..n_embd],
+                &state.x,
+                &layer.ffn_norm,
+                self.cfg.rms_eps,
+            );
+            prof.ffn_norm_ns += t0.elapsed().as_nanos() as u64;
+
+            let t0 = Instant::now();
+            matvec_pair_f32(
+                pool,
+                kt,
+                layer.w_gate.dtype,
+                layer.w_gate.bytes,
+                layer.w_gate.rows,
+                &mut state.hb,
+                layer.w_up.dtype,
+                layer.w_up.bytes,
+                layer.w_up.rows,
+                &mut state.hb2,
+                &state.xb[..n_embd],
+                &mut state.mv_scratch,
+                n_embd,
+            );
+            prof.ffn_gate_up_ns += t0.elapsed().as_nanos() as u64;
+            prof.ffn_gate_up_bytes += (layer.w_gate.bytes.len() + layer.w_up.bytes.len()) as u64;
+
+            let t0 = Instant::now();
+            swiglu_inplace(&mut state.hb, &state.hb2);
+            prof.swiglu_ns += t0.elapsed().as_nanos() as u64;
+
+            let t0 = Instant::now();
+            matvec_f32(
+                pool,
+                kt,
+                layer.w_down.dtype,
+                layer.w_down.bytes,
+                &state.hb,
+                &mut state.mv_scratch,
+                &mut state.xb2,
+                layer.w_down.rows,
+                layer.w_down.cols,
+            );
+            for i in 0..n_embd {
+                state.x[i] += state.xb2[i];
+            }
+            prof.ffn_down_ns += t0.elapsed().as_nanos() as u64;
+            prof.ffn_down_bytes += layer.w_down.bytes.len() as u64;
+        }
+
+        if compute_logits {
+            let t0 = Instant::now();
+            rms_norm(
+                &mut state.xb[..n_embd],
+                &state.x,
+                &self.output_norm,
+                self.cfg.rms_eps,
+            );
+            prof.output_norm_ns += t0.elapsed().as_nanos() as u64;
+
+            let t0 = Instant::now();
+            matvec_f32(
+                pool,
+                kt,
+                self.output.dtype,
+                self.output.bytes,
+                &state.xb[..n_embd],
+                &mut state.mv_scratch,
+                &mut state.logits,
+                self.output.rows,
+                self.output.cols,
+            );
+            prof.lm_head_ns += t0.elapsed().as_nanos() as u64;
+            prof.lm_head_bytes += self.output.bytes.len() as u64;
+        }
+
+        prof.runs += 1;
+        prof.total_ns += t_total.elapsed().as_nanos() as u64;
+        Ok(())
+    }
+
+    pub fn lm_head_dtype(&self) -> DType {
+        self.output.dtype
+    }
+}
+
+/// Cumulative CPU operator profiling counters across `runs` token steps.
+#[derive(Debug, Clone, Default)]
+pub struct CpuDecodeProfile {
+    pub runs: usize,
+    pub total_ns: u64,
+    pub embed_ns: u64,
+    pub attn_norm_ns: u64,
+    pub attn_qkv_ns: u64,
+    pub qk_norm_ns: u64,
+    pub rope_kv_ns: u64,
+    pub gqa_attn_ns: u64,
+    pub attn_wo_ns: u64,
+    pub ffn_norm_ns: u64,
+    pub ffn_gate_up_ns: u64,
+    pub swiglu_ns: u64,
+    pub ffn_down_ns: u64,
+    pub output_norm_ns: u64,
+    pub lm_head_ns: u64,
+    pub embed_bytes: u64,
+    pub attn_qkv_bytes: u64,
+    pub gqa_kv_bytes: u64,
+    pub attn_wo_bytes: u64,
+    pub ffn_gate_up_bytes: u64,
+    pub ffn_down_bytes: u64,
+    pub lm_head_bytes: u64,
 }
