@@ -1,0 +1,504 @@
+//! Llama / SmolLM2 / Qwen3-style GQA Transformer forward pass.
+
+use thiserror::Error;
+use tm_core::{DType, dequantize_row_bytes, f32_to_f16};
+use tm_cpu::{
+    KernelTable, MatvecScratch, RopeType, ThreadPool, gqa_attention_f16_kv, matvec_f32, rms_norm,
+    rope_inplace, swiglu_inplace,
+};
+use tm_gguf::{GgufError, GgufFile};
+
+#[derive(Debug, Error)]
+pub enum ModelError {
+    #[error(transparent)]
+    Gguf(#[from] GgufError),
+    #[error("unsupported model architecture '{0}' (M1 supports 'llama')")]
+    UnsupportedArch(String),
+    #[error("position {pos} exceeds configured max_ctx {max_ctx}")]
+    ContextOverflow { pos: usize, max_ctx: usize },
+    #[error("token id {token_id} out of vocab range {vocab_size}")]
+    TokenOutOfRange { token_id: u32, vocab_size: usize },
+}
+
+/// Model hyperparameters parsed from GGUF metadata.
+#[derive(Debug, Clone)]
+pub struct LlamaConfig {
+    pub arch: String,
+    pub n_layers: usize,
+    pub n_embd: usize,
+    pub n_ff: usize,
+    pub n_head: usize,
+    pub n_head_kv: usize,
+    pub head_dim: usize,
+    pub rope_dim: usize,
+    pub vocab_size: usize,
+    pub max_ctx_train: usize,
+    pub rope_freq_base: f32,
+    pub rms_eps: f32,
+    pub rope_type: RopeType,
+}
+
+/// Zero-copy weight matrix view carrying its own `DType` (per `AGENTS.md` rule #5).
+#[derive(Clone, Copy)]
+struct MatView<'a> {
+    bytes: &'a [u8],
+    dtype: DType,
+    rows: usize,
+    cols: usize,
+}
+
+struct LayerWeights<'a> {
+    attn_norm: Vec<f32>,
+    ffn_norm: Vec<f32>,
+    wq: MatView<'a>,
+    wk: MatView<'a>,
+    wv: MatView<'a>,
+    wo: MatView<'a>,
+    w_gate: MatView<'a>,
+    w_up: MatView<'a>,
+    w_down: MatView<'a>,
+}
+
+/// Loaded Llama-family model borrowing quantized weight slices directly from `GgufFile`.
+pub struct LlamaModel<'a> {
+    pub cfg: LlamaConfig,
+    token_embd: MatView<'a>,
+    output: MatView<'a>,
+    output_norm: Vec<f32>,
+    rope_freqs: Option<Vec<f32>>,
+    layers: Vec<LayerWeights<'a>>,
+}
+
+/// Pre-allocated per-session inference state (KV cache + scratch buffers).
+/// Zero heap allocations occur inside `LlamaModel::forward_token`.
+pub struct LlamaState {
+    pub max_ctx: usize,
+    /// Per-layer F16 K cache: `layers[l]` has `[max_ctx, n_head_kv * head_dim]`.
+    k_cache: Vec<Vec<u16>>,
+    /// Per-layer F16 V cache: `layers[l]` has `[max_ctx, n_head_kv * head_dim]`.
+    v_cache: Vec<Vec<u16>>,
+    x: Vec<f32>,
+    xb: Vec<f32>,
+    xb2: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    hb: Vec<f32>,
+    hb2: Vec<f32>,
+    scores: Vec<f32>,
+    logits: Vec<f32>,
+    mv_scratch: MatvecScratch,
+}
+
+impl LlamaState {
+    /// Allocates KV cache and all working buffers up front for `max_ctx` tokens.
+    pub fn new(cfg: &LlamaConfig, max_ctx: usize) -> Self {
+        let kv_dim = cfg.n_head_kv * cfg.head_dim;
+        let k_cache = (0..cfg.n_layers)
+            .map(|_| vec![0u16; max_ctx * kv_dim])
+            .collect();
+        let v_cache = (0..cfg.n_layers)
+            .map(|_| vec![0u16; max_ctx * kv_dim])
+            .collect();
+        let max_cols = cfg.n_embd.max(cfg.n_ff).max(cfg.n_head * cfg.head_dim);
+
+        Self {
+            max_ctx,
+            k_cache,
+            v_cache,
+            x: vec![0.0; cfg.n_embd],
+            xb: vec![0.0; cfg.n_embd],
+            xb2: vec![0.0; cfg.n_embd],
+            q: vec![0.0; cfg.n_head * cfg.head_dim],
+            k: vec![0.0; kv_dim],
+            v: vec![0.0; kv_dim],
+            hb: vec![0.0; cfg.n_ff],
+            hb2: vec![0.0; cfg.n_ff],
+            scores: vec![0.0; max_ctx],
+            logits: vec![0.0; cfg.vocab_size],
+            mv_scratch: MatvecScratch::new(max_cols),
+        }
+    }
+
+    pub fn logits(&self) -> &[f32] {
+        &self.logits
+    }
+}
+
+fn load_f32_vec(
+    gguf: &GgufFile,
+    name: &str,
+    layer: &str,
+    len: usize,
+) -> Result<Vec<f32>, ModelError> {
+    let (info, bytes) = gguf.req_tensor(name, layer, &[len])?;
+    let mut out = vec![0.0f32; len];
+    dequantize_row_bytes(info.dtype, bytes, &mut out);
+    Ok(out)
+}
+
+fn load_mat<'a>(
+    gguf: &'a GgufFile,
+    name: &str,
+    layer: &str,
+    cols: usize,
+    rows: usize,
+) -> Result<MatView<'a>, ModelError> {
+    // GGML stores [cols, rows] (ne0 = cols, ne1 = rows).
+    let (info, bytes) = gguf.req_tensor(name, layer, &[cols, rows])?;
+    Ok(MatView {
+        bytes,
+        dtype: info.dtype,
+        rows,
+        cols,
+    })
+}
+
+impl<'a> LlamaModel<'a> {
+    /// Loads and strictly validates a Llama-architecture GGUF model (zero-copy weight views).
+    pub fn from_gguf(gguf: &'a GgufFile) -> Result<Self, ModelError> {
+        let arch = gguf.req_str("general.architecture")?.to_string();
+        if arch != "llama" {
+            return Err(ModelError::UnsupportedArch(arch));
+        }
+
+        let n_layers = gguf.req_usize("llama.block_count")?;
+        let n_embd = gguf.req_usize("llama.embedding_length")?;
+        let n_ff = gguf.req_usize("llama.feed_forward_length")?;
+        let n_head = gguf.req_usize("llama.attention.head_count")?;
+        let n_head_kv = gguf
+            .get_meta("llama.attention.head_count_kv")
+            .and_then(|v| v.as_usize())
+            .unwrap_or(n_head);
+        let head_dim = gguf
+            .get_meta("llama.attention.key_length")
+            .and_then(|v| v.as_usize())
+            .unwrap_or(n_embd / n_head);
+        let rope_dim = gguf
+            .get_meta("llama.rope.dimension_count")
+            .and_then(|v| v.as_usize())
+            .unwrap_or(head_dim);
+        let max_ctx_train = gguf
+            .get_meta("llama.context_length")
+            .and_then(|v| v.as_usize())
+            .unwrap_or(2048);
+        let rope_freq_base = gguf
+            .get_meta("llama.rope.freq_base")
+            .and_then(|v| v.as_f32())
+            .unwrap_or(10000.0);
+        let rms_eps = gguf
+            .get_meta("llama.attention.layer_norm_rms_epsilon")
+            .and_then(|v| v.as_f32())
+            .unwrap_or(1e-5);
+
+        let embd_info =
+            gguf.tensor_info("token_embd.weight")
+                .ok_or_else(|| GgufError::MissingTensor {
+                    path: gguf.path().display().to_string(),
+                    tensor: "token_embd.weight".to_string(),
+                    layer: "global".to_string(),
+                })?;
+        let vocab_size = gguf
+            .get_meta("llama.vocab_size")
+            .and_then(|v| v.as_usize())
+            .unwrap_or_else(|| embd_info.dims.get(1).copied().unwrap_or(0));
+
+        let cfg = LlamaConfig {
+            arch,
+            n_layers,
+            n_embd,
+            n_ff,
+            n_head,
+            n_head_kv,
+            head_dim,
+            rope_dim,
+            vocab_size,
+            max_ctx_train,
+            rope_freq_base,
+            rms_eps,
+            rope_type: RopeType::Norm,
+        };
+
+        let token_embd = load_mat(gguf, "token_embd.weight", "global", n_embd, vocab_size)?;
+        let output = if gguf.tensor_info("output.weight").is_some() {
+            load_mat(gguf, "output.weight", "global", n_embd, vocab_size)?
+        } else {
+            // Tied input/output embeddings (e.g. SmolLM2, Llama-3.2-1B)
+            token_embd
+        };
+        let output_norm = load_f32_vec(gguf, "output_norm.weight", "global", n_embd)?;
+        let rope_freqs = if gguf.tensor_info("rope_freqs.weight").is_some() {
+            Some(load_f32_vec(
+                gguf,
+                "rope_freqs.weight",
+                "global",
+                rope_dim / 2,
+            )?)
+        } else {
+            None
+        };
+
+        let q_dim = n_head * head_dim;
+        let kv_dim = n_head_kv * head_dim;
+        let mut layers = Vec::with_capacity(n_layers);
+
+        for l in 0..n_layers {
+            let ltag = format!("blk.{l}");
+            layers.push(LayerWeights {
+                attn_norm: load_f32_vec(gguf, &format!("{ltag}.attn_norm.weight"), &ltag, n_embd)?,
+                ffn_norm: load_f32_vec(gguf, &format!("{ltag}.ffn_norm.weight"), &ltag, n_embd)?,
+                wq: load_mat(gguf, &format!("{ltag}.attn_q.weight"), &ltag, n_embd, q_dim)?,
+                wk: load_mat(
+                    gguf,
+                    &format!("{ltag}.attn_k.weight"),
+                    &ltag,
+                    n_embd,
+                    kv_dim,
+                )?,
+                wv: load_mat(
+                    gguf,
+                    &format!("{ltag}.attn_v.weight"),
+                    &ltag,
+                    n_embd,
+                    kv_dim,
+                )?,
+                wo: load_mat(
+                    gguf,
+                    &format!("{ltag}.attn_output.weight"),
+                    &ltag,
+                    q_dim,
+                    n_embd,
+                )?,
+                w_gate: load_mat(
+                    gguf,
+                    &format!("{ltag}.ffn_gate.weight"),
+                    &ltag,
+                    n_embd,
+                    n_ff,
+                )?,
+                w_up: load_mat(gguf, &format!("{ltag}.ffn_up.weight"), &ltag, n_embd, n_ff)?,
+                w_down: load_mat(
+                    gguf,
+                    &format!("{ltag}.ffn_down.weight"),
+                    &ltag,
+                    n_ff,
+                    n_embd,
+                )?,
+            });
+        }
+
+        Ok(Self {
+            cfg,
+            token_embd,
+            output,
+            output_norm,
+            rope_freqs,
+            layers,
+        })
+    }
+
+    /// Runs a single-token forward pass at sequence position `pos`.
+    ///
+    /// Performs **zero heap allocations**. If `compute_logits` is `false` (during prompt
+    /// prefill for non-final tokens), skips the expensive LM head projection.
+    pub fn forward_token(
+        &self,
+        state: &mut LlamaState,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        token_id: u32,
+        pos: usize,
+        compute_logits: bool,
+    ) -> Result<(), ModelError> {
+        if pos >= state.max_ctx {
+            return Err(ModelError::ContextOverflow {
+                pos,
+                max_ctx: state.max_ctx,
+            });
+        }
+        let tid = token_id as usize;
+        if tid >= self.cfg.vocab_size {
+            return Err(ModelError::TokenOutOfRange {
+                token_id,
+                vocab_size: self.cfg.vocab_size,
+            });
+        }
+
+        let n_embd = self.cfg.n_embd;
+        let kv_dim = self.cfg.n_head_kv * self.cfg.head_dim;
+
+        // 1. Token embedding lookup (zero-copy row slice -> f32)
+        let row_bytes = self.token_embd.dtype.row_bytes(n_embd);
+        let emb_row = &self.token_embd.bytes[tid * row_bytes..(tid + 1) * row_bytes];
+        dequantize_row_bytes(self.token_embd.dtype, emb_row, &mut state.x);
+
+        // 2. Transformer layers
+        for (l, layer) in self.layers.iter().enumerate() {
+            rms_norm(&mut state.xb, &state.x, &layer.attn_norm, self.cfg.rms_eps);
+
+            matvec_f32(
+                pool,
+                kt,
+                layer.wq.dtype,
+                layer.wq.bytes,
+                &state.xb,
+                &mut state.mv_scratch,
+                &mut state.q,
+                layer.wq.rows,
+                layer.wq.cols,
+            );
+            matvec_f32(
+                pool,
+                kt,
+                layer.wk.dtype,
+                layer.wk.bytes,
+                &state.xb,
+                &mut state.mv_scratch,
+                &mut state.k,
+                layer.wk.rows,
+                layer.wk.cols,
+            );
+            matvec_f32(
+                pool,
+                kt,
+                layer.wv.dtype,
+                layer.wv.bytes,
+                &state.xb,
+                &mut state.mv_scratch,
+                &mut state.v,
+                layer.wv.rows,
+                layer.wv.cols,
+            );
+
+            rope_inplace(
+                &mut state.q,
+                self.cfg.n_head,
+                self.cfg.head_dim,
+                self.cfg.rope_dim,
+                pos,
+                self.cfg.rope_freq_base,
+                self.rope_freqs.as_deref(),
+                self.cfg.rope_type,
+            );
+            rope_inplace(
+                &mut state.k,
+                self.cfg.n_head_kv,
+                self.cfg.head_dim,
+                self.cfg.rope_dim,
+                pos,
+                self.cfg.rope_freq_base,
+                self.rope_freqs.as_deref(),
+                self.cfg.rope_type,
+            );
+
+            // Store K, V into F16 KV cache at position `pos`
+            let kv_off = pos * kv_dim;
+            let k_dst = &mut state.k_cache[l][kv_off..kv_off + kv_dim];
+            let v_dst = &mut state.v_cache[l][kv_off..kv_off + kv_dim];
+            for i in 0..kv_dim {
+                k_dst[i] = f32_to_f16(state.k[i]);
+                v_dst[i] = f32_to_f16(state.v[i]);
+            }
+
+            // GQA attention over 0..=pos
+            gqa_attention_f16_kv(
+                &mut state.xb,
+                &state.q,
+                &state.k_cache[l],
+                &state.v_cache[l],
+                self.cfg.n_head,
+                self.cfg.n_head_kv,
+                self.cfg.head_dim,
+                pos + 1,
+                &mut state.scores,
+            );
+
+            // Output projection + residual
+            matvec_f32(
+                pool,
+                kt,
+                layer.wo.dtype,
+                layer.wo.bytes,
+                &state.xb,
+                &mut state.mv_scratch,
+                &mut state.xb2,
+                layer.wo.rows,
+                layer.wo.cols,
+            );
+            for i in 0..n_embd {
+                state.x[i] += state.xb2[i];
+            }
+
+            // FFN (SwiGLU)
+            rms_norm(&mut state.xb, &state.x, &layer.ffn_norm, self.cfg.rms_eps);
+            matvec_f32(
+                pool,
+                kt,
+                layer.w_gate.dtype,
+                layer.w_gate.bytes,
+                &state.xb,
+                &mut state.mv_scratch,
+                &mut state.hb,
+                layer.w_gate.rows,
+                layer.w_gate.cols,
+            );
+            matvec_f32(
+                pool,
+                kt,
+                layer.w_up.dtype,
+                layer.w_up.bytes,
+                &state.xb,
+                &mut state.mv_scratch,
+                &mut state.hb2,
+                layer.w_up.rows,
+                layer.w_up.cols,
+            );
+            swiglu_inplace(&mut state.hb, &state.hb2);
+            matvec_f32(
+                pool,
+                kt,
+                layer.w_down.dtype,
+                layer.w_down.bytes,
+                &state.hb,
+                &mut state.mv_scratch,
+                &mut state.xb2,
+                layer.w_down.rows,
+                layer.w_down.cols,
+            );
+            for i in 0..n_embd {
+                state.x[i] += state.xb2[i];
+            }
+        }
+
+        // 3. Final norm + LM head
+        if compute_logits {
+            rms_norm(&mut state.xb, &state.x, &self.output_norm, self.cfg.rms_eps);
+            matvec_f32(
+                pool,
+                kt,
+                self.output.dtype,
+                self.output.bytes,
+                &state.xb,
+                &mut state.mv_scratch,
+                &mut state.logits,
+                self.output.rows,
+                self.output.cols,
+            );
+        }
+
+        Ok(())
+    }
+}
+
+/// Greedy argmax over logits.
+pub fn argmax(logits: &[f32]) -> u32 {
+    let mut best_idx = 0usize;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+    best_idx as u32
+}

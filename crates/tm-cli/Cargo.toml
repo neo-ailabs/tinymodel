@@ -1,0 +1,25 @@
+[package]
+name = "tm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Command-line runner and benchmark tool for tinymodel"
+
+[[bin]]
+name = "tinymodel"
+path = "src/main.rs"
+
+[features]
+default = ["edge"]
+micro = ["tm-cpu/micro"]
+edge = ["tm-cpu/edge"]
+
+[dependencies]
+anyhow = "1"
+tm-core = { path = "../tm-core" }
+tm-cpu = { path = "../tm-cpu", default-features = false }
+tm-gguf = { path = "../tm-gguf" }
+tm-models = { path = "../tm-models" }
+tm-tokenizer = { path = "../tm-tokenizer" }

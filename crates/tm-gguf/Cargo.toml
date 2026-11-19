@@ -1,0 +1,13 @@
+[package]
+name = "tm-gguf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Zero-copy GGUF v2/v3 parser and mmap tensor loader for tinymodel"
+
+[dependencies]
+memmap2 = "0.9"
+thiserror = "2"
+tm-core = { path = "../tm-core" }

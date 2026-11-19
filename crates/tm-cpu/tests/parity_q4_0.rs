@@ -319,3 +319,107 @@ fn thread_pool_matches_single_thread_bit_exact() {
         single.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn l1_parity_q4_1_q8_0_q6_k_pow2_bit_exact() {
+    use tm_core::{BlockQ4_1, BlockQ6K, BlockQ8_1, BlockQ8K};
+
+    let mut rng = Rng(0x7777_8888_9999_AAAA);
+    let isas = supported_isas();
+
+    // 1. Q4_1 x Q8_1
+    let nb32 = 33;
+    let x41: Vec<BlockQ4_1> = (0..nb32)
+        .map(|_| {
+            let mut qs = [0u8; 16];
+            for b in &mut qs {
+                *b = rng.next_u8();
+            }
+            BlockQ4_1 {
+                d: rng.pow2_scale(),
+                m: rng.pow2_scale(),
+                qs,
+            }
+        })
+        .collect();
+    let y81: Vec<BlockQ8_1> = (0..nb32)
+        .map(|_| {
+            let mut qs = [0i8; 32];
+            for q in &mut qs {
+                *q = rng.next_i8();
+            }
+            BlockQ8_1 {
+                d: rng.pow2_scale(),
+                s: rng.pow2_scale(),
+                qs,
+            }
+        })
+        .collect();
+    let ref_41 = generic::vec_dot_q4_1_q8_1(&x41, &y81);
+
+    // 2. Q8_0 x Q8_0
+    let x80 = gen_q8_blocks(&mut rng, nb32, true);
+    let y80 = gen_q8_blocks(&mut rng, nb32, true);
+    let ref_80 = generic::vec_dot_q8_0_q8_0(&x80, &y80);
+
+    // 3. Q6_K x Q8_K
+    let nb256 = 7;
+    let x6k: Vec<BlockQ6K> = (0..nb256)
+        .map(|_| {
+            let mut ql = [0u8; 128];
+            let mut qh = [0u8; 64];
+            let mut scales = [0i8; 16];
+            for b in &mut ql {
+                *b = rng.next_u8();
+            }
+            for b in &mut qh {
+                *b = rng.next_u8();
+            }
+            for s in &mut scales {
+                *s = ((rng.next_u8() % 15) as i8) - 7;
+            }
+            BlockQ6K {
+                ql,
+                qh,
+                scales,
+                d: rng.pow2_scale(),
+            }
+        })
+        .collect();
+    let y8k: Vec<BlockQ8K> = (0..nb256)
+        .map(|_| {
+            let mut qs = [0i8; 256];
+            for q in &mut qs {
+                *q = ((rng.next_u8() % 63) as i8) - 31;
+            }
+            BlockQ8K {
+                d: 0.03125,
+                qs,
+                bsums: [0; 16],
+            }
+        })
+        .collect();
+    let ref_6k = generic::vec_dot_q6_k_q8_k(&x6k, &y8k);
+
+    for &isa in &isas {
+        let kt = select_kernels(isa);
+        assert_eq!(
+            (kt.vec_dot_q4_1_q8_1)(&x41, &y81).to_bits(),
+            ref_41.to_bits(),
+            "Q4_1 bit mismatch for isa={}",
+            isa.name()
+        );
+        assert_eq!(
+            (kt.vec_dot_q8_0_q8_0)(&x80, &y80).to_bits(),
+            ref_80.to_bits(),
+            "Q8_0 bit mismatch for isa={}",
+            isa.name()
+        );
+        assert_eq!(
+            (kt.vec_dot_q6_k_q8_k)(&x6k, &y8k).to_bits(),
+            ref_6k.to_bits(),
+            "Q6_K bit mismatch for isa={}",
+            isa.name()
+        );
+    }
+}

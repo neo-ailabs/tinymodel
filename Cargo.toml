@@ -2,8 +2,12 @@
 resolver = "2"
 members = [
     "crates/tm-core",
+    "crates/tm-gguf",
     "crates/tm-cpu",
     "crates/tm-metal",
+    "crates/tm-tokenizer",
+    "crates/tm-models",
+    "crates/tm-cli",
 ]
 
 [workspace.package]

@@ -1,15 +1,20 @@
 //! Quantization block layouts and data types.
 //!
-//! Block layouts (`BlockQ4_0`, `BlockQ8_0`) match ggml's binary GGUF format:
+//! Block layouts (`BlockQ4_0`, `BlockQ4_1`, `BlockQ8_0`, `BlockQ8_1`, `BlockQ6_K`, `BlockQ8_K`)
+//! match ggml's binary GGUF format:
 //! Copyright (c) 2023-2026 The ggml authors (MIT License).
 //! Upstream reference: llama.cpp `ggml/src/ggml-common.h` (commit `3cf03257` / `b001d7b`).
 
 use crate::fp16::{f16_to_f32, f32_to_f16};
 
-/// Number of weights per `BlockQ4_0`.
+/// Number of weights per `BlockQ4_0` / `BlockQ4_1`.
 pub const QK4_0: usize = 32;
-/// Number of weights per `BlockQ8_0`.
+pub const QK4_1: usize = 32;
+/// Number of weights per `BlockQ8_0` / `BlockQ8_1`.
 pub const QK8_0: usize = 32;
+pub const QK8_1: usize = 32;
+/// Number of weights per K-quant super-block (`BlockQ6_K`, `BlockQ8_K`).
+pub const QK_K: usize = 256;
 
 /// Supported tensor data types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -18,16 +23,39 @@ pub enum DType {
     F16,
     BF16,
     Q4_0,
+    Q4_1,
     Q8_0,
+    Q8_1,
+    Q6K,
+    Q8K,
 }
 
 impl DType {
+    /// Maps a GGUF / ggml `ggml_type` integer ID to `DType`.
+    pub const fn from_ggml_type(id: u32) -> Option<Self> {
+        match id {
+            0 => Some(DType::F32),
+            1 => Some(DType::F16),
+            2 => Some(DType::Q4_0),
+            3 => Some(DType::Q4_1),
+            8 => Some(DType::Q8_0),
+            9 => Some(DType::Q8_1),
+            14 => Some(DType::Q6K),
+            15 => Some(DType::Q8K),
+            30 => Some(DType::BF16),
+            _ => None,
+        }
+    }
+
     /// Block size in elements.
     pub const fn block_elements(self) -> usize {
         match self {
             DType::F32 | DType::F16 | DType::BF16 => 1,
             DType::Q4_0 => QK4_0,
+            DType::Q4_1 => QK4_1,
             DType::Q8_0 => QK8_0,
+            DType::Q8_1 => QK8_1,
+            DType::Q6K | DType::Q8K => QK_K,
         }
     }
 
@@ -37,17 +65,21 @@ impl DType {
             DType::F32 => 4,
             DType::F16 | DType::BF16 => 2,
             DType::Q4_0 => core::mem::size_of::<BlockQ4_0>(),
+            DType::Q4_1 => core::mem::size_of::<BlockQ4_1>(),
             DType::Q8_0 => core::mem::size_of::<BlockQ8_0>(),
+            DType::Q8_1 => core::mem::size_of::<BlockQ8_1>(),
+            DType::Q6K => core::mem::size_of::<BlockQ6K>(),
+            DType::Q8K => core::mem::size_of::<BlockQ8K>(),
         }
+    }
+
+    /// Byte size of `n_elements` stored in this `DType` (requires `n_elements % block_elements == 0`).
+    pub const fn row_bytes(self, n_elements: usize) -> usize {
+        (n_elements / self.block_elements()) * self.block_bytes()
     }
 }
 
 /// 4-bit symmetric quantization block (32 weights in 18 bytes).
-///
-/// Layout matches `block_q4_0` in ggml:
-/// - `d`: IEEE 754 binary16 scale (little-endian `u16`).
-/// - `qs[j]` low nibble (`& 0x0F`) stores weight `j` (0..16), offset by +8.
-/// - `qs[j]` high nibble (`>> 4`) stores weight `j + 16` (16..32), offset by +8.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockQ4_0 {
@@ -55,11 +87,16 @@ pub struct BlockQ4_0 {
     pub qs: [u8; QK4_0 / 2],
 }
 
+/// 4-bit asymmetric quantization block (32 weights in 20 bytes): `w = q * d + m`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockQ4_1 {
+    pub d: u16,
+    pub m: u16,
+    pub qs: [u8; QK4_1 / 2],
+}
+
 /// 8-bit symmetric quantization block (32 weights in 34 bytes).
-///
-/// Layout matches `block_q8_0` in ggml:
-/// - `d`: IEEE 754 binary16 scale (little-endian `u16`).
-/// - `qs[0..32]`: signed 8-bit quantized values.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockQ8_0 {
@@ -67,8 +104,40 @@ pub struct BlockQ8_0 {
     pub qs: [i8; QK8_0],
 }
 
+/// 8-bit quantization block with precomputed `s = d * sum(qs)` (32 weights in 36 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockQ8_1 {
+    pub d: u16,
+    pub s: u16,
+    pub qs: [i8; QK8_1],
+}
+
+/// 6-bit K-quant super-block (256 weights in 210 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockQ6K {
+    pub ql: [u8; QK_K / 2],
+    pub qh: [u8; QK_K / 4],
+    pub scales: [i8; QK_K / 16],
+    pub d: u16,
+}
+
+/// 8-bit K-quant activation super-block (256 weights in 292 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BlockQ8K {
+    pub d: f32,
+    pub qs: [i8; QK_K],
+    pub bsums: [i16; QK_K / 16],
+}
+
 const _: () = assert!(core::mem::size_of::<BlockQ4_0>() == 18);
+const _: () = assert!(core::mem::size_of::<BlockQ4_1>() == 20);
 const _: () = assert!(core::mem::size_of::<BlockQ8_0>() == 34);
+const _: () = assert!(core::mem::size_of::<BlockQ8_1>() == 36);
+const _: () = assert!(core::mem::size_of::<BlockQ6K>() == 210);
+const _: () = assert!(core::mem::size_of::<BlockQ8K>() == 292);
 
 /// Quantizes `src` (`f32`, length multiple of 32) into `dst` (`BlockQ8_0`).
 pub fn quantize_row_q8_0(src: &[f32], dst: &mut [BlockQ8_0]) {
@@ -93,9 +162,82 @@ pub fn quantize_row_q8_0(src: &[f32], dst: &mut [BlockQ8_0]) {
         block.d = f32_to_f16(d);
 
         for (j, &v) in slice.iter().enumerate() {
+            block.qs[j] = (v * id).round().clamp(-127.0, 127.0) as i8;
+        }
+    }
+}
+
+/// Quantizes `src` (`f32`, length multiple of 32) into `dst` (`BlockQ8_1`).
+pub fn quantize_row_q8_1(src: &[f32], dst: &mut [BlockQ8_1]) {
+    assert_eq!(src.len() % QK8_1, 0);
+    let nb = src.len() / QK8_1;
+    assert_eq!(dst.len(), nb);
+
+    for (ib, block) in dst.iter_mut().enumerate() {
+        let base = ib * QK8_1;
+        let slice = &src[base..base + QK8_1];
+
+        let mut amax = 0.0f32;
+        for &v in slice {
+            let av = v.abs();
+            if av > amax {
+                amax = av;
+            }
+        }
+
+        let d = amax / 127.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+
+        let mut sum: i32 = 0;
+        for (j, &v) in slice.iter().enumerate() {
             let q = (v * id).round().clamp(-127.0, 127.0) as i8;
             block.qs[j] = q;
+            sum += q as i32;
         }
+        block.d = f32_to_f16(d);
+        block.s = f32_to_f16((sum as f32) * d);
+    }
+}
+
+/// Quantizes `src` (`f32`, length multiple of 256) into `dst` (`BlockQ8K`).
+pub fn quantize_row_q8_k(src: &[f32], dst: &mut [BlockQ8K]) {
+    assert_eq!(src.len() % QK_K, 0);
+    let nb = src.len() / QK_K;
+    assert_eq!(dst.len(), nb);
+
+    for (ib, block) in dst.iter_mut().enumerate() {
+        let base = ib * QK_K;
+        let slice = &src[base..base + QK_K];
+
+        let mut max_v = 0.0f32;
+        let mut amax = 0.0f32;
+        for &v in slice {
+            let av = v.abs();
+            if av > amax {
+                amax = av;
+                max_v = v;
+            }
+        }
+
+        if amax == 0.0 {
+            block.d = 0.0;
+            block.qs = [0; QK_K];
+            block.bsums = [0; QK_K / 16];
+            continue;
+        }
+
+        let iscale = -127.0 / max_v;
+        for (q, &v) in block.qs.iter_mut().zip(slice.iter()) {
+            *q = (iscale * v).round().clamp(-128.0, 127.0) as i8;
+        }
+        for j in 0..(QK_K / 16) {
+            let mut sum: i32 = 0;
+            for l in 0..16 {
+                sum += block.qs[j * 16 + l] as i32;
+            }
+            block.bsums[j] = sum as i16;
+        }
+        block.d = 1.0 / iscale;
     }
 }
 
@@ -146,6 +288,112 @@ pub fn dequantize_row_q4_0(src: &[BlockQ4_0], dst: &mut [f32]) {
             let x1 = ((block.qs[j] >> 4) as i32) - 8;
             dst[base + j] = (x0 as f32) * d;
             dst[base + j + QK4_0 / 2] = (x1 as f32) * d;
+        }
+    }
+}
+
+/// Dequantizes raw little-endian bytes of any supported `DType` into `dst` (`f32`).
+/// Used for zero-copy embedding table lookups without unsafe pointer casts.
+pub fn dequantize_row_bytes(dtype: DType, src: &[u8], dst: &mut [f32]) {
+    let n = dst.len();
+    assert_eq!(n % dtype.block_elements(), 0);
+    assert_eq!(src.len(), dtype.row_bytes(n));
+
+    match dtype {
+        DType::F32 => {
+            for (d, &chunk) in dst.iter_mut().zip(src.as_chunks::<4>().0.iter()) {
+                *d = f32::from_le_bytes(chunk);
+            }
+        }
+        DType::F16 => {
+            for (d, &chunk) in dst.iter_mut().zip(src.as_chunks::<2>().0.iter()) {
+                *d = f16_to_f32(u16::from_le_bytes(chunk));
+            }
+        }
+        DType::BF16 => {
+            for (d, &chunk) in dst.iter_mut().zip(src.as_chunks::<2>().0.iter()) {
+                let bits = (u16::from_le_bytes(chunk) as u32) << 16;
+                *d = f32::from_bits(bits);
+            }
+        }
+        DType::Q4_0 => {
+            for (ib, blk) in src.as_chunks::<18>().0.iter().enumerate() {
+                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                let base = ib * QK4_0;
+                for j in 0..16 {
+                    let b = blk[2 + j];
+                    dst[base + j] = (((b & 0x0F) as i32) - 8) as f32 * d;
+                    dst[base + j + 16] = (((b >> 4) as i32) - 8) as f32 * d;
+                }
+            }
+        }
+        DType::Q4_1 => {
+            for (ib, blk) in src.as_chunks::<20>().0.iter().enumerate() {
+                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                let m = f16_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
+                let base = ib * QK4_1;
+                for j in 0..16 {
+                    let b = blk[4 + j];
+                    dst[base + j] = ((b & 0x0F) as f32) * d + m;
+                    dst[base + j + 16] = ((b >> 4) as f32) * d + m;
+                }
+            }
+        }
+        DType::Q8_0 => {
+            for (ib, blk) in src.as_chunks::<34>().0.iter().enumerate() {
+                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                let base = ib * QK8_0;
+                for j in 0..32 {
+                    dst[base + j] = (blk[2 + j] as i8) as f32 * d;
+                }
+            }
+        }
+        DType::Q8_1 => {
+            for (ib, blk) in src.as_chunks::<36>().0.iter().enumerate() {
+                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                let base = ib * QK8_1;
+                for j in 0..32 {
+                    dst[base + j] = (blk[4 + j] as i8) as f32 * d;
+                }
+            }
+        }
+        DType::Q6K => {
+            for (ib, blk) in src.as_chunks::<210>().0.iter().enumerate() {
+                let ql_all = &blk[0..128];
+                let qh_all = &blk[128..192];
+                let sc_all = &blk[192..208];
+                let d = f16_to_f32(u16::from_le_bytes([blk[208], blk[209]]));
+
+                let base = ib * QK_K;
+                for n128 in 0..2 {
+                    let ql = &ql_all[n128 * 64..(n128 + 1) * 64];
+                    let qh = &qh_all[n128 * 32..(n128 + 1) * 32];
+                    let sc = &sc_all[n128 * 8..(n128 + 1) * 8];
+                    let out = &mut dst[base + n128 * 128..base + (n128 + 1) * 128];
+
+                    for l in 0..32 {
+                        let is = l / 16;
+                        let q1 = (((ql[l] & 0x0F) | ((qh[l] & 3) << 4)) as i32) - 32;
+                        let q2 = (((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) as i32) - 32;
+                        let q3 = (((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i32) - 32;
+                        let q4 = (((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i32) - 32;
+
+                        out[l] = d * ((sc[is] as i8) as f32) * (q1 as f32);
+                        out[l + 32] = d * ((sc[is + 2] as i8) as f32) * (q2 as f32);
+                        out[l + 64] = d * ((sc[is + 4] as i8) as f32) * (q3 as f32);
+                        out[l + 96] = d * ((sc[is + 6] as i8) as f32) * (q4 as f32);
+                    }
+                }
+            }
+        }
+        DType::Q8K => {
+            for (ib, blk) in src.as_chunks::<292>().0.iter().enumerate() {
+                let d = f32::from_le_bytes([blk[0], blk[1], blk[2], blk[3]]);
+                let base = ib * QK_K;
+                for j in 0..QK_K {
+                    dst[base + j] = (blk[4 + j] as i8) as f32 * d;
+                }
+            }
         }
     }
 }

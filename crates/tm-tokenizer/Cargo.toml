@@ -1,0 +1,12 @@
+[package]
+name = "tm-tokenizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Lightweight pure-Rust GPT-2 byte-level BPE tokenizer loaded from GGUF metadata"
+
+[dependencies]
+thiserror = "2"
+tm-gguf = { path = "../tm-gguf" }

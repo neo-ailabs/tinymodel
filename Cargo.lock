@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -32,6 +38,15 @@ name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
+name = "memmap2"
+version = "0.9.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b0ca1155a9ecc25aa12e8313a119f32edf0255fea2f44839c4ac0a12b2ac157"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "objc2"
@@ -136,6 +151,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tm-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tm-core",
+ "tm-cpu",
+ "tm-gguf",
+ "tm-models",
+ "tm-tokenizer",
+]
+
+[[package]]
 name = "tm-core"
 version = "0.1.0"
 
@@ -143,6 +170,15 @@ version = "0.1.0"
 name = "tm-cpu"
 version = "0.1.0"
 dependencies = [
+ "tm-core",
+]
+
+[[package]]
+name = "tm-gguf"
+version = "0.1.0"
+dependencies = [
+ "memmap2",
+ "thiserror",
  "tm-core",
 ]
 
@@ -155,6 +191,24 @@ dependencies = [
  "objc2-metal",
  "thiserror",
  "tm-core",
+]
+
+[[package]]
+name = "tm-models"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "tm-core",
+ "tm-cpu",
+ "tm-gguf",
+]
+
+[[package]]
+name = "tm-tokenizer"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "tm-gguf",
 ]
 
 [[package]]
