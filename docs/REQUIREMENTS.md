@@ -16,7 +16,7 @@
 | Profile | 目标设备 | 模型规模 | 内存 | 带宽 | CPU 特性 | 加速器 |
 |---|---|---|---|---|---|---|
 | `micro` | Raspberry Pi Zero 2W（以及 Pi 3 / Pi 4） | **≤0.5B**（实际主要是 100–350M） | 512MB（实际可用约 350MB） | 约 2 GB/s | Cortex-A53，ARMv8.0 NEON（**没有 dotprod，不支持 FP16 运算**） | 无 |
-| `edge` | Raspberry Pi 5、手机、RK3588、Jetson | **≤5B** | 4–16GB | 约 11.5 GB/s（Pi 5） | A76+：NEON + dotprod（i8mm 视芯片而定） | 可选 Vulkan |
+| `edge` | Raspberry Pi 5、手机（参考机型 **Google Pixel 8 / Tensor G3**）、RK3588、Jetson | **≤5B** | 4–16GB | 约 11.5 GB/s（Pi 5） | A76+：NEON + dotprod（i8mm 视芯片而定） | 可选 Vulkan |
 | `host` | x86 台式机、Apple Silicon、独显主机 | **≤8B**（可延伸到 9B，例如 Qwen3.5-9B） | 16GB 以上 | 70 GB/s – 1.8 TB/s | AVX2 / AVX-512 / VNNI / AMX；NEON / i8mm / SME2 | **Metal、Vulkan、CUDA**（按此顺序实现） |
 
 主力开发机：Apple M4，16GB（属于 host 档，同时用来开发 ARM CPU 内核）。
@@ -93,5 +93,5 @@
 | Profile | 模型 |
 |---|---|
 | micro | SmolLM2-135M、SmolLM2-360M、LFM2-350M、Gemma 3 270M |
-| edge | Llama 3.2 1B/3B、Qwen3.5-0.8B/2B/4B、Gemma 4 E2B、Phi-4-mini |
+| edge | Llama 3.2 1B/3B、Qwen3.5-0.8B/2B/4B、Gemma 4 E2B、Phi-4-mini（测试设备：Pi 5、**Google Pixel 8**） |
 | host | Llama 3.1 8B、Qwen3-8B、Qwen3.5-9B、Gemma 4 E4B |

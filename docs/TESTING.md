@@ -26,12 +26,26 @@
 4. 结果 JSON 带 schema 版本，存入 `bench/results/<device>/<date>-<commit>.json`。
 5. 声称有性能提升，必须附上同一台机器的基线。
 
-## 4. 设备矩阵
+## 4. 设备矩阵与外部设备测试接口
 
-| 设备 | 角色 | CI |
-|---|---|---|
-| Apple M4 16GB | 主力开发；aarch64 内核、Metal | 本地 |
-| Raspberry Pi 5 | edge 档基准 | 手动或自托管 runner |
-| Raspberry Pi Zero 2W | micro 档基准 | 手动 |
-| x86 + NVIDIA | AVX2 / AVX-512、CUDA | 远期 |
-| CI（GitHub Actions） | x86_64 和 aarch64 Linux 的 L0/L1/L5 测试、交叉编译检查、GPU 后端只做编译检查 | 每次提交 |
+| 设备 | 角色 | 接入方式 | CI |
+|---|---|---|---|
+| Apple M4 16GB | 主力开发；aarch64 内核、Metal | `--target local` | 本地 |
+| **Google Pixel 8（Tensor G3）** | edge 档手机基准（异构 1×X3 + 4×A715 + 4×A510、i8mm、功耗） | `--target adb`（USB / 无线 ADB） | 手动 |
+| Raspberry Pi 5 | edge 档 SBC 基准（4×A76、dotprod） | `--target ssh://pi@<host>` | 手动或自托管 runner |
+| Raspberry Pi 4B | micro ISA 大内存基准（4×A72、纯 ARMv8.0 NEON） | `--target ssh://pi@<host> --profile micro` | 手动 |
+| Raspberry Pi Zero 2W | micro 档极限内存基准（4×A53、512MB） | `--target ssh://pi@<host> --profile micro` | 手动 |
+| x86 + NVIDIA | AVX2 / AVX-512、CUDA | `--target ssh://...` | 远期 |
+| CI（GitHub Actions） | x86_64 和 aarch64 Linux 的 L0/L1/L5 测试、交叉编译检查、GPU 后端只做编译检查 | — | 每次提交 |
+
+### 外部设备一键测试命令（`bench/device_harness.py` + `tinymodel probe`）
+1. **端侧单文件自包含探针**（无需目标机装 Python / 编译器）：
+   - `tinymodel probe [-t <threads>] [--stream-mib <mib>] [--json]`：输出 ISA 能力、大小核拓扑及 `taskset` 掩码、`MemAvailable`/cgroup v2 水位、L1 内核逐位自检、内存安全的多线程 STREAM 持续读写带宽、温度与电池功率。
+   - `tinymodel bench -m <model.gguf> [-f bench/data/prompt_short.txt] --json`：输出 `load_ms`、`ttft_ms`、`pp_tps`、`tg_tps`、有效带宽、`VmHWM` 峰值内存、前后温度/功率及贪心 token 序列指纹。
+2. **宿主机统一调度器**：
+   ```sh
+   python3 bench/device_harness.py list
+   python3 bench/device_harness.py probe --target adb --build
+   python3 bench/device_harness.py run --target adb -m models/Qwen3.5-0.8B-Q4_0.gguf --cluster-policy no-little --reps 5 --compare-local --build
+   python3 bench/device_harness.py run --target ssh://pi@raspberrypi.local --profile micro -m models/SmolLM2-360M-Instruct-Q4_0.gguf --reps 5 --build
+   ```

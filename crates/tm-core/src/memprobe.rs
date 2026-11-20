@@ -157,8 +157,8 @@ pub fn compute_budget(
     })
 }
 
-/// Probes host + cgroup v2 memory on Linux (Raspberry Pi OS, Ubuntu arm64, Docker, Home Assistant).
-#[cfg(target_os = "linux")]
+/// Probes host + cgroup v2 memory on Linux and Android (Raspberry Pi, Docker, Pixel / Android).
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn probe_system_memory() -> Result<MemoryBudget, MemProbeError> {
     use std::fs;
     use std::path::PathBuf;
@@ -196,9 +196,47 @@ pub fn probe_system_memory() -> Result<MemoryBudget, MemProbeError> {
     compute_budget(mem_total, mem_avail, min_cg_max, matched_cur)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub fn probe_system_memory() -> Result<MemoryBudget, MemProbeError> {
     Err(MemProbeError::UnsupportedPlatform)
+}
+
+/// Parses `(VmRSS, VmHWM)` in bytes from `/proc/self/status` text (current & peak RSS).
+pub fn parse_proc_status_rss(status_text: &str) -> (Option<u64>, Option<u64>) {
+    let mut rss_kb: Option<u64> = None;
+    let mut hwm_kb: Option<u64> = None;
+    for line in status_text.lines() {
+        let Some((k, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Some(tok) = rest.split_whitespace().next() else {
+            continue;
+        };
+        let Ok(val) = tok.parse::<u64>() else {
+            continue;
+        };
+        match k.trim() {
+            "VmRSS" => rss_kb = Some(val),
+            "VmHWM" => hwm_kb = Some(val),
+            _ => {}
+        }
+    }
+    (rss_kb.map(|v| v * 1024), hwm_kb.map(|v| v * 1024))
+}
+
+/// Reads current `(rss_bytes, peak_rss_bytes)` of the running process when `/proc/self/status` is available.
+pub fn probe_process_rss_bytes() -> (Option<u64>, Option<u64>) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        if let Ok(text) = std::fs::read_to_string("/proc/self/status") {
+            return parse_proc_status_rss(&text);
+        }
+        (None, None)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        (None, None)
+    }
 }
 
 #[cfg(test)]
@@ -248,5 +286,19 @@ Cached:           480112 kB
         assert!(parse_cgroup_v2_max("0\n").is_err());
         assert!(parse_cgroup_v2_max("").is_err());
         assert!(compute_budget(0, 1024, None, None).is_err());
+    }
+
+    #[test]
+    fn parses_proc_status_vmrss_and_vmhwm() {
+        let status = "\
+Name:\ttinymodel
+VmPeak:\t  612340 kB
+VmSize:\t  608120 kB
+VmHWM:\t  548000 kB
+VmRSS:\t  544128 kB
+";
+        let (rss, hwm) = parse_proc_status_rss(status);
+        assert_eq!(rss, Some(544_128 * 1024));
+        assert_eq!(hwm, Some(548_000 * 1024));
     }
 }

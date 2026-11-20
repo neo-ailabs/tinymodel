@@ -17,4 +17,4 @@ pub use dtype::{
 };
 pub use error::CoreError;
 pub use fp16::{f16_to_f32, f32_to_f16};
-pub use memprobe::{MemProbeError, MemoryBudget, probe_system_memory};
+pub use memprobe::{MemProbeError, MemoryBudget, probe_process_rss_bytes, probe_system_memory};

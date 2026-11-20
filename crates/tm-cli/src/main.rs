@@ -1,5 +1,9 @@
-//! `tinymodel` CLI: inspect GGUF models, run inference, dump multi-token logits,
-//! benchmark pp/tg throughput, and profile CPU / Metal GPU execution.
+#![forbid(unsafe_code)]
+
+//! `tinymodel` CLI: inspect GGUF models, probe hardware/telemetry, run inference,
+//! dump multi-token logits, benchmark pp/tg throughput, and profile CPU / Metal GPU execution.
+
+mod probe;
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -7,6 +11,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use tm_core::probe_process_rss_bytes;
 use tm_cpu::{ThreadPool, active_kernels};
 use tm_gguf::GgufFile;
 use tm_models::{
@@ -18,9 +23,10 @@ use tm_tokenizer::Tokenizer;
 fn print_usage() {
     eprintln!(
         "Usage:
+  tinymodel probe [-t <threads>] [--stream-mib <mib>] [--no-stream] [--json]
   tinymodel inspect <model.gguf>
   tinymodel run -m <model.gguf> [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--metal]
-  tinymodel bench -m <model.gguf> [-n <tokens>] [-t <threads>] [-c <ctx>] [--metal]
+  tinymodel bench -m <model.gguf> [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--metal] [--json]
   tinymodel profile -m <model.gguf> [-n <tokens>] [-t <threads>] [-c <ctx>] [--metal]
   tinymodel logits -m <model.gguf> -o <out.bin> [-p <prompt> | --tokens 1,2,3] [-t <threads>] [-c <ctx>] [--metal]"
     );
@@ -62,6 +68,7 @@ struct RunOpts {
     threads: usize,
     max_ctx: usize,
     use_metal: bool,
+    json: bool,
     sampler: SamplerConfig,
 }
 
@@ -75,6 +82,7 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
     let mut threads = 4usize;
     let mut max_ctx = 2048usize;
     let mut use_metal = false;
+    let mut json = false;
     let mut sampler = SamplerConfig::default();
 
     let mut i = 0;
@@ -189,6 +197,9 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
             "--metal" => {
                 use_metal = true;
             }
+            "--json" => {
+                json = true;
+            }
             other => bail!("unknown argument: {other}"),
         }
         i += 1;
@@ -205,6 +216,7 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
         threads,
         max_ctx,
         use_metal,
+        json,
         sampler,
     })
 }
@@ -472,13 +484,134 @@ fn cmd_run_metal(opts: RunOpts) -> Result<()> {
     Ok(())
 }
 
+fn compute_active_decode_bytes(gguf: &GgufFile) -> u64 {
+    let mut total = 0u64;
+    let has_separate_output = gguf.tensor_info("output.weight").is_some();
+    for name in gguf.tensor_names() {
+        if let Some(info) = gguf.tensor_info(name) {
+            if has_separate_output && name == "token_embd.weight" {
+                // In decode, untied `token_embd.weight` only reads 1 row; exclude from streaming weight bytes.
+                continue;
+            }
+            total += info.byte_len as u64;
+        }
+    }
+    total
+}
+
+fn resolve_bench_pp_ids(opts: &RunOpts, gguf: &GgufFile) -> Result<(Vec<u32>, bool)> {
+    let has_custom =
+        opts.prompt.is_some() || opts.prompt_file.is_some() || opts.explicit_tokens.is_some();
+    if has_custom {
+        let tok = Tokenizer::from_gguf(gguf)?;
+        let ids = resolve_prompt_ids(opts, &tok)?;
+        if ids.len() + opts.n_predict + 2 > opts.max_ctx {
+            bail!(
+                "prompt ({} tokens) + n_predict ({}) exceeds max_ctx ({})",
+                ids.len(),
+                opts.n_predict,
+                opts.max_ctx
+            );
+        }
+        Ok((ids, true))
+    } else {
+        let n_pp = 512usize.min(opts.max_ctx.saturating_sub(opts.n_predict + 2));
+        let ids: Vec<u32> = (0..n_pp).map(|i| ((i % 1000) + 1) as u32).collect();
+        Ok((ids, false))
+    }
+}
+
+struct BenchMetrics<'a> {
+    model_name: &'a str,
+    arch: &'a str,
+    backend: &'a str,
+    isa: &'a str,
+    device_name: &'a str,
+    weights_mode: &'a str,
+    threads: usize,
+    max_ctx: usize,
+    corpus_mode: bool,
+    active_decode_bytes: u64,
+    load_ms: f64,
+    ttft_ms: f64,
+    n_pp: usize,
+    pp_ms: f64,
+    n_gen: usize,
+    tg_ms: f64,
+    last_tok: u32,
+    greedy_hash: String,
+    tel_before: probe::TelemetrySnapshot,
+    tel_after: probe::TelemetrySnapshot,
+}
+
+impl<'a> BenchMetrics<'a> {
+    fn print_json(&self) {
+        let pp_tps = (self.n_pp as f64) / (self.pp_ms * 1e-3).max(1e-9);
+        let tg_tps = (self.n_gen as f64) / (self.tg_ms * 1e-3).max(1e-9);
+        let ms_per_tok = if self.n_gen > 0 {
+            self.tg_ms / (self.n_gen as f64)
+        } else {
+            0.0
+        };
+        let eff_bw_gbs = if self.n_gen > 0 && self.tg_ms > 0.0 {
+            ((self.active_decode_bytes as f64) * (self.n_gen as f64) / (self.tg_ms * 1e-3)) / 1e9
+        } else {
+            0.0
+        };
+        let (rss_bytes, peak_rss_bytes) = probe_process_rss_bytes();
+        println!(
+            "{{\"schema_version\":1,\"model\":\"{}\",\"arch\":\"{}\",\"backend\":\"{}\",\
+            \"isa\":\"{}\",\"device_name\":\"{}\",\"weights_mode\":\"{}\",\
+            \"threads\":{},\"max_ctx\":{},\"corpus_mode\":{},\"active_decode_bytes\":{},\
+            \"load_ms\":{:.2},\"ttft_ms\":{:.2},\"pp_tokens\":{},\"pp_ms\":{:.2},\"pp_tps\":{:.2},\
+            \"tg_tokens\":{},\"tg_ms\":{:.2},\"tg_tps\":{:.2},\"ms_per_tok\":{:.3},\
+            \"decode_eff_bw_gbs\":{:.2},\"last_tok\":{},\"greedy_tokens_fnv1a64\":\"{}\",\
+            \"rss_bytes\":{},\"peak_rss_bytes\":{},\"telemetry_before\":{},\"telemetry_after\":{}}}",
+            probe::json_escape(self.model_name),
+            probe::json_escape(self.arch),
+            probe::json_escape(self.backend),
+            probe::json_escape(self.isa),
+            probe::json_escape(self.device_name),
+            probe::json_escape(self.weights_mode),
+            self.threads,
+            self.max_ctx,
+            self.corpus_mode,
+            self.active_decode_bytes,
+            self.load_ms,
+            self.ttft_ms,
+            self.n_pp,
+            self.pp_ms,
+            pp_tps,
+            self.n_gen,
+            self.tg_ms,
+            tg_tps,
+            ms_per_tok,
+            eff_bw_gbs,
+            self.last_tok,
+            self.greedy_hash,
+            probe::opt_u64_json(rss_bytes),
+            probe::opt_u64_json(peak_rss_bytes),
+            self.tel_before.to_json(),
+            self.tel_after.to_json(),
+        );
+    }
+}
+
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn cmd_bench_metal(opts: RunOpts) -> Result<()> {
+    let tel_before = probe::collect_telemetry();
     let t_load = Instant::now();
     let gguf = std::sync::Arc::new(GgufFile::open(&opts.model)?);
     let arch = gguf.req_str("general.architecture")?.to_string();
-    let n_pp = 512usize.min(opts.max_ctx.saturating_sub(opts.n_predict + 2));
-    let pp_ids: Vec<u32> = (0..n_pp).map(|i| ((i % 1000) + 1) as u32).collect();
+    let active_decode_bytes = compute_active_decode_bytes(&gguf);
+    let (pp_ids, corpus_mode) = resolve_bench_pp_ids(&opts, &gguf)?;
+    let n_pp = pp_ids.len();
+    let model_name = opts
+        .model
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("?")
+        .to_string();
 
     if arch == "qwen35" {
         let mut runner = tm_metal::Qwen35MetalRunner::from_gguf(gguf, opts.max_ctx)?;
@@ -491,39 +624,77 @@ fn cmd_bench_metal(opts: RunOpts) -> Result<()> {
 
         runner.reset_state();
         let t_pp = Instant::now();
-        runner.forward_batch(&pp_ids, 0, false)?;
+        runner.forward_batch(&pp_ids, 0, corpus_mode)?;
+        let first_tok = if corpus_mode {
+            argmax(runner.logits())
+        } else {
+            0
+        };
         let pp_sec = t_pp.elapsed().as_secs_f64();
         let pp_tps = (n_pp as f64) / pp_sec.max(1e-9);
 
-        runner.reset_state();
-        let mut tok = runner.forward_token_greedy(1, 0)?;
         let n_gen = opts.n_predict;
+        let mut gen_tokens = Vec::with_capacity(n_gen + 1);
+        let (mut tok, base_pos) = if corpus_mode {
+            (first_tok, n_pp)
+        } else {
+            runner.reset_state();
+            (runner.forward_token_greedy(1, 0)?, 1)
+        };
+        gen_tokens.push(tok);
         let t0 = Instant::now();
         for step in 0..n_gen {
-            tok = runner.forward_token_greedy(tok, step + 1)?;
+            tok = runner.forward_token_greedy(tok, base_pos + step)?;
+            gen_tokens.push(tok);
         }
         let sec = t0.elapsed().as_secs_f64();
         let tps = (n_gen as f64) / sec.max(1e-9);
-        println!(
-            "bench: model={} backend=metal ({}) weights={} load={:.1}ms pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
-            opts.model
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("?"),
-            runner.device_name(),
-            if runner.is_zero_copy_weights() {
-                "zero-copy"
-            } else {
-                "copied"
-            },
-            load_ms,
-            n_pp,
-            pp_tps,
-            n_gen,
-            tps,
-            (sec * 1e3) / (n_gen as f64),
-            tok
-        );
+        let tel_after = probe::collect_telemetry();
+        let dev_name = runner.device_name();
+        let wmode = if runner.is_zero_copy_weights() {
+            "zero-copy"
+        } else {
+            "copied"
+        };
+        if opts.json {
+            BenchMetrics {
+                model_name: &model_name,
+                arch: &arch,
+                backend: "metal",
+                isa: "metal",
+                device_name: &dev_name,
+                weights_mode: wmode,
+                threads: 1,
+                max_ctx: opts.max_ctx,
+                corpus_mode,
+                active_decode_bytes,
+                load_ms,
+                ttft_ms: pp_sec * 1e3,
+                n_pp,
+                pp_ms: pp_sec * 1e3,
+                n_gen,
+                tg_ms: sec * 1e3,
+                last_tok: tok,
+                greedy_hash: probe::hash_token_sequence(&gen_tokens),
+                tel_before,
+                tel_after,
+            }
+            .print_json();
+        } else {
+            println!(
+                "bench: model={} backend=metal ({}) weights={} load={:.1}ms pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
+                model_name,
+                dev_name,
+                wmode,
+                load_ms,
+                n_pp,
+                pp_tps,
+                n_gen,
+                tps,
+                (sec * 1e3) / (n_gen as f64),
+                tok
+            );
+        }
         return Ok(());
     }
 
@@ -535,38 +706,72 @@ fn cmd_bench_metal(opts: RunOpts) -> Result<()> {
     let _ = runner.forward_batch(&warmup_ids, 0, false)?;
 
     let t_pp = Instant::now();
-    let _ = runner.forward_batch(&pp_ids, 0, false)?;
+    let pp_logits = runner.forward_batch(&pp_ids, 0, corpus_mode)?;
+    let first_tok = if corpus_mode { argmax(pp_logits) } else { 0 };
     let pp_sec = t_pp.elapsed().as_secs_f64();
     let pp_tps = (n_pp as f64) / pp_sec.max(1e-9);
 
-    let mut tok = runner.forward_token_greedy(1, 0)?;
     let n_gen = opts.n_predict;
+    let mut gen_tokens = Vec::with_capacity(n_gen + 1);
+    let (mut tok, base_pos) = if corpus_mode {
+        (first_tok, n_pp)
+    } else {
+        (runner.forward_token_greedy(1, 0)?, 1)
+    };
+    gen_tokens.push(tok);
     let t0 = Instant::now();
     for step in 0..n_gen {
-        tok = runner.forward_token_greedy(tok, step + 1)?;
+        tok = runner.forward_token_greedy(tok, base_pos + step)?;
+        gen_tokens.push(tok);
     }
     let sec = t0.elapsed().as_secs_f64();
     let tps = (n_gen as f64) / sec.max(1e-9);
-    println!(
-        "bench: model={} backend=metal ({}) weights={} load={:.1}ms pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
-        opts.model
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?"),
-        runner.device_name(),
-        if runner.is_zero_copy() {
-            "zero-copy"
-        } else {
-            "copied"
-        },
-        load_ms,
-        n_pp,
-        pp_tps,
-        n_gen,
-        tps,
-        (sec * 1e3) / (n_gen as f64),
-        tok
-    );
+    let tel_after = probe::collect_telemetry();
+    let dev_name = runner.device_name();
+    let wmode = if runner.is_zero_copy() {
+        "zero-copy"
+    } else {
+        "copied"
+    };
+    if opts.json {
+        BenchMetrics {
+            model_name: &model_name,
+            arch: &arch,
+            backend: "metal",
+            isa: "metal",
+            device_name: &dev_name,
+            weights_mode: wmode,
+            threads: 1,
+            max_ctx: opts.max_ctx,
+            corpus_mode,
+            active_decode_bytes,
+            load_ms,
+            ttft_ms: pp_sec * 1e3,
+            n_pp,
+            pp_ms: pp_sec * 1e3,
+            n_gen,
+            tg_ms: sec * 1e3,
+            last_tok: tok,
+            greedy_hash: probe::hash_token_sequence(&gen_tokens),
+            tel_before,
+            tel_after,
+        }
+        .print_json();
+    } else {
+        println!(
+            "bench: model={} backend=metal ({}) weights={} load={:.1}ms pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
+            model_name,
+            dev_name,
+            wmode,
+            load_ms,
+            n_pp,
+            pp_tps,
+            n_gen,
+            tps,
+            (sec * 1e3) / (n_gen as f64),
+            tok
+        );
+    }
     Ok(())
 }
 
@@ -778,16 +983,31 @@ fn cmd_bench(opts: RunOpts) -> Result<()> {
         #[cfg(not(all(feature = "metal", target_vendor = "apple")))]
         bail!("--metal requires compiling with feature 'metal' on Apple Silicon");
     }
+    let tel_before = probe::collect_telemetry();
+    let t_load = Instant::now();
     let gguf = GgufFile::open(&opts.model)?;
     let arch = gguf.req_str("general.architecture")?.to_string();
+    let active_decode_bytes = compute_active_decode_bytes(&gguf);
+    let (pp_ids, corpus_mode) = resolve_bench_pp_ids(&opts, &gguf)?;
+    let n_pp = pp_ids.len();
     let pool = ThreadPool::new(opts.threads);
     let kt = active_kernels();
-    let n_pp = 512usize.min(opts.max_ctx.saturating_sub(opts.n_predict + 2));
-    let pp_ids: Vec<u32> = (0..n_pp).map(|i| ((i % 1000) + 1) as u32).collect();
+    let dev_model_name = probe::detect_device_model_name();
+    let model_name = opts
+        .model
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("?")
+        .to_string();
 
     if arch == "qwen35" {
         let model = Qwen35Model::from_gguf(&gguf)?;
+        check_linux_dirty_budget(
+            estimate_qwen35_dirty_bytes(&model, opts.max_ctx),
+            opts.max_ctx,
+        )?;
         let mut state = Qwen35State::new(&model, opts.max_ctx);
+        let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
         model.forward_token(&mut state, &pool, kt, 1, 0, true)?;
         state.reset();
@@ -795,35 +1015,72 @@ fn cmd_bench(opts: RunOpts) -> Result<()> {
 
         state.reset();
         let t_pp = Instant::now();
-        model.forward_batch(&mut state, &pool, kt, &pp_ids, 0, false)?;
-        let pp_tps = (n_pp as f64) / t_pp.elapsed().as_secs_f64().max(1e-9);
+        model.forward_batch(&mut state, &pool, kt, &pp_ids, 0, corpus_mode)?;
+        let first_tok = if corpus_mode {
+            argmax(state.logits())
+        } else {
+            0
+        };
+        let pp_sec = t_pp.elapsed().as_secs_f64();
+        let pp_tps = (n_pp as f64) / pp_sec.max(1e-9);
 
-        state.reset();
-        model.forward_token(&mut state, &pool, kt, 1, 0, true)?;
-        let mut tok = argmax(state.logits());
         let n_gen = opts.n_predict;
+        let mut gen_tokens = Vec::with_capacity(n_gen + 1);
+        let (mut tok, base_pos) = if corpus_mode {
+            (first_tok, n_pp)
+        } else {
+            state.reset();
+            model.forward_token(&mut state, &pool, kt, 1, 0, true)?;
+            (argmax(state.logits()), 1)
+        };
+        gen_tokens.push(tok);
         let t0 = Instant::now();
         for step in 0..n_gen {
-            model.forward_token(&mut state, &pool, kt, tok, step + 1, true)?;
+            model.forward_token(&mut state, &pool, kt, tok, base_pos + step, true)?;
             tok = argmax(state.logits());
+            gen_tokens.push(tok);
         }
         let sec = t0.elapsed().as_secs_f64();
         let tps = (n_gen as f64) / sec.max(1e-9);
-        println!(
-            "bench: model={} isa={} threads={} pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
-            opts.model
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("?"),
-            kt.isa.name(),
-            pool.num_threads(),
-            n_pp,
-            pp_tps,
-            n_gen,
-            tps,
-            (sec * 1e3) / (n_gen as f64),
-            tok
-        );
+        let tel_after = probe::collect_telemetry();
+        if opts.json {
+            BenchMetrics {
+                model_name: &model_name,
+                arch: &arch,
+                backend: "cpu",
+                isa: kt.isa.name(),
+                device_name: &dev_model_name,
+                weights_mode: "mmap",
+                threads: pool.num_threads(),
+                max_ctx: opts.max_ctx,
+                corpus_mode,
+                active_decode_bytes,
+                load_ms,
+                ttft_ms: pp_sec * 1e3,
+                n_pp,
+                pp_ms: pp_sec * 1e3,
+                n_gen,
+                tg_ms: sec * 1e3,
+                last_tok: tok,
+                greedy_hash: probe::hash_token_sequence(&gen_tokens),
+                tel_before,
+                tel_after,
+            }
+            .print_json();
+        } else {
+            println!(
+                "bench: model={} isa={} threads={} pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
+                model_name,
+                kt.isa.name(),
+                pool.num_threads(),
+                n_pp,
+                pp_tps,
+                n_gen,
+                tps,
+                (sec * 1e3) / (n_gen as f64),
+                tok
+            );
+        }
         return Ok(());
     }
 
@@ -833,41 +1090,79 @@ fn cmd_bench(opts: RunOpts) -> Result<()> {
         opts.max_ctx,
     )?;
     let mut state = LlamaState::new(&model.cfg, opts.max_ctx);
+    let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
     model.forward_token(&mut state, &pool, kt, 1, 0, true)?;
     let warm_ids = [1u32; 8];
     model.forward_batch(&mut state, &pool, kt, &warm_ids, 0, false)?;
 
     let t_pp = Instant::now();
-    model.forward_batch(&mut state, &pool, kt, &pp_ids, 0, false)?;
-    let pp_tps = (n_pp as f64) / t_pp.elapsed().as_secs_f64().max(1e-9);
-
-    model.forward_token(&mut state, &pool, kt, 1, 0, true)?;
-    let mut tok = argmax(state.logits());
+    model.forward_batch(&mut state, &pool, kt, &pp_ids, 0, corpus_mode)?;
+    let first_tok = if corpus_mode {
+        argmax(state.logits())
+    } else {
+        0
+    };
+    let pp_sec = t_pp.elapsed().as_secs_f64();
+    let pp_tps = (n_pp as f64) / pp_sec.max(1e-9);
 
     let n_gen = opts.n_predict;
+    let mut gen_tokens = Vec::with_capacity(n_gen + 1);
+    let (mut tok, base_pos) = if corpus_mode {
+        (first_tok, n_pp)
+    } else {
+        model.forward_token(&mut state, &pool, kt, 1, 0, true)?;
+        (argmax(state.logits()), 1)
+    };
+    gen_tokens.push(tok);
+
     let t0 = Instant::now();
     for step in 0..n_gen {
-        model.forward_token(&mut state, &pool, kt, tok, step + 1, true)?;
+        model.forward_token(&mut state, &pool, kt, tok, base_pos + step, true)?;
         tok = argmax(state.logits());
+        gen_tokens.push(tok);
     }
     let sec = t0.elapsed().as_secs_f64();
     let tps = (n_gen as f64) / sec.max(1e-9);
-    println!(
-        "bench: model={} isa={} threads={} pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
-        opts.model
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?"),
-        kt.isa.name(),
-        pool.num_threads(),
-        n_pp,
-        pp_tps,
-        n_gen,
-        tps,
-        (sec * 1e3) / (n_gen as f64),
-        tok
-    );
+    let tel_after = probe::collect_telemetry();
+    if opts.json {
+        BenchMetrics {
+            model_name: &model_name,
+            arch: &arch,
+            backend: "cpu",
+            isa: kt.isa.name(),
+            device_name: &dev_model_name,
+            weights_mode: "mmap",
+            threads: pool.num_threads(),
+            max_ctx: opts.max_ctx,
+            corpus_mode,
+            active_decode_bytes,
+            load_ms,
+            ttft_ms: pp_sec * 1e3,
+            n_pp,
+            pp_ms: pp_sec * 1e3,
+            n_gen,
+            tg_ms: sec * 1e3,
+            last_tok: tok,
+            greedy_hash: probe::hash_token_sequence(&gen_tokens),
+            tel_before,
+            tel_after,
+        }
+        .print_json();
+    } else {
+        println!(
+            "bench: model={} isa={} threads={} pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
+            model_name,
+            kt.isa.name(),
+            pool.num_threads(),
+            n_pp,
+            pp_tps,
+            n_gen,
+            tps,
+            (sec * 1e3) / (n_gen as f64),
+            tok
+        );
+    }
     Ok(())
 }
 
@@ -1216,6 +1511,7 @@ fn main() -> Result<()> {
     }
 
     match args[1].as_str() {
+        "probe" => probe::cmd_probe(probe::parse_probe_opts(&args[2..])?),
         "inspect" => {
             let p = args.get(2).context("missing <model.gguf>")?;
             cmd_inspect(PathBuf::from(p))
