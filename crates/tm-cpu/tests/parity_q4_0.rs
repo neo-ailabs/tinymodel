@@ -359,9 +359,11 @@ fn l1_parity_q4_1_q8_0_q5_k_q6_k_pow2_bit_exact() {
         .collect();
     let ref_41 = generic::vec_dot_q4_1_q8_1(&x41, &y81);
 
-    // 2. Q8_0 x Q8_0
-    let x80 = gen_q8_blocks(&mut rng, nb32, true);
-    let y80 = gen_q8_blocks(&mut rng, nb32, true);
+    // 2. Q8_0 x Q8_0 (explicitly include all `-128 * -128` block to guard against i16 overflow!)
+    let mut x80 = gen_q8_blocks(&mut rng, nb32, true);
+    let mut y80 = gen_q8_blocks(&mut rng, nb32, true);
+    x80[0].qs = [i8::MIN; 32];
+    y80[0].qs = [i8::MIN; 32];
     let ref_80 = generic::vec_dot_q8_0_q8_0(&x80, &y80);
 
     // 3. Q6_K x Q8_K

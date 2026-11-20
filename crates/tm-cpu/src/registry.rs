@@ -234,6 +234,70 @@ mod aarch64_wrappers {
         unsafe { neon_v80::quantize_q8_1(src, dst) }
     }
 
+    fn neon_v80_vec_dot_q4_1(x: &[BlockQ4_1], y: &[BlockQ8_1]) -> f32 {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { neon_v80::vec_dot_q4_1_q8_1(x, y) }
+    }
+
+    fn neon_v80_gemv_q4_1(
+        w: &[BlockQ4_1],
+        x: &[BlockQ8_1],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { neon_v80::gemv_q4_1_q8_1(w, x, out, rows, cols_blocks) }
+    }
+
+    fn neon_v80_vec_dot_q8_0(x: &[BlockQ8_0], y: &[BlockQ8_0]) -> f32 {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { neon_v80::vec_dot_q8_0_q8_0(x, y) }
+    }
+
+    fn neon_v80_gemv_q8_0(
+        w: &[BlockQ8_0],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { neon_v80::gemv_q8_0_q8_0(w, x, out, rows, cols_blocks) }
+    }
+
+    fn neon_v80_vec_dot_q5_k(x: &[BlockQ5K], y: &[BlockQ8K]) -> f32 {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { neon_v80::vec_dot_q5_k_q8_k(x, y) }
+    }
+
+    fn neon_v80_gemv_q5_k(
+        w: &[BlockQ5K],
+        x: &[BlockQ8K],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { neon_v80::gemv_q5_k_q8_k(w, x, out, rows, cols_blocks) }
+    }
+
+    fn neon_v80_vec_dot_q6_k(x: &[BlockQ6K], y: &[BlockQ8K]) -> f32 {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { neon_v80::vec_dot_q6_k_q8_k(x, y) }
+    }
+
+    fn neon_v80_gemv_q6_k(
+        w: &[BlockQ6K],
+        x: &[BlockQ8K],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { neon_v80::gemv_q6_k_q8_k(w, x, out, rows, cols_blocks) }
+    }
+
     #[cfg(feature = "dotprod")]
     fn dotprod_gemv_q4_1(
         w: &[BlockQ4_1],
@@ -251,14 +315,14 @@ mod aarch64_wrappers {
         vec_dot_q4_0_q8_0: neon_v80_vec_dot,
         gemv_q4_0_q8_0: neon_v80_gemv,
         gemm_q4_0_q8_0: neon_v80_gemm,
-        vec_dot_q4_1_q8_1: generic::vec_dot_q4_1_q8_1,
-        gemv_q4_1_q8_1: generic::gemv_q4_1_q8_1,
-        vec_dot_q8_0_q8_0: generic::vec_dot_q8_0_q8_0,
-        gemv_q8_0_q8_0: generic::gemv_q8_0_q8_0,
-        vec_dot_q5_k_q8_k: generic::vec_dot_q5_k_q8_k,
-        gemv_q5_k_q8_k: generic::gemv_q5_k_q8_k,
-        vec_dot_q6_k_q8_k: generic::vec_dot_q6_k_q8_k,
-        gemv_q6_k_q8_k: generic::gemv_q6_k_q8_k,
+        vec_dot_q4_1_q8_1: neon_v80_vec_dot_q4_1,
+        gemv_q4_1_q8_1: neon_v80_gemv_q4_1,
+        vec_dot_q8_0_q8_0: neon_v80_vec_dot_q8_0,
+        gemv_q8_0_q8_0: neon_v80_gemv_q8_0,
+        vec_dot_q5_k_q8_k: neon_v80_vec_dot_q5_k,
+        gemv_q5_k_q8_k: neon_v80_gemv_q5_k,
+        vec_dot_q6_k_q8_k: neon_v80_vec_dot_q6_k,
+        gemv_q6_k_q8_k: neon_v80_gemv_q6_k,
         dot_f32_f16: neon_dot_f32_f16,
         axpy_f32_f16: neon_axpy_f32_f16,
         f32_to_f16_slice: neon_f32_to_f16_slice,

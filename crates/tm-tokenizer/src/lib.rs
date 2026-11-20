@@ -1,6 +1,11 @@
 #![forbid(unsafe_code)]
 
-//! Lightweight pure-Rust GPT-2 byte-level BPE tokenizer loaded directly from GGUF metadata.
+//! Lightweight, flat-arena pure-Rust GPT-2 byte-level BPE tokenizer loaded from GGUF metadata.
+//!
+//! Stores the entire vocabulary in a single contiguous `String` arena (`vocab_pool` +
+//! `vocab_offsets`) with an open-addressed `u32` hash index and integer-pair BPE merges
+//! (`(id_a, id_b) -> (rank, id_merged)`), eliminating ~1M per-token heap allocations and
+//! saving ~60 MiB of dirty RAM on 248k-vocab models (such as Qwen3.5) for Pi Zero 2W / Pi 4B.
 
 use std::collections::HashMap;
 
@@ -15,11 +20,28 @@ pub enum TokenizerError {
     UnsupportedModel(String),
 }
 
+const EMPTY_SLOT: u32 = u32::MAX;
+
+#[inline]
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
 /// GPT-2 byte-level BPE tokenizer (covers SmolLM2, Llama 3.x, Qwen2/3/3.5).
 pub struct Tokenizer {
-    vocab: Vec<String>,
-    token_to_id: HashMap<String, u32>,
-    merges: HashMap<(String, String), usize>,
+    real_vocab_size: usize,
+    vocab_pool: String,
+    vocab_offsets: Vec<u32>,
+    /// Open-addressed hash table (size = power of 2, `EMPTY_SLOT` = empty) mapping string -> token ID.
+    vocab_table: Vec<u32>,
+    vocab_mask: usize,
+    /// Packed `(id_a << 32) | id_b` -> `(merge_rank, merged_id)`.
+    merges: HashMap<u64, (u32, u32)>,
     byte_to_char: [char; 256],
     char_to_byte: HashMap<char, u8>,
     pub bos_id: Option<u32>,
@@ -29,7 +51,7 @@ pub struct Tokenizer {
 }
 
 impl Tokenizer {
-    /// Loads tokenizer tables directly from an opened `GgufFile`.
+    /// Loads tokenizer tables directly from an opened `GgufFile` into a flat contiguous arena.
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self, TokenizerError> {
         let model = gguf
             .get_meta("tokenizer.ggml.model")
@@ -39,29 +61,66 @@ impl Tokenizer {
             return Err(TokenizerError::UnsupportedModel(model.to_string()));
         }
 
-        let tokens_val = gguf
-            .get_meta("tokenizer.ggml.tokens")
-            .ok_or(TokenizerError::MissingKey("tokenizer.ggml.tokens"))?;
-        let token_strs = tokens_val
-            .as_string_array()
+        let (total_bytes, token_iter) = gguf
+            .string_array_iter("tokenizer.ggml.tokens")
             .ok_or(TokenizerError::MissingKey("tokenizer.ggml.tokens"))?;
 
-        let mut vocab = Vec::with_capacity(token_strs.len());
-        let mut token_to_id = HashMap::with_capacity(token_strs.len());
-        for (id, s) in token_strs.into_iter().enumerate() {
-            let owned = s.to_string();
-            token_to_id.insert(owned.clone(), id as u32);
-            vocab.push(owned);
+        let real_vocab_size = token_iter.len();
+
+        let mut vocab_pool = String::with_capacity(total_bytes + 4096);
+        let mut vocab_offsets = Vec::with_capacity(real_vocab_size + 256);
+        vocab_offsets.push(0u32);
+
+        // Size open-addressed table for <= 50% load factor (including any extra interned merge pieces)
+        let table_cap = ((real_vocab_size + 4096) * 2).next_power_of_two().max(64);
+        let vocab_mask = table_cap - 1;
+        let mut vocab_table = vec![EMPTY_SLOT; table_cap];
+
+        for (id, s) in token_iter.enumerate() {
+            vocab_pool.push_str(s);
+            vocab_offsets.push(vocab_pool.len() as u32);
+            table_upsert(
+                &mut vocab_table,
+                vocab_mask,
+                &vocab_pool,
+                &vocab_offsets,
+                s,
+                id as u32,
+            );
         }
 
         let mut merges = HashMap::new();
-        if let Some(mval) = gguf.get_meta("tokenizer.ggml.merges")
-            && let Some(mlist) = mval.as_string_array()
-        {
+        if let Some((_, mlist)) = gguf.string_array_iter("tokenizer.ggml.merges") {
             merges.reserve(mlist.len());
-            for (rank, line) in mlist.into_iter().enumerate() {
+            let mut merged_scratch = String::with_capacity(64);
+            for (rank, line) in mlist.enumerate() {
                 if let Some((a, b)) = line.split_once(' ') {
-                    merges.insert((a.to_string(), b.to_string()), rank);
+                    let id_a = intern_or_lookup(
+                        &mut vocab_table,
+                        vocab_mask,
+                        &mut vocab_pool,
+                        &mut vocab_offsets,
+                        a,
+                    );
+                    let id_b = intern_or_lookup(
+                        &mut vocab_table,
+                        vocab_mask,
+                        &mut vocab_pool,
+                        &mut vocab_offsets,
+                        b,
+                    );
+                    merged_scratch.clear();
+                    merged_scratch.push_str(a);
+                    merged_scratch.push_str(b);
+                    let id_ab = intern_or_lookup(
+                        &mut vocab_table,
+                        vocab_mask,
+                        &mut vocab_pool,
+                        &mut vocab_offsets,
+                        &merged_scratch,
+                    );
+                    let pair_key = ((id_a as u64) << 32) | (id_b as u64);
+                    merges.entry(pair_key).or_insert((rank as u32, id_ab));
                 }
             }
         }
@@ -86,8 +145,11 @@ impl Tokenizer {
         let (byte_to_char, char_to_byte) = build_gpt2_byte_maps();
 
         Ok(Self {
-            vocab,
-            token_to_id,
+            real_vocab_size,
+            vocab_pool,
+            vocab_offsets,
+            vocab_table,
+            vocab_mask,
             merges,
             byte_to_char,
             char_to_byte,
@@ -99,53 +161,90 @@ impl Tokenizer {
     }
 
     pub fn vocab_size(&self) -> usize {
-        self.vocab.len()
+        self.real_vocab_size
     }
 
-    /// Encodes `text` into token IDs (prepending BOS if `add_bos_override` or `self.add_bos` is true).
+    #[inline]
+    fn token_str(&self, id: u32) -> Option<&str> {
+        let idx = id as usize;
+        let start = *self.vocab_offsets.get(idx)? as usize;
+        let end = *self.vocab_offsets.get(idx + 1)? as usize;
+        self.vocab_pool.get(start..end)
+    }
+
+    #[inline]
+    fn lookup_id(&self, s: &str) -> Option<u32> {
+        table_lookup(
+            &self.vocab_table,
+            self.vocab_mask,
+            &self.vocab_pool,
+            &self.vocab_offsets,
+            s,
+        )
+    }
+
+    /// Encodes `text` into token IDs (prepending BOS if `add_bos` is true).
     pub fn encode(&self, text: &str, add_bos: bool) -> Vec<u32> {
         let mut ids = Vec::new();
         if add_bos && let Some(bos) = self.bos_id {
             ids.push(bos);
         }
 
-        for chunk in pretokenize_bpe(text, self.max_digits) {
-            let encoded: String = chunk
-                .as_bytes()
-                .iter()
-                .map(|&b| self.byte_to_char[b as usize])
-                .collect();
+        let mut encoded = String::with_capacity(64);
+        let mut sym_ids: Vec<u32> = Vec::with_capacity(64);
+        let mut char_buf = [0u8; 4];
 
-            if let Some(&id) = self.token_to_id.get(&encoded) {
+        for chunk in pretokenize_bpe(text, self.max_digits) {
+            encoded.clear();
+            for &b in chunk.as_bytes() {
+                encoded.push(self.byte_to_char[b as usize]);
+            }
+
+            if let Some(id) = self.lookup_id(&encoded)
+                && (id as usize) < self.real_vocab_size
+            {
                 ids.push(id);
                 continue;
             }
 
-            let mut symbols: Vec<String> = encoded.chars().map(|c| c.to_string()).collect();
-            while symbols.len() >= 2 {
-                let mut best_rank = usize::MAX;
-                let mut best_idx = None;
-                for i in 0..(symbols.len() - 1) {
-                    // Look up merge rank without allocating when possible
-                    if let Some(&rank) = self
-                        .merges
-                        .get(&(symbols[i].clone(), symbols[i + 1].clone()))
+            sym_ids.clear();
+            let mut all_found = true;
+            for ch in encoded.chars() {
+                let s = ch.encode_utf8(&mut char_buf);
+                if let Some(id) = self.lookup_id(s) {
+                    sym_ids.push(id);
+                } else {
+                    all_found = false;
+                    break;
+                }
+            }
+            if !all_found {
+                continue;
+            }
+
+            while sym_ids.len() >= 2 {
+                let mut best_rank = u32::MAX;
+                let mut best_idx = 0usize;
+                let mut best_merged = 0u32;
+                for i in 0..(sym_ids.len() - 1) {
+                    let pair_key = ((sym_ids[i] as u64) << 32) | (sym_ids[i + 1] as u64);
+                    if let Some(&(rank, merged_id)) = self.merges.get(&pair_key)
                         && rank < best_rank
                     {
                         best_rank = rank;
-                        best_idx = Some(i);
+                        best_idx = i;
+                        best_merged = merged_id;
                     }
                 }
-                let Some(idx) = best_idx else {
+                if best_rank == u32::MAX {
                     break;
-                };
-                let merged = format!("{}{}", symbols[idx], symbols[idx + 1]);
-                symbols[idx] = merged;
-                symbols.remove(idx + 1);
+                }
+                sym_ids[best_idx] = best_merged;
+                sym_ids.remove(best_idx + 1);
             }
 
-            for sym in symbols {
-                if let Some(&id) = self.token_to_id.get(&sym) {
+            for &id in &sym_ids {
+                if (id as usize) < self.real_vocab_size {
                     ids.push(id);
                 }
             }
@@ -156,7 +255,10 @@ impl Tokenizer {
 
     /// Decodes a single token ID into raw bytes (exact GPT-2 byte-level decoding).
     pub fn decode_token_bytes(&self, id: u32) -> Vec<u8> {
-        let Some(tok) = self.vocab.get(id as usize) else {
+        if (id as usize) >= self.real_vocab_size {
+            return Vec::new();
+        }
+        let Some(tok) = self.token_str(id) else {
             return Vec::new();
         };
         let mut out = Vec::with_capacity(tok.len());
@@ -179,6 +281,72 @@ impl Tokenizer {
         }
         String::from_utf8_lossy(&bytes).into_owned()
     }
+}
+
+#[inline]
+fn table_lookup(table: &[u32], mask: usize, pool: &str, offsets: &[u32], key: &str) -> Option<u32> {
+    let mut slot = (fnv1a_64(key.as_bytes()) as usize) & mask;
+    loop {
+        let id = table[slot];
+        if id == EMPTY_SLOT {
+            return None;
+        }
+        let idx = id as usize;
+        let s0 = offsets[idx] as usize;
+        let s1 = offsets[idx + 1] as usize;
+        if &pool[s0..s1] == key {
+            return Some(id);
+        }
+        slot = (slot + 1) & mask;
+    }
+}
+
+#[inline]
+fn table_upsert(
+    table: &mut [u32],
+    mask: usize,
+    pool: &str,
+    offsets: &[u32],
+    key: &str,
+    new_id: u32,
+) {
+    let mut slot = (fnv1a_64(key.as_bytes()) as usize) & mask;
+    loop {
+        let cur = table[slot];
+        if cur == EMPTY_SLOT {
+            table[slot] = new_id;
+            return;
+        }
+        let idx = cur as usize;
+        let s0 = offsets[idx] as usize;
+        let s1 = offsets[idx + 1] as usize;
+        if &pool[s0..s1] == key {
+            table[slot] = new_id;
+            return;
+        }
+        slot = (slot + 1) & mask;
+    }
+}
+
+#[inline]
+fn intern_or_lookup(
+    table: &mut [u32],
+    mask: usize,
+    pool: &mut String,
+    offsets: &mut Vec<u32>,
+    key: &str,
+) -> u32 {
+    if let Some(id) = table_lookup(table, mask, pool, offsets, key) {
+        return id;
+    }
+    // Only intern extra intermediate pieces while keeping load factor < 85%
+    let new_id = (offsets.len() - 1) as u32;
+    pool.push_str(key);
+    offsets.push(pool.len() as u32);
+    if offsets.len() < (table.len() * 7) / 8 {
+        table_upsert(table, mask, pool, offsets, key, new_id);
+    }
+    new_id
 }
 
 /// Standard OpenAI GPT-2 `bytes_to_unicode()` bijection.
@@ -363,4 +531,21 @@ fn pretokenize_bpe(text: &str, max_digits: usize) -> Vec<&str> {
     }
 
     chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pretokenize_digit_splitting_qwen_vs_llama() {
+        assert_eq!(
+            pretokenize_bpe("Year 2026!", 1),
+            vec!["Year", " ", "2", "0", "2", "6", "!"]
+        );
+        assert_eq!(
+            pretokenize_bpe("Year 2026!", 3),
+            vec!["Year", " ", "202", "6", "!"]
+        );
+    }
 }

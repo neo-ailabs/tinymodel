@@ -5,7 +5,8 @@
 
 use std::time::Instant;
 use tm_core::{
-    BlockQ4_0, BlockQ5K, BlockQ8_0, BlockQ8K, QK_K, QK4_0, f32_to_f16, quantize_row_q8_k,
+    BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, QK_K, QK4_0,
+    f32_to_f16, quantize_row_q8_1, quantize_row_q8_k,
 };
 use tm_cpu::isa::supported_isas;
 use tm_cpu::{ThreadPool, select_kernels};
@@ -234,6 +235,139 @@ fn main() {
             sec * 1e3,
             (q5_bytes / sec) / 1e9,
             out_q5.iter().take(8).sum::<f32>()
+        );
+    }
+
+    // Benchmark Q8_0 x Q8_0 GEMV (SmolLM2-360M lm_head shape: 49152 x 960)
+    let q8_rows = 49152usize;
+    let q8_cols = 960usize;
+    let q8_nb = q8_cols / QK4_0;
+    let w_q80: Vec<BlockQ8_0> = (0..q8_rows * q8_nb)
+        .map(|i| BlockQ8_0 {
+            d: f32_to_f16(0.03125),
+            qs: [((i & 0x7F) as i8) - 64; 32],
+        })
+        .collect();
+    let x_q80 = dst_q80[..q8_nb].to_vec();
+    let q8_bytes = (q8_rows * q8_nb * core::mem::size_of::<BlockQ8_0>()) as f64;
+    println!("\n--- Q8_0 x Q8_0 GEMV (49152x960, 4 threads) ---");
+    for &isa in &isas {
+        let kt = select_kernels(isa);
+        let mut out_q8 = vec![0.0f32; q8_rows];
+        let out_ptr = out_q8.as_mut_ptr() as usize;
+        let run_q8 = || {
+            pool4.parallel_for(q8_rows, 3072, |r0, r1| {
+                let len = r1 - r0;
+                // SAFETY: Disjoint `[r0..r1)` per worker.
+                let o =
+                    unsafe { core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(r0), len) };
+                (kt.gemv_q8_0_q8_0)(&w_q80[r0 * q8_nb..r1 * q8_nb], &x_q80, o, len, q8_nb);
+            });
+        };
+        run_q8();
+        let iters = if isa == tm_cpu::Isa::Generic { 5 } else { 30 };
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            run_q8();
+        }
+        let sec = t0.elapsed().as_secs_f64() / (iters as f64);
+        println!(
+            "{:<10} {:>7.3} ms | {:>6.2} GB/s | checksum={:.2}",
+            isa.name(),
+            sec * 1e3,
+            (q8_bytes / sec) / 1e9,
+            out_q8.iter().take(8).sum::<f32>()
+        );
+    }
+
+    // Benchmark Q4_1 x Q8_1 GEMV (Qwen3.5-0.8B ffn_down shape: 1024 x 3584)
+    let q41_rows = 1024usize;
+    let q41_cols = 3584usize;
+    let q41_nb = q41_cols / QK4_0;
+    let w_q41: Vec<BlockQ4_1> = (0..q41_rows * q41_nb)
+        .map(|i| BlockQ4_1 {
+            d: f32_to_f16(0.03125),
+            m: f32_to_f16(-0.125),
+            qs: [(i & 0xFF) as u8; 16],
+        })
+        .collect();
+    let mut x_q81 = vec![
+        BlockQ8_1 {
+            d: 0,
+            s: 0,
+            qs: [0; 32]
+        };
+        q41_nb
+    ];
+    quantize_row_q8_1(&src_f32[..q41_cols], &mut x_q81);
+    let q41_bytes = (q41_rows * q41_nb * core::mem::size_of::<BlockQ4_1>()) as f64;
+    println!("\n--- Q4_1 x Q8_1 GEMV (1024x3584, 4 threads) ---");
+    for &isa in &isas {
+        let kt = select_kernels(isa);
+        let mut out_q41 = vec![0.0f32; q41_rows];
+        let out_ptr = out_q41.as_mut_ptr() as usize;
+        let run_q41 = || {
+            pool4.parallel_for(q41_rows, 256, |r0, r1| {
+                let len = r1 - r0;
+                // SAFETY: Disjoint `[r0..r1)` per worker.
+                let o =
+                    unsafe { core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(r0), len) };
+                (kt.gemv_q4_1_q8_1)(&w_q41[r0 * q41_nb..r1 * q41_nb], &x_q81, o, len, q41_nb);
+            });
+        };
+        run_q41();
+        let iters = if isa == tm_cpu::Isa::Generic { 20 } else { 100 };
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            run_q41();
+        }
+        let sec = t0.elapsed().as_secs_f64() / (iters as f64);
+        println!(
+            "{:<10} {:>7.3} ms | {:>6.2} GB/s | checksum={:.2}",
+            isa.name(),
+            sec * 1e3,
+            (q41_bytes / sec) / 1e9,
+            out_q41.iter().take(8).sum::<f32>()
+        );
+    }
+
+    // Benchmark Q6_K x Q8_K GEMV (2048 x 2048, 4 threads)
+    let w_q6: Vec<BlockQ6K> = (0..q5_rows * q5_nb)
+        .map(|i| BlockQ6K {
+            ql: [(i & 0xFF) as u8; 128],
+            qh: [0x55; 64],
+            scales: [((i & 0x0F) as i8) - 7; 16],
+            d: f32_to_f16(0.03125),
+        })
+        .collect();
+    let q6_bytes = (q5_rows * q5_nb * core::mem::size_of::<BlockQ6K>()) as f64;
+    println!("\n--- Q6_K x Q8_K GEMV (2048x2048, 4 threads) ---");
+    for &isa in &isas {
+        let kt = select_kernels(isa);
+        let mut out_q6 = vec![0.0f32; q5_rows];
+        let out_ptr = out_q6.as_mut_ptr() as usize;
+        let run_q6 = || {
+            pool4.parallel_for(q5_rows, 512, |r0, r1| {
+                let len = r1 - r0;
+                // SAFETY: Disjoint `[r0..r1)` per worker.
+                let o =
+                    unsafe { core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(r0), len) };
+                (kt.gemv_q6_k_q8_k)(&w_q6[r0 * q5_nb..r1 * q5_nb], &x_q8k, o, len, q5_nb);
+            });
+        };
+        run_q6();
+        let iters = if isa == tm_cpu::Isa::Generic { 10 } else { 50 };
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            run_q6();
+        }
+        let sec = t0.elapsed().as_secs_f64() / (iters as f64);
+        println!(
+            "{:<10} {:>7.3} ms | {:>6.2} GB/s | checksum={:.2}",
+            isa.name(),
+            sec * 1e3,
+            (q6_bytes / sec) / 1e9,
+            out_q6.iter().take(8).sum::<f32>()
         );
     }
 }

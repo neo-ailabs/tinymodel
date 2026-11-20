@@ -95,6 +95,15 @@ pub enum MetadataValue {
     U64(u64),
     I64(i64),
     F64(f64),
+    /// Zero-copy string array storing `(byte_offset, byte_len)` spans inside `GgufFile`'s mmap.
+    /// Eliminates ~500k `String` heap allocations and ~45 MiB dirty RAM on 248k-vocab models.
+    StringSpans {
+        spans: Vec<(u32, u32)>,
+        total_bytes: usize,
+    },
+    U32Array(Vec<u32>),
+    I32Array(Vec<i32>),
+    F32Array(Vec<f32>),
     Array(Vec<MetadataValue>),
 }
 
@@ -150,6 +159,8 @@ impl MetadataValue {
 
     pub fn as_i32_array(&self) -> Option<Vec<i32>> {
         match self {
+            MetadataValue::I32Array(v) => Some(v.clone()),
+            MetadataValue::U32Array(v) => v.iter().map(|&x| i32::try_from(x).ok()).collect(),
             MetadataValue::Array(items) => items
                 .iter()
                 .map(|v| match *v {
@@ -159,6 +170,55 @@ impl MetadataValue {
                 })
                 .collect(),
             _ => None,
+        }
+    }
+
+    pub fn as_f32_slice(&self) -> Option<&[f32]> {
+        match self {
+            MetadataValue::F32Array(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+}
+
+/// Zero-copy iterator over a GGUF metadata string array (`StringSpans` or `Array`).
+pub enum StringArrayIter<'a> {
+    Spans {
+        data: &'a [u8],
+        iter: core::slice::Iter<'a, (u32, u32)>,
+    },
+    Values(core::slice::Iter<'a, MetadataValue>),
+}
+
+impl<'a> Iterator for StringArrayIter<'a> {
+    type Item = &'a str;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            StringArrayIter::Spans { data, iter } => {
+                let &(start, len) = iter.next()?;
+                let s = start as usize;
+                let e = s + (len as usize);
+                std::str::from_utf8(&data[s..e]).ok()
+            }
+            StringArrayIter::Values(iter) => iter.next()?.as_str(),
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl<'a> ExactSizeIterator for StringArrayIter<'a> {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            StringArrayIter::Spans { iter, .. } => iter.len(),
+            StringArrayIter::Values(iter) => iter.len(),
         }
     }
 }
@@ -220,6 +280,9 @@ impl GgufFile {
             path: path_str.clone(),
             source,
         })?;
+        // Hint sequential page-cache readahead on Unix (accelerates cold SD/SSD load on Pi 4B / Zero 2W).
+        #[cfg(unix)]
+        let _ = mmap.advise(memmap2::Advice::Sequential);
         Self::parse(path_buf, Backing::Mmap(mmap))
     }
 
@@ -436,6 +499,27 @@ impl GgufFile {
         self.metadata.get(key)
     }
 
+    /// Returns `(total_utf8_bytes, zero_copy_iter)` for a GGUF string array metadata entry.
+    pub fn string_array_iter(&self, key: &str) -> Option<(usize, StringArrayIter<'_>)> {
+        match self.metadata.get(key)? {
+            MetadataValue::StringSpans { spans, total_bytes } => Some((
+                *total_bytes,
+                StringArrayIter::Spans {
+                    data: self.backing.as_slice(),
+                    iter: spans.iter(),
+                },
+            )),
+            MetadataValue::Array(items) => {
+                let mut total = 0usize;
+                for item in items {
+                    total += item.as_str()?.len();
+                }
+                Some((total, StringArrayIter::Values(items.iter())))
+            }
+            _ => None,
+        }
+    }
+
     pub fn req_str(&self, key: &str) -> Result<&str, GgufError> {
         let v = self
             .metadata
@@ -636,11 +720,64 @@ impl<'a> Cursor<'a> {
                         offset: self.pos,
                     });
                 }
-                let mut items = Vec::with_capacity(len);
-                for _ in 0..len {
-                    items.push(self.read_value(key, elem_type)?);
+                match elem_type {
+                    4 => {
+                        let mut v = Vec::with_capacity(len.min(1_048_576));
+                        for _ in 0..len {
+                            v.push(self.read_u32()?);
+                        }
+                        Ok(MetadataValue::U32Array(v))
+                    }
+                    5 => {
+                        let mut v = Vec::with_capacity(len.min(1_048_576));
+                        for _ in 0..len {
+                            v.push(self.read_i32()?);
+                        }
+                        Ok(MetadataValue::I32Array(v))
+                    }
+                    6 => {
+                        let mut v = Vec::with_capacity(len.min(1_048_576));
+                        for _ in 0..len {
+                            v.push(self.read_f32()?);
+                        }
+                        Ok(MetadataValue::F32Array(v))
+                    }
+                    8 if self.pos < (u32::MAX as usize / 2) => {
+                        let mut spans = Vec::with_capacity(len.min(1_048_576));
+                        let mut total_bytes = 0usize;
+                        for _ in 0..len {
+                            let hdr_pos = self.pos;
+                            let slen = usize::try_from(self.read_u64()?).map_err(|_| {
+                                GgufError::UnexpectedEof {
+                                    path: self.path.to_string(),
+                                    offset: hdr_pos,
+                                }
+                            })?;
+                            let str_start = self.pos;
+                            let bytes = self.read_bytes(slen)?;
+                            if str_start > u32::MAX as usize || slen > u32::MAX as usize {
+                                return Err(GgufError::UnexpectedEof {
+                                    path: self.path.to_string(),
+                                    offset: hdr_pos,
+                                });
+                            }
+                            std::str::from_utf8(bytes).map_err(|_| GgufError::InvalidUtf8 {
+                                path: self.path.to_string(),
+                                offset: hdr_pos,
+                            })?;
+                            spans.push((str_start as u32, slen as u32));
+                            total_bytes += slen;
+                        }
+                        Ok(MetadataValue::StringSpans { spans, total_bytes })
+                    }
+                    _ => {
+                        let mut items = Vec::with_capacity(len.min(1_048_576));
+                        for _ in 0..len {
+                            items.push(self.read_value(key, elem_type)?);
+                        }
+                        Ok(MetadataValue::Array(items))
+                    }
                 }
-                Ok(MetadataValue::Array(items))
             }
             10 => Ok(MetadataValue::U64(self.read_u64()?)),
             11 => Ok(MetadataValue::I64(self.read_i64()?)),

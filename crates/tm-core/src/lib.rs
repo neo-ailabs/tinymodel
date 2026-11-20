@@ -7,6 +7,7 @@ pub mod arena;
 pub mod dtype;
 pub mod error;
 pub mod fp16;
+pub mod memprobe;
 
 pub use arena::Arena;
 pub use dtype::{
@@ -16,3 +17,4 @@ pub use dtype::{
 };
 pub use error::CoreError;
 pub use fp16::{f16_to_f32, f32_to_f16};
+pub use memprobe::{MemProbeError, MemoryBudget, probe_system_memory};

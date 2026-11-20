@@ -570,6 +570,54 @@ fn cmd_bench_metal(opts: RunOpts) -> Result<()> {
     Ok(())
 }
 
+/// On Linux (including Raspberry Pi & Docker cgroup v2), verifies that runtime dirty-page
+/// buffers (KV cache + GDN recurrent state + scratch) fit comfortably inside `available_bytes`
+/// before allocating, preventing SD-swap thrashing or container OOM kills.
+fn check_linux_dirty_budget(required_bytes: u64, max_ctx: usize) -> Result<()> {
+    const OS_HEADROOM_BYTES: u64 = 32 * 1024 * 1024;
+    if let Ok(budget) = tm_core::probe_system_memory() {
+        let safe_limit = budget.available_bytes.saturating_sub(OS_HEADROOM_BYTES);
+        if required_bytes > safe_limit {
+            let cg_note = budget
+                .cgroup_max_bytes
+                .map(|m| format!(" (cgroup memory.max={:.1} MiB)", m as f64 / 1048576.0))
+                .unwrap_or_default();
+            bail!(
+                "insufficient memory for runtime state (-c {max_ctx}): need {:.1} MiB dirty RAM, \
+                 only {:.1} MiB safely available{}; reduce -c <ctx> or free system memory",
+                required_bytes as f64 / 1048576.0,
+                safe_limit as f64 / 1048576.0,
+                cg_note,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn estimate_llama_dirty_bytes(cfg: &tm_models::LlamaConfig, max_ctx: usize) -> u64 {
+    let kv_bytes =
+        (2 * cfg.n_layers * max_ctx * cfg.n_head_kv * cfg.head_dim * core::mem::size_of::<u16>())
+            as u64;
+    let scratch_bytes = ((cfg.vocab_size + 36 * (cfg.n_embd + cfg.n_ff)) * 4) as u64;
+    kv_bytes + scratch_bytes
+}
+
+fn estimate_qwen35_dirty_bytes(model: &Qwen35Model, max_ctx: usize) -> u64 {
+    let c = &model.cfg;
+    let kv_bytes = (2
+        * model.num_full_attn_layers()
+        * max_ctx
+        * c.n_head_kv
+        * c.head_dim
+        * core::mem::size_of::<u16>()) as u64;
+    let gdn_per_layer = (c.ssm_dt_rank * c.ssm_state_size * c.ssm_state_size
+        + c.conv_dim() * c.ssm_conv_kernel)
+        * 4;
+    let gdn_bytes = (model.num_gdn_layers() * gdn_per_layer) as u64;
+    let scratch_bytes = ((c.vocab_size + 36 * (c.n_embd + c.n_ff)) * 4) as u64;
+    kv_bytes + gdn_bytes + scratch_bytes
+}
+
 fn cmd_run(opts: RunOpts) -> Result<()> {
     if opts.use_metal {
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
@@ -587,6 +635,10 @@ fn cmd_run(opts: RunOpts) -> Result<()> {
 
     if arch == "qwen35" {
         let model = Qwen35Model::from_gguf(&gguf)?;
+        check_linux_dirty_budget(
+            estimate_qwen35_dirty_bytes(&model, opts.max_ctx),
+            opts.max_ctx,
+        )?;
         let mut state = Qwen35State::new(&model, opts.max_ctx);
         let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
@@ -651,6 +703,10 @@ fn cmd_run(opts: RunOpts) -> Result<()> {
     }
 
     let model = LlamaModel::from_gguf(&gguf)?;
+    check_linux_dirty_budget(
+        estimate_llama_dirty_bytes(&model.cfg, opts.max_ctx),
+        opts.max_ctx,
+    )?;
     let mut state = LlamaState::new(&model.cfg, opts.max_ctx);
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
@@ -772,6 +828,10 @@ fn cmd_bench(opts: RunOpts) -> Result<()> {
     }
 
     let model = LlamaModel::from_gguf(&gguf)?;
+    check_linux_dirty_budget(
+        estimate_llama_dirty_bytes(&model.cfg, opts.max_ctx),
+        opts.max_ctx,
+    )?;
     let mut state = LlamaState::new(&model.cfg, opts.max_ctx);
 
     model.forward_token(&mut state, &pool, kt, 1, 0, true)?;
@@ -918,6 +978,10 @@ fn cmd_profile(opts: RunOpts) -> Result<()> {
     }
 
     let model = LlamaModel::from_gguf(&gguf)?;
+    check_linux_dirty_budget(
+        estimate_llama_dirty_bytes(&model.cfg, opts.max_ctx),
+        opts.max_ctx,
+    )?;
     let mut state = LlamaState::new(&model.cfg, opts.max_ctx);
 
     for i in 0..4 {
@@ -1115,6 +1179,10 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
     }
 
     let model = LlamaModel::from_gguf(&gguf)?;
+    check_linux_dirty_budget(
+        estimate_llama_dirty_bytes(&model.cfg, opts.max_ctx),
+        opts.max_ctx,
+    )?;
     let mut state = LlamaState::new(&model.cfg, opts.max_ctx);
     let vocab = model.cfg.vocab_size as u32;
     writer.write_all(b"TMLG")?;

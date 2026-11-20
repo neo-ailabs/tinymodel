@@ -10,5 +10,5 @@ description = "Hand-written per-architecture forward passes (Llama, Qwen3, ...) 
 [dependencies]
 thiserror = "2"
 tm-core = { path = "../tm-core" }
-tm-cpu = { path = "../tm-cpu" }
+tm-cpu = { path = "../tm-cpu", default-features = false }
 tm-gguf = { path = "../tm-gguf" }
