@@ -62,3 +62,49 @@
 
 - **TTFT 实测与压缩空间**：`Qwen3.5-0.8B` 约 300 token 输入实测 TTFT 为 **`4.19 – 4.52 s`**（`SmolLM2-360M` 仅 **`1.62 s`**），而模型冷/热加载本身仅 **`128 – 228 ms`**。因此手机端压 TTFT 的头号抓手依然是 **F-13 前缀缓存 + 状态快照**（可将多轮对话 TTFT 从 4.5s 压至 `< 50 ms`），其次是 M3 接入 **Mali-G715 Vulkan Prefill**。
 - **端侧微调（QLoRA）修正**：实测 `Qwen3.5-0.8B` 5 核 CPU `i8mm` Prefill 为 `71.4 tok/s`，折算纯 CPU FP32/FP16 QLoRA 稳态吞吐约为 **`12 – 20 tok/s`**（接入 Mali-G715 Vulkan FP16 后有望翻倍至 **`35 – 60 tok/s`**），且 `0.8B` 训练总 RSS 仅 `~610 MiB`，在 Pixel 8 的 `3.81 GiB` 可用内存中极为宽裕。
+
+---
+
+## 5. 多引擎同机交替对比实测（`tinymodel` vs `llama.cpp` vs `HuggingFace candle`）
+
+严格按照 [TESTING.md](../TESTING.md) §3.2 基准协议，使用 [device_harness.py](../../bench/device_harness.py) 的 `compare` 子命令在同一台 Google Pixel 8 上**逐轮交替运行**（保证热包络完全一致），对比了 5 组配置（原始结果存档于 [2026-11-20-8efe61d-multi-engine.json](../../bench/results/pixel-8/2026-11-20-8efe61d-multi-engine.json)）：
+- **`tinymodel`**（纯 Rust，`880 KB` 静态 ELF，绑 `0x1f0` 5T，零拷贝 `mmap`）
+- **`llama.cpp (--repack 0)`**（`b001d7b`，绑 `0x1f0` 5T，零拷贝 `mmap` 同口径对比）
+- **`llama.cpp (KleidiAI --repack 1)`**（绑 `0x1f0` 5T，Arm 官方手写汇编微内核 + 加载时内存重排）
+- **`llama.cpp (默认未绑核)`**（开箱默认 `-t 9 --repack 1`）
+- **HuggingFace `candle` v0.9.2**（纯 Rust 对照基线，`2.8 MB` 静态 ELF，绑 `0x1f0` 5T；不支持 `Qwen3.5` GDN 结构）
+
+### 5.1 实测对比总表（3 轮交替取中位数，热稳态）
+
+| 模型（Q4_0） | 引擎配置 | Prefill `pp512` (tok/s) | **Decode `tg64` (tok/s)** | 相对 `llama.cpp (mmap)` | **峰值内存 RSS (MiB)** |
+|---|---|---:|---:|---:|---:|
+| **`SmolLM2-360M`**<br>（文件 `219.1 MiB`） | **`tinymodel` (`0x1f0`)** | 187.74 | **`89.23`** | **93.3%**（超默认未绑核 **+15.4%**） | **`259.0`**（最低！） |
+| | `llama.cpp (--repack 0)` | 239.59 | **95.62** | 100.0% | 286.2 |
+| | `llama.cpp (KleidiAI repack=1)` | 470.29 | **100.12** | 104.7% | **494.7（2.26× 文件大小！）** |
+| | `llama.cpp (默认 9T 未绑核)` | 400.44 | **77.29** | 80.8% | 494.9 |
+| | `HuggingFace candle` | 12.04 | **1.34** | 1.4% | **904.9（3.49× `tinymodel`！）** |
+| **`Qwen3.5-0.8B`**<br>（文件 `483.7 MiB`） | **`tinymodel` (`0x1f0`)** | 59.32 | **`24.16`** | **84.5%** | **`524.6`**（省 `100–612 MiB`！） |
+| | `llama.cpp (--repack 0)` | 91.72 | **28.58** | 100.0% | 625.1 |
+| | `llama.cpp (KleidiAI repack=1)` | 178.07 | **30.85** | 107.9% | **1136.5（2.17× `tinymodel`！）** |
+| | `llama.cpp (默认 9T 未绑核)` | 180.66 | **30.86** | 108.0% | 1137.4 |
+| **`Llama-3.2-1B`**<br>（文件 `737.2 MiB`） | **`tinymodel` (`0x1f0`)** | 53.45 | **`18.35`** | **87.5%**（Prefill **89.3%**） | **`773.8`**（省 `104–2868 MiB`！） |
+| | `llama.cpp (--repack 0)` | 59.87 | **20.98** | 100.0% | 878.2 |
+| | `llama.cpp (KleidiAI repack=1)` | 123.25 | **25.40** | 121.1% | **1625.3（2.10× `tinymodel`！）** |
+| | `llama.cpp (默认 9T 未绑核)` | 158.75 | **20.66** | 98.5% | 1625.2 |
+| | `HuggingFace candle` | 7.09 | **1.00** | 4.8% | **3641.9（4.71× `tinymodel`，逼近 OOM！）** |
+| **`Qwen3.5-2B`**<br>（文件 `1158.6 MiB`） | **`tinymodel` (`0x1f0`)** | **29.94** | **`9.15`** | Decode **75.2%** / **Prefill `107.8%`！** | **`1199.6`**（省 `118–1332 MiB`！） |
+| | `llama.cpp (--repack 0)` | 27.77 | **12.16** | 100.0% | 1318.1 |
+| | `llama.cpp (KleidiAI repack=1)` | 77.00 | **13.89** | 114.2% | **2531.9（净多吃 `1.33 GiB` 内存！）** |
+| | `llama.cpp (默认 9T 未绑核)` | 83.02 | **15.33** | 126.1% | 2531.9 |
+
+### 5.2 核心结论与下一阶段（M3）精准发力点
+
+1. **对比纯 Rust 生态（`HuggingFace candle`）：代际级领先**
+   - `tinymodel` 的 Decode 速度快 **`18.4× – 66.6×`**，Prefill 快 **`7.5× – 15.6×`**，内存占用仅为 `candle` 的 **`1/3.5 – 1/4.7`**（`Llama-1B` 上 `candle` 飙至 `3.64 GiB` 濒临触发 Android LMK 杀进程，而 `tinymodel` 仅 `773.8 MiB`），且原生支持 `Qwen3.5` GDN 混合结构。
+2. **对比 `llama.cpp` 的巨大内存优势（手机端生死线）**
+   - `tinymodel` 在全部四款模型上内存占用均为全场最低：比同为零拷贝的 `llama.cpp (--repack 0)` 省 **`27 – 118 MiB`**；
+   - **揭开了 `llama.cpp` 默认开启 `KleidiAI repack=1` 在手机端的隐蔽代价**：由于在加载时把权重重排进匿名堆内存同时保留 `mmap` 页，`llama.cpp (KleidiAI)` 的峰值 RSS 直接**翻了 2.1 倍**（`Qwen3.5-2B` 从 `1.20 GiB` 暴涨到 **`2.53 GiB`**；若跑 4B 模型将突破 `5 GiB` 直接在 8GB 手机上 OOM 崩溃！）。
+   - **对 `tinymodel` 的直接启示（验证 `F-04` 设计前瞻性！）**：在 M3 实现 **`Q4_0_4x8` 离线文件重排 + 直接零拷贝 `mmap`**，就能**同时白拿 KleidiAI 的 `2.5×` Prefill 提速与 `+15%` Decode 提速，且保持 `1.20 GiB` 的极低零拷贝内存，不花 1 字节额外脏内存**！
+3. **定位出的 2 个具体 CPU 内核提速点（M3 优先攻克）**
+   - **① `Qwen3.5` GDN 递推与卷积的 NEON 向量化**：目前 [ops.rs](../../crates/tm-cpu/src/ops.rs) 中的 `gdn_recurrence_parallel` 与 `l2_norm_inplace` 仍是标量循环（占 Pixel 8 单步耗时的 `15.2%`），改为手写 NEON `vfmaq_f32` 后预计直接追平 `Qwen3.5` 与 `llama.cpp (--repack 0)` 的大半差距；
+   - **② `Q4_0_4x8` 重排微内核 + `Q6_K` 4 行展开 `i8mm` 内核**：攻克 Prefill `pp512` 的 `2×` 差距以及 248k 词表 `lm_head`（占 `27.6%` 时间）的带宽效率。

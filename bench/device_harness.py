@@ -820,6 +820,249 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_remote_shell_timed(
+    transport: DeviceTransport,
+    shell_cmd: str,
+    timeout: int = 900,
+) -> Tuple[str, str, int, Optional[float]]:
+    """Runs an arbitrary shell command on an ADB or SSH target wrapped with `/system/bin/time -v` or `/usr/bin/time -v`."""
+    wrapped = (
+        "if [ -x /system/bin/time ]; then /system/bin/time -v sh -c "
+        + shlex.quote(shell_cmd)
+        + "; elif [ -x /usr/bin/time ]; then /usr/bin/time -v sh -c "
+        + shlex.quote(shell_cmd)
+        + "; else sh -c "
+        + shlex.quote(shell_cmd)
+        + "; fi"
+    )
+    if isinstance(transport, AdbTransport):
+        proc = transport._adb(["shell", wrapped], check=False, timeout=timeout)
+    elif isinstance(transport, SshTransport):
+        proc = transport._ssh(wrapped, check=False, timeout=timeout)
+    else:
+        proc = subprocess.run(
+            shell_cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
+    combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    rss_mib: Optional[float] = None
+    m_kib = re.search(r"(?:Max RSS \(KiB\)|Maximum resident set size \(kbytes\)):\s*(\d+)", combined)
+    if m_kib:
+        rss_mib = int(m_kib.group(1)) / 1024.0
+    return proc.stdout, proc.stderr, proc.returncode, rss_mib
+
+
+def parse_llama_bench_json(raw_output: str) -> Tuple[float, float]:
+    start = raw_output.find("[")
+    end = raw_output.rfind("]")
+    if start == -1 or end == -1 or end <= start:
+        raise RuntimeError(f"Failed to locate JSON array in llama-bench output:\n{raw_output[:600]}")
+    arr = json.loads(raw_output[start : end + 1])
+    pp_tps = 0.0
+    tg_tps = 0.0
+    for item in arr:
+        if int(item.get("n_prompt", 0)) > 0 and int(item.get("n_gen", 0)) == 0:
+            pp_tps = float(item["avg_ts"])
+        elif int(item.get("n_gen", 0)) > 0 and int(item.get("n_prompt", 0)) == 0:
+            tg_tps = float(item["avg_ts"])
+    return pp_tps, tg_tps
+
+
+def cmd_compare(args: argparse.Namespace) -> int:
+    """
+    Runs interleaved same-device multi-engine benchmarks (`docs/TESTING.md` §3.2):
+      - `tinymodel` (pinned `no-little`, zero-copy mmap)
+      - `llama.cpp (repack=0)` (pinned `no-little`, zero-copy mmap — apples-to-apples)
+      - `llama.cpp (KleidiAI repack=1)` (pinned `no-little`, Arm KleidiAI repacked)
+      - `llama.cpp (default unpinned)` (out-of-the-box default threads + repack=1)
+      - optional `candle` (pinned `no-little`, pure-Rust baseline on supported architectures)
+    """
+    transport = make_transport(args.target, args.remote_dir)
+    rbin_tm = transport.prepare_binary(args.profile, args.build)
+
+    probe_proc, _ = transport.run_tinymodel(rbin_tm, ["probe", "--json", "--no-stream"])
+    if probe_proc.returncode != 0:
+        raise RuntimeError(f"Target probe failed: {probe_proc.stderr or probe_proc.stdout}")
+    probe_info = parse_last_json_line(probe_proc.stdout)
+    cpu_mask, eff_threads = select_cluster_mask_and_threads(
+        probe_info.get("clusters", []),
+        policy=args.cluster_policy,
+        explicit_mask=args.cpu_mask,
+        explicit_threads=args.threads,
+    )
+    clean_mask = re.sub(r"^0[xX]", "", cpu_mask) if cpu_mask else None
+    taskset_pfx = f"taskset {shlex.quote(clean_mask)} " if clean_mask else ""
+
+    llama_local = Path(args.llama_bench_bin)
+    if not llama_local.exists():
+        raise RuntimeError(f"Cross-compiled llama-bench not found at {llama_local}")
+    rbin_llama = transport.stage_file(llama_local)
+    run_remote_shell_timed(transport, f"chmod 755 {shlex.quote(rbin_llama)}")
+
+    rbin_candle: Optional[str] = None
+    if args.candle_bin:
+        candle_local = Path(args.candle_bin)
+        if candle_local.exists():
+            rbin_candle = transport.stage_file(candle_local)
+            run_remote_shell_timed(transport, f"chmod 755 {shlex.quote(rbin_candle)}")
+
+    comparison_models: List[Dict[str, Any]] = []
+    for model_str in args.models:
+        model_path = Path(model_str)
+        remote_model = transport.stage_file(model_path, subdir="models")
+        is_qwen35 = "qwen3.5" in model_path.name.lower() or "qwen35" in model_path.name.lower()
+
+        engines_data: Dict[str, List[Dict[str, Any]]] = {
+            "tinymodel": [],
+            "llamacpp_norepack": [],
+            "llamacpp_kleidiai": [],
+            "llamacpp_default_unpinned": [],
+        }
+        if rbin_candle and not is_qwen35 and args.include_candle:
+            engines_data["candle"] = []
+
+        # Interleave engines within each repetition so thermal drift affects all engines equally!
+        for rep in range(args.reps):
+            print(f"[{model_path.name}] Interleaved round {rep + 1}/{args.reps}...", file=sys.stderr)
+
+            # 1. tinymodel (pinned)
+            tm_cmd = (
+                f"{taskset_pfx}{shlex.quote(rbin_tm)} bench -m {shlex.quote(remote_model)} "
+                f"-n {args.n_predict} -t {eff_threads} -c 1024 --json"
+            )
+            out, err, rc, rss = run_remote_shell_timed(transport, tm_cmd)
+            if rc != 0:
+                raise RuntimeError(f"tinymodel failed: {err or out}")
+            tm_rec = parse_last_json_line(out)
+            tm_rss = (
+                tm_rec["peak_rss_bytes"] / 1048576.0
+                if tm_rec.get("peak_rss_bytes")
+                else rss
+            )
+            engines_data["tinymodel"].append(
+                {"pp_tps": tm_rec["pp_tps"], "tg_tps": tm_rec["tg_tps"], "peak_rss_mib": tm_rss}
+            )
+
+            # 2. llama.cpp (--repack 0, pinned, zero-copy mmap)
+            ll0_cmd = (
+                f"{taskset_pfx}{shlex.quote(rbin_llama)} -m {shlex.quote(remote_model)} "
+                f"-p 512 -n {args.n_predict} -t {eff_threads} -r 1 --repack 0 -o json"
+            )
+            out0, err0, rc0, rss0 = run_remote_shell_timed(transport, ll0_cmd)
+            if rc0 != 0:
+                raise RuntimeError(f"llama-bench (--repack 0) failed: {err0 or out0}")
+            pp0, tg0 = parse_llama_bench_json(out0 + "\n" + err0)
+            engines_data["llamacpp_norepack"].append(
+                {"pp_tps": pp0, "tg_tps": tg0, "peak_rss_mib": rss0}
+            )
+
+            # 3. llama.cpp (KleidiAI --repack 1, pinned)
+            ll1_cmd = (
+                f"{taskset_pfx}{shlex.quote(rbin_llama)} -m {shlex.quote(remote_model)} "
+                f"-p 512 -n {args.n_predict} -t {eff_threads} -r 1 --repack 1 -o json"
+            )
+            out1, err1, rc1, rss1 = run_remote_shell_timed(transport, ll1_cmd)
+            if rc1 != 0:
+                raise RuntimeError(f"llama-bench (--repack 1) failed: {err1 or out1}")
+            pp1, tg1 = parse_llama_bench_json(out1 + "\n" + err1)
+            engines_data["llamacpp_kleidiai"].append(
+                {"pp_tps": pp1, "tg_tps": tg1, "peak_rss_mib": rss1}
+            )
+
+            # 4. llama.cpp (out-of-the-box default: unpinned all cores, default threads, --repack 1)
+            lld_cmd = (
+                f"{shlex.quote(rbin_llama)} -m {shlex.quote(remote_model)} "
+                f"-p 512 -n {args.n_predict} -r 1 --repack 1 -o json"
+            )
+            outd, errd, rcd, rssd = run_remote_shell_timed(transport, lld_cmd)
+            if rcd == 0:
+                ppd, tgd = parse_llama_bench_json(outd + "\n" + errd)
+                engines_data["llamacpp_default_unpinned"].append(
+                    {"pp_tps": ppd, "tg_tps": tgd, "peak_rss_mib": rssd}
+                )
+
+            # 5. HuggingFace candle (run once on rep 0 since ~1 tok/s takes ~60s per model)
+            if "candle" in engines_data and rep == 0 and rbin_candle:
+                cd_cmd = (
+                    f"RAYON_NUM_THREADS={eff_threads} {taskset_pfx}{shlex.quote(rbin_candle)} "
+                    f"{shlex.quote(remote_model)} 512 {args.n_predict}"
+                )
+                outc, errc, rcc, rssc = run_remote_shell_timed(transport, cd_cmd, timeout=900)
+                if rcc == 0:
+                    crec = parse_last_json_line(outc + "\n" + errc)
+                    engines_data["candle"].append(
+                        {
+                            "pp_tps": crec["pp_tps"],
+                            "tg_tps": crec["tg_tps"],
+                            "peak_rss_mib": crec.get("peak_rss_mib") or rssc,
+                        }
+                    )
+
+        summarized_engines: Dict[str, Any] = {}
+        for eng_name, samples in engines_data.items():
+            if not samples:
+                continue
+            pps = [float(s["pp_tps"]) for s in samples]
+            tgs = [float(s["tg_tps"]) for s in samples]
+            rsss = [float(s["peak_rss_mib"]) for s in samples if s.get("peak_rss_mib") is not None]
+            summarized_engines[eng_name] = {
+                "runs": len(samples),
+                "pp512_tps_median": round(statistics.median(pps), 2),
+                "tg_tps_median": round(statistics.median(tgs), 2),
+                "tg_tps_max": round(max(tgs), 2),
+                "peak_rss_mib_max": round(max(rsss), 1) if rsss else None,
+                "raw": samples,
+            }
+
+        comparison_models.append(
+            {
+                "model": model_path.name,
+                "threads_pinned": eff_threads,
+                "cpu_mask": cpu_mask,
+                "engines": summarized_engines,
+            }
+        )
+
+    commit = git_short_commit()
+    today = dt.date.today().isoformat()
+    extra_tel = transport.extra_device_telemetry()
+    dev_slug = slugify_device(
+        extra_tel.get("android_model") or probe_info.get("device_model", transport.kind)
+    )
+    out_dir = RESULTS_ROOT / dev_slug
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_json = out_dir / f"{today}-{commit}-multi-engine.json"
+    payload = {
+        "schema_version": 1,
+        "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "git_commit": commit,
+        "target": transport.describe(),
+        "device_probe": probe_info,
+        "extra_telemetry": extra_tel,
+        "models": comparison_models,
+    }
+    out_json.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    print(f"\n### Multi-Engine Comparison on `{probe_info.get('device_model')}` (Interleaved, `{cpu_mask or 'all'}`, `{eff_threads}T`)")
+    print("| Model | Engine | pp512 (tok/s) | tg64 (tok/s) | vs llama.cpp (mmap) | Peak RSS (MiB) |")
+    print("|---|---|---:|---:|---:|---:|")
+    for cm in comparison_models:
+        base_tg = cm["engines"].get("llamacpp_norepack", {}).get("tg_tps_median") or 1.0
+        for eng, st in cm["engines"].items():
+            rel = 100.0 * st["tg_tps_median"] / base_tg
+            rss_s = f"{st['peak_rss_mib_max']:.1f}" if st["peak_rss_mib_max"] is not None else "-"
+            print(
+                f"| `{cm['model']}` | `{eng}` | {st['pp512_tps_median']:.2f} | "
+                f"**{st['tg_tps_median']:.2f}** | {rel:.1f}% | {rss_s} |"
+            )
+    print(f"\nSaved multi-engine comparison JSON -> {out_json}")
+    return 0
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="tinymodel External Device Test & Benchmark Harness")
     sub = p.add_subparsers(dest="subcmd", required=True)
@@ -860,6 +1103,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--prompt-fixture", default="prompt_short.txt", help="Frozen fixture filename in bench/data/")
     p_run.add_argument("--compare-local", action="store_true", help="Compare greedy token hash against local host")
 
+    p_cmp = sub.add_parser("compare", help="Run interleaved multi-engine comparison (tinymodel vs llama.cpp vs candle)")
+    p_cmp.add_argument("--target", default="adb", help="local | adb[:<serial>] | ssh://[user@]host[:port]")
+    p_cmp.add_argument("--remote-dir", default=None, help="Remote staging directory on device")
+    p_cmp.add_argument("--profile", choices=["edge", "micro"], default="edge")
+    p_cmp.add_argument("--build", action="store_true")
+    p_cmp.add_argument("-m", "--models", action="append", required=True)
+    p_cmp.add_argument("--reps", type=int, default=3, help="Interleaved repetitions per model")
+    p_cmp.add_argument("-n", "--n-predict", type=int, default=64)
+    p_cmp.add_argument("-t", "--threads", type=int, default=None)
+    p_cmp.add_argument("--cluster-policy", choices=["all", "no-little", "mid-only"], default="no-little")
+    p_cmp.add_argument("--cpu-mask", default=None)
+    p_cmp.add_argument(
+        "--llama-bench-bin",
+        default=str(REPO_ROOT / "bench" / "tmp" / "llama-aarch64-musl" / "bin" / "llama-bench"),
+    )
+    p_cmp.add_argument("--candle-bin", default=None, help="Optional cross-compiled candle-bench-gguf binary")
+    p_cmp.add_argument("--include-candle", action="store_true", help="Include HuggingFace candle in comparison")
+
     return p
 
 
@@ -872,6 +1133,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_probe(args)
     if args.subcmd == "run":
         return cmd_run(args)
+    if args.subcmd == "compare":
+        return cmd_compare(args)
     return 1
 
 

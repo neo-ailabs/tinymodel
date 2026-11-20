@@ -1,0 +1,529 @@
+{
+  "schema_version": 1,
+  "timestamp_utc": "2026-11-20T15:16:06.434941+00:00",
+  "git_commit": "8efe61d",
+  "target": "adb:3B131FDJH00216 (/data/local/tmp/tinymodel)",
+  "device_probe": {
+    "schema_version": 1,
+    "device_model": "Pixel 8",
+    "os": "linux",
+    "arch": "aarch64",
+    "logical_cpus": 9,
+    "active_isa": "i8mm",
+    "caps": {
+      "neon": true,
+      "dotprod": true,
+      "i8mm": true,
+      "avx2": false,
+      "avx512_vnni": false
+    },
+    "supported_isas": [
+      "generic",
+      "neon",
+      "dotprod",
+      "i8mm"
+    ],
+    "clusters": [
+      {
+        "uarch": "Cortex-A510",
+        "max_freq_mhz": 1704,
+        "count": 4,
+        "cpus": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "cpu_mask_hex": "0xf"
+      },
+      {
+        "uarch": "Cortex-A715",
+        "max_freq_mhz": 2367,
+        "count": 4,
+        "cpus": [
+          4,
+          5,
+          6,
+          7
+        ],
+        "cpu_mask_hex": "0xf0"
+      },
+      {
+        "uarch": "Cortex-X3",
+        "max_freq_mhz": 2914,
+        "count": 1,
+        "cpus": [
+          8
+        ],
+        "cpu_mask_hex": "0x100"
+      }
+    ],
+    "memory": {
+      "total_bytes": 7941091328,
+      "available_bytes": 4282269696,
+      "cgroup_max_bytes": null
+    },
+    "process_rss_bytes": 901120,
+    "process_peak_rss_bytes": 901120,
+    "kernel_self_check": {
+      "passed": true,
+      "error": null
+    },
+    "stream_bw": null,
+    "telemetry": {
+      "max_temp_c": null,
+      "cur_freq_mhz_max": 610.0,
+      "governor": "sched_pixel",
+      "battery_power_mw": 7790.6,
+      "battery_status": "Charging",
+      "zones": []
+    }
+  },
+  "extra_telemetry": {
+    "android_model": "Pixel 8",
+    "android_soc": "Tensor G3",
+    "android_release": "16"
+  },
+  "models": [
+    {
+      "model": "SmolLM2-360M-Instruct-Q4_0.gguf",
+      "threads_pinned": 5,
+      "cpu_mask": "0x1f0",
+      "engines": {
+        "tinymodel": {
+          "runs": 3,
+          "pp512_tps_median": 187.74,
+          "tg_tps_median": 89.23,
+          "tg_tps_max": 90.88,
+          "peak_rss_mib_max": 259.0,
+          "raw": [
+            {
+              "pp_tps": 187.74,
+              "tg_tps": 90.88,
+              "peak_rss_mib": 256.390625
+            },
+            {
+              "pp_tps": 188.95,
+              "tg_tps": 89.23,
+              "peak_rss_mib": 257.515625
+            },
+            {
+              "pp_tps": 167.38,
+              "tg_tps": 78.79,
+              "peak_rss_mib": 258.95703125
+            }
+          ]
+        },
+        "llamacpp_norepack": {
+          "runs": 3,
+          "pp512_tps_median": 239.59,
+          "tg_tps_median": 95.62,
+          "tg_tps_max": 96.57,
+          "peak_rss_mib_max": 286.2,
+          "raw": [
+            {
+              "pp_tps": 243.206756,
+              "tg_tps": 96.568341,
+              "peak_rss_mib": 286.1953125
+            },
+            {
+              "pp_tps": 239.587391,
+              "tg_tps": 95.621087,
+              "peak_rss_mib": 286.25
+            },
+            {
+              "pp_tps": 211.589957,
+              "tg_tps": 80.445085,
+              "peak_rss_mib": 286.19921875
+            }
+          ]
+        },
+        "llamacpp_kleidiai": {
+          "runs": 3,
+          "pp512_tps_median": 470.29,
+          "tg_tps_median": 100.12,
+          "tg_tps_max": 102.09,
+          "peak_rss_mib_max": 494.7,
+          "raw": [
+            {
+              "pp_tps": 473.582062,
+              "tg_tps": 102.093672,
+              "peak_rss_mib": 494.73828125
+            },
+            {
+              "pp_tps": 470.290903,
+              "tg_tps": 100.123532,
+              "peak_rss_mib": 494.73046875
+            },
+            {
+              "pp_tps": 398.293659,
+              "tg_tps": 88.392792,
+              "peak_rss_mib": 494.50390625
+            }
+          ]
+        },
+        "llamacpp_default_unpinned": {
+          "runs": 3,
+          "pp512_tps_median": 400.44,
+          "tg_tps_median": 77.29,
+          "tg_tps_max": 81.46,
+          "peak_rss_mib_max": 494.9,
+          "raw": [
+            {
+              "pp_tps": 402.52954,
+              "tg_tps": 75.660988,
+              "peak_rss_mib": 494.91796875
+            },
+            {
+              "pp_tps": 400.443708,
+              "tg_tps": 77.292798,
+              "peak_rss_mib": 494.29296875
+            },
+            {
+              "pp_tps": 99.665558,
+              "tg_tps": 81.464191,
+              "peak_rss_mib": 494.0859375
+            }
+          ]
+        },
+        "candle": {
+          "runs": 1,
+          "pp512_tps_median": 12.04,
+          "tg_tps_median": 1.34,
+          "tg_tps_max": 1.34,
+          "peak_rss_mib_max": 904.9,
+          "raw": [
+            {
+              "pp_tps": 12.04,
+              "tg_tps": 1.34,
+              "peak_rss_mib": 904.9
+            }
+          ]
+        }
+      }
+    },
+    {
+      "model": "Qwen3.5-0.8B-Q4_0.gguf",
+      "threads_pinned": 5,
+      "cpu_mask": "0x1f0",
+      "engines": {
+        "tinymodel": {
+          "runs": 3,
+          "pp512_tps_median": 59.32,
+          "tg_tps_median": 24.16,
+          "tg_tps_max": 27.33,
+          "peak_rss_mib_max": 524.6,
+          "raw": [
+            {
+              "pp_tps": 67.3,
+              "tg_tps": 27.33,
+              "peak_rss_mib": 524.57421875
+            },
+            {
+              "pp_tps": 59.0,
+              "tg_tps": 23.76,
+              "peak_rss_mib": 515.39453125
+            },
+            {
+              "pp_tps": 59.32,
+              "tg_tps": 24.16,
+              "peak_rss_mib": 517.3984375
+            }
+          ]
+        },
+        "llamacpp_norepack": {
+          "runs": 3,
+          "pp512_tps_median": 91.72,
+          "tg_tps_median": 28.58,
+          "tg_tps_max": 28.66,
+          "peak_rss_mib_max": 625.1,
+          "raw": [
+            {
+              "pp_tps": 91.268268,
+              "tg_tps": 28.662427,
+              "peak_rss_mib": 625.0546875
+            },
+            {
+              "pp_tps": 92.008094,
+              "tg_tps": 28.58041,
+              "peak_rss_mib": 625.109375
+            },
+            {
+              "pp_tps": 91.719563,
+              "tg_tps": 28.478166,
+              "peak_rss_mib": 625.04296875
+            }
+          ]
+        },
+        "llamacpp_kleidiai": {
+          "runs": 3,
+          "pp512_tps_median": 178.07,
+          "tg_tps_median": 30.85,
+          "tg_tps_max": 31.08,
+          "peak_rss_mib_max": 1136.5,
+          "raw": [
+            {
+              "pp_tps": 177.459284,
+              "tg_tps": 30.845555,
+              "peak_rss_mib": 1136.46875
+            },
+            {
+              "pp_tps": 178.071532,
+              "tg_tps": 30.846523,
+              "peak_rss_mib": 1136.46484375
+            },
+            {
+              "pp_tps": 178.715255,
+              "tg_tps": 31.082341,
+              "peak_rss_mib": 1136.48046875
+            }
+          ]
+        },
+        "llamacpp_default_unpinned": {
+          "runs": 3,
+          "pp512_tps_median": 180.66,
+          "tg_tps_median": 30.86,
+          "tg_tps_max": 32.05,
+          "peak_rss_mib_max": 1137.4,
+          "raw": [
+            {
+              "pp_tps": 182.366612,
+              "tg_tps": 30.862046,
+              "peak_rss_mib": 1137.4140625
+            },
+            {
+              "pp_tps": 180.656087,
+              "tg_tps": 32.046259,
+              "peak_rss_mib": 1137.2109375
+            },
+            {
+              "pp_tps": 174.452316,
+              "tg_tps": 29.427655,
+              "peak_rss_mib": 1137.140625
+            }
+          ]
+        }
+      }
+    },
+    {
+      "model": "Llama-3.2-1B-Instruct-Q4_0.gguf",
+      "threads_pinned": 5,
+      "cpu_mask": "0x1f0",
+      "engines": {
+        "tinymodel": {
+          "runs": 3,
+          "pp512_tps_median": 53.45,
+          "tg_tps_median": 18.35,
+          "tg_tps_max": 23.33,
+          "peak_rss_mib_max": 773.8,
+          "raw": [
+            {
+              "pp_tps": 53.45,
+              "tg_tps": 18.35,
+              "peak_rss_mib": 773.41015625
+            },
+            {
+              "pp_tps": 70.87,
+              "tg_tps": 23.33,
+              "peak_rss_mib": 773.8203125
+            },
+            {
+              "pp_tps": 45.49,
+              "tg_tps": 11.61,
+              "peak_rss_mib": 773.1875
+            }
+          ]
+        },
+        "llamacpp_norepack": {
+          "runs": 3,
+          "pp512_tps_median": 59.87,
+          "tg_tps_median": 20.98,
+          "tg_tps_max": 23.12,
+          "peak_rss_mib_max": 878.2,
+          "raw": [
+            {
+              "pp_tps": 59.867669,
+              "tg_tps": 20.744815,
+              "peak_rss_mib": 878.25
+            },
+            {
+              "pp_tps": 68.640187,
+              "tg_tps": 23.12215,
+              "peak_rss_mib": 877.828125
+            },
+            {
+              "pp_tps": 44.917597,
+              "tg_tps": 20.983153,
+              "peak_rss_mib": 878.02734375
+            }
+          ]
+        },
+        "llamacpp_kleidiai": {
+          "runs": 3,
+          "pp512_tps_median": 123.25,
+          "tg_tps_median": 25.4,
+          "tg_tps_max": 25.42,
+          "peak_rss_mib_max": 1625.3,
+          "raw": [
+            {
+              "pp_tps": 123.252416,
+              "tg_tps": 19.963713,
+              "peak_rss_mib": 1625.2734375
+            },
+            {
+              "pp_tps": 88.40147,
+              "tg_tps": 25.402638,
+              "peak_rss_mib": 1624.84765625
+            },
+            {
+              "pp_tps": 139.438618,
+              "tg_tps": 25.416447,
+              "peak_rss_mib": 1624.93359375
+            }
+          ]
+        },
+        "llamacpp_default_unpinned": {
+          "runs": 3,
+          "pp512_tps_median": 158.75,
+          "tg_tps_median": 20.66,
+          "tg_tps_max": 21.42,
+          "peak_rss_mib_max": 1625.2,
+          "raw": [
+            {
+              "pp_tps": 116.507499,
+              "tg_tps": 19.524244,
+              "peak_rss_mib": 1625.2265625
+            },
+            {
+              "pp_tps": 159.243515,
+              "tg_tps": 21.420583,
+              "peak_rss_mib": 1624.671875
+            },
+            {
+              "pp_tps": 158.749044,
+              "tg_tps": 20.655962,
+              "peak_rss_mib": 1624.82421875
+            }
+          ]
+        },
+        "candle": {
+          "runs": 1,
+          "pp512_tps_median": 7.09,
+          "tg_tps_median": 1.0,
+          "tg_tps_max": 1.0,
+          "peak_rss_mib_max": 3641.9,
+          "raw": [
+            {
+              "pp_tps": 7.09,
+              "tg_tps": 1.0,
+              "peak_rss_mib": 3641.9
+            }
+          ]
+        }
+      }
+    },
+    {
+      "model": "Qwen3.5-2B-Q4_0.gguf",
+      "threads_pinned": 5,
+      "cpu_mask": "0x1f0",
+      "engines": {
+        "tinymodel": {
+          "runs": 3,
+          "pp512_tps_median": 29.94,
+          "tg_tps_median": 9.15,
+          "tg_tps_max": 10.92,
+          "peak_rss_mib_max": 1199.6,
+          "raw": [
+            {
+              "pp_tps": 29.94,
+              "tg_tps": 7.27,
+              "peak_rss_mib": 1199.58984375
+            },
+            {
+              "pp_tps": 21.15,
+              "tg_tps": 9.15,
+              "peak_rss_mib": 1194.16796875
+            },
+            {
+              "pp_tps": 31.23,
+              "tg_tps": 10.92,
+              "peak_rss_mib": 1198.484375
+            }
+          ]
+        },
+        "llamacpp_norepack": {
+          "runs": 3,
+          "pp512_tps_median": 27.77,
+          "tg_tps_median": 12.16,
+          "tg_tps_max": 12.36,
+          "peak_rss_mib_max": 1318.1,
+          "raw": [
+            {
+              "pp_tps": 38.383503,
+              "tg_tps": 12.362266,
+              "peak_rss_mib": 1317.890625
+            },
+            {
+              "pp_tps": 26.594995,
+              "tg_tps": 12.161206,
+              "peak_rss_mib": 1317.8203125
+            },
+            {
+              "pp_tps": 27.773741,
+              "tg_tps": 8.744979,
+              "peak_rss_mib": 1318.0703125
+            }
+          ]
+        },
+        "llamacpp_kleidiai": {
+          "runs": 3,
+          "pp512_tps_median": 77.0,
+          "tg_tps_median": 13.89,
+          "tg_tps_max": 14.68,
+          "peak_rss_mib_max": 2531.9,
+          "raw": [
+            {
+              "pp_tps": 81.550353,
+              "tg_tps": 13.888455,
+              "peak_rss_mib": 2531.8828125
+            },
+            {
+              "pp_tps": 60.744416,
+              "tg_tps": 12.674268,
+              "peak_rss_mib": 2531.76953125
+            },
+            {
+              "pp_tps": 77.00283,
+              "tg_tps": 14.675997,
+              "peak_rss_mib": 2531.78515625
+            }
+          ]
+        },
+        "llamacpp_default_unpinned": {
+          "runs": 3,
+          "pp512_tps_median": 83.02,
+          "tg_tps_median": 15.33,
+          "tg_tps_max": 16.14,
+          "peak_rss_mib_max": 2531.9,
+          "raw": [
+            {
+              "pp_tps": 72.322953,
+              "tg_tps": 15.334286,
+              "peak_rss_mib": 2531.9375
+            },
+            {
+              "pp_tps": 83.020072,
+              "tg_tps": 14.875027,
+              "peak_rss_mib": 2531.83203125
+            },
+            {
+              "pp_tps": 92.368748,
+              "tg_tps": 16.141895,
+              "peak_rss_mib": 2531.82421875
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
