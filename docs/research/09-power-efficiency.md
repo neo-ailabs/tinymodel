@@ -81,6 +81,7 @@ decode 期间层与层之间的间隔很短，自旋能省掉唤醒延迟，是�
 |---|---|---|
 | **M4** | 省电模式下 decode 用 2–3 线程，或改用 Metal；后台任务设低 QoS 放到 E 核；prefill 用 Metal | CPU 时间省 14–23%（实测），整机功耗待测 |
 | **Pi 5** | decode 阶段降频或用 `schedutil`；用 3 线程；加主动散热避免降频 | CPU 功耗省 20–35%（估算） |
+| **RK3588** | `--cluster-policy no-little` 严格绑 4×A76 大核（`0xf0`），避免等 A55 空转；decode 限频至 1.8–2.0 GHz；远期用 Mali Vulkan / RKNPU2 | 8nm 制程每 token 能耗比 Pi 5 低 40–55%（估算） |
 | **Pi 4B** | 只跑 decode 的场景不开 `arm_boost`；decode 用 3 线程；Q4_0 加上前缀缓存 | 估算 15–25% |
 | **Zero 2W** | 本来带宽就只有约 2 GB/s，**2 个线程可能就够喂饱带宽**，多开只是空转（待测）；低比特量化收益最大 | 待测 |
 | **Pixel 8** | ① decode 放在 **4 个 A715 中核**上，不用 X3（X3 每单位性能的功耗明显更高），也不用 A510（会拖住同步）；② 用 Android 的 **PerformanceHint（ADPF）API** 上报每个 token 的目标耗时，让系统选能满足要求的最低频率；③ 控制生成速度；④ 充电时才做 prefill 密集的任务 | 估计每 token 能耗能降 30–50%，要用 ODPM 实测 |

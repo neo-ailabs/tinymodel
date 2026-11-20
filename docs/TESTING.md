@@ -31,7 +31,8 @@
 | 设备 | 角色 | 接入方式 | CI |
 |---|---|---|---|
 | Apple M4 16GB | 主力开发；aarch64 内核、Metal | `--target local` | 本地 |
-| **Google Pixel 8（Tensor G3）** | edge 档手机基准（异构 1×X3 + 4×A715 + 4×A510、i8mm、功耗） | `--target adb`（USB / 无线 ADB） | 手动 |
+| **Google Pixel 8（Tensor G3）** | edge 档手机基准（异构 1×X3 + 4×A715 + 4×A510、i8mm、功耗） | `--target adb`（USB / 无线 ADB） | 手动（已实测） |
+| **Rockchip RK3588** | edge 档大内存 SBC 基准（4×A76 + 4×A55、64-bit LPDDR4X/5、Mali-G610） | `--target ssh://root@<host>` | 手动 |
 | Raspberry Pi 5 | edge 档 SBC 基准（4×A76、dotprod） | `--target ssh://pi@<host>` | 手动或自托管 runner |
 | Raspberry Pi 4B | micro ISA 大内存基准（4×A72、纯 ARMv8.0 NEON） | `--target ssh://pi@<host> --profile micro` | 手动 |
 | Raspberry Pi Zero 2W | micro 档极限内存基准（4×A53、512MB） | `--target ssh://pi@<host> --profile micro` | 手动 |

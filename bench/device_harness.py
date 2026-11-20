@@ -390,7 +390,8 @@ class AdbTransport(DeviceTransport):
         env_prefix = ""
         if env:
             env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items()) + " "
-        taskset_prefix = f"taskset {shlex.quote(cpu_mask)} " if cpu_mask else ""
+        clean_mask = re.sub(r"^0[xX]", "", cpu_mask) if cpu_mask else None
+        taskset_prefix = f"taskset {shlex.quote(clean_mask)} " if clean_mask else ""
         quoted_cmd = " ".join(shlex.quote(x) for x in [remote_bin] + args)
         # Preserve remote exit status explicitly across older Android `adb shell` versions
         shell_cmd = f"{env_prefix}{taskset_prefix}{quoted_cmd}"
@@ -490,7 +491,8 @@ class SshTransport(DeviceTransport):
         env_prefix = ""
         if env:
             env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items()) + " "
-        taskset_prefix = f"taskset {shlex.quote(cpu_mask)} " if cpu_mask else ""
+        clean_mask = re.sub(r"^0[xX]", "", cpu_mask) if cpu_mask else None
+        taskset_prefix = f"taskset {shlex.quote(clean_mask)} " if clean_mask else ""
         quoted_cmd = " ".join(shlex.quote(x) for x in [remote_bin] + args)
         proc = self._ssh(f"{env_prefix}{taskset_prefix}{quoted_cmd}", check=False, timeout=timeout)
         return proc, None

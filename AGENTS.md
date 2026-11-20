@@ -84,7 +84,7 @@ cargo fmt --all
 - 开发机：Apple M4，16GB，macOS；工具链 `stable`（1.99.1）和 `nightly`。**项目固定用 stable**（`rust-toolchain.toml`）。
 - M4 支持 NEON、dotprod、i8mm、SME2；本机实测见 `docs/research/poc/`。
 - 交叉编译用 `cargo-zigbuild` 或 `cross`。
-- **分析报告的固定参考设备**：凡是涉及性能、内存、部署、微调、延迟的分析，除了 M4、Pi 5、Pi 4B / Zero 2W 之外，**都要附上 Google Pixel 8（Tensor G3，Android）的分析**。设备档案见 `docs/research/08-pixel8.md`。
+- **分析报告的固定参考设备**：凡是涉及性能、内存、部署、微调、延迟、功耗的分析，除了 M4、Pi 5、Pi 4B / Zero 2W 之外，**都要附上 Google Pixel 8（Tensor G3，Android）和 Rockchip RK3588（4×A76 + 4×A55，Linux SBC）的分析**。设备档案见 `docs/research/08-pixel8.md` 和 `docs/research/10-rk3588.md`。
 
 ## 9. 已知陷阱（务必注意）
 

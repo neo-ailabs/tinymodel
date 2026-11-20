@@ -1,87 +1,64 @@
-# Google Pixel 8（Tensor G3）设备档案与分析
+# Google Pixel 8（Tensor G3）设备档案与真机实测报告
 
-> 日期：2026-11-20  
-> 这是固定参考设备之一（见 `AGENTS.md` §8）。今后凡是涉及性能、内存、部署、微调、延迟的分析，都要附上 Pixel 8 这一列。  
-> ⚠️ **本文所有吞吐和带宽数字都是估算**，还没有在真机上测过（当前没有连接设备）。规格里标“待核实”的项，要用真机上的 `/proc/cpuinfo`、`getauxval` 和 STREAM 结果确认。
+> 更新日期：2026-11-20（**已完成真机实测**，序列号 `3B131FDJH00216`，Android 16）  
+> 固定参考设备之一（见 [AGENTS.md](../../AGENTS.md) §8）。原始基准结果存档于 [2026-11-20-a80228f.json](../../bench/results/pixel-8/2026-11-20-a80228f.json)。
 
 ---
 
-## 1. 硬件规格
+## 1. 真机探测硬件规格（`tinymodel probe` 实测确认）
 
-| 项 | Pixel 8 | 对比 Pi 5 |
+| 项 | Pixel 8 真机实测值 | 对比 Pi 5 / RK3588 |
 |---|---|---|
-| SoC | Google Tensor G3（三星 4nm） | BCM2712（16nm） |
-| CPU | **1× Cortex-X3 @ 2.91 GHz + 4× Cortex-A715 @ 2.37 GHz + 4× Cortex-A510 @ 1.70 GHz**（9 核，三种核） | 4× Cortex-A76 @ 2.4 GHz（同构） |
-| ISA | **ARMv9.0-A**：NEON、dotprod、**i8mm**、BF16、**FP16 运算**、SVE2（向量长度 128 位，相对 NEON 没有宽度优势） | ARMv8.2-A：NEON、dotprod、FP16；无 i8mm |
-| 内存 | **8 GB LPDDR5X**（Pixel 8 Pro 为 12 GB） | 4/8/16 GB LPDDR4X |
-| 带宽 | 理论约 50–68 GB/s（待核实）；CPU 实际可持续读取**估计 25–40 GB/s** | 约 11.5 GB/s |
-| GPU | Arm **Mali-G715 MC7**，Vulkan 1.3 | VideoCore VII |
-| NPU | Tensor G3 TPU：**只能通过 Android AICore / Gemini Nano 使用，第三方原生代码用不了**；NNAPI 已废弃 | 无 |
-| 散热 | 被动散热，**Tensor G3 持续满载会明显降频**（估计几分钟后掉到峰值的 50–70%） | 可以加主动风扇 |
-
-**结论**：Pixel 8 的带宽是 Pi 5 的 2–3 倍，还有 i8mm 和 FP16 运算，峰值性能远高于 Pi 5。但它有两个难点：**三种核混合调度**和**温控降频**，必须专门处理。
+| **SoC / OS** | **Google Tensor G3**（三星 4nm），Android 16（`sched_pixel` 调频器） | Pi 5：BCM2712 (16nm)；RK3588：8nm |
+| **三丛集异构 CPU** | - `cpu0..3`：**4× Cortex-A510 @ 1704 MHz**（掩码 `0x0f`）<br>- `cpu4..7`：**4× Cortex-A715 @ 2367 MHz**（掩码 `0xf0`）<br>- `cpu8`：**1× Cortex-X3 @ 2914 MHz**（掩码 `0x100`） | Pi 5：4×A76 同构；RK3588：4×A76 + 4×A55 |
+| **ISA 与 L1 自检** | 自动命中 **`Isa::NeonI8mm`**（`neon`、`dotprod`、`i8mm` 全支持；真机 L1 逐位自检 **PASSED**） | Pi 5 / RK3588 仅到 `dotprod`（无 `i8mm`） |
+| **物理内存与可用水位** | 总计 `7.39 GiB`（`7,941,091,328 B`），空闲可用 **`3.81 GiB`** | 足够无压力常驻 `Qwen3.5-2B`（峰值 RSS `1.17 GiB`） |
+| **实测 STREAM 持续带宽** | - **仅绑 `4×A715`（`0xf0`, 4T）**：**Read `31.17 GB/s` / Copy `40.34 GB/s`**<br>- 绑 `X3 + 4×A715`（`0x1f0`, 5T）：Read `21.84 GB/s` / Copy `25.37 GB/s`<br>- 单核 `1×X3`（`0x100`, 1T）：Read `19.19 GB/s`<br>- 全核混跑（8T，含 A510）：Read `15.61 GB/s`（**被小核拖慢一半！**） | Pi 5 约 `11.5 GB/s`；RK3588 约 `17–23 GB/s` |
+| **GPU / NPU** | Arm Mali-G715 MC7（Vulkan 1.3，M3 接入）；TPU 仅限系统 AICore 使用 | — |
 
 ---
 
-## 2. `tinymodel` 在 Pixel 8 上的适配情况（代码审计）
+## 2. 异构大小核调度实测与已落地的动态分块优化
 
-| 项 | 现状 | 问题与建议 |
-|---|---|---|
-| ISA 探测 | [isa.rs](../../crates/tm-cpu/src/isa.rs) 用的是 `std::arch::is_aarch64_feature_detected!`，在 Android 上也能用 | ✅ 应该会自动选中 `Isa::NeonI8mm`，A510 也支持 i8mm |
-| **线程池分块** | [ops.rs](../../crates/tm-cpu/src/ops.rs) 的 `matvec_f32` 按“每个线程一块”切分（`rows.div_ceil(n_thr)`），这是为同构核设计的 | ❌ **在 Pixel 8 上最慢的 A510 会拖住整体**。建议：① 默认只用 5 个线程（X3 + 4×A715）；② 异构机器上把块切细（每线程 4–8 块），靠现有的原子认领做动态负载均衡；③ 可选按核绑定（`sched_setaffinity`）。这一点也适用于大多数手机 |
-| 内存探测 | [memprobe.rs](../../crates/tm-core/src/memprobe.rs) 已开启 `#[cfg(any(target_os = "linux", target_os = "android"))]` 并支持从 `/proc/self/status` 读取 `VmHWM` 峰值内存 | ✅ 已修复 Android 目标条件，并在 SELinux 拦截 cgroup 文件时自动回退只读 `/proc/meminfo`；注意 Android LMK 会在 `MemAvailable` 耗尽前杀进程，仍需留足余量 |
-| `mlock` | ARCHITECTURE 建议锁住大 arena | 普通 App 的 `RLIMIT_MEMLOCK` 一般只有 64 KB，**基本不能用**；只能靠 mmap 加页缓存 |
-| 16 KB 页 | — | Android 15 起支持 16 KB 页内核（Pixel 8 可以在开发者选项里切换）。**ELF 要用 `-z max-page-size=16384` 链接**，否则在 16 KB 内核上无法加载。GGUF 是整个文件做 mmap，不受影响 |
-| GPU | 还没有 Vulkan 后端（M3） | Mali-G715 支持 Vulkan 1.3 和整数点积扩展；是否支持 cooperative matrix 待核实 |
+在真机上以 `Qwen3.5-0.8B-Q4_0`（`-n 64 -c 1024`）实测四种绑核策略及 [ops.rs](../../crates/tm-cpu/src/ops.rs) 动态细粒度分块（`dynamic_row_chunk`）改造前后的对比：
 
-### 一键自动化验证（已实现 `bench/device_harness.py`，不需要 NDK）
-插上 Pixel 8 并开启 USB 调试（或 `adb connect <ip:port>`）后，直接运行统一外部设备测试接口即可自动完成交叉编译、按需推送、异构核识别与绑核、STREAM 带宽、温度/电池功耗采集和贪心对齐校验：
-```sh
-python3 bench/device_harness.py list
-python3 bench/device_harness.py probe --target adb --build
-# 排除 A510 小核（4×A715 + 1×X3）跑最高性能，或用 --cluster-policy mid-only 只跑 4×A715 省电模式：
-python3 bench/device_harness.py run --target adb -m models/Qwen3.5-0.8B-Q4_0.gguf \
-    --cluster-policy no-little --reps 5 --compare-local --build
-```
+| 绑核掩码与线程配置 | 物理核心组合 | Prefill `pp512` | Decode `tg64`（优化前均分） | **Decode `tg64`（动态分块后）** | 结论 |
+|---|---|---:|---:|---:|---|
+| **`0x1f0` (`-t 5`, `no-little`)** | **1×X3 + 4×A715** | **70.9 – 71.3 tok/s** | 36.37 tok/s | **`37.89 tok/s`（冷机峰值）** | **最高综合吞吐（默认推荐）** |
+| **`0xf0` (`-t 4`, `mid-only`)** | **4×A715 同构中核** | **71.4 – 71.7 tok/s** | 28.75 tok/s | **`28.75 tok/s`** | **最高能效档**（不开高功耗 X3 仍保住 76% 速度） |
+| `0x100` (`-t 1`) | 仅 1×X3 超大核 | 36.4 tok/s | 13.49 tok/s | 13.49 tok/s | 单核带宽达 `~6.7 GB/s` |
+| `0x1ff` (`-t 9`, `all`) | 全 9 核（含 4×A510） | 38.3 → **45.5 tok/s** | 8.76 tok/s | **`13.34 tok/s`（+52.3%）** | **严禁把 A510 放进推理线程池**（即使动态分块仍受 DSU 争抢拖累） |
+
+### 已完成的代码适配清单
+- ✅ **异构自适应分块**（[ops.rs](../../crates/tm-cpu/src/ops.rs)）：`n_thr <= 4` 保持每核单段连续预取（M4 / Pi 5 / `4×A715` 零回退）；`n_thr > 4` 自动切分为 `4×` 细粒度块 + 单头 GQA/GDN 原子抢占，Pixel 8 5 线程再提速 **+4.2%**、未绑核 9 线程提速 **+52.3%**。
+- ✅ **Android 内存探测与峰值 RSS**（[memprobe.rs](../../crates/tm-core/src/memprobe.rs)）：支持 `target_os = "android"` 与 `/proc/self/status` `VmHWM` 读取。
+- ✅ **Android `toybox taskset` 兼容**（[device_harness.py](../../bench/device_harness.py)）：自动剥离 `0x` 前缀（传 `1f0` / `f0`），同时兼容 Android `toybox` 与 Linux `util-linux`。
 
 ---
 
-## 3. 推理性能估算（Qwen3.5-0.8B-Q4_0 和 2B）
+## 3. 四款基准模型真机实测结果（`0x1f0`：1×X3 + 4×A715，`Isa::NeonI8mm`）
 
-| 指标 | Pixel 8（估算） | Pi 5（估算） | Pi 4B（估算） | M4（实测） |
-|---|---:|---:|---:|---:|
-| decode 0.8B（受带宽限制） | **30–55 tok/s**，降频后更低 | 15–20 tok/s | 7.5–9 tok/s | CPU 112.8 / Metal 127.0 tok/s |
-| decode 2B | 15–25 tok/s | 6–8 tok/s | 3.5–3.9 tok/s | CPU 51.2 / Metal 63.0 tok/s |
-| prefill 0.8B（受算力限制，i8mm） | 100–250 tok/s | 40–80 tok/s | 28–35 tok/s | Metal 1536 tok/s |
-| 可以放心跑的模型上限 | **2B–4B**（App 实际可用内存估计 3–4 GB） | 2B–4B | 0.8B–2B | 8B |
+连续跑满 4 款模型 × 多轮测试（覆盖冷机峰值与被动散热温控稳态）：
 
----
+| 模型（Q4_0） | 文件大小 | Prefill `pp512`（中位数 / 峰值） | **Decode `tg64`（热稳态 / 冷峰值）** | 冻结语料 TTFT (~300 tok) | 峰值 RSS (`VmHWM`) | 额外脏内存 | 跨机/自洽确定性 |
+|---|---:|---:|---:|---:|---:|---:|---|
+| **`SmolLM2-360M-Instruct`** | 219.1 MiB | `180.0` / **`186.5 tok/s`** | **`83.6`** / **`90.0 tok/s`** | **1.62 – 1.75 s** | **256.5 MiB** | **+37.4 MiB** | ✅ 与 M4 **100% 逐 token 一致** |
+| **`Qwen3.5-0.8B` (GDN)** | 483.7 MiB | `67.6` / **`71.4 tok/s`** | **`30.8`** / **`37.9 tok/s`** | **4.19 – 4.52 s** | **522.9 MiB** | **+39.2 MiB** | ✅ 与 M4 **100% 逐 token 一致** |
+| **`Llama-3.2-1B-Instruct`** | 737.2 MiB | `60.0` / **`68.2 tok/s`** | **`23.1`** / **`23.8 tok/s`** | **5.14 s** | **769.4 MiB** | **+32.2 MiB** | ✅ 本机多轮 100% 一致¹ |
+| **`Qwen3.5-2B` (GDN)** | 1158.6 MiB | `31.8` / **`33.2 tok/s`** | **`11.0`** / **`13.1 tok/s`** | **9.22 s** | **1200.0 MiB** | **+41.4 MiB** | ✅ 本机多轮 100% 一致¹ |
 
-## 4. 首字延迟（TTFT）
+> ¹ 注：Pixel 8 本机多轮贪心输出 `100%` 逐位确定一致（符合 N-10）；1B/2B 模型在 350+ token 长序列末尾与 macOS M4 出现单个近距词分叉，源于 `musl libm` 与 Apple `libSystem libm` 的超越函数（`expf`/`sin`/`cos`）存在 1 ULP 舍入差异（短句如 `"The capital of France is"` 24 token 两端输出逐字完全相同）。
 
-- 292 token 的 prompt：prefill 估计 **1.2–3 s**。比 Pi 4B（8–10 s）快很多，但离 M4 Metal（214 ms）差得远。
-- 收益最大的手段和其他设备一样：**前缀缓存加状态快照**。Qwen3.5 的快照约 18 MiB 加上每个 token 12 KB，恢复只要几毫秒。
-- 手机特有的问题：
-  - **冷启动**：App 被系统杀掉后，模型页可能被换出，重新打开时要从 UFS 闪存读。UFS 4.0 顺序读超过 2 GB/s，0.8B 模型的冷启动在 0.5 s 以内（估算）。
-  - **首轮计算前先把线程放到大核上**，可以用 ADPF（Android Dynamic Performance Framework）的 hint 申请提频；否则调度器可能从小核开始慢慢升频，首字延迟会多出几百毫秒。
-
----
-
-## 5. 微调
-
-| 项 | Pixel 8 |
-|---|---|
-| 浮点算力 | FP32 峰值估计约 245 GFLOPS（X3 加 4×A715，不算 A510）。**有 FP16 运算**，反向可以用 FP16 计算、FP32 累加，但要校验精度 |
-| 降频后的有效算力 | 约 70–100 GFLOPS FP32 |
-| 可以跑的模型 | 0.8B 宽裕，2B 可以（脏内存约 250–400 MiB，加上模型文件） |
-| 估算训练吞吐 | 0.8B **约 15–25 tok/s**，2B 约 6–10 tok/s |
-| 适合做什么 | 充电且温度正常时，过夜做几百到几千条样本的个性化微调；10 万 token 约 1–2 小时 |
-| 限制 | 后台训练会被 Android 限制，要用前台服务或 WorkManager 的充电约束；要能随时中断并恢复 |
+### 实测关键发现
+1. **极低运行时脏内存开销**：得益于零拷贝 `mmap`、扁平词表与 `FP16` KV cache，哪怕跑 **248k 词表的 `Qwen3.5-2B`**，全进程 `VmHWM` 峰值内存（`1200.0 MiB`）仅比模型文件本身多出 **`41.4 MiB`**！在 8GB Pixel 8（可用 `3.81 GiB`）上甚至具备跑 **3B–4B Q4_0** 模型的充裕空间。
+2. **被动散热温控幅度**：连续高负载运行十余轮后，Tensor G3 的 `Qwen3.5-0.8B` Decode 从冷机 **`37.9 tok/s`** 平滑回落至热稳态 **`30.8 tok/s`（仅降约 18.7%）**，远好于早期预估的 50% 腰斩。
+3. **Qwen3.5 CPU 热点分布（Pixel 8 真机 `profile`）**：
+   - `lm_head (Q6_K, 248k 词表)` 占 **27.6%**（`10.18 ms`），`ffn_gate_up+silu` 占 **20.4%**，`gdn_proj` 占 **14.9%**，`gdn_recur+gnorm` 占 **8.5%**——这验证了 M3/M4 阶段对大词表 `lm_head` 做低比特量化或 MTP 投机解码在手机端同样有接近 **25%–30%** 的提速空间。
+4. **USB 供电测量提示**：USB 连线测试期间手机处于 `Charging` 状态，`/sys/class/power_supply/battery/current_now` 反映的是净充电电流而非纯放电功耗；后续测纯电池 J/token 时需切换为无线 `adb connect <ip:port>` 拔线放电测量，或使用 Perfetto ODPM 轨道。
 
 ---
 
-## 6. 待办（真机到手后）
-1. 用 musl 二进制在 adb shell 下跑 `bench`、`profile`，并测 STREAM 带宽，替换本文所有估算值。
-2. 分别测 1/5/9 线程，以及“绑大核”和“不绑”的情况，验证三种核的调度问题。
-3. 测持续 10 分钟满载下的降频曲线（读 `/sys/class/thermal`）。
-4. 修复 `memprobe` 的 `target_os = "android"` 条件，以及 `matvec_f32` 在异构核上的分块策略（各自配测试）。
+## 4. 首字延迟（TTFT）与微调评估更新
+
+- **TTFT 实测与压缩空间**：`Qwen3.5-0.8B` 约 300 token 输入实测 TTFT 为 **`4.19 – 4.52 s`**（`SmolLM2-360M` 仅 **`1.62 s`**），而模型冷/热加载本身仅 **`128 – 228 ms`**。因此手机端压 TTFT 的头号抓手依然是 **F-13 前缀缓存 + 状态快照**（可将多轮对话 TTFT 从 4.5s 压至 `< 50 ms`），其次是 M3 接入 **Mali-G715 Vulkan Prefill**。
+- **端侧微调（QLoRA）修正**：实测 `Qwen3.5-0.8B` 5 核 CPU `i8mm` Prefill 为 `71.4 tok/s`，折算纯 CPU FP32/FP16 QLoRA 稳态吞吐约为 **`12 – 20 tok/s`**（接入 Mali-G715 Vulkan FP16 后有望翻倍至 **`35 – 60 tok/s`**），且 `0.8B` 训练总 RSS 仅 `~610 MiB`，在 Pixel 8 的 `3.81 GiB` 可用内存中极为宽裕。

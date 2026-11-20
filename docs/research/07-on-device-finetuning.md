@@ -159,6 +159,7 @@ flowchart LR
 | **Pi Zero 2W**（4×A53 1GHz，512MB） | ~16 → ~5 GFLOPS（FP32） | 可用约 350MB | **SmolLM2-135M**（T=256） | 约 4–6 tok/s | 不现实；只适合**几十到几百条**样本，或用 MeZO / 只训输出头 |
 | **Pi 4B**（4×A72 1.5–1.8GHz） | ~96 → ~30 GFLOPS（FP32） | 1GB：360M；**2GB：0.8B** | 1GB 板 SmolLM2-360M；2GB 以上 Qwen3.5-0.8B | 360M 约 10–14 tok/s；0.8B 约 5–6 tok/s | 360M 约 4–6 天 |
 | **Pi 5**（4×A76 2.4GHz，有 FP16 运算） | ~150 → ~60–80 GFLOPS（FP32），FP16 约翻倍 | 4GB：0.8B；**8GB：2B** | Qwen3.5-2B | 0.8B 约 15–25 tok/s；2B 约 6–10 tok/s | 0.8B 约 2.5–4 天 |
+| **Rockchip RK3588**（4×A76 2.4GHz + Mali-G610 MP4，8–32GB） | CPU 同 Pi 5；接 Mali Vulkan 后 FP16 峰值 ~450–610 GFLOPS | 8GB：2B；**16/32GB：4B–8B** | 4B–8B（大内存优势！） | 0.8B CPU 约 16–26 / Vulkan 预估 45–75 tok/s | 适合 7×24h 无温控挂机；详见 [10-rk3588.md](10-rk3588.md) |
 | **手机旗舰**（A7x/X 系列大核，8–12GB） | 和 Pi 5 同量级或更高，**受温控限制，持续性能常掉到 50%** | 8GB | 0.8B–2B | 0.8B 约 15–40 tok/s | 适合充电时夜间跑小样本 |
 | **Google Pixel 8**（参考机型，Tensor G3，8GB） | 峰值约 245 GFLOPS FP32（X3 + 4×A715）→ 降频后约 70–100；有 FP16 运算 | 8GB（App 实际可用约 3–4GB） | 2B | 0.8B 约 15–25；2B 约 6–10 tok/s | 0.8B 约 2.5–4 天；详见 [08-pixel8.md](08-pixel8.md) |
 | **Apple M4 16GB**（Metal，10 核 GPU） | ~4.3 TFLOPS FP16/FP32 → ~1.5–2 TFLOPS | 16GB | **8B 可以跑**（4.7GiB 权重 + 约 0.8GiB 脏内存） | 0.8B 约 250–400；2B 约 120–160；4B 约 60–80；8B 约 30–40 tok/s | 0.8B 约 4–6 小时；8B 约 1.5–2 天 |

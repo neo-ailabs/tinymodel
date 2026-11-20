@@ -58,6 +58,20 @@ impl MatvecScratch {
     }
 }
 
+/// Computes optimal row chunk size:
+/// - For `n_thr <= 4` (homogeneous 1–4 core pools: M4 P-cores, Pi 5, Pi 4B, RK3588 4×A76, Pixel 8 4×A715),
+///   uses 1 contiguous hardware-prefetched slice per thread.
+/// - For `n_thr > 4` (heterogeneous big.LITTLE pools such as Pixel 8 `1×X3 + 4×A715` or 9-core unpinned),
+///   uses `4×` finer chunks so faster cores dynamically steal work via lock-free `fetch_add`.
+#[inline]
+fn dynamic_row_chunk(total_rows: usize, n_thr: usize) -> usize {
+    if n_thr <= 4 {
+        total_rows.div_ceil(n_thr.max(1)).next_multiple_of(4).max(4)
+    } else {
+        total_rows.div_ceil(n_thr * 4).next_multiple_of(8).max(32)
+    }
+}
+
 /// Dispatches quantized `y = W * x` across `pool` strictly by `dtype` of tensor `W`.
 ///
 /// Zero heap allocations: activation quantization uses `scratch`.
@@ -77,9 +91,8 @@ pub fn matvec_f32(
     assert_eq!(out.len(), rows);
     assert_eq!(w_bytes.len(), rows * dtype.row_bytes(cols));
 
-    // Align chunk to 4 rows for 4-row unrolled GEMV and 1 chunk per thread on homogeneous cores.
     let n_thr = pool.num_threads();
-    let chunk = rows.div_ceil(n_thr).next_multiple_of(4).max(4);
+    let chunk = dynamic_row_chunk(rows, n_thr);
     let out_ptr = out.as_mut_ptr() as usize;
 
     match dtype {
@@ -504,7 +517,11 @@ pub fn gqa_attention_f16_kv_parallel(
     let scale = 1.0 / (head_dim as f32).sqrt();
     let out_ptr = out.as_mut_ptr() as usize;
     let scores_ptr = scores.as_mut_ptr() as usize;
-    let chunk = n_heads.div_ceil(pool.num_threads()).max(1);
+    let chunk = if pool.num_threads() <= 4 {
+        n_heads.div_ceil(pool.num_threads()).max(1)
+    } else {
+        1
+    };
 
     pool.parallel_for(n_heads, chunk, |h0, h1| {
         for h in h0..h1 {
@@ -577,10 +594,7 @@ pub fn matvec_pair_f32(
         let oa_ptr = out_a.as_mut_ptr() as usize;
         let ob_ptr = out_b.as_mut_ptr() as usize;
         let total = rows_a + rows_b;
-        let chunk = total
-            .div_ceil(pool.num_threads())
-            .next_multiple_of(4)
-            .max(4);
+        let chunk = dynamic_row_chunk(total, pool.num_threads());
 
         pool.parallel_for(total, chunk, |s, e| {
             if s < rows_a {
@@ -669,10 +683,7 @@ pub fn matvec_triple_f32(
         let oc_ptr = out_c.as_mut_ptr() as usize;
         let ab = rows_a + rows_b;
         let total = ab + rows_c;
-        let chunk = total
-            .div_ceil(pool.num_threads())
-            .next_multiple_of(4)
-            .max(4);
+        let chunk = dynamic_row_chunk(total, pool.num_threads());
 
         pool.parallel_for(total, chunk, |s, e| {
             if s < rows_a {
@@ -754,7 +765,7 @@ pub fn matmul_f32(
     }
 
     let n_thr = pool.num_threads();
-    let chunk = rows.div_ceil(n_thr).next_multiple_of(4).max(4);
+    let chunk = dynamic_row_chunk(rows, n_thr);
     let out_ptr = out.as_mut_ptr() as usize;
 
     match dtype {
@@ -1131,7 +1142,11 @@ pub fn gdn_recurrence_parallel(
     let scale = 1.0 / (head_dim as f32).sqrt();
     let state_ptr = state.as_mut_ptr() as usize;
     let out_ptr = out.as_mut_ptr() as usize;
-    let chunk = n_v_heads.div_ceil(pool.num_threads()).max(1);
+    let chunk = if pool.num_threads() <= 4 {
+        n_v_heads.div_ceil(pool.num_threads()).max(1)
+    } else {
+        1
+    };
 
     pool.parallel_for(n_v_heads, chunk, |vh0, vh1| {
         for vh in vh0..vh1 {
