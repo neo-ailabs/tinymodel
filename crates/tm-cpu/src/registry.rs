@@ -3,7 +3,7 @@
 //! Design inspired by Strata `src/quant/registry.hpp` and `dispatch.cpp`
 //! (MIT License, Copyright (c) 2026 Niko1221 and the Strata contributors).
 
-use tm_core::{BlockQ4_0, BlockQ4_1, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K};
+use tm_core::{BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K};
 
 use crate::generic;
 use crate::isa::{Isa, detect_caps, effective_isa, isa_supported};
@@ -16,6 +16,8 @@ pub type VecDotQ4_1Fn = fn(&[BlockQ4_1], &[BlockQ8_1]) -> f32;
 pub type GemvQ4_1Fn = fn(&[BlockQ4_1], &[BlockQ8_1], &mut [f32], usize, usize);
 pub type VecDotQ8_0Fn = fn(&[BlockQ8_0], &[BlockQ8_0]) -> f32;
 pub type GemvQ8_0Fn = fn(&[BlockQ8_0], &[BlockQ8_0], &mut [f32], usize, usize);
+pub type VecDotQ5KFn = fn(&[BlockQ5K], &[BlockQ8K]) -> f32;
+pub type GemvQ5KFn = fn(&[BlockQ5K], &[BlockQ8K], &mut [f32], usize, usize);
 pub type VecDotQ6KFn = fn(&[BlockQ6K], &[BlockQ8K]) -> f32;
 pub type GemvQ6KFn = fn(&[BlockQ6K], &[BlockQ8K], &mut [f32], usize, usize);
 pub type DotF32F16Fn = fn(&[f32], &[u16]) -> f32;
@@ -35,6 +37,8 @@ pub struct KernelTable {
     pub gemv_q4_1_q8_1: GemvQ4_1Fn,
     pub vec_dot_q8_0_q8_0: VecDotQ8_0Fn,
     pub gemv_q8_0_q8_0: GemvQ8_0Fn,
+    pub vec_dot_q5_k_q8_k: VecDotQ5KFn,
+    pub gemv_q5_k_q8_k: GemvQ5KFn,
     pub vec_dot_q6_k_q8_k: VecDotQ6KFn,
     pub gemv_q6_k_q8_k: GemvQ6KFn,
     pub dot_f32_f16: DotF32F16Fn,
@@ -53,6 +57,8 @@ const GENERIC_TABLE: KernelTable = KernelTable {
     gemv_q4_1_q8_1: generic::gemv_q4_1_q8_1,
     vec_dot_q8_0_q8_0: generic::vec_dot_q8_0_q8_0,
     gemv_q8_0_q8_0: generic::gemv_q8_0_q8_0,
+    vec_dot_q5_k_q8_k: generic::vec_dot_q5_k_q8_k,
+    gemv_q5_k_q8_k: generic::gemv_q5_k_q8_k,
     vec_dot_q6_k_q8_k: generic::vec_dot_q6_k_q8_k,
     gemv_q6_k_q8_k: generic::gemv_q6_k_q8_k,
     dot_f32_f16: generic::dot_f32_f16,
@@ -155,6 +161,24 @@ mod aarch64_wrappers {
     }
 
     #[cfg(feature = "dotprod")]
+    fn dotprod_vec_dot_q5_k(x: &[BlockQ5K], y: &[BlockQ8K]) -> f32 {
+        // SAFETY: `DOTPROD_TABLE` is only selected after runtime `dotprod` detection.
+        unsafe { dotprod::vec_dot_q5_k_q8_k(x, y) }
+    }
+
+    #[cfg(feature = "dotprod")]
+    fn dotprod_gemv_q5_k(
+        w: &[BlockQ5K],
+        x: &[BlockQ8K],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: `DOTPROD_TABLE` is only selected after runtime `dotprod` detection.
+        unsafe { dotprod::gemv_q5_k_q8_k(w, x, out, rows, cols_blocks) }
+    }
+
+    #[cfg(feature = "dotprod")]
     fn dotprod_vec_dot_q6_k(x: &[BlockQ6K], y: &[BlockQ8K]) -> f32 {
         // SAFETY: `DOTPROD_TABLE` is only selected after runtime `dotprod` detection.
         unsafe { dotprod::vec_dot_q6_k_q8_k(x, y) }
@@ -231,6 +255,8 @@ mod aarch64_wrappers {
         gemv_q4_1_q8_1: generic::gemv_q4_1_q8_1,
         vec_dot_q8_0_q8_0: generic::vec_dot_q8_0_q8_0,
         gemv_q8_0_q8_0: generic::gemv_q8_0_q8_0,
+        vec_dot_q5_k_q8_k: generic::vec_dot_q5_k_q8_k,
+        gemv_q5_k_q8_k: generic::gemv_q5_k_q8_k,
         vec_dot_q6_k_q8_k: generic::vec_dot_q6_k_q8_k,
         gemv_q6_k_q8_k: generic::gemv_q6_k_q8_k,
         dot_f32_f16: neon_dot_f32_f16,
@@ -250,6 +276,8 @@ mod aarch64_wrappers {
         gemv_q4_1_q8_1: dotprod_gemv_q4_1,
         vec_dot_q8_0_q8_0: dotprod_vec_dot_q8_0,
         gemv_q8_0_q8_0: dotprod_gemv_q8_0,
+        vec_dot_q5_k_q8_k: dotprod_vec_dot_q5_k,
+        gemv_q5_k_q8_k: dotprod_gemv_q5_k,
         vec_dot_q6_k_q8_k: dotprod_vec_dot_q6_k,
         gemv_q6_k_q8_k: dotprod_gemv_q6_k,
         dot_f32_f16: neon_dot_f32_f16,
@@ -269,6 +297,8 @@ mod aarch64_wrappers {
         gemv_q4_1_q8_1: dotprod_gemv_q4_1,
         vec_dot_q8_0_q8_0: dotprod_vec_dot_q8_0,
         gemv_q8_0_q8_0: dotprod_gemv_q8_0,
+        vec_dot_q5_k_q8_k: dotprod_vec_dot_q5_k,
+        gemv_q5_k_q8_k: dotprod_gemv_q5_k,
         vec_dot_q6_k_q8_k: dotprod_vec_dot_q6_k,
         gemv_q6_k_q8_k: dotprod_gemv_q6_k,
         dot_f32_f16: neon_dot_f32_f16,

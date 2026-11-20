@@ -152,3 +152,76 @@ fn metal_gemm_q4_0_f32_batched_parity() {
         }
     }
 }
+
+#[test]
+fn metal_gemv_and_gemm_q5_k_f32_parity() {
+    use tm_core::{BlockQ5K, DType, QK_K, dequantize_row_bytes};
+
+    let ctx = MetalContext::new().expect("MetalContext::new failed");
+    let mut rng = Rng(0x5555_AAAA_1357_2468);
+
+    let rows = 35; // exercises non-multiple-of-16 / non-multiple-of-4 row tail
+    let cols = 768; // 3 superblocks
+    let cols_blocks = cols / QK_K;
+    let w: Vec<BlockQ5K> = (0..rows * cols_blocks)
+        .map(|_| {
+            let mut scales = [0u8; 12];
+            let mut qh = [0u8; 32];
+            let mut qs = [0u8; 128];
+            for b in &mut scales {
+                *b = rng.next_u8();
+            }
+            for b in &mut qh {
+                *b = rng.next_u8();
+            }
+            for b in &mut qs {
+                *b = rng.next_u8();
+            }
+            BlockQ5K {
+                d: f32_to_f16(rng.next_f32().abs() * 0.05 + 0.01),
+                dmin: f32_to_f16(rng.next_f32().abs() * 0.05 + 0.01),
+                scales,
+                qh,
+                qs,
+            }
+        })
+        .collect();
+
+    // SAFETY: `BlockQ5K` is `#[repr(C)]` POD of size 176 bytes.
+    let w_bytes: &[u8] =
+        unsafe { core::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 176) };
+    let mut deq_w = vec![0.0f32; rows * cols];
+    dequantize_row_bytes(DType::Q5K, w_bytes, &mut deq_w);
+
+    let w_buf = ctx.buffer_from_slice(&w).unwrap();
+
+    for n_tok in [1usize, 5, 11] {
+        let x: Vec<f32> = (0..n_tok * cols).map(|_| rng.next_f32()).collect();
+        let x_buf = ctx.buffer_from_slice(&x).unwrap();
+        let mut y_buf = ctx.alloc_buffer(n_tok * rows * 4).unwrap();
+
+        ctx.gemm_q5_k_f32(&w_buf, &x_buf, &mut y_buf, rows, cols, n_tok)
+            .unwrap();
+        let got = y_buf.as_f32_slice();
+
+        for t in 0..n_tok {
+            let xt = &x[t * cols..(t + 1) * cols];
+            for r in 0..rows {
+                let wr = &deq_w[r * cols..(r + 1) * cols];
+                let mut expected = 0.0f32;
+                let mut l1 = 0.0f32;
+                for k in 0..cols {
+                    let p = wr[k] * xt[k];
+                    expected += p;
+                    l1 += p.abs();
+                }
+                let rel = (got[t * rows + r] - expected).abs() / l1.max(1.0);
+                assert!(
+                    rel <= 1e-5,
+                    "Metal Q5_K mismatch n_tok={n_tok} t={t} r={r}: got={} expected={expected} rel={rel}",
+                    got[t * rows + r]
+                );
+            }
+        }
+    }
+}

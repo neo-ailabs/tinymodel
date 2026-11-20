@@ -25,6 +25,7 @@ pub struct Tokenizer {
     pub bos_id: Option<u32>,
     pub eos_id: Option<u32>,
     pub add_bos: bool,
+    max_digits: usize,
 }
 
 impl Tokenizer {
@@ -75,6 +76,12 @@ impl Tokenizer {
             .get_meta("tokenizer.ggml.add_bos_token")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let pre = gguf
+            .get_meta("tokenizer.ggml.pre")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // Qwen2 / Qwen3 / Qwen3.5 BPE regex uses single-digit `\p{N}` instead of `\p{N}{1,3}`.
+        let max_digits = if pre.starts_with("qwen") { 1 } else { 3 };
 
         let (byte_to_char, char_to_byte) = build_gpt2_byte_maps();
 
@@ -87,6 +94,7 @@ impl Tokenizer {
             bos_id,
             eos_id,
             add_bos,
+            max_digits,
         })
     }
 
@@ -101,7 +109,7 @@ impl Tokenizer {
             ids.push(bos);
         }
 
-        for chunk in pretokenize_llama3(text) {
+        for chunk in pretokenize_bpe(text, self.max_digits) {
             let encoded: String = chunk
                 .as_bytes()
                 .iter()
@@ -203,9 +211,9 @@ fn build_gpt2_byte_maps() -> ([char; 256], HashMap<char, u8>) {
     (byte_to_char, char_to_byte)
 }
 
-/// Dependency-free pre-tokenizer matching Llama-3 / SmolLM / GPT-4 BPE regex:
-/// `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
-fn pretokenize_llama3(text: &str) -> Vec<&str> {
+/// Dependency-free pre-tokenizer matching Llama-3 / SmolLM / Qwen2-3.5 BPE regex:
+/// `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,max_digits}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
+fn pretokenize_bpe(text: &str, max_digits: usize) -> Vec<&str> {
     let mut chunks = Vec::new();
     let bytes = text.as_bytes();
     let len = bytes.len();
@@ -268,12 +276,12 @@ fn pretokenize_llama3(text: &str) -> Vec<&str> {
             continue;
         }
 
-        // 3. \p{N}{1,3}
+        // 3. \p{N}{1,max_digits}
         if c0.is_numeric() {
             let mut end = c0.len_utf8();
             let mut count = 1usize;
             for (idx, c) in chars {
-                if c.is_numeric() && count < 3 {
+                if c.is_numeric() && count < max_digits {
                     end = idx + c.len_utf8();
                     count += 1;
                 } else {

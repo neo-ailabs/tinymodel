@@ -47,11 +47,15 @@ pub enum MetalError {
 mod apple;
 #[cfg(target_vendor = "apple")]
 pub mod llama_runner;
+#[cfg(target_vendor = "apple")]
+pub mod qwen35_runner;
 
 #[cfg(target_vendor = "apple")]
 pub use apple::{MetalBuffer, MetalContext};
 #[cfg(target_vendor = "apple")]
 pub use llama_runner::{LlamaMetalConfig, LlamaMetalRunner, MetalProfileReport, MetalStageStat};
+#[cfg(target_vendor = "apple")]
+pub use qwen35_runner::{Qwen35MetalConfig, Qwen35MetalRunner};
 
 #[cfg(not(target_vendor = "apple"))]
 pub struct MetalContext;

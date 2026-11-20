@@ -308,7 +308,7 @@ kernel void gqa_attn_f16_kv(
     ushort lane [[thread_index_in_simdgroup]]
 ) {
     constexpr uint SG = 4;
-    constexpr uint MAX_HD = 128;
+    constexpr uint MAX_HD = 256;
 
     const uint group = a.n_head / a.n_head_kv;
     const uint kv_h = head / group;
@@ -320,13 +320,16 @@ kernel void gqa_attn_f16_kv(
     if (tid < a.head_dim) {
         q_shared[tid] = qh[tid] * scale;
     }
+    if (tid + 128 < a.head_dim) {
+        q_shared[tid + 128] = qh[tid + 128] * scale;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Each simdgroup handles a strided subset of tokens `t = sg, sg + SG, ...`
     // and lanes within the simdgroup split `head_dim`.
     float m_local = -INFINITY;
     float l_local = 0.0f;
-    float o_local[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // supports head_dim up to 128 (4 * 32)
+    float o_local[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}; // supports head_dim up to 256 (8 * 32)
 
     const uint n_vec = (a.head_dim + 31) / 32;
 
@@ -375,7 +378,7 @@ kernel void gqa_attn_f16_kv(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tid < a.head_dim) {
+    for (uint d = tid; d < a.head_dim; d += 128) {
         float m_all = max(max(tg_m[0], tg_m[1]), max(tg_m[2], tg_m[3]));
         float denom = 0.0f;
         float acc = 0.0f;
@@ -383,10 +386,10 @@ kernel void gqa_attn_f16_kv(
             if (tg_l[s] > 0.0f) {
                 float w = exp(tg_m[s] - m_all);
                 denom += tg_l[s] * w;
-                acc += tg_o[s * MAX_HD + tid] * w;
+                acc += tg_o[s * MAX_HD + d] * w;
             }
         }
-        out[head * a.head_dim + tid] = acc / denom;
+        out[head * a.head_dim + d] = acc / denom;
     }
 }
 
@@ -1207,7 +1210,7 @@ kernel void gqa_attn_f16_kv_batch(
     ushort lane [[thread_index_in_simdgroup]]
 ) {
     constexpr uint SG = 4;
-    constexpr uint MAX_HD = 128;
+    constexpr uint MAX_HD = 256;
 
     const uint head = tg.x;
     const uint tok = tg.y;
@@ -1223,11 +1226,14 @@ kernel void gqa_attn_f16_kv_batch(
     if (tid < a.head_dim) {
         q_shared[tid] = qh[tid] * scale;
     }
+    if (tid + 128 < a.head_dim) {
+        q_shared[tid + 128] = qh[tid + 128] * scale;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float m_local = -INFINITY;
     float l_local = 0.0f;
-    float o_local[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float o_local[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     const uint n_vec = (a.head_dim + 31) / 32;
 
     for (uint t = sg; t < seq_len; t += SG) {
@@ -1274,7 +1280,7 @@ kernel void gqa_attn_f16_kv_batch(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tid < a.head_dim) {
+    for (uint d = tid; d < a.head_dim; d += 128) {
         float m_all = max(max(tg_m[0], tg_m[1]), max(tg_m[2], tg_m[3]));
         float denom = 0.0f;
         float acc = 0.0f;
@@ -1282,10 +1288,10 @@ kernel void gqa_attn_f16_kv_batch(
             if (tg_l[s] > 0.0f) {
                 float w = exp(tg_m[s] - m_all);
                 denom += tg_l[s] * w;
-                acc += tg_o[s * MAX_HD + tid] * w;
+                acc += tg_o[s * MAX_HD + d] * w;
             }
         }
-        out[ulong(tok) * ulong(q_dim) + head * a.head_dim + tid] = acc / denom;
+        out[ulong(tok) * ulong(q_dim) + head * a.head_dim + d] = acc / denom;
     }
 }
 
@@ -1831,5 +1837,763 @@ kernel void gemm_q6_k_res(
             const ulong yi = ulong(t0 + k) * ulong(a.n_out) + row;
             y[yi] = (a.add_residual != 0) ? (y[yi] + out) : out;
         }
+    }
+}
+
+// ============================================================================
+// 7. Coalesced Q5_K GEMV & GEMM + HD=256 FlashAttention + Qwen3.5 GDN Kernels
+// ============================================================================
+
+static inline void unpack_q5k_sc_m(device const uchar* s, uint is, thread uchar& sc, thread uchar& m) {
+    if (is < 4) {
+        sc = s[is] & 63;
+        m  = s[is + 4] & 63;
+    } else {
+        sc = (s[is + 4] & 0x0F) | ((s[is - 4] >> 6) << 4);
+        m  = (s[is + 4] >> 4)   | ((s[is]     >> 6) << 4);
+    }
+}
+
+// Coalesced Q5_K GEMV: 32 lanes cooperate on each 256-element superblock (`lane` in 0..31),
+// processing NR = 2 consecutive rows per simdgroup (SG = 4 -> 8 rows / threadgroup)
+// for high threadgroup occupancy on `n_out = 1024..2048` (`ssm_out.weight`).
+kernel void gemv_q5_k_res(
+    device const uchar* W [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant GemvArgs& a [[buffer(3)]],
+    uint tg_id [[threadgroup_position_in_grid]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NR = 2;
+    constexpr uint SG = 4;
+
+    const uint row0 = (tg_id * SG + sg) * NR;
+    const uint nb = a.n_in / 256;
+    if (row0 >= a.n_out) return;
+
+    const uint r0 = row0;
+    const uint r1 = min(row0 + 1, a.n_out - 1);
+    device const uchar* wp[NR] = {
+        W + ulong(r0) * ulong(a.row_bytes),
+        W + ulong(r1) * ulong(a.row_bytes)
+    };
+
+    float acc[NR] = {0.0f, 0.0f};
+
+    for (uint ib = 0; ib < nb; ++ib) {
+        device const float* xp = x + ib * 256;
+        const ulong blk_off = ulong(ib) * 176;
+
+        float d[NR], dmin[NR];
+        uchar qh_v[NR];
+        float sum_q[NR] = {0.0f, 0.0f};
+        float sum_m[NR] = {0.0f, 0.0f};
+
+        #pragma unroll
+        for (uint k = 0; k < NR; ++k) {
+            device const uchar* b = wp[k] + blk_off;
+            d[k]    = read_f16_u(b);
+            dmin[k] = read_f16_u(b + 2);
+            qh_v[k] = b[16 + lane];
+        }
+
+        #pragma unroll
+        for (uint chunk = 0; chunk < 4; ++chunk) {
+            const float x_lo = xp[chunk * 64 + lane];
+            const float x_hi = xp[chunk * 64 + 32 + lane];
+            const uint shift_lo = 2 * chunk;
+            const uint shift_hi = 2 * chunk + 1;
+
+            #pragma unroll
+            for (uint k = 0; k < NR; ++k) {
+                device const uchar* b = wp[k] + blk_off;
+                uchar sc_lo, m_lo, sc_hi, m_hi;
+                unpack_q5k_sc_m(b + 4, 2 * chunk,     sc_lo, m_lo);
+                unpack_q5k_sc_m(b + 4, 2 * chunk + 1, sc_hi, m_hi);
+
+                const uchar ql_b = b[48 + chunk * 32 + lane];
+                const float q_lo = float((ql_b & 0x0F) | (((qh_v[k] >> shift_lo) & 1) << 4));
+                const float q_hi = float((ql_b >> 4)   | (((qh_v[k] >> shift_hi) & 1) << 4));
+
+                sum_q[k] = fma(float(sc_lo) * q_lo, x_lo, sum_q[k]);
+                sum_q[k] = fma(float(sc_hi) * q_hi, x_hi, sum_q[k]);
+                sum_m[k] = fma(float(m_lo), x_lo, sum_m[k]);
+                sum_m[k] = fma(float(m_hi), x_hi, sum_m[k]);
+            }
+        }
+
+        #pragma unroll
+        for (uint k = 0; k < NR; ++k) {
+            acc[k] = fma(d[k], sum_q[k], fma(-dmin[k], sum_m[k], acc[k]));
+        }
+    }
+
+    const float out0 = simd_sum(acc[0]);
+    const float out1 = simd_sum(acc[1]);
+    if (lane == 0) {
+        y[r0] = (a.add_residual != 0) ? (y[r0] + out0) : out0;
+        if (row0 + 1 < a.n_out) y[r1] = (a.add_residual != 0) ? (y[r1] + out1) : out1;
+    }
+}
+
+// Batched Coalesced Q5_K GEMM: 4 rows/TG (SG=4, 32 lanes/row) x BT=8 tokens/TG.
+kernel void gemm_q5_k_res(
+    device const uchar* W [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant GemmArgs& a [[buffer(3)]],
+    uint2 tg_id [[threadgroup_position_in_grid]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint SG = 4;
+    constexpr uint BT = 8;
+
+    const uint row = tg_id.x * SG + sg;
+    const uint t0 = tg_id.y * BT;
+    if (row >= a.n_out || t0 >= a.n_tok) return;
+
+    const uint nb = a.n_in / 256;
+    device const uchar* wp = W + ulong(row) * ulong(a.row_bytes);
+
+    ulong x_off[BT];
+    #pragma unroll
+    for (uint k = 0; k < BT; ++k) {
+        x_off[k] = ulong(min(t0 + k, a.n_tok - 1)) * ulong(a.n_in);
+    }
+
+    float acc[BT] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint ib = 0; ib < nb; ++ib) {
+        device const uchar* b = wp + ulong(ib) * 176;
+        const float d    = read_f16_u(b);
+        const float dmin = read_f16_u(b + 2);
+        const uchar qh_v = b[16 + lane];
+
+        #pragma unroll
+        for (uint chunk = 0; chunk < 4; ++chunk) {
+            uchar sc_lo, m_lo, sc_hi, m_hi;
+            unpack_q5k_sc_m(b + 4, 2 * chunk,     sc_lo, m_lo);
+            unpack_q5k_sc_m(b + 4, 2 * chunk + 1, sc_hi, m_hi);
+
+            const uchar ql_b = b[48 + chunk * 32 + lane];
+            const float q_lo = float((ql_b & 0x0F) | (((qh_v >> (2 * chunk)) & 1) << 4));
+            const float q_hi = float((ql_b >> 4)   | (((qh_v >> (2 * chunk + 1)) & 1) << 4));
+
+            const float w_lo = fma(d * float(sc_lo), q_lo, -dmin * float(m_lo));
+            const float w_hi = fma(d * float(sc_hi), q_hi, -dmin * float(m_hi));
+
+            const uint x_base = ib * 256 + chunk * 64 + lane;
+            #pragma unroll
+            for (uint k = 0; k < BT; ++k) {
+                device const float* xp = x + x_off[k] + x_base;
+                acc[k] = fma(w_lo, xp[0],  acc[k]);
+                acc[k] = fma(w_hi, xp[32], acc[k]);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (uint k = 0; k < BT; ++k) {
+        const float out = simd_sum(acc[k]);
+        if (lane == 0 && (t0 + k) < a.n_tok) {
+            const ulong yi = ulong(t0 + k) * ulong(a.n_out) + row;
+            y[yi] = (a.add_residual != 0) ? (y[yi] + out) : out;
+        }
+    }
+}
+
+// Tiled Causal FlashAttention (`simdgroup_mma`) for `128 < head_dim <= 256` (e.g. Qwen3.5 HD=256):
+// BQ = 32, BK = 16, 128 threads (4 simdgroups), 20 KB threadgroup memory.
+kernel void fa_gqa_f16_kv_batch_hd256(
+    device const float* q [[buffer(0)]],
+    device const half* k_cache [[buffer(1)]],
+    device const half* v_cache [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant FlashAttnArgs& a [[buffer(4)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint MAX_HD = 256;
+    constexpr uint BQ = 32;
+    constexpr uint BK = 16;
+
+    const uint head = tg.x;
+    const uint t0 = tg.y * BQ;
+    if (t0 >= a.n_tok) return;
+
+    const uint q_dim = a.n_head * a.head_dim;
+    const uint kv_dim = a.n_head_kv * a.head_dim;
+    const uint group = a.n_head / a.n_head_kv;
+    const uint kv_h = head / group;
+    const float scale = rsqrt(float(a.head_dim));
+    const uint n_d8 = a.head_dim / 8;
+
+    threadgroup half  K_T_sh[MAX_HD][BK];
+    threadgroup half  V_sh[BK][MAX_HD];
+    threadgroup float S_sh[BQ][BK];
+    threadgroup half  P_sh[BQ][BK];
+    threadgroup float sg_stage[4][8][8];
+
+    const uint r = lane >> 2;
+    const uint sub = lane & 3;
+    const uint q_tok = t0 + sg * 8 + r;
+    const bool valid_q = (q_tok < a.n_tok);
+
+    simdgroup_half8x8 q_mat[32];
+    simdgroup_float8x8 o_acc[32];
+    for (uint d8 = 0; d8 < n_d8; ++d8) {
+        const uint d_col0 = d8 * 8 + sub * 2;
+        if (valid_q) {
+            device const float* qp = q + ulong(q_tok) * ulong(q_dim) + head * a.head_dim + d_col0;
+            P_sh[sg * 8 + r][sub * 2 + 0] = half(qp[0] * scale);
+            P_sh[sg * 8 + r][sub * 2 + 1] = half(qp[1] * scale);
+        } else {
+            P_sh[sg * 8 + r][sub * 2 + 0] = half(0.0f);
+            P_sh[sg * 8 + r][sub * 2 + 1] = half(0.0f);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_load(q_mat[d8], &P_sh[sg * 8][0], BK);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        o_acc[d8] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    const uint last_tok_in_tg = min(t0 + BQ - 1, a.n_tok - 1);
+    const uint max_kv = a.seq_len + last_tok_in_tg;
+    const uint causal_limit = valid_q ? (a.seq_len + q_tok) : 0;
+
+    float m_row = -INFINITY;
+    float l_row = 0.0f;
+
+    const uint k_loc = tid >> 3;
+    const uint d_sub = tid & 7;
+
+    for (uint kt = 0; kt < max_kv; kt += BK) {
+        if (kt + k_loc < max_kv) {
+            const ulong kv_off = ulong(kt + k_loc) * ulong(kv_dim) + kv_h * a.head_dim;
+            device const half* kh = k_cache + kv_off;
+            device const half* vh = v_cache + kv_off;
+            for (uint d = d_sub; d < a.head_dim; d += 8) {
+                K_T_sh[d][k_loc] = kh[d];
+                V_sh[k_loc][d]   = vh[d];
+            }
+        } else {
+            for (uint d = d_sub; d < a.head_dim; d += 8) {
+                K_T_sh[d][k_loc] = half(0.0f);
+                V_sh[k_loc][d]   = half(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 s0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_float8x8 s1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint d8 = 0; d8 < n_d8; ++d8) {
+            simdgroup_half8x8 kt0, kt1;
+            simdgroup_load(kt0, &K_T_sh[d8 * 8][0], BK);
+            simdgroup_load(kt1, &K_T_sh[d8 * 8][8], BK);
+            simdgroup_multiply_accumulate(s0, q_mat[d8], kt0, s0);
+            simdgroup_multiply_accumulate(s1, q_mat[d8], kt1, s1);
+        }
+        simdgroup_store(s0, &S_sh[sg * 8][0], BK);
+        simdgroup_store(s1, &S_sh[sg * 8][8], BK);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint c_base = sub * 4;
+        float sc0 = (kt + c_base + 0 < causal_limit) ? S_sh[sg * 8 + r][c_base + 0] : -INFINITY;
+        float sc1 = (kt + c_base + 1 < causal_limit) ? S_sh[sg * 8 + r][c_base + 1] : -INFINITY;
+        float sc2 = (kt + c_base + 2 < causal_limit) ? S_sh[sg * 8 + r][c_base + 2] : -INFINITY;
+        float sc3 = (kt + c_base + 3 < causal_limit) ? S_sh[sg * 8 + r][c_base + 3] : -INFINITY;
+
+        float row_max = max(max(sc0, sc1), max(sc2, sc3));
+        row_max = max(row_max, simd_shuffle_xor(row_max, 1));
+        row_max = max(row_max, simd_shuffle_xor(row_max, 2));
+
+        const float m_new = max(m_row, row_max);
+        const float alpha = (m_row == -INFINITY || m_new == -INFINITY) ? 0.0f : exp(m_row - m_new);
+
+        const float p0_f = (sc0 == -INFINITY || m_new == -INFINITY) ? 0.0f : exp(sc0 - m_new);
+        const float p1_f = (sc1 == -INFINITY || m_new == -INFINITY) ? 0.0f : exp(sc1 - m_new);
+        const float p2_f = (sc2 == -INFINITY || m_new == -INFINITY) ? 0.0f : exp(sc2 - m_new);
+        const float p3_f = (sc3 == -INFINITY || m_new == -INFINITY) ? 0.0f : exp(sc3 - m_new);
+
+        float row_sum = (p0_f + p1_f) + (p2_f + p3_f);
+        row_sum += simd_shuffle_xor(row_sum, 1);
+        row_sum += simd_shuffle_xor(row_sum, 2);
+
+        l_row = l_row * alpha + row_sum;
+        m_row = m_new;
+
+        P_sh[sg * 8 + r][c_base + 0] = half(p0_f);
+        P_sh[sg * 8 + r][c_base + 1] = half(p1_f);
+        P_sh[sg * 8 + r][c_base + 2] = half(p2_f);
+        P_sh[sg * 8 + r][c_base + 3] = half(p3_f);
+
+        sg_stage[sg][r][sub * 2 + 0] = 0.0f;
+        sg_stage[sg][r][sub * 2 + 1] = 0.0f;
+        if ((r >> 1) == sub) {
+            sg_stage[sg][r][r] = alpha;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 alpha_mat;
+        simdgroup_load(alpha_mat, &sg_stage[sg][0][0], 8);
+        simdgroup_half8x8 pm0, pm1;
+        simdgroup_load(pm0, &P_sh[sg * 8][0], BK);
+        simdgroup_load(pm1, &P_sh[sg * 8][8], BK);
+
+        for (uint d8 = 0; d8 < n_d8; ++d8) {
+            simdgroup_multiply(o_acc[d8], alpha_mat, o_acc[d8]);
+            simdgroup_half8x8 vm0, vm1;
+            simdgroup_load(vm0, &V_sh[0][d8 * 8], MAX_HD);
+            simdgroup_load(vm1, &V_sh[8][d8 * 8], MAX_HD);
+            simdgroup_multiply_accumulate(o_acc[d8], pm0, vm0, o_acc[d8]);
+            simdgroup_multiply_accumulate(o_acc[d8], pm1, vm1, o_acc[d8]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float inv_l = (l_row > 0.0f) ? (1.0f / l_row) : 0.0f;
+    sg_stage[sg][r][sub * 2 + 0] = 0.0f;
+    sg_stage[sg][r][sub * 2 + 1] = 0.0f;
+    if ((r >> 1) == sub) {
+        sg_stage[sg][r][r] = inv_l;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 inv_mat;
+    simdgroup_load(inv_mat, &sg_stage[sg][0][0], 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint d8 = 0; d8 < n_d8; ++d8) {
+        simdgroup_multiply(o_acc[d8], inv_mat, o_acc[d8]);
+        simdgroup_store(o_acc[d8], &sg_stage[sg][0][0], 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (valid_q) {
+            device float* op = out + ulong(q_tok) * ulong(q_dim) + head * a.head_dim + d8 * 8 + sub * 2;
+            op[0] = sg_stage[sg][r][sub * 2 + 0];
+            op[1] = sg_stage[sg][r][sub * 2 + 1];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+struct PairGemvArgs {
+    uint n_in;
+    uint a_rows;
+    uint b_rows;
+    uint row_bytes;
+};
+
+// Fused 2-matrix Q4_0 GEMV sharing input `x` (e.g. GDN `wqkv` + `wz` in a single dispatch!).
+//Requires `a_rows` to be even (e.g. 6144).
+kernel void gemv_pair_q4_0(
+    device const uchar* Wa [[buffer(0)]],
+    device const uchar* Wb [[buffer(1)]],
+    device const float* x  [[buffer(2)]],
+    device float* ya       [[buffer(3)]],
+    device float* yb       [[buffer(4)]],
+    constant PairGemvArgs& a [[buffer(5)]],
+    uint tg_id [[threadgroup_position_in_grid]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint LPR = 8;
+    constexpr uint NR = 2;
+    constexpr uint RG = 4;
+    constexpr uint SG = 4;
+
+    const uint li = lane % LPR;
+    const uint row0 = tg_id * (SG * RG * NR) + (sg * RG + lane / LPR) * NR;
+    const uint total_rows = a.a_rows + a.b_rows;
+    if (row0 >= total_rows) return;
+
+    device const uchar* mat_w;
+    device float* y;
+    uint local_row0;
+    uint mat_rows;
+    if (row0 < a.a_rows) {
+        mat_w = Wa;
+        y = ya;
+        local_row0 = row0;
+        mat_rows = a.a_rows;
+    } else {
+        mat_w = Wb;
+        y = yb;
+        local_row0 = row0 - a.a_rows;
+        mat_rows = a.b_rows;
+    }
+
+    const uint nb = a.n_in / 32;
+    const uint r0 = local_row0;
+    const uint r1 = min(local_row0 + 1, mat_rows - 1);
+    device const uchar* wp0 = mat_w + ulong(r0) * ulong(a.row_bytes);
+    device const uchar* wp1 = mat_w + ulong(r1) * ulong(a.row_bytes);
+
+    float acc0 = 0.0f, acc1 = 0.0f;
+    for (uint ib = li; ib < nb; ib += LPR) {
+        device const float* xp = x + ib * 32;
+        device const uchar* b0 = wp0 + ib * 18;
+        device const uchar* b1 = wp1 + ib * 18;
+        const float d0 = read_f16_u(b0);
+        const float d1 = read_f16_u(b1);
+        device const ushort* p0 = (device const ushort*)(b0 + 2);
+        device const ushort* p1 = (device const ushort*)(b1 + 2);
+
+        float dot0 = 0.0f, dot1 = 0.0f, sumx = 0.0f;
+        #pragma unroll
+        for (uint j = 0; j < 8; ++j) {
+            const float x0 = xp[2 * j];
+            const float x1 = xp[2 * j + 1];
+            const float x2 = xp[2 * j + 16];
+            const float x3 = xp[2 * j + 17];
+            sumx += (x0 + x1) + (x2 + x3);
+
+            const ushort v0 = p0[j];
+            dot0 = fma(float(v0 & 15), x0, dot0);
+            dot0 = fma(float((v0 >> 4) & 15), x2, dot0);
+            dot0 = fma(float((v0 >> 8) & 15), x1, dot0);
+            dot0 = fma(float(v0 >> 12), x3, dot0);
+
+            const ushort v1 = p1[j];
+            dot1 = fma(float(v1 & 15), x0, dot1);
+            dot1 = fma(float((v1 >> 4) & 15), x2, dot1);
+            dot1 = fma(float((v1 >> 8) & 15), x1, dot1);
+            dot1 = fma(float(v1 >> 12), x3, dot1);
+        }
+        const float corr = -8.0f * sumx;
+        acc0 = fma(d0, dot0 + corr, acc0);
+        acc1 = fma(d1, dot1 + corr, acc1);
+    }
+
+    const float out0 = reduce_lpr8(acc0);
+    const float out1 = reduce_lpr8(acc1);
+    if (li == 0) {
+        y[r0] = out0;
+        if (local_row0 + 1 < mat_rows) {
+            y[local_row0 + 1] = out1;
+        }
+    }
+}
+
+// Fused 2-matrix Q8_0 GEMV sharing input `x` (e.g. GDN `ssm_alpha` + `ssm_beta` in 1 dispatch!).
+// 1 row per simdgroup (32 coalesced lanes), SG = 4 rows / threadgroup.
+kernel void gemv_pair_q8_0(
+    device const uchar* Wa [[buffer(0)]],
+    device const uchar* Wb [[buffer(1)]],
+    device const float* x  [[buffer(2)]],
+    device float* ya       [[buffer(3)]],
+    device float* yb       [[buffer(4)]],
+    constant PairGemvArgs& a [[buffer(5)]],
+    uint tg_id [[threadgroup_position_in_grid]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint SG = 4;
+    const uint row = tg_id * SG + sg;
+    if (row >= a.a_rows + a.b_rows) return;
+
+    device const uchar* mat_w = (row < a.a_rows) ? Wa : Wb;
+    device float* y           = (row < a.a_rows) ? ya : yb;
+    const uint local_row      = (row < a.a_rows) ? row : (row - a.a_rows);
+
+    const uint nb = a.n_in / 32;
+    device const uchar* wp = mat_w + ulong(local_row) * ulong(a.row_bytes);
+
+    float acc = 0.0f;
+    for (uint ib = 0; ib < nb; ++ib) {
+        device const uchar* b = wp + ib * 34;
+        const float d = read_f16_u(b);
+        const float wv = d * float(((device const char*)(b + 2))[lane]);
+        acc = fma(wv, x[ib * 32 + lane], acc);
+    }
+    const float out = simd_sum(acc);
+    if (lane == 0) {
+        y[local_row] = out;
+    }
+}
+
+struct SplitQgArgs {
+    uint n_head;
+    uint head_dim;
+    float eps;
+};
+
+// De-interleaves Qwen3.5 `qg_full` `[n_tok, n_head, 2 * head_dim]` into `q` (with per-head
+// RMSNorm `q_norm` fused!) and `gate` (`[n_tok, n_head, head_dim]`). 1 simdgroup (32 lanes) per (head, tok).
+kernel void qwen35_split_qg_qnorm_f32(
+    device const float* qg_full [[buffer(0)]],
+    device const float* q_norm  [[buffer(1)]],
+    device float* q_out         [[buffer(2)]],
+    device float* gate_out      [[buffer(3)]],
+    constant SplitQgArgs& a     [[buffer(4)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    const uint head = tg.x;
+    const uint tok  = tg.y;
+    const uint hd   = a.head_dim;
+    const ulong src_off = (ulong(tok) * ulong(a.n_head) + ulong(head)) * ulong(2 * hd);
+    const ulong dst_off = (ulong(tok) * ulong(a.n_head) + ulong(head)) * ulong(hd);
+
+    device const float* src_q = qg_full + src_off;
+    device const float* src_g = qg_full + src_off + hd;
+    device float* dst_q = q_out + dst_off;
+    device float* dst_g = gate_out + dst_off;
+
+    float ss = 0.0f;
+    for (uint i = lane; i < hd; i += 32) {
+        float v = src_q[i];
+        ss = fma(v, v, ss);
+        dst_g[i] = src_g[i];
+    }
+    ss = simd_sum(ss);
+    const float scale = rsqrt(ss / float(hd) + a.eps);
+    for (uint i = lane; i < hd; i += 32) {
+        dst_q[i] = src_q[i] * scale * q_norm[i];
+    }
+}
+
+kernel void sigmoid_mul_f32(
+    device float* out [[buffer(0)]],
+    device const float* gate [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= n) return;
+    out[tid] *= 1.0f / (1.0f + exp(-gate[tid]));
+}
+
+struct GdnGatesArgs {
+    uint n_v_heads;
+    uint n_tok;
+};
+
+kernel void gdn_gates_f32(
+    device const float* alpha   [[buffer(0)]],
+    device const float* beta_in [[buffer(1)]],
+    device const float* dt_bias [[buffer(2)]],
+    device const float* ssm_a   [[buffer(3)]],
+    device float* g_exp         [[buffer(4)]],
+    device float* beta_out      [[buffer(5)]],
+    constant GdnGatesArgs& a    [[buffer(6)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    const uint total = a.n_tok * a.n_v_heads;
+    if (tid >= total) return;
+    const uint vh = tid % a.n_v_heads;
+    const float x = alpha[tid] + dt_bias[vh];
+    const float sp = (x > 20.0f) ? x : log(1.0f + exp(x));
+    g_exp[tid] = exp(sp * ssm_a[vh]);
+    beta_out[tid] = 1.0f / (1.0f + exp(-beta_in[tid]));
+}
+
+struct GdnConvArgs {
+    uint n_k_heads;
+    uint n_v_heads;
+    uint s_dim;
+    uint n_tok;
+    float eps;
+};
+
+// Fused Causal Conv1d (kernel=4) + SiLU (BEFORE split) + Split Q/K/V + per-head L2-Norm on Q & K ONLY!
+// Grid: `2 * n_k_heads + n_v_heads` threadgroups (48 TGs for Qwen3.5), 128 threads (`s_dim == 128`) per TG.
+kernel void gdn_conv_silu_l2_f32(
+    device const float* qkv     [[buffer(0)]],
+    device const float* conv1d  [[buffer(1)]],
+    device float* conv_hist     [[buffer(2)]],
+    device float* q_out         [[buffer(3)]],
+    device float* k_out         [[buffer(4)]],
+    device float* v_out         [[buffer(5)]],
+    constant GdnConvArgs& a     [[buffer(6)]],
+    uint group [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    const uint total_groups = 2 * a.n_k_heads + a.n_v_heads;
+    if (group >= total_groups || tid >= a.s_dim) return;
+
+    const uint conv_dim = total_groups * a.s_dim;
+    const uint k_dim = a.n_k_heads * a.s_dim;
+    const uint v_dim = a.n_v_heads * a.s_dim;
+    const uint ch = group * a.s_dim + tid;
+
+    float h0 = conv_hist[ch * 3 + 0];
+    float h1 = conv_hist[ch * 3 + 1];
+    float h2 = conv_hist[ch * 3 + 2];
+
+    const float w0 = conv1d[ch * 4 + 0];
+    const float w1 = conv1d[ch * 4 + 1];
+    const float w2 = conv1d[ch * 4 + 2];
+    const float w3 = conv1d[ch * 4 + 3];
+
+    threadgroup float partial[4];
+    const bool is_qk = (group < 2 * a.n_k_heads);
+
+    for (uint t = 0; t < a.n_tok; ++t) {
+        const float x3 = qkv[ulong(t) * ulong(conv_dim) + ch];
+        const float raw = fma(h0, w0, fma(h1, w1, fma(h2, w2, x3 * w3)));
+        h0 = h1;
+        h1 = h2;
+        h2 = x3;
+
+        // AGENTS.md §9: SiLU BEFORE splitting into Q / K / V!
+        float val = raw / (1.0f + exp(-raw));
+
+        if (is_qk) {
+            float ss = simd_sum(val * val);
+            if (lane == 0) partial[sg] = ss;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (sg == 0) {
+                float v = (lane < 4) ? partial[lane] : 0.0f;
+                float tot = simd_sum(v);
+                if (lane == 0) partial[0] = rsqrt(tot + a.eps);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            val *= partial[0];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (group < a.n_k_heads) {
+                q_out[ulong(t) * ulong(k_dim) + group * a.s_dim + tid] = val;
+            } else {
+                const uint kh = group - a.n_k_heads;
+                k_out[ulong(t) * ulong(k_dim) + kh * a.s_dim + tid] = val;
+            }
+        } else {
+            // AGENTS.md §9: NEVER L2-normalize V!
+            const uint vh = group - 2 * a.n_k_heads;
+            v_out[ulong(t) * ulong(v_dim) + vh * a.s_dim + tid] = val;
+        }
+    }
+
+    conv_hist[ch * 3 + 0] = h0;
+    conv_hist[ch * 3 + 1] = h1;
+    conv_hist[ch * 3 + 2] = h2;
+}
+
+struct GdnRecurArgs {
+    uint n_k_heads;
+    uint n_v_heads;
+    uint s_dim;
+    uint n_tok;
+};
+
+// Register-resident Gated DeltaNet recurrence (`s_dim == 128`):
+// 4 lanes cooperate on one transposed state row `j` (32 floats/lane in registers!).
+// 1 threadgroup (128 threads = 4 simdgroups) owns 32 rows `j` of value head `vh`.
+// Grid: `(s_dim / 32, n_v_heads)` = `(4, 16)` = 64 threadgroups on Qwen3.5!
+// State is loaded from DRAM ONCE, updated across all `n_tok` steps in registers, and stored ONCE.
+kernel void gdn_recurrence_f32(
+    device const float* q     [[buffer(0)]],
+    device const float* k     [[buffer(1)]],
+    device const float* v     [[buffer(2)]],
+    device const float* g_exp [[buffer(3)]],
+    device const float* beta  [[buffer(4)]],
+    device float* state       [[buffer(5)]],
+    device float* out         [[buffer(6)]],
+    constant GdnRecurArgs& a  [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    const uint j = tg.x * 32 + sg * 8 + (lane >> 2);
+    const uint vh = tg.y;
+    if (vh >= a.n_v_heads || j >= a.s_dim) return;
+
+    const uint sub = lane & 3;
+    // AGENTS.md §9: Tiled head mapping `kh = vh % HK`!
+    const uint kh = vh % a.n_k_heads;
+    const uint S = a.s_dim; // 128
+    const uint k_dim = a.n_k_heads * S;
+    const uint v_dim = a.n_v_heads * S;
+    const float scale = rsqrt(float(S));
+
+    device float* s_row = state + (ulong(vh) * ulong(S) + ulong(j)) * ulong(S);
+    float s_reg[32];
+    #pragma unroll
+    for (uint m = 0; m < 32; ++m) {
+        s_reg[m] = s_row[m * 4 + sub];
+    }
+
+    for (uint t = 0; t < a.n_tok; ++t) {
+        device const float* q_h = q + ulong(t) * ulong(k_dim) + kh * S;
+        device const float* k_h = k + ulong(t) * ulong(k_dim) + kh * S;
+        const float v_j = v[ulong(t) * ulong(v_dim) + vh * S + j];
+        const float g   = g_exp[t * a.n_v_heads + vh];
+        const float b   = beta[t * a.n_v_heads + vh];
+
+        float partial_kv = 0.0f;
+        #pragma unroll
+        for (uint m = 0; m < 32; ++m) {
+            const float sv = s_reg[m] * g;
+            s_reg[m] = sv;
+            partial_kv = fma(sv, k_h[m * 4 + sub], partial_kv);
+        }
+        float sum_kv = partial_kv + simd_shuffle_xor(partial_kv, 1);
+        sum_kv += simd_shuffle_xor(sum_kv, 2);
+
+        const float delta_j = (v_j - sum_kv) * b;
+
+        float partial_oq = 0.0f;
+        #pragma unroll
+        for (uint m = 0; m < 32; ++m) {
+            const float sv = fma(delta_j, k_h[m * 4 + sub], s_reg[m]);
+            s_reg[m] = sv;
+            partial_oq = fma(sv, q_h[m * 4 + sub], partial_oq);
+        }
+        float sum_oq = partial_oq + simd_shuffle_xor(partial_oq, 1);
+        sum_oq += simd_shuffle_xor(sum_oq, 2);
+
+        if (sub == 0) {
+            out[ulong(t) * ulong(v_dim) + vh * S + j] = sum_oq * scale;
+        }
+    }
+
+    #pragma unroll
+    for (uint m = 0; m < 32; ++m) {
+        s_row[m * 4 + sub] = s_reg[m];
+    }
+}
+
+struct GdnNormArgs {
+    uint n_v_heads;
+    uint s_dim;
+    float eps;
+};
+
+// Per-head gated RMSNorm with SiLU on `z`: `out_h = rms_norm(out_h, ssm_norm, eps) * silu(z_h)`.
+// Grid: `(n_v_heads, n_tok)` threadgroups, 32 threads (1 simdgroup) per TG.
+kernel void gdn_norm_gated_silu_f32(
+    device float* out            [[buffer(0)]],
+    device const float* ssm_norm [[buffer(1)]],
+    device const float* z        [[buffer(2)]],
+    constant GdnNormArgs& a      [[buffer(3)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    const uint vh = tg.x;
+    const uint t  = tg.y;
+    const uint S  = a.s_dim;
+    const ulong off = (ulong(t) * ulong(a.n_v_heads) + ulong(vh)) * ulong(S);
+
+    device float* o_h = out + off;
+    device const float* z_h = z + off;
+
+    float ss = 0.0f;
+    for (uint i = lane; i < S; i += 32) {
+        float v = o_h[i];
+        ss = fma(v, v, ss);
+    }
+    ss = simd_sum(ss);
+    const float scale = rsqrt(ss / float(S) + a.eps);
+
+    for (uint i = lane; i < S; i += 32) {
+        const float zv = z_h[i];
+        const float silu_z = zv / (1.0f + exp(-zv));
+        o_h[i] = (o_h[i] * scale * ssm_norm[i]) * silu_z;
     }
 }

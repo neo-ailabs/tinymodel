@@ -16,7 +16,7 @@ use tm_gguf::{GgufError, GgufFile};
 pub enum ModelError {
     #[error(transparent)]
     Gguf(#[from] GgufError),
-    #[error("unsupported model architecture '{0}' (M1 supports 'llama' and 'qwen3')")]
+    #[error("unsupported model architecture '{0}' (supports 'llama', 'qwen3', and 'qwen35')")]
     UnsupportedArch(String),
     #[error("position {pos} exceeds configured max_ctx {max_ctx}")]
     ContextOverflow { pos: usize, max_ctx: usize },

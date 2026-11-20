@@ -321,8 +321,10 @@ fn thread_pool_matches_single_thread_bit_exact() {
 }
 
 #[test]
-fn l1_parity_q4_1_q8_0_q6_k_pow2_bit_exact() {
-    use tm_core::{BlockQ4_1, BlockQ6K, BlockQ8_1, BlockQ8K};
+fn l1_parity_q4_1_q8_0_q5_k_q6_k_pow2_bit_exact() {
+    use tm_core::{
+        BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_1, BlockQ8K, DType, dequantize_row_bytes,
+    };
 
     let mut rng = Rng(0x7777_8888_9999_AAAA);
     let isas = supported_isas();
@@ -389,17 +391,71 @@ fn l1_parity_q4_1_q8_0_q6_k_pow2_bit_exact() {
     let y8k: Vec<BlockQ8K> = (0..nb256)
         .map(|_| {
             let mut qs = [0i8; 256];
-            for q in &mut qs {
-                *q = ((rng.next_u8() % 63) as i8) - 31;
+            let mut bsums = [0i16; 16];
+            for (j, bsum) in bsums.iter_mut().enumerate() {
+                let mut s = 0i16;
+                for l in 0..16 {
+                    let q = ((rng.next_u8() % 63) as i8) - 31;
+                    qs[j * 16 + l] = q;
+                    s += q as i16;
+                }
+                *bsum = s;
             }
             BlockQ8K {
                 d: 0.03125,
                 qs,
-                bsums: [0; 16],
+                bsums,
             }
         })
         .collect();
     let ref_6k = generic::vec_dot_q6_k_q8_k(&x6k, &y8k);
+
+    // 3b. Q5_K x Q8_K (and exact agreement with dequantize_row_bytes(DType::Q5K))
+    let x5k: Vec<BlockQ5K> = (0..nb256)
+        .map(|_| {
+            let mut scales = [0u8; 12];
+            let mut qh = [0u8; 32];
+            let mut qs = [0u8; 128];
+            for b in &mut scales {
+                // Keep 6-bit unpacked scales/mins small (0..15) so integer dot fits comfortably in exact f32 mantissa
+                *b = rng.next_u8() & 0x33;
+            }
+            for b in &mut qh {
+                *b = rng.next_u8();
+            }
+            for b in &mut qs {
+                *b = rng.next_u8();
+            }
+            BlockQ5K {
+                d: rng.pow2_scale(),
+                dmin: rng.pow2_scale(),
+                scales,
+                qh,
+                qs,
+            }
+        })
+        .collect();
+    let ref_5k = generic::vec_dot_q5_k_q8_k(&x5k, &y8k);
+
+    // Verify `dequantize_row_bytes(DType::Q5K)` matches `vec_dot_q5_k_q8_k` bit-for-bit on pow2 scales!
+    // SAFETY: `BlockQ5K` is `#[repr(C)]` POD of size 176 bytes with no padding.
+    let x5k_bytes: &[u8] =
+        unsafe { core::slice::from_raw_parts(x5k.as_ptr() as *const u8, nb256 * 176) };
+    let mut deq_5k = vec![0.0f32; nb256 * 256];
+    dequantize_row_bytes(DType::Q5K, x5k_bytes, &mut deq_5k);
+    let mut deq_dot = 0.0f32;
+    for (ib, by) in y8k.iter().enumerate() {
+        let mut block_sum = 0.0f32;
+        for l in 0..256 {
+            block_sum += deq_5k[ib * 256 + l] * (by.qs[l] as f32) * by.d;
+        }
+        deq_dot += block_sum;
+    }
+    assert_eq!(
+        deq_dot.to_bits(),
+        ref_5k.to_bits(),
+        "Q5_K dequantize_row_bytes vs vec_dot_q5_k_q8_k mismatch: deq={deq_dot} vec_dot={ref_5k}"
+    );
 
     for &isa in &isas {
         let kt = select_kernels(isa);
@@ -416,6 +472,12 @@ fn l1_parity_q4_1_q8_0_q6_k_pow2_bit_exact() {
             isa.name()
         );
         assert_eq!(
+            (kt.vec_dot_q5_k_q8_k)(&x5k, &y8k).to_bits(),
+            ref_5k.to_bits(),
+            "Q5_K bit mismatch for isa={}",
+            isa.name()
+        );
+        assert_eq!(
             (kt.vec_dot_q6_k_q8_k)(&x6k, &y8k).to_bits(),
             ref_6k.to_bits(),
             "Q6_K bit mismatch for isa={}",
@@ -423,10 +485,14 @@ fn l1_parity_q4_1_q8_0_q6_k_pow2_bit_exact() {
         );
     }
 
-    // 4. Multi-row GEMV parity for Q8_0 (rows=7) and Q6_K (rows=5)
+    // 4. Multi-row GEMV parity for Q8_0 (rows=7), Q5_K (rows=5), and Q6_K (rows=5)
     let w80 = gen_q8_blocks(&mut rng, 7 * nb32, true);
     let mut ref_g80 = vec![0.0f32; 7];
     generic::gemv_q8_0_q8_0(&w80, &y80, &mut ref_g80, 7, nb32);
+
+    let w5k: Vec<BlockQ5K> = (0..5 * nb256).map(|i| x5k[i % nb256]).collect();
+    let mut ref_g5k = vec![0.0f32; 5];
+    generic::gemv_q5_k_q8_k(&w5k, &y8k, &mut ref_g5k, 5, nb256);
 
     let w6k: Vec<BlockQ6K> = (0..5 * nb256).map(|i| x6k[i % nb256]).collect();
     let mut ref_g6k = vec![0.0f32; 5];
@@ -440,6 +506,15 @@ fn l1_parity_q4_1_q8_0_q6_k_pow2_bit_exact() {
             got_g80.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             ref_g80.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             "gemv Q8_0 bit mismatch for isa={}",
+            isa.name()
+        );
+
+        let mut got_g5k = vec![0.0f32; 5];
+        (kt.gemv_q5_k_q8_k)(&w5k, &y8k, &mut got_g5k, 5, nb256);
+        assert_eq!(
+            got_g5k.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            ref_g5k.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "gemv Q5_K bit mismatch for isa={}",
             isa.name()
         );
 

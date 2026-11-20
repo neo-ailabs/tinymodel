@@ -7,7 +7,10 @@
 //!   (ggml `ggml/src/ggml-cpu/arch/arm/quants.c` commit `3cf03257`).
 
 use core::arch::aarch64::*;
-use tm_core::{BlockQ4_0, BlockQ4_1, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, QK_K};
+use tm_core::{
+    BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, QK_K,
+    unpack_q5k_scales_mins,
+};
 
 use super::asm::f16_to_f32_hw;
 
@@ -924,6 +927,207 @@ pub unsafe fn gemv_q6_k_q8_k(
         while r < rows {
             let row = &w[r * cols_blocks..(r + 1) * cols_blocks];
             *out.get_unchecked_mut(r) = vec_dot_q6_k_q8_k(row, x);
+            r += 1;
+        }
+    }
+}
+
+/// ARMv8.2 `dotprod` `vec_dot_q5_k_q8_k`.
+/// Matches `ggml_vec_dot_q5_K_q8_K` (`ggml/src/ggml-cpu/arch/arm/quants.c`, MIT License).
+///
+/// # Safety
+/// Caller must ensure CPU supports `dotprod` and `x.len() == y.len()`.
+#[target_feature(enable = "neon,dotprod")]
+pub unsafe fn vec_dot_q5_k_q8_k(x: &[BlockQ5K], y: &[BlockQ8K]) -> f32 {
+    debug_assert_eq!(x.len(), y.len());
+    let nb = x.len();
+    let mut sumf = 0.0f32;
+
+    // SAFETY: All indices are strictly bounded by `nb` and `QK_K = 256`.
+    unsafe {
+        let m4b = vdupq_n_u8(0x0F);
+        let mone = vdupq_n_u8(1);
+        let mtwo = vdupq_n_u8(2);
+        let zero = vdupq_n_s32(0);
+
+        for ib in 0..nb {
+            let bx = x.get_unchecked(ib);
+            let by = y.get_unchecked(ib);
+
+            let (sc, mins) = unpack_q5k_scales_mins(&bx.scales);
+            let q8sums = vpaddq_s16(
+                vld1q_s16(by.bsums.as_ptr()),
+                vld1q_s16(by.bsums.as_ptr().add(8)),
+            );
+            let mins_v = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(mins.as_ptr())));
+            let prod_m = vaddq_s32(
+                vmull_s16(vget_low_s16(q8sums), vget_low_s16(mins_v)),
+                vmull_s16(vget_high_s16(q8sums), vget_high_s16(mins_v)),
+            );
+            let sumi_mins = vaddvq_s32(prod_m);
+
+            let mut qh0 = vld1q_u8(bx.qh.as_ptr());
+            let mut qh1 = vld1q_u8(bx.qh.as_ptr().add(16));
+            let mut vsum = zero;
+
+            for chunk in 0..4 {
+                let q5_ptr = bx.qs.as_ptr().add(chunk * 32);
+                let q8_ptr = by.qs.as_ptr().add(chunk * 64);
+
+                let ql0 = vld1q_u8(q5_ptr);
+                let ql1 = vld1q_u8(q5_ptr.add(16));
+
+                let h_lo0 = vshlq_n_u8::<4>(vandq_u8(qh0, mone));
+                let h_lo1 = vshlq_n_u8::<4>(vandq_u8(qh1, mone));
+                let h_hi0 = vshlq_n_u8::<3>(vandq_u8(qh0, mtwo));
+                let h_hi1 = vshlq_n_u8::<3>(vandq_u8(qh1, mtwo));
+                qh0 = vshrq_n_u8::<2>(qh0);
+                qh1 = vshrq_n_u8::<2>(qh1);
+
+                let q0 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(ql0, m4b), h_lo0));
+                let q1 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(ql1, m4b), h_lo1));
+                let q2 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(ql0), h_hi0));
+                let q3 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(ql1), h_hi1));
+
+                let y0 = vld1q_s8(q8_ptr);
+                let y1 = vld1q_s8(q8_ptr.add(16));
+                let y2 = vld1q_s8(q8_ptr.add(32));
+                let y3 = vld1q_s8(q8_ptr.add(48));
+
+                let d_lo = vdotq_s32(vdotq_s32(zero, q0, y0), q1, y1);
+                let d_hi = vdotq_s32(vdotq_s32(zero, q2, y2), q3, y3);
+
+                vsum = vmlaq_n_s32(vsum, d_lo, *sc.get_unchecked(2 * chunk) as i32);
+                vsum = vmlaq_n_s32(vsum, d_hi, *sc.get_unchecked(2 * chunk + 1) as i32);
+            }
+
+            let sumi = vaddvq_s32(vsum);
+            let d = f16_to_f32_hw(bx.d) * by.d;
+            let dmin = f16_to_f32_hw(bx.dmin) * by.d;
+            sumf += d * (sumi as f32) - dmin * (sumi_mins as f32);
+        }
+    }
+
+    sumf
+}
+
+/// 2-row unrolled `dotprod` GEMV for `Q5_K x Q8_K`: loads `y` and `q8sums` once across 2 rows.
+///
+/// # Safety
+/// Caller must ensure CPU supports `dotprod` and buffer lengths match dimensions.
+#[target_feature(enable = "neon,dotprod")]
+pub unsafe fn gemv_q5_k_q8_k(
+    w: &[BlockQ5K],
+    x: &[BlockQ8K],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), cols_blocks);
+    assert_eq!(out.len(), rows);
+
+    let mut r = 0usize;
+    // SAFETY: All row and block indices are strictly within bounds.
+    unsafe {
+        let m4b = vdupq_n_u8(0x0F);
+        let mone = vdupq_n_u8(1);
+        let mtwo = vdupq_n_u8(2);
+        let zero = vdupq_n_s32(0);
+
+        while r + 2 <= rows {
+            let w0 = &w[r * cols_blocks..(r + 1) * cols_blocks];
+            let w1 = &w[(r + 1) * cols_blocks..(r + 2) * cols_blocks];
+            let mut sum0 = 0.0f32;
+            let mut sum1 = 0.0f32;
+
+            for ib in 0..cols_blocks {
+                let by = x.get_unchecked(ib);
+                let bx0 = w0.get_unchecked(ib);
+                let bx1 = w1.get_unchecked(ib);
+
+                let q8sums = vpaddq_s16(
+                    vld1q_s16(by.bsums.as_ptr()),
+                    vld1q_s16(by.bsums.as_ptr().add(8)),
+                );
+
+                let (sc0, mins0) = unpack_q5k_scales_mins(&bx0.scales);
+                let (sc1, mins1) = unpack_q5k_scales_mins(&bx1.scales);
+
+                let m0_v = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(mins0.as_ptr())));
+                let m1_v = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(mins1.as_ptr())));
+                let sumi_mins0 = vaddvq_s32(vaddq_s32(
+                    vmull_s16(vget_low_s16(q8sums), vget_low_s16(m0_v)),
+                    vmull_s16(vget_high_s16(q8sums), vget_high_s16(m0_v)),
+                ));
+                let sumi_mins1 = vaddvq_s32(vaddq_s32(
+                    vmull_s16(vget_low_s16(q8sums), vget_low_s16(m1_v)),
+                    vmull_s16(vget_high_s16(q8sums), vget_high_s16(m1_v)),
+                ));
+
+                let mut qh0_a = vld1q_u8(bx0.qh.as_ptr());
+                let mut qh0_b = vld1q_u8(bx0.qh.as_ptr().add(16));
+                let mut qh1_a = vld1q_u8(bx1.qh.as_ptr());
+                let mut qh1_b = vld1q_u8(bx1.qh.as_ptr().add(16));
+
+                let mut vsum0 = zero;
+                let mut vsum1 = zero;
+
+                for chunk in 0..4 {
+                    let q8_ptr = by.qs.as_ptr().add(chunk * 64);
+                    let y0 = vld1q_s8(q8_ptr);
+                    let y1 = vld1q_s8(q8_ptr.add(16));
+                    let y2 = vld1q_s8(q8_ptr.add(32));
+                    let y3 = vld1q_s8(q8_ptr.add(48));
+
+                    macro_rules! step_q5k {
+                        ($bx:expr, $sc:expr, $qha:expr, $qhb:expr, $vsum:expr) => {{
+                            let q5_ptr = $bx.qs.as_ptr().add(chunk * 32);
+                            let ql0 = vld1q_u8(q5_ptr);
+                            let ql1 = vld1q_u8(q5_ptr.add(16));
+
+                            let h_lo0 = vshlq_n_u8::<4>(vandq_u8($qha, mone));
+                            let h_lo1 = vshlq_n_u8::<4>(vandq_u8($qhb, mone));
+                            let h_hi0 = vshlq_n_u8::<3>(vandq_u8($qha, mtwo));
+                            let h_hi1 = vshlq_n_u8::<3>(vandq_u8($qhb, mtwo));
+                            $qha = vshrq_n_u8::<2>($qha);
+                            $qhb = vshrq_n_u8::<2>($qhb);
+
+                            let q0 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(ql0, m4b), h_lo0));
+                            let q1 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(ql1, m4b), h_lo1));
+                            let q2 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(ql0), h_hi0));
+                            let q3 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(ql1), h_hi1));
+
+                            let d_lo = vdotq_s32(vdotq_s32(zero, q0, y0), q1, y1);
+                            let d_hi = vdotq_s32(vdotq_s32(zero, q2, y2), q3, y3);
+
+                            $vsum = vmlaq_n_s32($vsum, d_lo, *$sc.get_unchecked(2 * chunk) as i32);
+                            $vsum =
+                                vmlaq_n_s32($vsum, d_hi, *$sc.get_unchecked(2 * chunk + 1) as i32);
+                        }};
+                    }
+
+                    step_q5k!(bx0, sc0, qh0_a, qh0_b, vsum0);
+                    step_q5k!(bx1, sc1, qh1_a, qh1_b, vsum1);
+                }
+
+                let d0 = f16_to_f32_hw(bx0.d) * by.d;
+                let dmin0 = f16_to_f32_hw(bx0.dmin) * by.d;
+                sum0 += d0 * (vaddvq_s32(vsum0) as f32) - dmin0 * (sumi_mins0 as f32);
+
+                let d1 = f16_to_f32_hw(bx1.d) * by.d;
+                let dmin1 = f16_to_f32_hw(bx1.dmin) * by.d;
+                sum1 += d1 * (vaddvq_s32(vsum1) as f32) - dmin1 * (sumi_mins1 as f32);
+            }
+
+            *out.get_unchecked_mut(r) = sum0;
+            *out.get_unchecked_mut(r + 1) = sum1;
+            r += 2;
+        }
+
+        while r < rows {
+            let row = &w[r * cols_blocks..(r + 1) * cols_blocks];
+            *out.get_unchecked_mut(r) = vec_dot_q5_k_q8_k(row, x);
             r += 1;
         }
     }

@@ -1,6 +1,6 @@
 //! Quantization block layouts and data types.
 //!
-//! Block layouts (`BlockQ4_0`, `BlockQ4_1`, `BlockQ8_0`, `BlockQ8_1`, `BlockQ6_K`, `BlockQ8_K`)
+//! Block layouts (`BlockQ4_0`, `BlockQ4_1`, `BlockQ8_0`, `BlockQ8_1`, `BlockQ5K`, `BlockQ6K`, `BlockQ8K`)
 //! match ggml's binary GGUF format:
 //! Copyright (c) 2023-2026 The ggml authors (MIT License).
 //! Upstream reference: llama.cpp `ggml/src/ggml-common.h` (commit `3cf03257` / `b001d7b`).
@@ -13,7 +13,7 @@ pub const QK4_1: usize = 32;
 /// Number of weights per `BlockQ8_0` / `BlockQ8_1`.
 pub const QK8_0: usize = 32;
 pub const QK8_1: usize = 32;
-/// Number of weights per K-quant super-block (`BlockQ6_K`, `BlockQ8_K`).
+/// Number of weights per K-quant super-block (`BlockQ5K`, `BlockQ6K`, `BlockQ8K`).
 pub const QK_K: usize = 256;
 
 /// Supported tensor data types.
@@ -26,6 +26,7 @@ pub enum DType {
     Q4_1,
     Q8_0,
     Q8_1,
+    Q5K,
     Q6K,
     Q8K,
 }
@@ -40,6 +41,7 @@ impl DType {
             3 => Some(DType::Q4_1),
             8 => Some(DType::Q8_0),
             9 => Some(DType::Q8_1),
+            13 => Some(DType::Q5K),
             14 => Some(DType::Q6K),
             15 => Some(DType::Q8K),
             30 => Some(DType::BF16),
@@ -55,7 +57,7 @@ impl DType {
             DType::Q4_1 => QK4_1,
             DType::Q8_0 => QK8_0,
             DType::Q8_1 => QK8_1,
-            DType::Q6K | DType::Q8K => QK_K,
+            DType::Q5K | DType::Q6K | DType::Q8K => QK_K,
         }
     }
 
@@ -68,6 +70,7 @@ impl DType {
             DType::Q4_1 => core::mem::size_of::<BlockQ4_1>(),
             DType::Q8_0 => core::mem::size_of::<BlockQ8_0>(),
             DType::Q8_1 => core::mem::size_of::<BlockQ8_1>(),
+            DType::Q5K => core::mem::size_of::<BlockQ5K>(),
             DType::Q6K => core::mem::size_of::<BlockQ6K>(),
             DType::Q8K => core::mem::size_of::<BlockQ8K>(),
         }
@@ -113,6 +116,44 @@ pub struct BlockQ8_1 {
     pub qs: [i8; QK8_1],
 }
 
+/// 5-bit K-quant super-block (256 weights in 176 bytes): `w = d * sc * q5 - dmin * m`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockQ5K {
+    pub d: u16,
+    pub dmin: u16,
+    pub scales: [u8; 12],
+    pub qh: [u8; QK_K / 8],
+    pub qs: [u8; QK_K / 2],
+}
+
+/// Unpacks the 12-byte 6-bit packed `scales` array of `BlockQ4_K` / `BlockQ5K`
+/// into 8 6-bit sub-block scales (`sc[0..8]`) and 8 6-bit sub-block mins (`m[0..8]`).
+#[inline]
+pub const fn unpack_q5k_scales_mins(s: &[u8; 12]) -> ([u8; 8], [u8; 8]) {
+    let sc = [
+        s[0] & 63,
+        s[1] & 63,
+        s[2] & 63,
+        s[3] & 63,
+        (s[8] & 0x0F) | ((s[0] >> 6) << 4),
+        (s[9] & 0x0F) | ((s[1] >> 6) << 4),
+        (s[10] & 0x0F) | ((s[2] >> 6) << 4),
+        (s[11] & 0x0F) | ((s[3] >> 6) << 4),
+    ];
+    let m = [
+        s[4] & 63,
+        s[5] & 63,
+        s[6] & 63,
+        s[7] & 63,
+        (s[8] >> 4) | ((s[4] >> 6) << 4),
+        (s[9] >> 4) | ((s[5] >> 6) << 4),
+        (s[10] >> 4) | ((s[6] >> 6) << 4),
+        (s[11] >> 4) | ((s[7] >> 6) << 4),
+    ];
+    (sc, m)
+}
+
 /// 6-bit K-quant super-block (256 weights in 210 bytes).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +177,7 @@ const _: () = assert!(core::mem::size_of::<BlockQ4_0>() == 18);
 const _: () = assert!(core::mem::size_of::<BlockQ4_1>() == 20);
 const _: () = assert!(core::mem::size_of::<BlockQ8_0>() == 34);
 const _: () = assert!(core::mem::size_of::<BlockQ8_1>() == 36);
+const _: () = assert!(core::mem::size_of::<BlockQ5K>() == 176);
 const _: () = assert!(core::mem::size_of::<BlockQ6K>() == 210);
 const _: () = assert!(core::mem::size_of::<BlockQ8K>() == 292);
 
@@ -354,6 +396,37 @@ pub fn dequantize_row_bytes(dtype: DType, src: &[u8], dst: &mut [f32]) {
                 let base = ib * QK8_1;
                 for j in 0..32 {
                     dst[base + j] = (blk[4 + j] as i8) as f32 * d;
+                }
+            }
+        }
+        DType::Q5K => {
+            for (ib, blk) in src.as_chunks::<176>().0.iter().enumerate() {
+                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                let dmin = f16_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
+                let mut scales_12 = [0u8; 12];
+                scales_12.copy_from_slice(&blk[4..16]);
+                let (sc, m) = unpack_q5k_scales_mins(&scales_12);
+                let qh = &blk[16..48];
+                let qs = &blk[48..176];
+
+                let base = ib * QK_K;
+                let mut u1 = 1u8;
+                let mut u2 = 2u8;
+                for chunk in 0..4 {
+                    let d1 = d * (sc[2 * chunk] as f32);
+                    let m1 = dmin * (m[2 * chunk] as f32);
+                    let d2 = d * (sc[2 * chunk + 1] as f32);
+                    let m2 = dmin * (m[2 * chunk + 1] as f32);
+                    let ql = &qs[chunk * 32..(chunk + 1) * 32];
+                    let out = &mut dst[base + chunk * 64..base + (chunk + 1) * 64];
+                    for l in 0..32 {
+                        let q1 = (ql[l] & 0x0F) + if (qh[l] & u1) != 0 { 16 } else { 0 };
+                        let q2 = (ql[l] >> 4) + if (qh[l] & u2) != 0 { 16 } else { 0 };
+                        out[l] = d1 * (q1 as f32) - m1;
+                        out[l + 32] = d2 * (q2 as f32) - m2;
+                    }
+                    u1 = u1.wrapping_shl(2);
+                    u2 = u2.wrapping_shl(2);
                 }
             }
         }

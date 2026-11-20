@@ -6,7 +6,8 @@
 //! Upstream reference: llama.cpp `ggml/src/ggml-cpu/quants.c` (commit `3cf03257`).
 
 use tm_core::{
-    BlockQ4_0, BlockQ4_1, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, QK_K, QK8_0, QK8_1, f16_to_f32,
+    BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, QK_K, QK8_0, QK8_1,
+    f16_to_f32, unpack_q5k_scales_mins,
 };
 
 /// Scalar dot product between one row of `BlockQ4_0` and one vector of `BlockQ8_0`.
@@ -119,6 +120,50 @@ pub fn vec_dot_q8_0_q8_0(x: &[BlockQ8_0], y: &[BlockQ8_0]) -> f32 {
     sumf
 }
 
+/// Scalar dot product between `BlockQ5K` and `BlockQ8K`.
+/// Matches ggml `ggml_vec_dot_q5_K_q8_K` (Copyright (c) 2023-2026 The ggml authors, MIT).
+#[inline]
+pub fn vec_dot_q5_k_q8_k(x: &[BlockQ5K], y: &[BlockQ8K]) -> f32 {
+    debug_assert_eq!(x.len(), y.len());
+    let mut sumf = 0.0f32;
+
+    for (bx, by) in x.iter().zip(y.iter()) {
+        let (sc, mins) = unpack_q5k_scales_mins(&bx.scales);
+
+        let mut sumi_mins: i32 = 0;
+        for j in 0..(QK_K / 16) {
+            sumi_mins += (by.bsums[j] as i32) * (mins[j / 2] as i32);
+        }
+
+        let mut sumi: i32 = 0;
+        let mut u1 = 1u8;
+        let mut u2 = 2u8;
+        for chunk in 0..4 {
+            let ql = &bx.qs[chunk * 32..(chunk + 1) * 32];
+            let q8_lo = &by.qs[chunk * 64..chunk * 64 + 32];
+            let q8_hi = &by.qs[chunk * 64 + 32..(chunk + 1) * 64];
+
+            let mut dot_lo: i32 = 0;
+            let mut dot_hi: i32 = 0;
+            for l in 0..32 {
+                let q5_lo = ((ql[l] & 0x0F) + if (bx.qh[l] & u1) != 0 { 16 } else { 0 }) as i32;
+                let q5_hi = ((ql[l] >> 4) + if (bx.qh[l] & u2) != 0 { 16 } else { 0 }) as i32;
+                dot_lo += q5_lo * (q8_lo[l] as i32);
+                dot_hi += q5_hi * (q8_hi[l] as i32);
+            }
+            sumi += (sc[2 * chunk] as i32) * dot_lo + (sc[2 * chunk + 1] as i32) * dot_hi;
+            u1 = u1.wrapping_shl(2);
+            u2 = u2.wrapping_shl(2);
+        }
+
+        let d = f16_to_f32(bx.d) * by.d;
+        let dmin = f16_to_f32(bx.dmin) * by.d;
+        sumf += d * (sumi as f32) - dmin * (sumi_mins as f32);
+    }
+
+    sumf
+}
+
 /// Scalar dot product between `BlockQ6K` and `BlockQ8K`.
 /// Matches ggml `ggml_vec_dot_q6_K_q8_K` (Copyright (c) 2023-2026 The ggml authors, MIT).
 #[inline]
@@ -183,6 +228,22 @@ pub fn gemv_q8_0_q8_0(
     assert_eq!(out.len(), rows);
     for r in 0..rows {
         out[r] = vec_dot_q8_0_q8_0(&w[r * cols_blocks..(r + 1) * cols_blocks], x);
+    }
+}
+
+/// Scalar GEMV for `Q5_K x Q8_K`.
+pub fn gemv_q5_k_q8_k(
+    w: &[BlockQ5K],
+    x: &[BlockQ8K],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), cols_blocks);
+    assert_eq!(out.len(), rows);
+    for r in 0..rows {
+        out[r] = vec_dot_q5_k_q8_k(&w[r * cols_blocks..(r + 1) * cols_blocks], x);
     }
 }
 

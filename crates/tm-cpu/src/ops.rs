@@ -5,8 +5,8 @@
 //! pre-allocated scratch buffers.
 
 use tm_core::{
-    BlockQ4_0, BlockQ4_1, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, DType, QK_K, QK4_0, QK4_1,
-    QK8_0, f16_to_f32, quantize_row_q8_k,
+    BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, DType, QK_K, QK4_0,
+    QK4_1, QK8_0, f16_to_f32, quantize_row_q8_k,
 };
 
 use crate::{KernelTable, ThreadPool, generic};
@@ -165,6 +165,33 @@ pub fn matvec_f32(
                 let o =
                     unsafe { core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(r0), len) };
                 (kt.gemv_q8_0_q8_0)(
+                    &w[r0 * cols_blocks..r1 * cols_blocks],
+                    xq_ref,
+                    o,
+                    len,
+                    cols_blocks,
+                );
+            });
+        }
+        DType::Q5K => {
+            let cols_blocks = cols / QK_K;
+            let xq = &mut scratch.q8_k[..cols_blocks];
+            quantize_row_q8_k(x, xq);
+            let xq_ref: &[BlockQ8K] = xq;
+            assert!(
+                (w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockQ5K>()),
+                "Q5K tensor pointer misaligned"
+            );
+            // SAFETY: Length and alignment of `w_bytes` are verified above; `BlockQ5K` is `#[repr(C)]` POD.
+            let w: &[BlockQ5K] = unsafe {
+                core::slice::from_raw_parts(w_bytes.as_ptr() as *const BlockQ5K, rows * cols_blocks)
+            };
+            pool.parallel_for(rows, chunk, |r0, r1| {
+                let len = r1 - r0;
+                // SAFETY: Disjoint `[r0..r1)` output ranges per parallel chunk.
+                let o =
+                    unsafe { core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(r0), len) };
+                (kt.gemv_q5_k_q8_k)(
                     &w[r0 * cols_blocks..r1 * cols_blocks],
                     xq_ref,
                     o,
@@ -917,6 +944,64 @@ pub fn matmul_f32(
                 }
             });
         }
+        DType::Q5K => {
+            let cols_blocks = cols / QK_K;
+            let xq = &mut scratch.q8_k[..n_tok * cols_blocks];
+            for t in 0..n_tok {
+                quantize_row_q8_k(
+                    &x[t * cols..(t + 1) * cols],
+                    &mut xq[t * cols_blocks..(t + 1) * cols_blocks],
+                );
+            }
+            let xq_ref: &[BlockQ8K] = xq;
+            assert!((w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockQ5K>()));
+            // SAFETY: Alignment and length verified; `BlockQ5K` is `#[repr(C)]` POD.
+            let w: &[BlockQ5K] = unsafe {
+                core::slice::from_raw_parts(w_bytes.as_ptr() as *const BlockQ5K, rows * cols_blocks)
+            };
+            pool.parallel_for(rows, chunk, |r0, r1| {
+                let mut r = r0;
+                while r + 2 <= r1 {
+                    let w2 = &w[r * cols_blocks..(r + 2) * cols_blocks];
+                    for t in 0..n_tok {
+                        // SAFETY: Disjoint `[t * rows + r .. t * rows + r + 2)` per worker.
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                (out_ptr as *mut f32).add(t * rows + r),
+                                2,
+                            )
+                        };
+                        (kt.gemv_q5_k_q8_k)(
+                            w2,
+                            &xq_ref[t * cols_blocks..(t + 1) * cols_blocks],
+                            dst,
+                            2,
+                            cols_blocks,
+                        );
+                    }
+                    r += 2;
+                }
+                if r < r1 {
+                    let wr = &w[r * cols_blocks..r1 * cols_blocks];
+                    for t in 0..n_tok {
+                        // SAFETY: Disjoint `[t * rows + r]` per worker.
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                (out_ptr as *mut f32).add(t * rows + r),
+                                1,
+                            )
+                        };
+                        (kt.gemv_q5_k_q8_k)(
+                            wr,
+                            &xq_ref[t * cols_blocks..(t + 1) * cols_blocks],
+                            dst,
+                            1,
+                            cols_blocks,
+                        );
+                    }
+                }
+            });
+        }
         DType::Q6K => {
             let cols_blocks = cols / QK_K;
             let xq = &mut scratch.q8_k[..n_tok * cols_blocks];
@@ -991,4 +1076,110 @@ pub fn matmul_f32(
             }
         }
     }
+}
+
+/// In-place L2 normalization per head: `x[i] /= sqrt(sum(x^2) + eps)`.
+/// Matches `build_gdn_l2_norm` in llama.cpp (`models.h`).
+#[inline]
+pub fn l2_norm_inplace(x: &mut [f32], eps: f32) {
+    let mut ss = 0.0f64;
+    for &v in x.iter() {
+        let vf = v as f64;
+        ss += vf * vf;
+    }
+    let scale = (1.0 / (ss + eps as f64).sqrt()) as f32;
+    for v in x.iter_mut() {
+        *v *= scale;
+    }
+}
+
+/// Multi-head Gated DeltaNet recurrent step across `n_tok` tokens (`n_tok >= 1`),
+/// parallelized across `n_v_heads` value heads on `pool`.
+///
+/// Follows `Strata/docs/GDN_CONTRACT.md` and `AGENTS.md` §9:
+/// - Key head mapping: `kh = vh % n_k_heads` (tiled, NOT contiguous repeat).
+/// - `state` is stored transposed per value head `[n_v_heads, head_dim, head_dim]`:
+///   row `j` (`state_vh[j * head_dim .. (j + 1) * head_dim]`) holds column `j` of `S`.
+/// - `out` is scaled by `1 / sqrt(head_dim)`.
+/// - Multi-token (`n_tok > 1`) executes the exact same per-token operation order as `n_tok == 1`.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_recurrence_parallel(
+    pool: &ThreadPool,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g_exp: &[f32],
+    beta: &[f32],
+    state: &mut [f32],
+    out: &mut [f32],
+    n_k_heads: usize,
+    n_v_heads: usize,
+    head_dim: usize,
+    n_tok: usize,
+) {
+    let k_dim = n_k_heads * head_dim;
+    let v_dim = n_v_heads * head_dim;
+    let state_per_head = head_dim * head_dim;
+    assert_eq!(q.len(), n_tok * k_dim);
+    assert_eq!(k.len(), n_tok * k_dim);
+    assert_eq!(v.len(), n_tok * v_dim);
+    assert_eq!(g_exp.len(), n_tok * n_v_heads);
+    assert_eq!(beta.len(), n_tok * n_v_heads);
+    assert_eq!(state.len(), n_v_heads * state_per_head);
+    assert_eq!(out.len(), n_tok * v_dim);
+
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let state_ptr = state.as_mut_ptr() as usize;
+    let out_ptr = out.as_mut_ptr() as usize;
+    let chunk = n_v_heads.div_ceil(pool.num_threads()).max(1);
+
+    pool.parallel_for(n_v_heads, chunk, |vh0, vh1| {
+        for vh in vh0..vh1 {
+            let kh = vh % n_k_heads;
+            // SAFETY: Each value head `vh` owns disjoint `[vh * state_per_head .. (vh + 1) * state_per_head]`.
+            let s_vh = unsafe {
+                core::slice::from_raw_parts_mut(
+                    (state_ptr as *mut f32).add(vh * state_per_head),
+                    state_per_head,
+                )
+            };
+
+            for t in 0..n_tok {
+                let q_h = &q[t * k_dim + kh * head_dim..t * k_dim + (kh + 1) * head_dim];
+                let k_h = &k[t * k_dim + kh * head_dim..t * k_dim + (kh + 1) * head_dim];
+                let v_h = &v[t * v_dim + vh * head_dim..t * v_dim + (vh + 1) * head_dim];
+                let g = g_exp[t * n_v_heads + vh];
+                let b = beta[t * n_v_heads + vh];
+
+                // SAFETY: Disjoint `[t * v_dim + vh * head_dim .. + head_dim]` per `vh`.
+                let o_h = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        (out_ptr as *mut f32).add(t * v_dim + vh * head_dim),
+                        head_dim,
+                    )
+                };
+
+                for j in 0..head_dim {
+                    let s_row = &mut s_vh[j * head_dim..(j + 1) * head_dim];
+                    let mut sum_kv = 0.0f32;
+                    for (s_val, &kv) in s_row.iter_mut().zip(k_h.iter()) {
+                        let decayed = *s_val * g;
+                        *s_val = decayed;
+                        sum_kv += decayed * kv;
+                    }
+
+                    let delta_j = (v_h[j] - sum_kv) * b;
+
+                    let mut sum_oq = 0.0f32;
+                    for ((s_val, &kv), &qv) in s_row.iter_mut().zip(k_h.iter()).zip(q_h.iter()) {
+                        let updated = *s_val + delta_j * kv;
+                        *s_val = updated;
+                        sum_oq += updated * qv;
+                    }
+
+                    o_h[j] = sum_oq * scale;
+                }
+            }
+        }
+    });
 }

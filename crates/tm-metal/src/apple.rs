@@ -9,11 +9,31 @@ use objc2_metal::{
     MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
     MTLResourceOptions, MTLSize,
 };
-use tm_core::{BlockQ4_0, QK4_0};
+use tm_core::{BlockQ4_0, BlockQ5K, QK_K, QK4_0};
 
 use crate::MetalError;
 
 const GEMV_Q4_0_MSL: &str = include_str!("shaders/gemv_q4_0.metal");
+const LLAMA_OPS_MSL: &str = include_str!("shaders/llama_ops.metal");
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct OpsGemvArgs {
+    n_in: u32,
+    n_out: u32,
+    add_residual: u32,
+    row_bytes: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct OpsGemmArgs {
+    n_in: u32,
+    n_out: u32,
+    n_tok: u32,
+    add_residual: u32,
+    row_bytes: u32,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -64,6 +84,8 @@ pub struct MetalContext {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pipe_gemv_q4_0: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pipe_gemm_q4_0: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pipe_gemv_q5_k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pipe_gemm_q5_k: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl MetalContext {
@@ -79,14 +101,23 @@ impl MetalContext {
             .newLibraryWithSource_options_error(&src, None)
             .map_err(|e| MetalError::ShaderCompile(e.localizedDescription().to_string()))?;
 
+        let ops_src = NSString::from_str(LLAMA_OPS_MSL);
+        let ops_lib = device
+            .newLibraryWithSource_options_error(&ops_src, None)
+            .map_err(|e| MetalError::ShaderCompile(e.localizedDescription().to_string()))?;
+
         let pipe_gemv_q4_0 = Self::build_pipeline(&device, &library, "gemv_q4_0_f32_lpr8_nr2")?;
         let pipe_gemm_q4_0 = Self::build_pipeline(&device, &library, "gemm_q4_0_f32_lpr8")?;
+        let pipe_gemv_q5_k = Self::build_pipeline(&device, &ops_lib, "gemv_q5_k_res")?;
+        let pipe_gemm_q5_k = Self::build_pipeline(&device, &ops_lib, "gemm_q5_k_res")?;
 
         Ok(Self {
             device,
             queue,
             pipe_gemv_q4_0,
             pipe_gemm_q4_0,
+            pipe_gemv_q5_k,
+            pipe_gemm_q5_k,
         })
     }
 
@@ -327,6 +358,113 @@ impl MetalContext {
 
         for _ in 0..repeat.max(1) {
             enc.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        }
+
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        Ok(())
+    }
+
+    /// Runs `Q5_K x F32` GEMV (`n_tokens == 1`) or batched GEMM (`n_tokens > 1`) on Metal GPU.
+    pub fn gemm_q5_k_f32(
+        &self,
+        w: &MetalBuffer,
+        x: &MetalBuffer,
+        y: &mut MetalBuffer,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+    ) -> Result<(), MetalError> {
+        if cols == 0 || !cols.is_multiple_of(QK_K) || rows == 0 || n_tokens == 0 {
+            return Err(MetalError::InvalidDimensions(format!(
+                "rows={rows}, cols={cols}, n_tokens={n_tokens}"
+            )));
+        }
+        let row_bytes = (cols / QK_K) * core::mem::size_of::<BlockQ5K>();
+        if w.byte_len < rows * row_bytes
+            || x.byte_len < n_tokens * cols * 4
+            || y.byte_len < n_tokens * rows * 4
+        {
+            return Err(MetalError::InvalidDimensions(
+                "buffer too small for Q5_K GEMV/GEMM".to_string(),
+            ));
+        }
+
+        const THREADS: usize = 128;
+        let cmd = self
+            .queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandEncodeFailed)?;
+        let enc = cmd
+            .computeCommandEncoder()
+            .ok_or(MetalError::CommandEncodeFailed)?;
+
+        if n_tokens == 1 {
+            Self::require_fit(&self.pipe_gemv_q5_k, "gemv_q5_k_res", THREADS)?;
+            let args = OpsGemvArgs {
+                n_in: cols as u32,
+                n_out: rows as u32,
+                add_residual: 0,
+                row_bytes: row_bytes as u32,
+            };
+            enc.setComputePipelineState(&self.pipe_gemv_q5_k);
+            // SAFETY: Buffers remain alive until `waitUntilCompleted`.
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&w.raw), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(&x.raw), 0, 1);
+                enc.setBuffer_offset_atIndex(Some(&y.raw), 0, 2);
+                enc.setBytes_length_atIndex(
+                    NonNull::from(&args).cast::<c_void>(),
+                    core::mem::size_of::<OpsGemvArgs>(),
+                    3,
+                );
+            }
+            enc.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: rows.div_ceil(8),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: THREADS,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        } else {
+            Self::require_fit(&self.pipe_gemm_q5_k, "gemm_q5_k_res", THREADS)?;
+            let args = OpsGemmArgs {
+                n_in: cols as u32,
+                n_out: rows as u32,
+                n_tok: n_tokens as u32,
+                add_residual: 0,
+                row_bytes: row_bytes as u32,
+            };
+            enc.setComputePipelineState(&self.pipe_gemm_q5_k);
+            // SAFETY: Buffers remain alive until `waitUntilCompleted`.
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&w.raw), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(&x.raw), 0, 1);
+                enc.setBuffer_offset_atIndex(Some(&y.raw), 0, 2);
+                enc.setBytes_length_atIndex(
+                    NonNull::from(&args).cast::<c_void>(),
+                    core::mem::size_of::<OpsGemmArgs>(),
+                    3,
+                );
+            }
+            enc.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: rows.div_ceil(4),
+                    height: n_tokens.div_ceil(8),
+                    depth: 1,
+                },
+                MTLSize {
+                    width: THREADS,
+                    height: 1,
+                    depth: 1,
+                },
+            );
         }
 
         enc.endEncoding();

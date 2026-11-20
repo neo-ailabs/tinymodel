@@ -1,13 +1,18 @@
-//! `tinymodel` CLI: inspect GGUF models, run greedy inference, and benchmark decode throughput.
+//! `tinymodel` CLI: inspect GGUF models, run inference, dump multi-token logits,
+//! benchmark pp/tg throughput, and profile CPU / Metal GPU execution.
 
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use tm_cpu::{ThreadPool, active_kernels};
 use tm_gguf::GgufFile;
-use tm_models::{CpuDecodeProfile, LlamaModel, LlamaState, Sampler, SamplerConfig, argmax};
+use tm_models::{
+    CpuDecodeProfile, LlamaModel, LlamaState, Qwen35DecodeProfile, Qwen35Model, Qwen35State,
+    Sampler, SamplerConfig, argmax,
+};
 use tm_tokenizer::Tokenizer;
 
 fn print_usage() {
@@ -16,7 +21,8 @@ fn print_usage() {
   tinymodel inspect <model.gguf>
   tinymodel run -m <model.gguf> [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--metal]
   tinymodel bench -m <model.gguf> [-n <tokens>] [-t <threads>] [-c <ctx>] [--metal]
-  tinymodel profile -m <model.gguf> [-n <tokens>] [-t <threads>] [-c <ctx>] [--metal]"
+  tinymodel profile -m <model.gguf> [-n <tokens>] [-t <threads>] [-c <ctx>] [--metal]
+  tinymodel logits -m <model.gguf> -o <out.bin> [-p <prompt> | --tokens 1,2,3] [-t <threads>] [-c <ctx>] [--metal]"
     );
 }
 
@@ -50,6 +56,8 @@ struct RunOpts {
     model: PathBuf,
     prompt: Option<String>,
     prompt_file: Option<PathBuf>,
+    explicit_tokens: Option<Vec<u32>>,
+    out_path: Option<PathBuf>,
     n_predict: usize,
     threads: usize,
     max_ctx: usize,
@@ -61,6 +69,8 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
     let mut model: Option<PathBuf> = None;
     let mut prompt: Option<String> = None;
     let mut prompt_file: Option<PathBuf> = None;
+    let mut explicit_tokens: Option<Vec<u32>> = None;
+    let mut out_path: Option<PathBuf> = None;
     let mut n_predict = 64usize;
     let mut threads = 4usize;
     let mut max_ctx = 2048usize;
@@ -89,6 +99,28 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
                 prompt_file = Some(PathBuf::from(
                     args.get(i).context("missing value for -f/--file")?,
                 ));
+            }
+            "-o" | "--output" => {
+                i += 1;
+                out_path = Some(PathBuf::from(
+                    args.get(i).context("missing value for -o/--output")?,
+                ));
+            }
+            "--tokens" => {
+                i += 1;
+                let raw = args.get(i).context("missing value for --tokens")?;
+                let mut ids = Vec::new();
+                for part in raw.split(',') {
+                    let trimmed = part.trim();
+                    if !trimmed.is_empty() {
+                        ids.push(
+                            trimmed
+                                .parse::<u32>()
+                                .context("invalid token id in --tokens")?,
+                        );
+                    }
+                }
+                explicit_tokens = Some(ids);
             }
             "-n" | "--n-predict" => {
                 i += 1;
@@ -167,6 +199,8 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
         model,
         prompt,
         prompt_file,
+        explicit_tokens,
+        out_path,
         n_predict,
         threads,
         max_ctx,
@@ -175,25 +209,200 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
     })
 }
 
-#[cfg(all(feature = "metal", target_vendor = "apple"))]
-fn cmd_run_metal(opts: RunOpts) -> Result<()> {
-    let t_load = Instant::now();
-    let gguf = std::sync::Arc::new(GgufFile::open(&opts.model)?);
-    let tok = Tokenizer::from_gguf(&gguf)?;
-    let mut runner = tm_metal::LlamaMetalRunner::from_gguf(gguf, opts.max_ctx)?;
-    let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
-
+fn resolve_prompt_ids(opts: &RunOpts, tok: &Tokenizer) -> Result<Vec<u32>> {
+    if let Some(ref ids) = opts.explicit_tokens {
+        if ids.is_empty() {
+            bail!("--tokens must contain at least 1 token id");
+        }
+        return Ok(ids.clone());
+    }
     let prompt_text = if let Some(ref fpath) = opts.prompt_file {
         std::fs::read_to_string(fpath)
             .with_context(|| format!("failed to read prompt file '{}'", fpath.display()))?
     } else {
-        opts.prompt.unwrap_or_else(|| "Hello".to_string())
+        opts.prompt.clone().unwrap_or_else(|| "Hello".to_string())
     };
-    let prompt_ids = tok.encode(&prompt_text, tok.add_bos);
-    if prompt_ids.is_empty() {
+    let ids = tok.encode(&prompt_text, tok.add_bos);
+    if ids.is_empty() {
         bail!("prompt encoded to 0 tokens");
     }
+    Ok(ids)
+}
 
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+fn print_metal_profile_report(
+    model_name: &str,
+    dev_name: &str,
+    rep: &tm_metal::MetalProfileReport,
+) {
+    let dec_tps = 1e6 / rep.decode_single_cb_wall_us.max(1e-3);
+    let host_ovh_us = (rep.decode_single_cb_wall_us - rep.decode_single_cb_gpu_us).max(0.0);
+    let sum_dec_gpu_us: f64 = rep.decode_stages.iter().map(|s| s.gpu_us).sum();
+    let total_dec_bytes: u64 = rep.decode_stages.iter().map(|s| s.bytes).sum();
+    let e2e_bw_gbs = (total_dec_bytes as f64 / 1e9) / (rep.decode_single_cb_wall_us * 1e-6);
+
+    println!("=== Metal Profile: {model_name} ({dev_name}) ===");
+    println!(
+        "Decode 1-CB E2E: wall={:.1} us/tok ({:.2} tok/s) | gpu={:.1} us/tok | host+sync={:.1} us/tok ({:.1}%) | eff_bw={:.2} GB/s",
+        rep.decode_single_cb_wall_us,
+        dec_tps,
+        rep.decode_single_cb_gpu_us,
+        host_ovh_us,
+        100.0 * host_ovh_us / rep.decode_single_cb_wall_us.max(1e-3),
+        e2e_bw_gbs,
+    );
+    println!();
+    println!(
+        "{:<28} {:>10} {:>8} {:>10} {:>12} {:>14}",
+        "Decode Stage", "GPU us", "Share%", "MiB/tok", "Eff GB/s", "Eff GFLOP/s"
+    );
+    println!("{}", "-".repeat(86));
+    for st in &rep.decode_stages {
+        let pct = 100.0 * st.gpu_us / sum_dec_gpu_us.max(1e-3);
+        let mib = st.bytes as f64 / (1024.0 * 1024.0);
+        let gbs = if st.bytes > 0 {
+            (st.bytes as f64 / 1e9) / (st.gpu_us * 1e-6)
+        } else {
+            0.0
+        };
+        let gflops = if st.flops > 0 {
+            (st.flops as f64 / 1e9) / (st.gpu_us * 1e-6)
+        } else {
+            0.0
+        };
+        println!(
+            "{:<28} {:>10.1} {:>7.1}% {:>10.2} {:>12.2} {:>14.1}",
+            st.name, st.gpu_us, pct, mib, gbs, gflops
+        );
+    }
+    println!(
+        "{:<28} {:>10.1} {:>7.1}% {:>10.2}",
+        "Sum (multi-CB)",
+        sum_dec_gpu_us,
+        100.0,
+        total_dec_bytes as f64 / (1024.0 * 1024.0)
+    );
+
+    let pp_tps = (rep.prefill_tokens as f64) / (rep.prefill_wall_ms * 1e-3).max(1e-9);
+    println!();
+    println!(
+        "Prefill pp{}: wall={:.2} ms ({:.1} tok/s)",
+        rep.prefill_tokens, rep.prefill_wall_ms, pp_tps
+    );
+    if !rep.prefill_chunk_stages.is_empty() {
+        let sum_pp_gpu_us: f64 = rep.prefill_chunk_stages.iter().map(|s| s.gpu_us).sum();
+        println!(
+            "{:<28} {:>10} {:>8} {:>10} {:>12} {:>14}",
+            "Prefill Stage", "GPU ms", "Share%", "MiB", "Eff GB/s", "Eff GFLOP/s"
+        );
+        println!("{}", "-".repeat(86));
+        for st in &rep.prefill_chunk_stages {
+            let pct = 100.0 * st.gpu_us / sum_pp_gpu_us.max(1e-3);
+            let mib = st.bytes as f64 / (1024.0 * 1024.0);
+            let gbs = if st.bytes > 0 {
+                (st.bytes as f64 / 1e9) / (st.gpu_us * 1e-6)
+            } else {
+                0.0
+            };
+            let gflops = if st.flops > 0 {
+                (st.flops as f64 / 1e9) / (st.gpu_us * 1e-6)
+            } else {
+                0.0
+            };
+            println!(
+                "{:<28} {:>10.3} {:>7.1}% {:>10.2} {:>12.2} {:>14.1}",
+                st.name,
+                st.gpu_us * 1e-3,
+                pct,
+                mib,
+                gbs,
+                gflops
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+fn cmd_run_metal(opts: RunOpts) -> Result<()> {
+    let t_load = Instant::now();
+    let gguf = std::sync::Arc::new(GgufFile::open(&opts.model)?);
+    let arch = gguf.req_str("general.architecture")?.to_string();
+    let tok = Tokenizer::from_gguf(&gguf)?;
+    let prompt_ids = resolve_prompt_ids(&opts, &tok)?;
+    let is_pure_greedy =
+        opts.sampler.temperature <= 0.0 && (opts.sampler.repeat_penalty - 1.0).abs() < 1e-6;
+
+    if arch == "qwen35" {
+        let mut runner = tm_metal::Qwen35MetalRunner::from_gguf(gguf, opts.max_ctx)?;
+        let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "[tinymodel] arch=qwen35 backend=metal ({}) weights={} load={:.1}ms prompt_tokens={} vocab={} layers={}",
+            runner.device_name(),
+            if runner.is_zero_copy_weights() {
+                "zero-copy"
+            } else {
+                "copied"
+            },
+            load_ms,
+            prompt_ids.len(),
+            runner.cfg.vocab_size,
+            runner.cfg.n_layers
+        );
+
+        let mut sampler = Sampler::new(opts.sampler, runner.cfg.vocab_size);
+        let mut history = prompt_ids.clone();
+
+        let t_pp = Instant::now();
+        runner.forward_batch(&prompt_ids, 0, true)?;
+        let mut next_id = sampler.sample(runner.logits(), &history);
+        let pp_sec = t_pp.elapsed().as_secs_f64();
+
+        let mut stdout = io::stdout().lock();
+        let mut pos = prompt_ids.len();
+        let mut generated = 0usize;
+        let t_gen = Instant::now();
+        while generated < opts.n_predict {
+            if tok.eos_id == Some(next_id) {
+                break;
+            }
+            stdout.write_all(&tok.decode_token_bytes(next_id))?;
+            stdout.flush()?;
+            history.push(next_id);
+            generated += 1;
+            if generated >= opts.n_predict {
+                break;
+            }
+            if is_pure_greedy {
+                next_id = runner.forward_token_greedy(next_id, pos)?;
+            } else {
+                runner.forward_token(next_id, pos, true)?;
+                next_id = sampler.sample(runner.logits(), &history);
+            }
+            pos += 1;
+        }
+        let gen_sec = t_gen.elapsed().as_secs_f64();
+        writeln!(stdout)?;
+        let pp_tps = (prompt_ids.len() as f64) / pp_sec.max(1e-9);
+        let tg_runs = generated.saturating_sub(1);
+        let tg_tps = if tg_runs > 0 {
+            (tg_runs as f64) / gen_sec.max(1e-9)
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[tinymodel] prompt: {:.2} ms / {} tok ({:.2} tok/s) | eval: {:.2} ms / {} runs ({:.2} tok/s)",
+            pp_sec * 1e3,
+            prompt_ids.len(),
+            pp_tps,
+            gen_sec * 1e3,
+            tg_runs,
+            tg_tps
+        );
+        return Ok(());
+    }
+
+    let mut runner = tm_metal::LlamaMetalRunner::from_gguf(gguf, opts.max_ctx)?;
+    let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
     eprintln!(
         "[tinymodel] backend=metal ({}) weights={} load={:.1}ms prompt_tokens={} vocab={} layers={}",
         runner.device_name(),
@@ -220,8 +429,6 @@ fn cmd_run_metal(opts: RunOpts) -> Result<()> {
     let mut pos = prompt_ids.len();
     let mut generated = 0usize;
 
-    let is_pure_greedy =
-        opts.sampler.temperature <= 0.0 && (opts.sampler.repeat_penalty - 1.0).abs() < 1e-6;
     let t_gen = Instant::now();
     while generated < opts.n_predict {
         if tok.eos_id == Some(next_id) {
@@ -269,23 +476,69 @@ fn cmd_run_metal(opts: RunOpts) -> Result<()> {
 fn cmd_bench_metal(opts: RunOpts) -> Result<()> {
     let t_load = Instant::now();
     let gguf = std::sync::Arc::new(GgufFile::open(&opts.model)?);
+    let arch = gguf.req_str("general.architecture")?.to_string();
+    let n_pp = 512usize.min(opts.max_ctx.saturating_sub(opts.n_predict + 2));
+    let pp_ids: Vec<u32> = (0..n_pp).map(|i| ((i % 1000) + 1) as u32).collect();
+
+    if arch == "qwen35" {
+        let mut runner = tm_metal::Qwen35MetalRunner::from_gguf(gguf, opts.max_ctx)?;
+        let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
+
+        runner.forward_token(1, 0, true)?;
+        let warmup_ids = [1u32; 8];
+        runner.reset_state();
+        runner.forward_batch(&warmup_ids, 0, false)?;
+
+        runner.reset_state();
+        let t_pp = Instant::now();
+        runner.forward_batch(&pp_ids, 0, false)?;
+        let pp_sec = t_pp.elapsed().as_secs_f64();
+        let pp_tps = (n_pp as f64) / pp_sec.max(1e-9);
+
+        runner.reset_state();
+        let mut tok = runner.forward_token_greedy(1, 0)?;
+        let n_gen = opts.n_predict;
+        let t0 = Instant::now();
+        for step in 0..n_gen {
+            tok = runner.forward_token_greedy(tok, step + 1)?;
+        }
+        let sec = t0.elapsed().as_secs_f64();
+        let tps = (n_gen as f64) / sec.max(1e-9);
+        println!(
+            "bench: model={} backend=metal ({}) weights={} load={:.1}ms pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
+            opts.model
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?"),
+            runner.device_name(),
+            if runner.is_zero_copy_weights() {
+                "zero-copy"
+            } else {
+                "copied"
+            },
+            load_ms,
+            n_pp,
+            pp_tps,
+            n_gen,
+            tps,
+            (sec * 1e3) / (n_gen as f64),
+            tok
+        );
+        return Ok(());
+    }
+
     let mut runner = tm_metal::LlamaMetalRunner::from_gguf(gguf, opts.max_ctx)?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
-    // Warmup 1 token + 1 small batch
     let _ = runner.forward_token(1, 0, true)?;
     let warmup_ids = [1u32; 8];
     let _ = runner.forward_batch(&warmup_ids, 0, false)?;
 
-    // Measure pp512 (or max_ctx - n_predict - 2 if smaller)
-    let n_pp = 512usize.min(opts.max_ctx.saturating_sub(opts.n_predict + 2));
-    let pp_ids: Vec<u32> = (0..n_pp).map(|i| ((i % 1000) + 1) as u32).collect();
     let t_pp = Instant::now();
     let _ = runner.forward_batch(&pp_ids, 0, false)?;
     let pp_sec = t_pp.elapsed().as_secs_f64();
     let pp_tps = (n_pp as f64) / pp_sec.max(1e-9);
 
-    // Measure tgN starting from pos 0 using GPU-side greedy argmax
     let mut tok = runner.forward_token_greedy(1, 0)?;
     let n_gen = opts.n_predict;
     let t0 = Instant::now();
@@ -326,24 +579,80 @@ fn cmd_run(opts: RunOpts) -> Result<()> {
     }
     let t_load = Instant::now();
     let gguf = GgufFile::open(&opts.model)?;
+    let arch = gguf.req_str("general.architecture")?.to_string();
     let tok = Tokenizer::from_gguf(&gguf)?;
-    let model = LlamaModel::from_gguf(&gguf)?;
-    let mut state = LlamaState::new(&model.cfg, opts.max_ctx);
+    let prompt_ids = resolve_prompt_ids(&opts, &tok)?;
     let pool = ThreadPool::new(opts.threads);
     let kt = active_kernels();
-    let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
-    let prompt_text = if let Some(ref fpath) = opts.prompt_file {
-        std::fs::read_to_string(fpath)
-            .with_context(|| format!("failed to read prompt file '{}'", fpath.display()))?
-    } else {
-        opts.prompt.unwrap_or_else(|| "Hello".to_string())
-    };
+    if arch == "qwen35" {
+        let model = Qwen35Model::from_gguf(&gguf)?;
+        let mut state = Qwen35State::new(&model, opts.max_ctx);
+        let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
-    let prompt_ids = tok.encode(&prompt_text, tok.add_bos);
-    if prompt_ids.is_empty() {
-        bail!("prompt encoded to 0 tokens");
+        eprintln!(
+            "[tinymodel] arch=qwen35 isa={} threads={} load={:.1}ms prompt_tokens={} vocab={} layers={} (gdn={}, full={})",
+            kt.isa.name(),
+            pool.num_threads(),
+            load_ms,
+            prompt_ids.len(),
+            model.cfg.vocab_size,
+            model.cfg.n_layers,
+            model.num_gdn_layers(),
+            model.num_full_attn_layers()
+        );
+
+        let t_pp = Instant::now();
+        model.forward_batch(&mut state, &pool, kt, &prompt_ids, 0, true)?;
+        let pp_sec = t_pp.elapsed().as_secs_f64();
+
+        let mut stdout = io::stdout().lock();
+        let mut sampler = Sampler::new(opts.sampler, model.cfg.vocab_size);
+        let mut history = prompt_ids.clone();
+        let mut next_id = sampler.sample(state.logits(), &history);
+        let mut pos = prompt_ids.len();
+        let mut generated = 0usize;
+
+        let t_gen = Instant::now();
+        while generated < opts.n_predict {
+            if tok.eos_id == Some(next_id) {
+                break;
+            }
+            stdout.write_all(&tok.decode_token_bytes(next_id))?;
+            stdout.flush()?;
+            history.push(next_id);
+            generated += 1;
+            if generated >= opts.n_predict {
+                break;
+            }
+            model.forward_token(&mut state, &pool, kt, next_id, pos, true)?;
+            next_id = sampler.sample(state.logits(), &history);
+            pos += 1;
+        }
+        let gen_sec = t_gen.elapsed().as_secs_f64();
+        writeln!(stdout)?;
+        let pp_tps = (prompt_ids.len() as f64) / pp_sec.max(1e-9);
+        let tg_runs = generated.saturating_sub(1);
+        let tg_tps = if tg_runs > 0 {
+            (tg_runs as f64) / gen_sec.max(1e-9)
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[tinymodel] prompt: {:.2} ms / {} tok ({:.2} tok/s) | eval: {:.2} ms / {} runs ({:.2} tok/s)",
+            pp_sec * 1e3,
+            prompt_ids.len(),
+            pp_tps,
+            gen_sec * 1e3,
+            tg_runs,
+            tg_tps
+        );
+        return Ok(());
     }
+
+    let model = LlamaModel::from_gguf(&gguf)?;
+    let mut state = LlamaState::new(&model.cfg, opts.max_ctx);
+    let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
     eprintln!(
         "[tinymodel] isa={} threads={} load={:.1}ms prompt_tokens={} vocab={} layers={}",
@@ -355,12 +664,10 @@ fn cmd_run(opts: RunOpts) -> Result<()> {
         model.cfg.n_layers
     );
 
-    // Prefill prompt tokens via batched GEMM
     let t_pp = Instant::now();
     model.forward_batch(&mut state, &pool, kt, &prompt_ids, 0, true)?;
     let pp_sec = t_pp.elapsed().as_secs_f64();
 
-    // Decode with Sampler (temp=0 is greedy argmax fast path)
     let mut stdout = io::stdout().lock();
     let mut sampler = Sampler::new(opts.sampler, model.cfg.vocab_size);
     let mut history = prompt_ids.clone();
@@ -373,8 +680,7 @@ fn cmd_run(opts: RunOpts) -> Result<()> {
         if tok.eos_id == Some(next_id) {
             break;
         }
-        let bytes = tok.decode_token_bytes(next_id);
-        stdout.write_all(&bytes)?;
+        stdout.write_all(&tok.decode_token_bytes(next_id))?;
         stdout.flush()?;
         history.push(next_id);
         generated += 1;
@@ -417,24 +723,65 @@ fn cmd_bench(opts: RunOpts) -> Result<()> {
         bail!("--metal requires compiling with feature 'metal' on Apple Silicon");
     }
     let gguf = GgufFile::open(&opts.model)?;
-    let model = LlamaModel::from_gguf(&gguf)?;
-    let mut state = LlamaState::new(&model.cfg, opts.max_ctx);
+    let arch = gguf.req_str("general.architecture")?.to_string();
     let pool = ThreadPool::new(opts.threads);
     let kt = active_kernels();
+    let n_pp = 512usize.min(opts.max_ctx.saturating_sub(opts.n_predict + 2));
+    let pp_ids: Vec<u32> = (0..n_pp).map(|i| ((i % 1000) + 1) as u32).collect();
 
-    // Warmup 1 token + 1 small batch
+    if arch == "qwen35" {
+        let model = Qwen35Model::from_gguf(&gguf)?;
+        let mut state = Qwen35State::new(&model, opts.max_ctx);
+
+        model.forward_token(&mut state, &pool, kt, 1, 0, true)?;
+        state.reset();
+        model.forward_batch(&mut state, &pool, kt, &[1u32; 8], 0, false)?;
+
+        state.reset();
+        let t_pp = Instant::now();
+        model.forward_batch(&mut state, &pool, kt, &pp_ids, 0, false)?;
+        let pp_tps = (n_pp as f64) / t_pp.elapsed().as_secs_f64().max(1e-9);
+
+        state.reset();
+        model.forward_token(&mut state, &pool, kt, 1, 0, true)?;
+        let mut tok = argmax(state.logits());
+        let n_gen = opts.n_predict;
+        let t0 = Instant::now();
+        for step in 0..n_gen {
+            model.forward_token(&mut state, &pool, kt, tok, step + 1, true)?;
+            tok = argmax(state.logits());
+        }
+        let sec = t0.elapsed().as_secs_f64();
+        let tps = (n_gen as f64) / sec.max(1e-9);
+        println!(
+            "bench: model={} isa={} threads={} pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
+            opts.model
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?"),
+            kt.isa.name(),
+            pool.num_threads(),
+            n_pp,
+            pp_tps,
+            n_gen,
+            tps,
+            (sec * 1e3) / (n_gen as f64),
+            tok
+        );
+        return Ok(());
+    }
+
+    let model = LlamaModel::from_gguf(&gguf)?;
+    let mut state = LlamaState::new(&model.cfg, opts.max_ctx);
+
     model.forward_token(&mut state, &pool, kt, 1, 0, true)?;
     let warm_ids = [1u32; 8];
     model.forward_batch(&mut state, &pool, kt, &warm_ids, 0, false)?;
 
-    // Measure pp512
-    let n_pp = 512usize.min(opts.max_ctx.saturating_sub(opts.n_predict + 2));
-    let pp_ids: Vec<u32> = (0..n_pp).map(|i| ((i % 1000) + 1) as u32).collect();
     let t_pp = Instant::now();
     model.forward_batch(&mut state, &pool, kt, &pp_ids, 0, false)?;
     let pp_tps = (n_pp as f64) / t_pp.elapsed().as_secs_f64().max(1e-9);
 
-    // Measure tgN starting from pos 0
     model.forward_token(&mut state, &pool, kt, 1, 0, true)?;
     let mut tok = argmax(state.logits());
 
@@ -470,102 +817,24 @@ fn cmd_profile_metal(opts: RunOpts) -> Result<()> {
         .model
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("?");
+        .unwrap_or("?")
+        .to_string();
     let gguf = std::sync::Arc::new(GgufFile::open(&opts.model)?);
-    let mut runner = tm_metal::LlamaMetalRunner::from_gguf(gguf, opts.max_ctx)?;
+    let arch = gguf.req_str("general.architecture")?.to_string();
     let n_runs = opts.n_predict.max(16);
+
+    if arch == "qwen35" {
+        let mut runner = tm_metal::Qwen35MetalRunner::from_gguf(gguf, opts.max_ctx)?;
+        let dev = runner.device_name();
+        let rep = runner.profile(n_runs, 512)?;
+        print_metal_profile_report(&model_name, &dev, &rep);
+        return Ok(());
+    }
+
+    let mut runner = tm_metal::LlamaMetalRunner::from_gguf(gguf, opts.max_ctx)?;
+    let dev = runner.device_name();
     let rep = runner.profile(n_runs, 512)?;
-
-    let dec_tps = 1e6 / rep.decode_single_cb_wall_us.max(1e-3);
-    let host_ovh_us = (rep.decode_single_cb_wall_us - rep.decode_single_cb_gpu_us).max(0.0);
-    let sum_dec_gpu_us: f64 = rep.decode_stages.iter().map(|s| s.gpu_us).sum();
-    let total_dec_bytes: u64 = rep.decode_stages.iter().map(|s| s.bytes).sum();
-    let e2e_bw_gbs = (total_dec_bytes as f64 / 1e9) / (rep.decode_single_cb_wall_us * 1e-6);
-
-    println!(
-        "=== Metal Profile: {model_name} ({}) ===",
-        runner.device_name()
-    );
-    println!(
-        "Decode 1-CB E2E: wall={:.1} us/tok ({:.2} tok/s) | gpu={:.1} us/tok | host+sync={:.1} us/tok ({:.1}%) | eff_bw={:.2} GB/s",
-        rep.decode_single_cb_wall_us,
-        dec_tps,
-        rep.decode_single_cb_gpu_us,
-        host_ovh_us,
-        100.0 * host_ovh_us / rep.decode_single_cb_wall_us.max(1e-3),
-        e2e_bw_gbs,
-    );
-    println!();
-    println!(
-        "{:<20} {:>10} {:>8} {:>10} {:>12} {:>14}",
-        "Decode Stage", "GPU us", "Share%", "MiB/tok", "Eff GB/s", "Eff GFLOP/s"
-    );
-    println!("{}", "-".repeat(78));
-    for st in &rep.decode_stages {
-        let pct = 100.0 * st.gpu_us / sum_dec_gpu_us.max(1e-3);
-        let mib = st.bytes as f64 / (1024.0 * 1024.0);
-        let gbs = if st.bytes > 0 {
-            (st.bytes as f64 / 1e9) / (st.gpu_us * 1e-6)
-        } else {
-            0.0
-        };
-        let gflops = if st.flops > 0 {
-            (st.flops as f64 / 1e9) / (st.gpu_us * 1e-6)
-        } else {
-            0.0
-        };
-        println!(
-            "{:<20} {:>10.1} {:>7.1}% {:>10.2} {:>12.2} {:>14.1}",
-            st.name, st.gpu_us, pct, mib, gbs, gflops
-        );
-    }
-    println!(
-        "{:<20} {:>10.1} {:>7.1}% {:>10.2}",
-        "Sum (multi-CB)",
-        sum_dec_gpu_us,
-        100.0,
-        total_dec_bytes as f64 / (1024.0 * 1024.0)
-    );
-
-    let pp_tps = (rep.prefill_tokens as f64) / (rep.prefill_wall_ms * 1e-3).max(1e-9);
-    let sum_pp_gpu_us: f64 = rep.prefill_chunk_stages.iter().map(|s| s.gpu_us).sum();
-    println!();
-    println!(
-        "Prefill pp{}: wall={:.2} ms ({:.1} tok/s) | profiled chunk B={} (gpu_sum={:.2} ms/chunk):",
-        rep.prefill_tokens,
-        rep.prefill_wall_ms,
-        pp_tps,
-        rep.prefill_chunk_tokens,
-        sum_pp_gpu_us * 1e-3
-    );
-    println!(
-        "{:<20} {:>10} {:>8} {:>10} {:>12} {:>14}",
-        "Prefill Stage", "GPU ms", "Share%", "MiB", "Eff GB/s", "Eff GFLOP/s"
-    );
-    println!("{}", "-".repeat(78));
-    for st in &rep.prefill_chunk_stages {
-        let pct = 100.0 * st.gpu_us / sum_pp_gpu_us.max(1e-3);
-        let mib = st.bytes as f64 / (1024.0 * 1024.0);
-        let gbs = if st.bytes > 0 {
-            (st.bytes as f64 / 1e9) / (st.gpu_us * 1e-6)
-        } else {
-            0.0
-        };
-        let gflops = if st.flops > 0 {
-            (st.flops as f64 / 1e9) / (st.gpu_us * 1e-6)
-        } else {
-            0.0
-        };
-        println!(
-            "{:<20} {:>10.3} {:>7.1}% {:>10.2} {:>12.2} {:>14.1}",
-            st.name,
-            st.gpu_us * 1e-3,
-            pct,
-            mib,
-            gbs,
-            gflops
-        );
-    }
+    print_metal_profile_report(&model_name, &dev, &rep);
     Ok(())
 }
 
@@ -583,17 +852,78 @@ fn cmd_profile(opts: RunOpts) -> Result<()> {
         .and_then(|s| s.to_str())
         .unwrap_or("?");
     let gguf = GgufFile::open(&opts.model)?;
-    let model = LlamaModel::from_gguf(&gguf)?;
-    let mut state = LlamaState::new(&model.cfg, opts.max_ctx);
+    let arch = gguf.req_str("general.architecture")?.to_string();
     let pool = ThreadPool::new(opts.threads);
     let kt = active_kernels();
 
-    // Warmup
+    if arch == "qwen35" {
+        let model = Qwen35Model::from_gguf(&gguf)?;
+        let mut state = Qwen35State::new(&model, opts.max_ctx);
+        for i in 0..4 {
+            model.forward_token(&mut state, &pool, kt, 1, i, true)?;
+        }
+        state.reset();
+        let n_pp = 64usize.min(opts.max_ctx / 2);
+        let pp_ids = vec![1u32; n_pp];
+        let t_pp = Instant::now();
+        model.forward_batch(&mut state, &pool, kt, &pp_ids, 0, true)?;
+        let pp_ms = t_pp.elapsed().as_secs_f64() * 1e3;
+        let pp_tps = (n_pp as f64) / (pp_ms * 1e-3).max(1e-9);
+
+        let n_runs = opts.n_predict.max(16);
+        let mut prof = Qwen35DecodeProfile::default();
+        let mut tok = argmax(state.logits());
+        let t_dec = Instant::now();
+        for step in 0..n_runs {
+            model.forward_token_profiled(&mut state, &pool, kt, tok, n_pp + step, &mut prof)?;
+            tok = argmax(state.logits());
+        }
+        let total_ns = t_dec.elapsed().as_nanos() as u64;
+        let runs_f = prof.n_steps as f64;
+        let total_us = (total_ns as f64 / 1e3) / runs_f;
+        let dec_tps = 1e6 / total_us.max(1e-3);
+
+        println!(
+            "=== CPU Profile (Qwen3.5 Hybrid): {} (isa={}, threads={}) ===",
+            model_name,
+            kt.isa.name(),
+            pool.num_threads()
+        );
+        println!(
+            "Prefill pp{}: {:.2} ms ({:.2} tok/s) | Decode tg{}: {:.1} us/tok ({:.2} tok/s)",
+            n_pp, pp_ms, pp_tps, n_runs, total_us, dec_tps
+        );
+        println!("{:<22} {:>10} {:>8}", "Decode Stage", "Wall us", "Share%");
+        println!("{}", "-".repeat(44));
+        let rows = [
+            ("embed+rope_tbl", prof.embed_ns),
+            ("rms_norm", prof.rms_norm_ns),
+            ("gdn_proj", prof.gdn_proj_ns),
+            ("gdn_conv_l2", prof.gdn_conv_norm_ns),
+            ("gdn_recur+gnorm", prof.gdn_recur_ns),
+            ("gdn_ssm_out (Q5_K)", prof.gdn_out_ns),
+            ("full_qkv", prof.full_qkv_ns),
+            ("full_attn", prof.full_attn_ns),
+            ("full_wo", prof.full_wo_ns),
+            ("ffn_gate_up+silu", prof.ffn_gate_up_ns),
+            ("ffn_down", prof.ffn_down_ns),
+            ("lm_head (Q6_K)", prof.lm_head_ns),
+        ];
+        for (name, ns) in rows {
+            let us = (ns as f64 / 1e3) / runs_f;
+            let pct = 100.0 * (ns as f64) / (total_ns as f64).max(1.0);
+            println!("{:<22} {:>10.1} {:>7.1}%", name, us, pct);
+        }
+        return Ok(());
+    }
+
+    let model = LlamaModel::from_gguf(&gguf)?;
+    let mut state = LlamaState::new(&model.cfg, opts.max_ctx);
+
     for i in 0..4 {
         model.forward_token(&mut state, &pool, kt, 1, i, true)?;
     }
 
-    // Measure CPU batched prefill (64 tokens, compute last logits)
     let n_pp = 64usize.min(opts.max_ctx / 2);
     let pp_ids = vec![1u32; n_pp];
     let t_pp = Instant::now();
@@ -601,7 +931,6 @@ fn cmd_profile(opts: RunOpts) -> Result<()> {
     let pp_ms = t_pp.elapsed().as_secs_f64() * 1e3;
     let pp_tps = (n_pp as f64) / (pp_ms * 1e-3).max(1e-9);
 
-    // Measure profiled decode over `n_runs` tokens starting at pos 64 (realistic KV context)
     let n_runs = opts.n_predict.max(16);
     let mut prof = CpuDecodeProfile::default();
     let mut tok = argmax(state.logits());
@@ -678,6 +1007,139 @@ fn cmd_profile(opts: RunOpts) -> Result<()> {
     Ok(())
 }
 
+fn write_f32_le(w: &mut BufWriter<File>, slice: &[f32]) -> Result<()> {
+    for &v in slice {
+        w.write_all(&v.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+/// Evaluates a multi-token sequence and writes full `[n_steps, vocab_size]` FP32 logits
+/// in `TMLG` v1 binary format for `tools/logits_diff.py` (`AGENTS.md` Rule #7).
+fn cmd_logits(opts: RunOpts) -> Result<()> {
+    let out_path = opts
+        .out_path
+        .clone()
+        .context("logits requires -o <out.bin>")?;
+    let gguf = std::sync::Arc::new(GgufFile::open(&opts.model)?);
+    let arch = gguf.req_str("general.architecture")?.to_string();
+    let tok = Tokenizer::from_gguf(&gguf)?;
+    let input_ids = resolve_prompt_ids(&opts, &tok)?;
+    let n_steps = input_ids.len();
+
+    let file = File::create(&out_path)
+        .with_context(|| format!("failed to create '{}'", out_path.display()))?;
+    let mut writer = BufWriter::new(file);
+
+    if opts.use_metal {
+        #[cfg(all(feature = "metal", target_vendor = "apple"))]
+        {
+            if arch == "qwen35" {
+                let mut runner = tm_metal::Qwen35MetalRunner::from_gguf(gguf, opts.max_ctx)?;
+                let vocab = runner.cfg.vocab_size as u32;
+                writer.write_all(b"TMLG")?;
+                writer.write_all(&1u32.to_le_bytes())?;
+                writer.write_all(&(n_steps as u32).to_le_bytes())?;
+                writer.write_all(&vocab.to_le_bytes())?;
+                for &id in &input_ids {
+                    writer.write_all(&id.to_le_bytes())?;
+                }
+                for (pos, &id) in input_ids.iter().enumerate() {
+                    runner.forward_token(id, pos, true)?;
+                    write_f32_le(&mut writer, runner.logits())?;
+                }
+                writer.flush()?;
+                eprintln!(
+                    "[tinymodel logits] wrote {} steps x {} vocab (metal qwen35) -> {}",
+                    n_steps,
+                    vocab,
+                    out_path.display()
+                );
+                return Ok(());
+            } else {
+                let mut runner = tm_metal::LlamaMetalRunner::from_gguf(gguf, opts.max_ctx)?;
+                let vocab = runner.cfg.vocab_size as u32;
+                writer.write_all(b"TMLG")?;
+                writer.write_all(&1u32.to_le_bytes())?;
+                writer.write_all(&(n_steps as u32).to_le_bytes())?;
+                writer.write_all(&vocab.to_le_bytes())?;
+                for &id in &input_ids {
+                    writer.write_all(&id.to_le_bytes())?;
+                }
+                for (pos, &id) in input_ids.iter().enumerate() {
+                    let logits = runner.forward_token(id, pos, true)?;
+                    write_f32_le(&mut writer, logits)?;
+                }
+                writer.flush()?;
+                eprintln!(
+                    "[tinymodel logits] wrote {} steps x {} vocab (metal {}) -> {}",
+                    n_steps,
+                    vocab,
+                    arch,
+                    out_path.display()
+                );
+                return Ok(());
+            }
+        }
+        #[cfg(not(all(feature = "metal", target_vendor = "apple")))]
+        bail!("--metal requires compiling with feature 'metal' on Apple Silicon");
+    }
+
+    let pool = ThreadPool::new(opts.threads);
+    let kt = active_kernels();
+
+    if arch == "qwen35" {
+        let model = Qwen35Model::from_gguf(&gguf)?;
+        let mut state = Qwen35State::new(&model, opts.max_ctx);
+        let vocab = model.cfg.vocab_size as u32;
+        writer.write_all(b"TMLG")?;
+        writer.write_all(&1u32.to_le_bytes())?;
+        writer.write_all(&(n_steps as u32).to_le_bytes())?;
+        writer.write_all(&vocab.to_le_bytes())?;
+        for &id in &input_ids {
+            writer.write_all(&id.to_le_bytes())?;
+        }
+        for (pos, &id) in input_ids.iter().enumerate() {
+            model.forward_token(&mut state, &pool, kt, id, pos, true)?;
+            write_f32_le(&mut writer, state.logits())?;
+        }
+        writer.flush()?;
+        eprintln!(
+            "[tinymodel logits] wrote {} steps x {} vocab (cpu/{} qwen35) -> {}",
+            n_steps,
+            vocab,
+            kt.isa.name(),
+            out_path.display()
+        );
+        return Ok(());
+    }
+
+    let model = LlamaModel::from_gguf(&gguf)?;
+    let mut state = LlamaState::new(&model.cfg, opts.max_ctx);
+    let vocab = model.cfg.vocab_size as u32;
+    writer.write_all(b"TMLG")?;
+    writer.write_all(&1u32.to_le_bytes())?;
+    writer.write_all(&(n_steps as u32).to_le_bytes())?;
+    writer.write_all(&vocab.to_le_bytes())?;
+    for &id in &input_ids {
+        writer.write_all(&id.to_le_bytes())?;
+    }
+    for (pos, &id) in input_ids.iter().enumerate() {
+        model.forward_token(&mut state, &pool, kt, id, pos, true)?;
+        write_f32_le(&mut writer, state.logits())?;
+    }
+    writer.flush()?;
+    eprintln!(
+        "[tinymodel logits] wrote {} steps x {} vocab (cpu/{} {}) -> {}",
+        n_steps,
+        vocab,
+        kt.isa.name(),
+        arch,
+        out_path.display()
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -693,6 +1155,7 @@ fn main() -> Result<()> {
         "run" => cmd_run(parse_run_opts(&args[2..])?),
         "bench" => cmd_bench(parse_run_opts(&args[2..])?),
         "profile" => cmd_profile(parse_run_opts(&args[2..])?),
+        "logits" => cmd_logits(parse_run_opts(&args[2..])?),
         "-h" | "--help" => {
             print_usage();
             Ok(())

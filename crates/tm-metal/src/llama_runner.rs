@@ -165,6 +165,7 @@ struct Pipelines {
     gemv_pair_silu_q4_0: MtlPipe,
     gemv_q4_1: MtlPipe,
     gemv_q8_0: MtlPipe,
+    gemv_q5_k: MtlPipe,
     gemv_q6_k: MtlPipe,
     argmax: MtlPipe,
     // Batched prefill pipelines
@@ -177,10 +178,12 @@ struct Pipelines {
     rope_kv_batch: MtlPipe,
     gqa_attn_batch: MtlPipe,
     fa_gqa_batch: MtlPipe,
+    fa_gqa_batch_hd256: MtlPipe,
     gemm_q4_0: MtlPipe,
     silu_mul: MtlPipe,
     gemm_q4_1: MtlPipe,
     gemm_q8_0: MtlPipe,
+    gemm_q5_k: MtlPipe,
     gemm_q6_k: MtlPipe,
 }
 
@@ -332,7 +335,7 @@ fn load_gpu_mat(
 ) -> Result<GpuMat, MetalError> {
     let (info, bytes) = gguf.req_tensor(name, layer, &[cols, rows])?;
     match info.dtype {
-        DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q6K | DType::F32 => {}
+        DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q5K | DType::Q6K | DType::F32 => {}
         other => return Err(MetalError::UnsupportedDType(other)),
     }
     let (buf, offset) = if let Some(shared) = shared_weights {
@@ -442,6 +445,7 @@ impl LlamaMetalRunner {
             gemv_pair_silu_q4_0: build_pipe(&device, &lib, "gemv_pair_silu_q4_0", 128)?,
             gemv_q4_1: build_pipe(&device, &lib, "gemv_q4_1_res", 128)?,
             gemv_q8_0: build_pipe(&device, &lib, "gemv_q8_0_res", 128)?,
+            gemv_q5_k: build_pipe(&device, &lib, "gemv_q5_k_res", 128)?,
             gemv_q6_k: build_pipe(&device, &lib, "gemv_q6_k_res", 128)?,
             argmax: build_pipe(&device, &lib, "argmax_f32", 256)?,
             embed_q4_0_batch: build_pipe(&device, &lib, "embed_q4_0_batch", 64)?,
@@ -453,10 +457,12 @@ impl LlamaMetalRunner {
             rope_kv_batch: build_pipe(&device, &lib, "rope_and_kv_store_f16_batch", 64)?,
             gqa_attn_batch: build_pipe(&device, &lib, "gqa_attn_f16_kv_batch", 128)?,
             fa_gqa_batch: build_pipe(&device, &lib, "fa_gqa_f16_kv_batch", 128)?,
+            fa_gqa_batch_hd256: build_pipe(&device, &lib, "fa_gqa_f16_kv_batch_hd256", 128)?,
             gemm_q4_0: build_pipe(&device, &lib, "gemm_q4_0_res", 128)?,
             silu_mul: build_pipe(&device, &lib, "silu_mul_f32", 256)?,
             gemm_q4_1: build_pipe(&device, &lib, "gemm_q4_1_res", 128)?,
             gemm_q8_0: build_pipe(&device, &lib, "gemm_q8_0_res", 128)?,
+            gemm_q5_k: build_pipe(&device, &lib, "gemm_q5_k_res", 128)?,
             gemm_q6_k: build_pipe(&device, &lib, "gemm_q6_k_res", 128)?,
         };
 
@@ -690,6 +696,7 @@ impl LlamaMetalRunner {
             DType::Q4_0 => (&self.pipes.gemv_q4_0, 32),
             DType::Q4_1 => (&self.pipes.gemv_q4_1, 32),
             DType::Q8_0 => (&self.pipes.gemv_q8_0, 16),
+            DType::Q5K => (&self.pipes.gemv_q5_k, 8),
             DType::Q6K => (&self.pipes.gemv_q6_k, 16),
             other => return Err(MetalError::UnsupportedDType(other)),
         };
@@ -834,7 +841,7 @@ impl LlamaMetalRunner {
         b: usize,
     ) {
         const TG: usize = 128;
-        if self.cfg.head_dim <= 128 && self.cfg.head_dim.is_multiple_of(8) {
+        if self.cfg.head_dim <= 256 && self.cfg.head_dim.is_multiple_of(8) {
             const BQ: usize = 32;
             let fa = FlashAttnArgs {
                 n_head: self.cfg.n_head as u32,
@@ -843,7 +850,12 @@ impl LlamaMetalRunner {
                 seq_len: (chunk_pos + 1) as u32,
                 n_tok: b as u32,
             };
-            enc.setComputePipelineState(&self.pipes.fa_gqa_batch);
+            let fa_pipe = if self.cfg.head_dim <= 128 {
+                &self.pipes.fa_gqa_batch
+            } else {
+                &self.pipes.fa_gqa_batch_hd256
+            };
+            enc.setComputePipelineState(fa_pipe);
             // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
             unsafe {
                 enc.setBuffer_offset_atIndex(Some(&self.q), 0, 0);
@@ -916,6 +928,7 @@ impl LlamaMetalRunner {
             DType::Q4_0 => (&self.pipes.gemm_q4_0, 32, 32),
             DType::Q4_1 => (&self.pipes.gemm_q4_1, 32, 32),
             DType::Q8_0 => (&self.pipes.gemm_q8_0, 4, 8),
+            DType::Q5K => (&self.pipes.gemm_q5_k, 4, 8),
             DType::Q6K => (&self.pipes.gemm_q6_k, 4, 8),
             other => return Err(MetalError::UnsupportedDType(other)),
         };

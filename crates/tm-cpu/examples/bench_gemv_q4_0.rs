@@ -4,7 +4,9 @@
 //!   cargo run --release -p tm-cpu --example bench_gemv_q4_0
 
 use std::time::Instant;
-use tm_core::{BlockQ4_0, BlockQ8_0, QK4_0, f32_to_f16};
+use tm_core::{
+    BlockQ4_0, BlockQ5K, BlockQ8_0, BlockQ8K, QK_K, QK4_0, f32_to_f16, quantize_row_q8_k,
+};
 use tm_cpu::isa::supported_isas;
 use tm_cpu::{ThreadPool, select_kernels};
 
@@ -178,6 +180,60 @@ fn main() {
             q_us,
             kv_us,
             acc
+        );
+    }
+
+    // Benchmark Q5_K x Q8_K GEMV on Qwen3.5 `ssm_out.weight` shape (2048 x 2048)
+    let q5_rows = 2048usize;
+    let q5_cols = 2048usize;
+    let q5_nb = q5_cols / QK_K;
+    let w_q5: Vec<BlockQ5K> = (0..q5_rows * q5_nb)
+        .map(|i| BlockQ5K {
+            d: f32_to_f16(0.03125),
+            dmin: f32_to_f16(0.015625),
+            scales: [(i & 0x3F) as u8; 12],
+            qh: [0x55; 32],
+            qs: [0x96; 128],
+        })
+        .collect();
+    let mut x_q8k = vec![
+        BlockQ8K {
+            d: 0.0,
+            qs: [0; 256],
+            bsums: [0; 16]
+        };
+        q5_nb
+    ];
+    quantize_row_q8_k(&src_f32[..q5_cols], &mut x_q8k);
+    let q5_bytes = (q5_rows * q5_nb * core::mem::size_of::<BlockQ5K>()) as f64;
+    let pool4 = ThreadPool::new(4);
+    println!("\n--- Q5_K x Q8_K GEMV (2048x2048, 4 threads) ---");
+    for &isa in &isas {
+        let kt = select_kernels(isa);
+        let mut out_q5 = vec![0.0f32; q5_rows];
+        let out_ptr = out_q5.as_mut_ptr() as usize;
+        let run_q5 = || {
+            pool4.parallel_for(q5_rows, 512, |r0, r1| {
+                let len = r1 - r0;
+                // SAFETY: Disjoint `[r0..r1)` per worker.
+                let o =
+                    unsafe { core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(r0), len) };
+                (kt.gemv_q5_k_q8_k)(&w_q5[r0 * q5_nb..r1 * q5_nb], &x_q8k, o, len, q5_nb);
+            });
+        };
+        run_q5();
+        let iters = if isa == tm_cpu::Isa::Generic { 10 } else { 50 };
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            run_q5();
+        }
+        let sec = t0.elapsed().as_secs_f64() / (iters as f64);
+        println!(
+            "{:<10} {:>7.3} ms | {:>6.2} GB/s | checksum={:.2}",
+            isa.name(),
+            sec * 1e3,
+            (q5_bytes / sec) / 1e9,
+            out_q5.iter().take(8).sum::<f32>()
         );
     }
 }
