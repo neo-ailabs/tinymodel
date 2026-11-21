@@ -179,6 +179,22 @@ impl MetadataValue {
             _ => None,
         }
     }
+
+    pub fn as_usize_array(&self) -> Option<Vec<usize>> {
+        match self {
+            MetadataValue::U32Array(v) => Some(v.iter().map(|&x| x as usize).collect()),
+            MetadataValue::I32Array(v) => v.iter().map(|&x| usize::try_from(x).ok()).collect(),
+            MetadataValue::Array(items) => items.iter().map(|v| v.as_usize()).collect(),
+            _ => None,
+        }
+    }
+
+    pub fn as_bool_array(&self) -> Option<Vec<bool>> {
+        match self {
+            MetadataValue::Array(items) => items.iter().map(|v| v.as_bool()).collect(),
+            _ => None,
+        }
+    }
 }
 
 /// Zero-copy iterator over a GGUF metadata string array (`StringSpans` or `Array`).

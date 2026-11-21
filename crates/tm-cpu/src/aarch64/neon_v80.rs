@@ -1207,6 +1207,40 @@ unsafe fn sum_sq_8wide_neon(x: &[f32]) -> f32 {
     }
 }
 
+/// ARMv8.0 NEON `f32 x bf16` dot product matching `generic::dot_f32_bf16` bit-for-bit.
+///
+/// # Safety
+/// Caller must ensure NEON is available.
+#[target_feature(enable = "neon")]
+pub unsafe fn dot_f32_bf16(x: &[f32], w_bf16: &[u16]) -> f32 {
+    let n = x.len();
+    assert_eq!(w_bf16.len(), n);
+    let chunks8 = n / 8;
+    // SAFETY: `x` and `w_bf16` both have length `n`; `c * 8 + 8 <= n`.
+    unsafe {
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let xp = x.as_ptr();
+        let wp = w_bf16.as_ptr();
+        for c in 0..chunks8 {
+            let off = c * 8;
+            let raw8 = vld1q_u16(wp.add(off));
+            let w0 = vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(raw8)));
+            let w1 = vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_high_u16(raw8)));
+            let x0 = vld1q_f32(xp.add(off));
+            let x1 = vld1q_f32(xp.add(off + 4));
+            acc0 = vfmaq_f32(acc0, w0, x0);
+            acc1 = vfmaq_f32(acc1, w1, x1);
+        }
+        let mut sum = hsum_pairwise_8wide_f32(acc0, acc1);
+        for i in chunks8 * 8..n {
+            let w = f32::from_bits((*wp.add(i) as u32) << 16);
+            sum = w.mul_add(*xp.add(i), sum);
+        }
+        sum
+    }
+}
+
 /// ARMv8.0 NEON `rms_norm_f32` matching `generic::rms_norm_f32` bit-for-bit.
 ///
 /// # Safety

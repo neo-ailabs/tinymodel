@@ -434,12 +434,23 @@ fn main() {
         }
         let rms_us = t_r.elapsed().as_secs_f64() * 1e6 / 2000.0;
 
+        let bf16_row: Vec<u16> = (0..1536)
+            .map(|i| 0x3F00u16.wrapping_add(i as u16 & 0x7F))
+            .collect();
+        let t_bf = Instant::now();
+        let mut bf_acc = 0.0f32;
+        for _ in 0..2000 {
+            bf_acc += (kt.dot_f32_bf16)(&src_f32[..1536], &bf16_row);
+        }
+        let bf_us = t_bf.elapsed().as_secs_f64() * 1e6 / 2000.0;
+
         println!(
-            "{:<10} gdn_recur_16h={:>6.2} us/layer | rms_norm(2048)={:>5.3} us | chk={:.3}",
+            "{:<10} gdn_recur_16h={:>6.2} us/layer | rms_norm(2048)={:>5.3} us | dot_bf16(1536)={:>5.3} us | chk={:.3}",
             isa.name(),
             gdn_us,
             rms_us,
-            o_all[0] + rms_out[0]
+            bf_us,
+            o_all[0] + rms_out[0] + bf_acc * 1e-6
         );
     }
 }

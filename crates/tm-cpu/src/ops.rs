@@ -6,7 +6,7 @@
 
 use tm_core::{
     BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, DType, QK_K, QK4_0,
-    QK4_1, QK8_0, f16_to_f32, quantize_row_q8_k,
+    QK4_1, QK8_0, quantize_row_q8_k,
 };
 
 use crate::{KernelTable, ThreadPool, generic};
@@ -273,11 +273,26 @@ pub fn matvec_f32(
                     unsafe { core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(r0), len) };
                 for i in 0..len {
                     let row = &w[(r0 + i) * cols..(r0 + i + 1) * cols];
-                    let mut sum = 0.0f32;
-                    for (&wh, &xv) in row.iter().zip(x.iter()) {
-                        sum += f16_to_f32(wh) * xv;
-                    }
-                    o[i] = sum;
+                    o[i] = (kt.dot_f32_f16)(x, row);
+                }
+            });
+        }
+        DType::BF16 => {
+            assert!(
+                (w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<u16>()),
+                "BF16 tensor pointer misaligned"
+            );
+            // SAFETY: Length and alignment verified above.
+            let w: &[u16] =
+                unsafe { core::slice::from_raw_parts(w_bytes.as_ptr() as *const u16, rows * cols) };
+            pool.parallel_for(rows, chunk, |r0, r1| {
+                let len = r1 - r0;
+                // SAFETY: Disjoint `[r0..r1)` output ranges per parallel chunk.
+                let o =
+                    unsafe { core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(r0), len) };
+                for i in 0..len {
+                    let row = &w[(r0 + i) * cols..(r0 + i + 1) * cols];
+                    o[i] = (kt.dot_f32_bf16)(x, row);
                 }
             });
         }
@@ -416,6 +431,59 @@ pub fn swiglu_inplace_parallel(pool: &ThreadPool, gate: &mut [f32], up: &[f32]) 
             swiglu_inplace(g_slice, &up[s..e]);
         }
     });
+}
+
+/// Exact ggml tanh-approximation GELU: `0.5 * x * (1 + tanh(sqrt(2/pi) * x * (1 + 0.044715 * x^2)))`.
+#[inline]
+pub fn gelu_tanh_f32(x: f32) -> f32 {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+    const GELU_COEF_A: f32 = 0.044_715;
+    0.5 * x * (1.0 + (SQRT_2_OVER_PI * x * (1.0 + GELU_COEF_A * x * x)).tanh())
+}
+
+/// In-place GeGLU activation (`gate[i] = gelu_tanh(gate[i]) * up[i]`), matching `LLM_FFN_GELU` in ggml.
+pub fn geglu_inplace(gate: &mut [f32], up: &[f32]) {
+    debug_assert_eq!(gate.len(), up.len());
+    for (g, &u) in gate.iter_mut().zip(up.iter()) {
+        *g = gelu_tanh_f32(*g) * u;
+    }
+}
+
+/// Multi-threaded in-place GeGLU activation (`gate[i] = gelu_tanh(gate[i]) * up[i]`).
+pub fn geglu_inplace_parallel(pool: &ThreadPool, gate: &mut [f32], up: &[f32]) {
+    let n = gate.len();
+    assert_eq!(n, up.len());
+    if pool.num_threads() == 1 || n < 2048 {
+        geglu_inplace(gate, up);
+        return;
+    }
+    let gate_ptr = gate.as_mut_ptr() as usize;
+    let blocks64 = n.div_ceil(64);
+    let chunk_blocks = dynamic_row_chunk(blocks64, pool.num_threads());
+    pool.parallel_for(blocks64, chunk_blocks, |b0, b1| {
+        let s = b0 * 64;
+        let e = (b1 * 64).min(n);
+        if s < e {
+            // SAFETY: Disjoint `[s..e)` slices of `gate`.
+            let g_slice =
+                unsafe { core::slice::from_raw_parts_mut((gate_ptr as *mut f32).add(s), e - s) };
+            geglu_inplace(g_slice, &up[s..e]);
+        }
+    });
+}
+
+/// In-place unit-weight RMS normalization (`x[i] /= sqrt(mean(x^2) + eps)`), matching `ggml_rms_norm`.
+#[inline]
+pub fn rms_norm_unit_inplace(x: &mut [f32], eps: f32) {
+    if x.is_empty() {
+        return;
+    }
+    let n = x.len() as f32;
+    (crate::registry::active_kernels().l2_norm_f32)(x, eps * n);
+    let sqrt_n = n.sqrt();
+    for v in x.iter_mut() {
+        *v *= sqrt_n;
+    }
 }
 
 /// In-place numerically stable softmax.
@@ -1122,6 +1190,29 @@ pub fn matmul_f32(
                 }
             });
         }
+        DType::BF16 => {
+            assert!(
+                (w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<u16>()),
+                "BF16 tensor pointer misaligned"
+            );
+            // SAFETY: Length and alignment verified above.
+            let w: &[u16] =
+                unsafe { core::slice::from_raw_parts(w_bytes.as_ptr() as *const u16, rows * cols) };
+            let out_ptr = out.as_mut_ptr() as usize;
+            let chunk = dynamic_row_chunk(rows, pool.num_threads());
+            pool.parallel_for(rows, chunk, |r0, r1| {
+                for r in r0..r1 {
+                    let wr = &w[r * cols..(r + 1) * cols];
+                    for t in 0..n_tok {
+                        let xt = &x[t * cols..(t + 1) * cols];
+                        // SAFETY: Unique `(t, r)` element per worker `r`.
+                        unsafe {
+                            *(out_ptr as *mut f32).add(t * rows + r) = (kt.dot_f32_bf16)(xt, wr);
+                        }
+                    }
+                }
+            });
+        }
         _ => {
             for t in 0..n_tok {
                 matvec_f32(
@@ -1224,6 +1315,181 @@ pub fn gqa_attention_f16_kv_batch_parallel(
                 let v_off = step * kv_dim + kv_h * head_dim;
                 let vh = &v_cache[v_off..v_off + head_dim];
                 (kt.axpy_f32_f16)(oh, w, vh);
+            }
+        }
+    });
+}
+
+/// Extended single-token GQA attention supporting custom pre-softmax `attn_scale` (e.g. `1.0` on Gemma 4)
+/// and optional standard sliding-window `window` (`pos - step < window`, i.e. `[pos + 1 - window ..= pos]`).
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_f16_kv_ext_parallel(
+    pool: &ThreadPool,
+    kt: &KernelTable,
+    out: &mut [f32],
+    q: &[f32],
+    k_cache: &[u16],
+    v_cache: &[u16],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    pos: usize,
+    attn_scale: f32,
+    window: Option<usize>,
+    max_ctx: usize,
+    scores: &mut [f32],
+) {
+    let end_pos = pos + 1;
+    let start_kv = match window {
+        Some(w) if w > 0 => end_pos.saturating_sub(w),
+        _ => 0,
+    };
+    let win_len = end_pos - start_kv;
+    let kv_dim = n_kv_heads * head_dim;
+    let group = n_heads / n_kv_heads;
+
+    if pool.num_threads() == 1 || win_len < 24 {
+        let sc = &mut scores[..win_len];
+        for h in 0..n_heads {
+            let kv_h = h / group;
+            let qh = &q[h * head_dim..(h + 1) * head_dim];
+            for (idx, t) in (start_kv..end_pos).enumerate() {
+                let k_off = t * kv_dim + kv_h * head_dim;
+                sc[idx] = (kt.dot_f32_f16)(qh, &k_cache[k_off..k_off + head_dim]) * attn_scale;
+            }
+            softmax_inplace(sc);
+            let oh = &mut out[h * head_dim..(h + 1) * head_dim];
+            oh.fill(0.0);
+            for (idx, t) in (start_kv..end_pos).enumerate() {
+                let v_off = t * kv_dim + kv_h * head_dim;
+                (kt.axpy_f32_f16)(oh, sc[idx], &v_cache[v_off..v_off + head_dim]);
+            }
+        }
+        return;
+    }
+
+    let out_ptr = out.as_mut_ptr() as usize;
+    let scores_ptr = scores.as_mut_ptr() as usize;
+    let chunk = if pool.num_threads() <= 4 {
+        n_heads.div_ceil(pool.num_threads()).max(1)
+    } else {
+        1
+    };
+
+    pool.parallel_for(n_heads, chunk, |h0, h1| {
+        for h in h0..h1 {
+            let kv_h = h / group;
+            let qh = &q[h * head_dim..(h + 1) * head_dim];
+            // SAFETY: Disjoint `[h * max_ctx .. h * max_ctx + win_len)` per head `h`.
+            let sc = unsafe {
+                core::slice::from_raw_parts_mut((scores_ptr as *mut f32).add(h * max_ctx), win_len)
+            };
+            for (idx, t) in (start_kv..end_pos).enumerate() {
+                let k_off = t * kv_dim + kv_h * head_dim;
+                sc[idx] = (kt.dot_f32_f16)(qh, &k_cache[k_off..k_off + head_dim]) * attn_scale;
+            }
+            softmax_inplace(sc);
+            // SAFETY: Disjoint `[h * head_dim .. (h + 1) * head_dim)` per head `h`.
+            let oh = unsafe {
+                core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(h * head_dim), head_dim)
+            };
+            oh.fill(0.0);
+            for (idx, t) in (start_kv..end_pos).enumerate() {
+                let v_off = t * kv_dim + kv_h * head_dim;
+                (kt.axpy_f32_f16)(oh, sc[idx], &v_cache[v_off..v_off + head_dim]);
+            }
+        }
+    });
+}
+
+/// Extended batched multi-token GQA attention supporting custom `attn_scale` and optional `window`.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_f16_kv_ext_batch_parallel(
+    pool: &ThreadPool,
+    kt: &KernelTable,
+    out: &mut [f32],
+    q: &[f32],
+    k_cache: &[u16],
+    v_cache: &[u16],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    start_pos: usize,
+    n_tok: usize,
+    attn_scale: f32,
+    window: Option<usize>,
+    max_ctx: usize,
+    scores: &mut [f32],
+) {
+    let q_dim = n_heads * head_dim;
+    assert_eq!(out.len(), n_tok * q_dim);
+    assert_eq!(q.len(), n_tok * q_dim);
+
+    const STACK_SCORES_CAP: usize = 2048;
+    let max_win_needed = match window {
+        Some(w) if w > 0 => w.min(start_pos + n_tok),
+        _ => start_pos + n_tok,
+    };
+    if pool.num_threads() == 1 || n_tok == 0 || max_win_needed > STACK_SCORES_CAP {
+        for t in 0..n_tok {
+            gqa_attention_f16_kv_ext_parallel(
+                pool,
+                kt,
+                &mut out[t * q_dim..(t + 1) * q_dim],
+                &q[t * q_dim..(t + 1) * q_dim],
+                k_cache,
+                v_cache,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                start_pos + t,
+                attn_scale,
+                window,
+                max_ctx,
+                scores,
+            );
+        }
+        return;
+    }
+
+    let kv_dim = n_kv_heads * head_dim;
+    let group = n_heads / n_kv_heads;
+    let out_ptr = out.as_mut_ptr() as usize;
+    let total_tasks = n_tok * n_heads;
+    let chunk = dynamic_row_chunk(total_tasks, pool.num_threads());
+
+    pool.parallel_for(total_tasks, chunk, |idx0, idx1| {
+        let mut sc_buf = [0.0f32; STACK_SCORES_CAP];
+        for idx in idx0..idx1 {
+            let t = idx / n_heads;
+            let h = idx % n_heads;
+            let end_pos = start_pos + t + 1;
+            let start_kv = match window {
+                Some(w) if w > 0 => end_pos.saturating_sub(w),
+                _ => 0,
+            };
+            let win_len = end_pos - start_kv;
+            let kv_h = h / group;
+            let qh = &q[t * q_dim + h * head_dim..t * q_dim + (h + 1) * head_dim];
+            let sc = &mut sc_buf[..win_len];
+
+            for (w_idx, step) in (start_kv..end_pos).enumerate() {
+                let k_off = step * kv_dim + kv_h * head_dim;
+                sc[w_idx] = (kt.dot_f32_f16)(qh, &k_cache[k_off..k_off + head_dim]) * attn_scale;
+            }
+            softmax_inplace(sc);
+
+            // SAFETY: Disjoint `[head_dim]` slice of `out` per `(t, h)`.
+            let oh = unsafe {
+                core::slice::from_raw_parts_mut(
+                    (out_ptr as *mut f32).add(t * q_dim + h * head_dim),
+                    head_dim,
+                )
+            };
+            oh.fill(0.0);
+            for (w_idx, step) in (start_kv..end_pos).enumerate() {
+                let v_off = step * kv_dim + kv_h * head_dim;
+                (kt.axpy_f32_f16)(oh, sc[w_idx], &v_cache[v_off..v_off + head_dim]);
             }
         }
     });
@@ -1511,6 +1777,31 @@ fn gdn_recurrence_with_gate_inner(
                     }
                 }
             }
+        }
+    });
+}
+
+/// Parallelized in-place tanh logit soft-capping (`x = tanh(x / cap) * cap`) across `pool`.
+/// Avoids single-threaded 262k-element `tanhf` bottleneck on large-vocab models (e.g. Gemma 4).
+pub fn softcap_inplace_parallel(pool: &ThreadPool, vec: &mut [f32], cap: f32) {
+    let n = vec.len();
+    if n == 0 {
+        return;
+    }
+    let inv_cap = 1.0 / cap;
+    if pool.num_threads() <= 1 || n < 4096 {
+        for l in vec {
+            *l = (*l * inv_cap).tanh() * cap;
+        }
+        return;
+    }
+    let ptr = vec.as_mut_ptr() as usize;
+    let chunk = n.div_ceil(pool.num_threads()).max(1024);
+    pool.parallel_for(n, chunk, |i0, i1| {
+        // SAFETY: Disjoint `[i0..i1)` slices across worker threads.
+        let slice = unsafe { core::slice::from_raw_parts_mut((ptr as *mut f32).add(i0), i1 - i0) };
+        for l in slice {
+            *l = (*l * inv_cap).tanh() * cap;
         }
     });
 }

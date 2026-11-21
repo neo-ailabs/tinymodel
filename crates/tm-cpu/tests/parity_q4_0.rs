@@ -272,19 +272,18 @@ fn l1b_batch_width_invariance() {
                 cols_blocks,
                 n_tok,
             );
-            if isa != Isa::NeonI8mm {
-                // generic, neon_v80, dotprod preserve exact bit-level reduction order across batch widths.
-                assert_eq!(
-                    batch_arb.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                    single_arb[..n_tok * rows]
-                        .iter()
-                        .map(|v| v.to_bits())
-                        .collect::<Vec<_>>(),
-                    "arbitrary-scale batch-width invariance failed for isa={} n_tok={}",
-                    isa.name(),
-                    n_tok
-                );
-            }
+            // ALL ISAs (generic, neon_v80, dotprod, AND i8mm) preserve 100% bit-exact
+            // reduction order across every batch width (`AGENTS.md` §9 Determinism)!
+            assert_eq!(
+                batch_arb.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                single_arb[..n_tok * rows]
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                "arbitrary-scale batch-width invariance failed for isa={} n_tok={}",
+                isa.name(),
+                n_tok
+            );
         }
     }
 }
@@ -637,6 +636,9 @@ fn l1_parity_gdn_recurrence_and_norms_bit_exact_all_isas() {
         let mut ref_l2 = x.clone();
         (ref_kt.l2_norm_f32)(&mut ref_l2, 1e-6);
 
+        let w_bf16: Vec<u16> = w.iter().map(|&f| (f.to_bits() >> 16) as u16).collect();
+        let ref_bf16_dot = (ref_kt.dot_f32_bf16)(&x, &w_bf16);
+
         let init_state: Vec<f32> = (0..hd * hd).map(|_| rand_f32(&mut rng) * 0.25).collect();
         let steps = 4usize;
         let qs: Vec<f32> = (0..steps * hd).map(|_| rand_f32(&mut rng)).collect();
@@ -681,6 +683,14 @@ fn l1_parity_gdn_recurrence_and_norms_bit_exact_all_isas() {
                 got_l2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                 ref_l2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                 "l2_norm_f32 bit mismatch for isa={} hd={hd}",
+                isa.name()
+            );
+
+            let got_bf16_dot = (kt.dot_f32_bf16)(&x, &w_bf16);
+            assert_eq!(
+                got_bf16_dot.to_bits(),
+                ref_bf16_dot.to_bits(),
+                "dot_f32_bf16 bit mismatch for isa={} hd={hd}",
                 isa.name()
             );
 

@@ -28,6 +28,7 @@ use tm_cpu::{
 use tm_gguf::{GgufError, GgufFile};
 
 use crate::llama::ModelError;
+pub use crate::state::LayerState;
 
 /// Hyperparameters for `general.architecture == "qwen35"`.
 #[derive(Debug, Clone)]
@@ -72,38 +73,6 @@ impl Qwen35Config {
     #[inline]
     pub const fn ssm_head_v_dim(&self) -> usize {
         self.ssm_d_inner / self.ssm_dt_rank
-    }
-}
-
-/// Per-layer heterogeneous inference state (`docs/ARCHITECTURE.md` §5.2).
-#[derive(Clone)]
-pub enum LayerState {
-    /// Full GQA attention KV cache (`[max_ctx, n_head_kv * head_dim]` in IEEE-754 F16).
-    Kv {
-        k_cache: Vec<u16>,
-        v_cache: Vec<u16>,
-    },
-    /// Gated DeltaNet recurrent state (`[n_v_heads, S, S]` transposed) + causal Conv1d history
-    /// (`[conv_dim, conv_kernel - 1]` storing the `conv_kernel - 1` most recent raw `qkv` steps).
-    DeltaNet {
-        state: Vec<f32>,
-        conv_hist: Vec<f32>,
-    },
-}
-
-impl LayerState {
-    /// Zeroes out the layer state in-place without reallocating.
-    pub fn reset(&mut self) {
-        match self {
-            LayerState::Kv { k_cache, v_cache } => {
-                k_cache.fill(0);
-                v_cache.fill(0);
-            }
-            LayerState::DeltaNet { state, conv_hist } => {
-                state.fill(0.0);
-                conv_hist.fill(0.0);
-            }
-        }
     }
 }
 
@@ -213,6 +182,8 @@ impl Qwen35State {
                 AttnWeights::FullAttn { .. } => LayerState::Kv {
                     k_cache: vec![0u16; max_ctx * kv_dim],
                     v_cache: vec![0u16; max_ctx * kv_dim],
+                    kv_dim,
+                    window: None,
                 },
                 AttnWeights::Gdn { .. } => LayerState::DeltaNet {
                     state: vec![0.0f32; state_elems],
@@ -762,7 +733,9 @@ impl<'a> Qwen35Model<'a> {
                         wv,
                         wo,
                     },
-                    LayerState::Kv { k_cache, v_cache },
+                    LayerState::Kv {
+                        k_cache, v_cache, ..
+                    },
                 ) => {
                     matvec_triple_f32(
                         pool,
@@ -1261,7 +1234,9 @@ impl<'a> Qwen35Model<'a> {
                         wv,
                         wo,
                     },
-                    LayerState::Kv { k_cache, v_cache },
+                    LayerState::Kv {
+                        k_cache, v_cache, ..
+                    },
                 ) => {
                     let tq = prof.as_ref().map(|_| Instant::now());
                     matmul_f32(
@@ -1682,7 +1657,9 @@ impl<'a> Qwen35Model<'a> {
                         wv,
                         wo,
                     },
-                    LayerState::Kv { k_cache, v_cache },
+                    LayerState::Kv {
+                        k_cache, v_cache, ..
+                    },
                 ) => {
                     let tq = Instant::now();
                     matvec_triple_f32(
@@ -2049,10 +2026,12 @@ mod tests {
                     LayerState::Kv {
                         k_cache: ka,
                         v_cache: va,
+                        ..
                     },
                     LayerState::Kv {
                         k_cache: kb,
                         v_cache: vb,
+                        ..
                     },
                 ) => {
                     assert_eq!(ka, kb, "KV k_cache mutated on error at layer {i}");

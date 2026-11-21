@@ -279,6 +279,31 @@ pub fn gemv_q4_1_q8_1(
     }
 }
 
+/// Scalar `f32 x bf16` dot product matching 8-wide SIMD pairwise FMA bit-for-bit.
+pub fn dot_f32_bf16(x: &[f32], w_bf16: &[u16]) -> f32 {
+    let n = x.len();
+    assert_eq!(w_bf16.len(), n);
+    let chunks8 = n / 8;
+    let mut acc0 = [0.0f32; 4];
+    let mut acc1 = [0.0f32; 4];
+    for c in 0..chunks8 {
+        let base = c * 8;
+        for lane in 0..4 {
+            let w0 = f32::from_bits((w_bf16[base + lane] as u32) << 16);
+            let w1 = f32::from_bits((w_bf16[base + 4 + lane] as u32) << 16);
+            acc0[lane] = w0.mul_add(x[base + lane], acc0[lane]);
+            acc1[lane] = w1.mul_add(x[base + 4 + lane], acc1[lane]);
+        }
+    }
+    let mut sum =
+        ((acc0[0] + acc1[0]) + (acc0[1] + acc1[1])) + ((acc0[2] + acc1[2]) + (acc0[3] + acc1[3]));
+    for i in chunks8 * 8..n {
+        let w = f32::from_bits((w_bf16[i] as u32) << 16);
+        sum = w.mul_add(x[i], sum);
+    }
+    sum
+}
+
 /// Scalar `f32 x f16` dot product (for F16 KV attention).
 #[inline]
 pub fn dot_f32_f16(q: &[f32], k_f16: &[u16]) -> f32 {

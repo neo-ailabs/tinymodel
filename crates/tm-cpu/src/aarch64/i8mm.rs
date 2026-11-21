@@ -10,7 +10,152 @@ use core::arch::aarch64::*;
 use tm_core::{BlockQ4_0, BlockQ8_0};
 
 use super::asm::{f16_to_f32_hw, vmmlaq_s32};
-use super::dotprod;
+
+/// Single-row `vec_dot_q4_0_q8_0` for `Isa::NeonI8mm` using exact per-block `i32` reduction
+/// and `vfmaq_f32` so 1-token `gemv` and multi-token `smmla` `gemm` are 100% bit-for-bit identical
+/// across ALL batch widths (`AGENTS.md` §9 Determinism).
+///
+/// # Safety
+/// Caller must ensure CPU supports `i8mm` and `x.len() == y.len()`.
+#[target_feature(enable = "neon,dotprod,i8mm")]
+#[inline]
+pub unsafe fn vec_dot_q4_0_q8_0(x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
+    debug_assert_eq!(x.len(), y.len());
+    let nb = x.len();
+    // SAFETY: `ib` stays strictly within `0..nb`; `dotprod` + `i8mm` enabled.
+    unsafe {
+        let m4b = vdupq_n_u8(0x0F);
+        let s8b = vdupq_n_s8(8);
+        let zero = vdupq_n_s32(0);
+        let mut sumv = vdupq_n_f32(0.0);
+
+        for ib in 0..nb {
+            let bx = x.get_unchecked(ib);
+            let by = y.get_unchecked(ib);
+            let q = vld1q_u8(bx.qs.as_ptr());
+            let xl = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q, m4b)), s8b);
+            let xh = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(q)), s8b);
+            let yl = vld1q_s8(by.qs.as_ptr());
+            let yh = vld1q_s8(by.qs.as_ptr().add(16));
+            let p = vdotq_s32(vdotq_s32(zero, xl, yl), xh, yh);
+            let sumi = vaddvq_s32(p);
+            let scale = f16_to_f32_hw(bx.d) * f16_to_f32_hw(by.d);
+            sumv = vfmaq_f32(sumv, vdupq_n_f32(sumi as f32), vdupq_n_f32(scale));
+        }
+
+        vgetq_lane_f32::<0>(sumv)
+    }
+}
+
+/// 4-row unrolled `gemv_q4_0_q8_0` for `Isa::NeonI8mm`: uses `vdotq_s32` + `vpaddq_s32` to compute
+/// the exact 32-element `i32` dot product per block for 4 rows simultaneously, then accumulates
+/// with `vfmaq_f32` — **100% bit-for-bit identical** to `smmla` `gemm_q4_0_q8_0` across all batch widths!
+///
+/// # Safety
+/// Caller must ensure CPU supports `i8mm` and buffer lengths match dimensions.
+#[target_feature(enable = "neon,dotprod,i8mm")]
+pub unsafe fn gemv_q4_0_q8_0(
+    w: &[BlockQ4_0],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), cols_blocks);
+    assert_eq!(out.len(), rows);
+
+    let mut r = 0usize;
+    // SAFETY: All row and block indices are strictly bounded.
+    unsafe {
+        let m4b = vdupq_n_u8(0x0F);
+        let s8b = vdupq_n_s8(8);
+        let zero = vdupq_n_s32(0);
+
+        while r + 4 <= rows {
+            let w0 = &w[r * cols_blocks..(r + 1) * cols_blocks];
+            let w1 = &w[(r + 1) * cols_blocks..(r + 2) * cols_blocks];
+            let w2 = &w[(r + 2) * cols_blocks..(r + 3) * cols_blocks];
+            let w3 = &w[(r + 3) * cols_blocks..(r + 4) * cols_blocks];
+
+            let mut sumv = vdupq_n_f32(0.0);
+            for ib in 0..cols_blocks {
+                let by = x.get_unchecked(ib);
+                let yl = vld1q_s8(by.qs.as_ptr());
+                let yh = vld1q_s8(by.qs.as_ptr().add(16));
+                let dy = f16_to_f32_hw(by.d);
+
+                let bx0 = w0.get_unchecked(ib);
+                let bx1 = w1.get_unchecked(ib);
+                let bx2 = w2.get_unchecked(ib);
+                let bx3 = w3.get_unchecked(ib);
+
+                let q0 = vld1q_u8(bx0.qs.as_ptr());
+                let q1 = vld1q_u8(bx1.qs.as_ptr());
+                let q2 = vld1q_u8(bx2.qs.as_ptr());
+                let q3 = vld1q_u8(bx3.qs.as_ptr());
+
+                let p0 = vdotq_s32(
+                    vdotq_s32(
+                        zero,
+                        vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q0, m4b)), s8b),
+                        yl,
+                    ),
+                    vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(q0)), s8b),
+                    yh,
+                );
+                let p1 = vdotq_s32(
+                    vdotq_s32(
+                        zero,
+                        vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q1, m4b)), s8b),
+                        yl,
+                    ),
+                    vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(q1)), s8b),
+                    yh,
+                );
+                let p2 = vdotq_s32(
+                    vdotq_s32(
+                        zero,
+                        vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q2, m4b)), s8b),
+                        yl,
+                    ),
+                    vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(q2)), s8b),
+                    yh,
+                );
+                let p3 = vdotq_s32(
+                    vdotq_s32(
+                        zero,
+                        vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q3, m4b)), s8b),
+                        yl,
+                    ),
+                    vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(q3)), s8b),
+                    yh,
+                );
+
+                let p01 = vpaddq_s32(p0, p1);
+                let p23 = vpaddq_s32(p2, p3);
+                let acc4 = vpaddq_s32(p01, p23);
+
+                let scales = [
+                    f16_to_f32_hw(bx0.d) * dy,
+                    f16_to_f32_hw(bx1.d) * dy,
+                    f16_to_f32_hw(bx2.d) * dy,
+                    f16_to_f32_hw(bx3.d) * dy,
+                ];
+                sumv = vfmaq_f32(sumv, vcvtq_f32_s32(acc4), vld1q_f32(scales.as_ptr()));
+            }
+
+            vst1q_f32(out.as_mut_ptr().add(r), sumv);
+            r += 4;
+        }
+
+        while r < rows {
+            let wr = &w[r * cols_blocks..(r + 1) * cols_blocks];
+            *out.get_unchecked_mut(r) = vec_dot_q4_0_q8_0(wr, x);
+            r += 1;
+        }
+    }
+}
 
 /// Computes a 2-row x 2-token `Q4_0 x Q8_0` tile using `smmla` (`i8mm`).
 ///
@@ -104,7 +249,7 @@ pub unsafe fn vec_dot_2x2_q4_0_q8_0(
             acc = vmmlaq_s32(acc, l2, r2);
             acc = vmmlaq_s32(acc, l3, r3);
 
-            sumv = vmlaq_f32(sumv, vcvtq_f32_s32(acc), scale);
+            sumv = vfmaq_f32(sumv, vcvtq_f32_s32(acc), scale);
         }
 
         let mut res = [0.0f32; 4];
@@ -131,12 +276,10 @@ pub unsafe fn gemm_q4_0_q8_0(
     assert_eq!(x.len(), n_tokens * cols_blocks);
     assert_eq!(out.len(), n_tokens * rows);
 
-    if n_tokens < 8 {
-        // SAFETY: `dotprod` is enabled and dimensions verified above.
-        // For small batches (< 8, e.g. speculative verify), 4-token `dotprod` is faster
-        // than 2x2 `smmla` setup AND preserves bit-exact batch-width invariance.
+    if n_tokens == 1 {
+        // SAFETY: `i8mm` is enabled and dimensions verified above.
         unsafe {
-            dotprod::gemm_q4_0_q8_0(w, x, out, rows, cols_blocks, n_tokens);
+            gemv_q4_0_q8_0(w, x, out, rows, cols_blocks);
         }
         return;
     }
@@ -322,7 +465,7 @@ pub unsafe fn gemm_q4_0_q8_0(
             if t < n_tokens {
                 let xt = &x[t * cols_blocks..(t + 1) * cols_blocks];
                 let mut o4 = [0.0f32; 4];
-                dotprod::gemv_q4_0_q8_0(
+                gemv_q4_0_q8_0(
                     &w[r * cols_blocks..(r + 4) * cols_blocks],
                     xt,
                     &mut o4,
@@ -343,7 +486,7 @@ pub unsafe fn gemm_q4_0_q8_0(
             let wr = &w[r * cols_blocks..(r + 1) * cols_blocks];
             for t in 0..n_tokens {
                 let xt = &x[t * cols_blocks..(t + 1) * cols_blocks];
-                *out.get_unchecked_mut(t * rows + r) = dotprod::vec_dot_q4_0_q8_0(wr, xt);
+                *out.get_unchecked_mut(t * rows + r) = vec_dot_q4_0_q8_0(wr, xt);
             }
             r += 1;
         }

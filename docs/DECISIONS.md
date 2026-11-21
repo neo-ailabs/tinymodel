@@ -54,3 +54,12 @@
 - **背景**：这是 Rust 生态的惯例；它和要移植的上游许可证都兼容：ggml 和 Strata 是 MIT，KleidiAI 是 Apache-2.0。
 - **决策**：项目以 `MIT OR Apache-2.0` 双许可发布，许可证文本放在仓库根目录的 `LICENSE-MIT` 和 `LICENSE-APACHE`；每个 crate 的 `Cargo.toml` 都写 `license = "MIT OR Apache-2.0"`。
 - **后果**：移植的文件要保留上游的版权声明；第三方声明汇总在 `THIRD_PARTY_NOTICES.md` 中（第一次移植代码时创建）。
+
+### ADR-010 M2 混合模型状态管理、混合前缀缓存与 Gemma 4 PLE 按需查表
+- **状态**：Accepted（2026-11-21）
+- **背景**：M2 引入三类异构层结构——`Qwen3.5`（GDN 线性注意力递归状态 + Conv1d 历史）、`Gemma 4`（262k 词表 × 35 层 = 1.27GB 的 `per_layer_token_embd` PLE 词表、4:1 滑动窗口 SWA/比例 RoPE 全注意力、20 层跨层共享 KV 缓存 `shared_kv_layers`、`BF16` 模型投影）以及 `LFM2`（门控因果 `ShortConv` + QK-Norm GQA）。在 4GB–8GB 手机/SBC 上，全量解压 PLE 词表或为共享层重复分配 KV 缓存会直接突破内存上限；而递归层无法像标准 KV 那样任意截断回退。
+- **决策**：
+  1. 在 `tm-models::LayerState` 统一建模 `Kv { window }`、`SharedKv { source_layer, window }`、`DeltaNet { state, conv_hist }`、`ShortConv { conv_hist }` 四种变体，跨层共享层零重复 KV 分配，且在 Prefill 进入 `n_layer_kv_from_start` 时自动裁剪非输出 token 行。
+  2. 在 `tm-runtime` 实现带内存字节硬上限的 LRU `PrefixCache`：对纯注意力/SWA/共享 KV 模型支持**任意最长公共前缀截断复用**；对包含 `DeltaNet`/`ShortConv` 递归层的混合模型支持**精确检查点（含定期 `checkpoint_every` 边界快照）恢复**，保证多轮会话与未缓存全量 Prefill **逐位一致（bit-exact）**。
+  3. `Gemma 4` 的 `per_layer_token_embd` 保持 GGUF mmap 原位不解压，CPU 与 Metal 均仅按当前输入 token ID 按需读取单行（约 5KB/token），省下 ~1.2GB 常驻内存。
+- **后果**：`Gemma 4 E2B` 在 Pixel 8 真机总 RSS 仅 1.47GiB、匿名堆内存仅 55.6MiB 即可流畅运行；`tm-runtime` 作为上层 CLI/Server/FFI 的统一会话入口。

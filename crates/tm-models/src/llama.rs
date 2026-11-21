@@ -17,7 +17,9 @@ use tm_gguf::{GgufError, GgufFile};
 pub enum ModelError {
     #[error(transparent)]
     Gguf(#[from] GgufError),
-    #[error("unsupported model architecture '{0}' (supports 'llama', 'qwen3', and 'qwen35')")]
+    #[error(
+        "unsupported model architecture '{0}' (supports 'llama', 'qwen3', 'qwen35', 'gemma4', and 'lfm2')"
+    )]
     UnsupportedArch(String),
     #[error("position {pos} exceeds configured max_ctx {max_ctx}")]
     ContextOverflow { pos: usize, max_ctx: usize },
@@ -81,10 +83,11 @@ pub struct LlamaModel<'a> {
 /// Zero heap allocations occur inside `LlamaModel::forward_token`.
 pub struct LlamaState {
     pub max_ctx: usize,
+    pub kv_dim: usize,
     /// Per-layer F16 K cache: `layers[l]` has `[max_ctx, n_head_kv * head_dim]`.
-    k_cache: Vec<Vec<u16>>,
+    pub k_cache: Vec<Vec<u16>>,
     /// Per-layer F16 V cache: `layers[l]` has `[max_ctx, n_head_kv * head_dim]`.
-    v_cache: Vec<Vec<u16>>,
+    pub v_cache: Vec<Vec<u16>>,
     x: Vec<f32>,
     xb: Vec<f32>,
     xb2: Vec<f32>,
@@ -115,6 +118,7 @@ impl LlamaState {
 
         Self {
             max_ctx,
+            kv_dim,
             k_cache,
             v_cache,
             x: vec![0.0; MAX_CPU_BATCH * cfg.n_embd],
@@ -130,6 +134,15 @@ impl LlamaState {
             scores: vec![0.0; cfg.n_head * max_ctx],
             logits: vec![0.0; cfg.vocab_size],
             mv_scratch: MatvecScratch::new(max_cols),
+        }
+    }
+
+    pub fn reset(&mut self) {
+        for k in &mut self.k_cache {
+            k.fill(0);
+        }
+        for v in &mut self.v_cache {
+            v.fill(0);
         }
     }
 

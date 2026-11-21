@@ -16,8 +16,14 @@ use tm_gguf::GgufFile;
 pub enum TokenizerError {
     #[error("GGUF missing tokenizer metadata key '{0}'")]
     MissingKey(&'static str),
-    #[error("unsupported tokenizer model '{0}' (currently supported: 'gpt2')")]
+    #[error("unsupported tokenizer model '{0}' (currently supported: 'gpt2', 'gemma4')")]
     UnsupportedModel(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenizerMode {
+    Gpt2ByteBpe,
+    Gemma4SpmBpe,
 }
 
 const EMPTY_SLOT: u32 = u32::MAX;
@@ -32,8 +38,10 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
     h
 }
 
-/// GPT-2 byte-level BPE tokenizer (covers SmolLM2, Llama 3.x, Qwen2/3/3.5).
+/// Lightweight BPE tokenizer (covers GPT-2 byte-level BPE for SmolLM2/Llama-3/Qwen/LFM2
+/// and SPM-style raw UTF-8 BPE for Gemma 4).
 pub struct Tokenizer {
+    mode: TokenizerMode,
     real_vocab_size: usize,
     vocab_pool: String,
     vocab_offsets: Vec<u32>,
@@ -46,6 +54,7 @@ pub struct Tokenizer {
     char_to_byte: HashMap<char, u8>,
     pub bos_id: Option<u32>,
     pub eos_id: Option<u32>,
+    pub eot_id: Option<u32>,
     pub add_bos: bool,
     max_digits: usize,
 }
@@ -57,9 +66,17 @@ impl Tokenizer {
             .get_meta("tokenizer.ggml.model")
             .and_then(|v| v.as_str())
             .unwrap_or("gpt2");
-        if model != "gpt2" {
+        let pre = gguf
+            .get_meta("tokenizer.ggml.pre")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let mode = if model == "gemma4" || pre == "gemma4" {
+            TokenizerMode::Gemma4SpmBpe
+        } else if model == "gpt2" {
+            TokenizerMode::Gpt2ByteBpe
+        } else {
             return Err(TokenizerError::UnsupportedModel(model.to_string()));
-        }
+        };
 
         let (total_bytes, token_iter) = gguf
             .string_array_iter("tokenizer.ggml.tokens")
@@ -131,20 +148,38 @@ impl Tokenizer {
         let eos_id = gguf
             .get_meta("tokenizer.ggml.eos_token_id")
             .and_then(|v| v.as_u32());
-        let add_bos = gguf
+        let mut eot_id = gguf
+            .get_meta("tokenizer.ggml.eot_token_id")
+            .and_then(|v| v.as_u32());
+        if eot_id.is_none() {
+            for eog_str in ["<turn|>", "<end_of_turn>", "<|eot_id|>", "<|im_end|>"] {
+                if let Some(id) = table_lookup(
+                    &vocab_table,
+                    vocab_mask,
+                    &vocab_pool,
+                    &vocab_offsets,
+                    eog_str,
+                ) && (id as usize) < real_vocab_size
+                {
+                    eot_id = Some(id);
+                    break;
+                }
+            }
+        }
+        let mut add_bos = gguf
             .get_meta("tokenizer.ggml.add_bos_token")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let pre = gguf
-            .get_meta("tokenizer.ggml.pre")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        if mode == TokenizerMode::Gemma4SpmBpe {
+            add_bos = true;
+        }
         // Qwen2 / Qwen3 / Qwen3.5 BPE regex uses single-digit `\p{N}` instead of `\p{N}{1,3}`.
         let max_digits = if pre.starts_with("qwen") { 1 } else { 3 };
 
         let (byte_to_char, char_to_byte) = build_gpt2_byte_maps();
 
         Ok(Self {
+            mode,
             real_vocab_size,
             vocab_pool,
             vocab_offsets,
@@ -155,9 +190,15 @@ impl Tokenizer {
             char_to_byte,
             bos_id,
             eos_id,
+            eot_id,
             add_bos,
             max_digits,
         })
+    }
+
+    #[inline]
+    pub fn is_stop_token(&self, id: u32) -> bool {
+        self.eos_id == Some(id) || self.eot_id == Some(id)
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -188,6 +229,11 @@ impl Tokenizer {
         let mut ids = Vec::new();
         if add_bos && let Some(bos) = self.bos_id {
             ids.push(bos);
+        }
+
+        if self.mode == TokenizerMode::Gemma4SpmBpe {
+            self.encode_gemma4_into(text, &mut ids);
+            return ids;
         }
 
         let mut encoded = String::with_capacity(64);
@@ -222,26 +268,7 @@ impl Tokenizer {
                 continue;
             }
 
-            while sym_ids.len() >= 2 {
-                let mut best_rank = u32::MAX;
-                let mut best_idx = 0usize;
-                let mut best_merged = 0u32;
-                for i in 0..(sym_ids.len() - 1) {
-                    let pair_key = ((sym_ids[i] as u64) << 32) | (sym_ids[i + 1] as u64);
-                    if let Some(&(rank, merged_id)) = self.merges.get(&pair_key)
-                        && rank < best_rank
-                    {
-                        best_rank = rank;
-                        best_idx = i;
-                        best_merged = merged_id;
-                    }
-                }
-                if best_rank == u32::MAX {
-                    break;
-                }
-                sym_ids[best_idx] = best_merged;
-                sym_ids.remove(best_idx + 1);
-            }
+            self.apply_bpe_merges(&mut sym_ids);
 
             for &id in &sym_ids {
                 if (id as usize) < self.real_vocab_size {
@@ -253,7 +280,90 @@ impl Tokenizer {
         ids
     }
 
-    /// Decodes a single token ID into raw bytes (exact GPT-2 byte-level decoding).
+    fn apply_bpe_merges(&self, sym_ids: &mut Vec<u32>) {
+        while sym_ids.len() >= 2 {
+            let mut best_rank = u32::MAX;
+            let mut best_idx = 0usize;
+            let mut best_merged = 0u32;
+            for i in 0..(sym_ids.len() - 1) {
+                let pair_key = ((sym_ids[i] as u64) << 32) | (sym_ids[i + 1] as u64);
+                if let Some(&(rank, merged_id)) = self.merges.get(&pair_key)
+                    && rank < best_rank
+                {
+                    best_rank = rank;
+                    best_idx = i;
+                    best_merged = merged_id;
+                }
+            }
+            if best_rank == u32::MAX {
+                break;
+            }
+            sym_ids[best_idx] = best_merged;
+            sym_ids.remove(best_idx + 1);
+        }
+    }
+
+    fn encode_gemma4_into(&self, text: &str, ids: &mut Vec<u32>) {
+        // Gemma 4 SPM-style BPE (`llama-vocab.cpp`: `LLAMA_VOCAB_PRE_TYPE_GEMMA4`):
+        // 1. Split only on `[^\n]+|[\n]+`;
+        // 2. Replace `' '` with `'▁'` (`U+2581`), raw UTF-8 without GPT-2 byte encoding;
+        // 3. Direct vocab lookup for pure-newline runs, else UTF-8 chars with `<0xXX>` fallback + BPE merges.
+        let mut escaped = String::with_capacity(128);
+        let mut sym_ids: Vec<u32> = Vec::with_capacity(128);
+        let mut char_buf = [0u8; 4];
+
+        let mut i = 0usize;
+        let bytes = text.as_bytes();
+        while i < bytes.len() {
+            let is_nl = bytes[i] == b'\n';
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i] == b'\n') == is_nl {
+                i += 1;
+            }
+            let chunk = &text[start..i];
+            if is_nl
+                && let Some(id) = self.lookup_id(chunk)
+                && (id as usize) < self.real_vocab_size
+            {
+                ids.push(id);
+                continue;
+            }
+
+            escaped.clear();
+            for ch in chunk.chars() {
+                if ch == ' ' {
+                    escaped.push('\u{2581}');
+                } else {
+                    escaped.push(ch);
+                }
+            }
+
+            sym_ids.clear();
+            for ch in escaped.chars() {
+                let s = ch.encode_utf8(&mut char_buf);
+                if let Some(id) = self.lookup_id(s) {
+                    sym_ids.push(id);
+                } else {
+                    for &b in s.as_bytes() {
+                        let hex_tok = format!("<0x{b:02X}>");
+                        if let Some(bid) = self.lookup_id(&hex_tok) {
+                            sym_ids.push(bid);
+                        }
+                    }
+                }
+            }
+
+            self.apply_bpe_merges(&mut sym_ids);
+            for &id in &sym_ids {
+                if (id as usize) < self.real_vocab_size {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+
+    /// Decodes a single token ID into raw bytes.
     pub fn decode_token_bytes(&self, id: u32) -> Vec<u8> {
         if (id as usize) >= self.real_vocab_size {
             return Vec::new();
@@ -261,6 +371,25 @@ impl Tokenizer {
         let Some(tok) = self.token_str(id) else {
             return Vec::new();
         };
+        if self.mode == TokenizerMode::Gemma4SpmBpe {
+            if tok.len() == 6
+                && tok.starts_with("<0x")
+                && tok.ends_with('>')
+                && let Ok(b) = u8::from_str_radix(&tok[3..5], 16)
+            {
+                return vec![b];
+            }
+            let mut out = Vec::with_capacity(tok.len());
+            let mut buf = [0u8; 4];
+            for ch in tok.chars() {
+                if ch == '\u{2581}' {
+                    out.push(b' ');
+                } else {
+                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+            return out;
+        }
         let mut out = Vec::with_capacity(tok.len());
         for ch in tok.chars() {
             if let Some(&b) = self.char_to_byte.get(&ch) {
@@ -547,5 +676,23 @@ mod tests {
             pretokenize_bpe("Year 2026!", 3),
             vec!["Year", " ", "202", "6", "!"]
         );
+    }
+
+    #[test]
+    fn gemma4_spm_bpe_loads_and_roundtrips() {
+        let model_path = std::path::Path::new("../../models/gemma-4-E2B-it-Q4_0.gguf");
+        if !model_path.exists() {
+            return;
+        }
+        let gguf = GgufFile::open(model_path).expect("open Gemma 4 E2B");
+        let tok = Tokenizer::from_gguf(&gguf).expect("load Gemma 4 tokenizer");
+        assert_eq!(tok.vocab_size(), 262_144);
+        assert!(tok.add_bos);
+        assert_eq!(tok.bos_id, Some(2));
+        let text =
+            "Gemma 4 uses Per-Layer Embeddings (PLE) & sliding window: 2 + 2 = 4!\nNext line.";
+        let ids = tok.encode(text, false);
+        assert!(ids.len() > 5);
+        assert_eq!(tok.decode(&ids), text);
     }
 }

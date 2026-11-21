@@ -21,6 +21,7 @@ pub type GemvQ5KFn = fn(&[BlockQ5K], &[BlockQ8K], &mut [f32], usize, usize);
 pub type VecDotQ6KFn = fn(&[BlockQ6K], &[BlockQ8K]) -> f32;
 pub type GemvQ6KFn = fn(&[BlockQ6K], &[BlockQ8K], &mut [f32], usize, usize);
 pub type DotF32F16Fn = fn(&[f32], &[u16]) -> f32;
+pub type DotF32Bf16Fn = fn(&[f32], &[u16]) -> f32;
 pub type AxpyF32F16Fn = fn(&mut [f32], f32, &[u16]);
 pub type F32ToF16SliceFn = fn(&[f32], &mut [u16]);
 pub type QuantQ8_0Fn = fn(&[f32], &mut [BlockQ8_0]);
@@ -46,6 +47,7 @@ pub struct KernelTable {
     pub vec_dot_q6_k_q8_k: VecDotQ6KFn,
     pub gemv_q6_k_q8_k: GemvQ6KFn,
     pub dot_f32_f16: DotF32F16Fn,
+    pub dot_f32_bf16: DotF32Bf16Fn,
     pub axpy_f32_f16: AxpyF32F16Fn,
     pub f32_to_f16_slice: F32ToF16SliceFn,
     pub quantize_q8_0: QuantQ8_0Fn,
@@ -69,6 +71,7 @@ const GENERIC_TABLE: KernelTable = KernelTable {
     vec_dot_q6_k_q8_k: generic::vec_dot_q6_k_q8_k,
     gemv_q6_k_q8_k: generic::gemv_q6_k_q8_k,
     dot_f32_f16: generic::dot_f32_f16,
+    dot_f32_bf16: generic::dot_f32_bf16,
     axpy_f32_f16: generic::axpy_f32_f16,
     f32_to_f16_slice: generic::f32_to_f16_slice,
     quantize_q8_0: generic::quantize_q8_0,
@@ -207,6 +210,24 @@ mod aarch64_wrappers {
     }
 
     #[cfg(feature = "i8mm")]
+    fn i8mm_vec_dot(x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
+        // SAFETY: `I8MM_TABLE` is only selected after runtime `i8mm` + `dotprod` detection.
+        unsafe { i8mm::vec_dot_q4_0_q8_0(x, y) }
+    }
+
+    #[cfg(feature = "i8mm")]
+    fn i8mm_gemv(
+        w: &[BlockQ4_0],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: `I8MM_TABLE` is only selected after runtime `i8mm` + `dotprod` detection.
+        unsafe { i8mm::gemv_q4_0_q8_0(w, x, out, rows, cols_blocks) }
+    }
+
+    #[cfg(feature = "i8mm")]
     fn i8mm_gemm(
         w: &[BlockQ4_0],
         x: &[BlockQ8_0],
@@ -325,6 +346,11 @@ mod aarch64_wrappers {
         unsafe { neon_v80::rms_norm_f32(out, x, weight, eps) }
     }
 
+    fn neon_dot_f32_bf16(x: &[f32], w_bf16: &[u16]) -> f32 {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { neon_v80::dot_f32_bf16(x, w_bf16) }
+    }
+
     fn neon_l2_norm_f32(x: &mut [f32], eps: f32) {
         // SAFETY: NEON is always available on aarch64.
         unsafe { neon_v80::l2_norm_f32(x, eps) }
@@ -360,6 +386,7 @@ mod aarch64_wrappers {
         vec_dot_q6_k_q8_k: neon_v80_vec_dot_q6_k,
         gemv_q6_k_q8_k: neon_v80_gemv_q6_k,
         dot_f32_f16: neon_dot_f32_f16,
+        dot_f32_bf16: neon_dot_f32_bf16,
         axpy_f32_f16: neon_axpy_f32_f16,
         f32_to_f16_slice: neon_f32_to_f16_slice,
         quantize_q8_0: neon_quant_q8_0,
@@ -384,6 +411,7 @@ mod aarch64_wrappers {
         vec_dot_q6_k_q8_k: dotprod_vec_dot_q6_k,
         gemv_q6_k_q8_k: dotprod_gemv_q6_k,
         dot_f32_f16: neon_dot_f32_f16,
+        dot_f32_bf16: neon_dot_f32_bf16,
         axpy_f32_f16: neon_axpy_f32_f16,
         f32_to_f16_slice: neon_f32_to_f16_slice,
         quantize_q8_0: neon_quant_q8_0,
@@ -396,8 +424,8 @@ mod aarch64_wrappers {
     #[cfg(feature = "i8mm")]
     pub const I8MM_TABLE: KernelTable = KernelTable {
         isa: Isa::NeonI8mm,
-        vec_dot_q4_0_q8_0: dotprod_vec_dot,
-        gemv_q4_0_q8_0: dotprod_gemv,
+        vec_dot_q4_0_q8_0: i8mm_vec_dot,
+        gemv_q4_0_q8_0: i8mm_gemv,
         gemm_q4_0_q8_0: i8mm_gemm,
         vec_dot_q4_1_q8_1: dotprod_vec_dot_q4_1,
         gemv_q4_1_q8_1: dotprod_gemv_q4_1,
@@ -408,6 +436,7 @@ mod aarch64_wrappers {
         vec_dot_q6_k_q8_k: dotprod_vec_dot_q6_k,
         gemv_q6_k_q8_k: dotprod_gemv_q6_k,
         dot_f32_f16: neon_dot_f32_f16,
+        dot_f32_bf16: neon_dot_f32_bf16,
         axpy_f32_f16: neon_axpy_f32_f16,
         f32_to_f16_slice: neon_f32_to_f16_slice,
         quantize_q8_0: neon_quant_q8_0,
