@@ -5,4 +5,6 @@ pub mod asm;
 pub mod dotprod;
 #[cfg(feature = "i8mm")]
 pub mod i8mm;
+#[cfg(feature = "lut")]
+pub mod lut;
 pub mod neon_v80;

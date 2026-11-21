@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-21",
+  "device": "Apple M4 (16GB macOS)",
+  "micro_elf_audit": {
+    "elf_bytes": 1234480,
+    "elf_kib": 1205.5,
+    "elf_mib": 1.177,
+    "exec_instructions_scanned": 248260,
+    "sdot_udot_count": 0,
+    "smmla_ummla_count": 0,
+    "neon_tbl_tbx_count": 344
+  },
+  "interleaved_5round_smollm2_q4": {
+    "tm_i8mm_pp_median": 790.38,
+    "tm_i8mm_tg_median": 324.96,
+    "tm_neon_v80_pp_median": 326.36,
+    "tm_neon_v80_tg_median": 315.38,
+    "llama_cpp_pp_median": 1356.76,
+    "llama_cpp_tg_median": 262.44,
+    "rounds": [
+      {
+        "tm_neon_pp": 264.04,
+        "tm_neon_tg": 316.51,
+        "tm_i8mm_pp": 790.38,
+        "tm_i8mm_tg": 325.06,
+        "llama_pp": 1358.893086,
+        "llama_tg": 262.511331
+      },
+      {
+        "tm_neon_pp": 327.01,
+        "tm_neon_tg": 315.38,
+        "tm_i8mm_pp": 706.38,
+        "tm_i8mm_tg": 325.16,
+        "llama_pp": 1356.75877,
+        "llama_tg": 262.33298
+      },
+      {
+        "tm_i8mm_pp": 791.41,
+        "tm_i8mm_tg": 324.84,
+        "tm_neon_pp": 326.44,
+        "tm_neon_tg": 311.43,
+        "llama_pp": 1356.279567,
+        "llama_tg": 262.467595
+      },
+      {
+        "tm_neon_pp": 325.85,
+        "tm_neon_tg": 315.01,
+        "llama_pp": 1357.120795,
+        "llama_tg": 262.242061,
+        "tm_i8mm_pp": 792.37,
+        "tm_i8mm_tg": 324.94
+      },
+      {
+        "llama_pp": 1353.077461,
+        "llama_tg": 262.436428,
+        "tm_neon_pp": 326.36,
+        "tm_neon_tg": 316.35,
+        "tm_i8mm_pp": 787.57,
+        "tm_i8mm_tg": 324.96
+      }
+    ]
+  },
+  "variants": {
+    "smollm2_q4_0x4__neon_v80": {
+      "file_mib": 196.0,
+      "pp512_tps": 325.61,
+      "tg64_tps": 316.18,
+      "eff_bw_gbs": 64.42,
+      "peak_rss_mib": null
+    },
+    "smollm2_q4_0x4__i8mm": {
+      "file_mib": 196.0,
+      "pp512_tps": 786.3,
+      "tg64_tps": 324.84,
+      "eff_bw_gbs": 66.18,
+      "peak_rss_mib": null
+    },
+    "smollm2_q4_0x4_v16384__neon_v80": {
+      "file_mib": 177.98,
+      "pp512_tps": 325.46,
+      "tg64_tps": 343.17,
+      "eff_bw_gbs": 63.84,
+      "peak_rss_mib": null
+    },
+    "smollm2_q4_0x4_v16384__i8mm": {
+      "file_mib": 177.98,
+      "pp512_tps": 787.7,
+      "tg64_tps": 355.62,
+      "eff_bw_gbs": 66.16,
+      "peak_rss_mib": null
+    },
+    "smollm2_iq3_xxs__neon_v80": {
+      "file_mib": 182.53,
+      "pp512_tps": 227.35,
+      "tg64_tps": 216.83,
+      "eff_bw_gbs": 41.11,
+      "peak_rss_mib": null
+    },
+    "smollm2_iq3_xxs__i8mm": {
+      "file_mib": 182.53,
+      "pp512_tps": 262.0,
+      "tg64_tps": 230.43,
+      "eff_bw_gbs": 43.69,
+      "peak_rss_mib": null
+    },
+    "smollm2_q2_0_lut__neon_v80": {
+      "file_mib": 111.63,
+      "pp512_tps": 72.63,
+      "tg64_tps": 174.68,
+      "eff_bw_gbs": 20.13,
+      "peak_rss_mib": null
+    },
+    "smollm2_q2_0_lut__i8mm": {
+      "file_mib": 111.63,
+      "pp512_tps": 72.54,
+      "tg64_tps": 176.94,
+      "eff_bw_gbs": 20.39,
+      "peak_rss_mib": null
+    },
+    "smollm2_q2_0_v16384__neon_v80": {
+      "file_mib": 93.61,
+      "pp512_tps": 72.53,
+      "tg64_tps": 185.63,
+      "eff_bw_gbs": 18.11,
+      "peak_rss_mib": null
+    },
+    "smollm2_q2_0_v16384__i8mm": {
+      "file_mib": 93.61,
+      "pp512_tps": 72.12,
+      "tg64_tps": 185.98,
+      "eff_bw_gbs": 18.15,
+      "peak_rss_mib": null
+    },
+    "qwen35_0.8b_tq2_0_lut__neon_v80": {
+      "file_mib": 129.29,
+      "pp512_tps": 48.15,
+      "tg64_tps": 181.22,
+      "eff_bw_gbs": 24.47,
+      "peak_rss_mib": null
+    },
+    "qwen35_0.8b_tq2_0_lut__i8mm": {
+      "file_mib": 129.29,
+      "pp512_tps": 48.09,
+      "tg64_tps": 181.73,
+      "eff_bw_gbs": 24.53,
+      "peak_rss_mib": null
+    }
+  }
+}

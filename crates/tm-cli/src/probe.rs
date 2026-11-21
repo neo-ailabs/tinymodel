@@ -11,8 +11,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use tm_core::{
-    BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, f32_to_f16,
-    probe_process_memory_stats, probe_system_memory,
+    BlockIQ2XXS, BlockIQ3XXS, BlockIQ4NL, BlockQ2_0, BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ6K,
+    BlockQ8_0, BlockQ8_1, BlockQ8K, BlockTQ2_0, f32_to_f16, probe_process_memory_stats,
+    probe_system_memory,
 };
 use tm_cpu::isa::{detect_caps, effective_isa, supported_isas};
 use tm_cpu::{ThreadPool, generic, select_kernels};
@@ -519,11 +520,59 @@ pub fn run_kernel_self_check() -> (bool, Vec<&'static str>, Option<String>) {
         bsums: [80; 16],
     }];
 
+    let w_q20: Vec<BlockQ2_0> = (0..17)
+        .map(|r| BlockQ2_0 {
+            d: if r % 2 == 0 { d_pos } else { d_neg },
+            qs: [0x93u8.wrapping_add((r as u8) * 11); 16],
+        })
+        .collect();
+    let w_tq20: Vec<BlockTQ2_0> = (0..17)
+        .map(|r| {
+            let mut qs = [0u8; 64];
+            for (i, b) in qs.iter_mut().enumerate() {
+                let c0 = ((r + i) % 3) as u8;
+                let c1 = ((r * 3 + i * 5) % 3) as u8;
+                let c2 = ((r * 7 + i * 2) % 3) as u8;
+                let c3 = ((r + i * 7) % 3) as u8;
+                *b = c0 | (c1 << 2) | (c2 << 4) | (c3 << 6);
+            }
+            BlockTQ2_0 {
+                qs,
+                d: if r % 3 == 0 { d_neg } else { d_pos },
+            }
+        })
+        .collect();
+    let w_iq2 = [BlockIQ2XXS {
+        d: d_pos,
+        qs: [0x1234; 32],
+    }];
+    let w_iq3 = [BlockIQ3XXS {
+        d: d_pos,
+        qs: [0x5A; 96],
+    }];
+    let w_iq4 = [
+        BlockIQ4NL {
+            d: d_pos,
+            qs: [0x3C; 16],
+        },
+        BlockIQ4NL {
+            d: d_neg,
+            qs: [0x96; 16],
+        },
+    ];
+
     let ref_q40 = generic::vec_dot_q4_0_q8_0(&w_q40, &x_q80);
     let ref_q80 = generic::vec_dot_q8_0_q8_0(&x_q80, &x_q80);
     let ref_q41 = generic::vec_dot_q4_1_q8_1(&w_q41, &x_q81);
     let ref_q5k = generic::vec_dot_q5_k_q8_k(&w_q5k, &x_q8k);
     let ref_q6k = generic::vec_dot_q6_k_q8_k(&w_q6k, &x_q8k);
+    let ref_iq2 = generic::vec_dot_iq2_xxs_q8_k(&w_iq2, &x_q8k);
+    let ref_iq3 = generic::vec_dot_iq3_xxs_q8_k(&w_iq3, &x_q8k);
+    let ref_iq4 = generic::vec_dot_iq4_nl_q8_0(&w_iq4, &x_q80);
+    let mut ref_q20_gemv = [0.0f32; 17];
+    let mut ref_tq20_gemv = [0.0f32; 17];
+    generic::gemv_q2_0_q8_0(&w_q20, &x_q80, &mut ref_q20_gemv, 17, 1);
+    generic::gemv_tq2_0_q8_k(&w_tq20, &x_q8k, &mut ref_tq20_gemv, 17, 1);
 
     for &isa in &isas {
         let kt = select_kernels(isa);
@@ -533,6 +582,17 @@ pub fn run_kernel_self_check() -> (bool, Vec<&'static str>, Option<String>) {
             ("Q4_1", (kt.vec_dot_q4_1_q8_1)(&w_q41, &x_q81), ref_q41),
             ("Q5_K", (kt.vec_dot_q5_k_q8_k)(&w_q5k, &x_q8k), ref_q5k),
             ("Q6_K", (kt.vec_dot_q6_k_q8_k)(&w_q6k, &x_q8k), ref_q6k),
+            (
+                "IQ2_XXS",
+                (kt.vec_dot_iq2_xxs_q8_k)(&w_iq2, &x_q8k),
+                ref_iq2,
+            ),
+            (
+                "IQ3_XXS",
+                (kt.vec_dot_iq3_xxs_q8_k)(&w_iq3, &x_q8k),
+                ref_iq3,
+            ),
+            ("IQ4_NL", (kt.vec_dot_iq4_nl_q8_0)(&w_iq4, &x_q80), ref_iq4),
         ];
         for (tag, got, exp) in checks {
             if got.to_bits() != exp.to_bits() {
@@ -547,6 +607,36 @@ pub fn run_kernel_self_check() -> (bool, Vec<&'static str>, Option<String>) {
                         got.to_bits(),
                         exp,
                         exp.to_bits()
+                    )),
+                );
+            }
+        }
+        let mut got_q20 = [0.0f32; 17];
+        let mut got_tq20 = [0.0f32; 17];
+        (kt.gemv_q2_0_q8_0)(&w_q20, &x_q80, &mut got_q20, 17, 1);
+        (kt.gemv_tq2_0_q8_k)(&w_tq20, &x_q8k, &mut got_tq20, 17, 1);
+        for r in 0..17 {
+            if got_q20[r].to_bits() != ref_q20_gemv[r].to_bits() {
+                return (
+                    false,
+                    names,
+                    Some(format!(
+                        "ISA '{}' failed Q2_0 LUT GEMV row {r}: got={} != ref={}",
+                        isa.name(),
+                        got_q20[r],
+                        ref_q20_gemv[r]
+                    )),
+                );
+            }
+            if got_tq20[r].to_bits() != ref_tq20_gemv[r].to_bits() {
+                return (
+                    false,
+                    names,
+                    Some(format!(
+                        "ISA '{}' failed TQ2_0 LUT GEMV row {r}: got={} != ref={}",
+                        isa.name(),
+                        got_tq20[r],
+                        ref_tq20_gemv[r]
                     )),
                 );
             }
@@ -685,6 +775,7 @@ pub struct ProbeOpts {
     pub threads: usize,
     pub stream_mib: Option<usize>,
     pub skip_stream: bool,
+    pub use_vulkan: bool,
     pub json: bool,
 }
 
@@ -692,6 +783,7 @@ pub fn parse_probe_opts(args: &[String]) -> Result<ProbeOpts> {
     let mut threads = tm_cpu::recommended_threads();
     let mut stream_mib: Option<usize> = None;
     let mut skip_stream = false;
+    let mut use_vulkan = false;
     let mut json = false;
 
     let mut i = 0;
@@ -717,6 +809,9 @@ pub fn parse_probe_opts(args: &[String]) -> Result<ProbeOpts> {
             "--no-stream" => {
                 skip_stream = true;
             }
+            "--vulkan" => {
+                use_vulkan = true;
+            }
             "--json" => {
                 json = true;
             }
@@ -729,8 +824,92 @@ pub fn parse_probe_opts(args: &[String]) -> Result<ProbeOpts> {
         threads: threads.max(1),
         stream_mib,
         skip_stream,
+        use_vulkan,
         json,
     })
+}
+
+#[cfg(feature = "vulkan")]
+fn run_vulkan_probe_and_self_check() -> Result<(String, String)> {
+    use tm_core::BlockQ4_0;
+    use tm_vulkan::{Q4Layout, VulkanContext};
+
+    let ctx = VulkanContext::new()?;
+    let info = ctx.info().clone();
+
+    // Live GPU L1 parity self-check on `Q4_0` multi-token GEMV/GEMM (`8 x 128`, `4` tokens)
+    let rows = 8usize;
+    let cols = 128usize;
+    let nb = cols / 32;
+    let n_tok = 4usize;
+    let mut blocks = Vec::with_capacity(rows * nb);
+    for r in 0..rows {
+        for ib in 0..nb {
+            let mut qs = [0u8; 16];
+            for (j, q) in qs.iter_mut().enumerate() {
+                *q = (((r * 3 + ib * 5 + j) & 0xF) as u8)
+                    | ((((15 - ((r * 7 + ib + j * 3) & 0xF)) & 0xF) as u8) << 4);
+            }
+            let d = f32_to_f16(0.0625 * ((r as f32) - 3.5) + 0.03125 * (ib as f32));
+            blocks.push(BlockQ4_0 { d, qs });
+        }
+    }
+    let x_vec: Vec<f32> = (0..n_tok * cols)
+        .map(|i| (((i * 19 + 7) % 89) as f32 - 44.0) * 0.05)
+        .collect();
+
+    let mut ref_out = vec![0.0f32; n_tok * rows];
+    let mut w_row = vec![0.0f32; cols];
+    for r in 0..rows {
+        tm_core::dequantize_row_q4_0(&blocks[r * nb..(r + 1) * nb], &mut w_row);
+        for t in 0..n_tok {
+            ref_out[t * rows + r] = w_row
+                .iter()
+                .zip(&x_vec[t * cols..(t + 1) * cols])
+                .map(|(a, b)| a * b)
+                .sum();
+        }
+    }
+
+    let w_gpu = ctx.upload_q4_0(&blocks, rows, cols, Q4Layout::Aos)?;
+    let x_buf = ctx.upload(&x_vec)?;
+    let y_buf = ctx.alloc_buffer((n_tok * rows * 4) as u64)?;
+    ctx.gemm_q4_0_f32(&w_gpu, &x_buf, &y_buf, n_tok, 1)?;
+    let got = ctx.read_f32(&y_buf, n_tok * rows)?;
+    for i in 0..got.len() {
+        let err = (got[i] - ref_out[i]).abs();
+        if err > 1e-4 {
+            bail!(
+                "Vulkan L1 gemm_q4_0 mismatch at {i}: got={} ref={}",
+                got[i],
+                ref_out[i]
+            );
+        }
+    }
+
+    let vk_obj_json = format!(
+        "{{\"device_name\":\"{}\",\"driver\":\"{}\",\"uma\":{},\"subgroup_size\":{},\"coopmat\":{},\"vram_bytes\":{},\"self_check_passed\":true}}",
+        json_escape(&info.name),
+        json_escape(&info.driver_info),
+        info.unified_memory,
+        info.subgroup_size,
+        info.cooperative_matrix,
+        info.device_local_bytes,
+    );
+    let summary = format!(
+        "{} (Vulkan {}.{}.{}, UMA={}, subgroup={} [{}..{}], coopmat={}, VRAM={:.1} MiB) — L1 GPU Self-Check PASSED",
+        info.name,
+        info.api_version.0,
+        info.api_version.1,
+        info.api_version.2,
+        info.unified_memory,
+        info.subgroup_size,
+        info.min_subgroup_size,
+        info.max_subgroup_size,
+        info.cooperative_matrix,
+        info.device_local_bytes as f64 / 1048576.0,
+    );
+    Ok((vk_obj_json, summary))
 }
 
 pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
@@ -755,6 +934,18 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
     };
     let mem_stats = probe_process_memory_stats();
     let telemetry = collect_telemetry();
+    let vk_probe: Option<(String, String)> = if opts.use_vulkan {
+        #[cfg(feature = "vulkan")]
+        {
+            Some(run_vulkan_probe_and_self_check()?)
+        }
+        #[cfg(not(feature = "vulkan"))]
+        {
+            bail!("--vulkan requires compiling with feature 'vulkan'");
+        }
+    } else {
+        None
+    };
 
     if opts.json {
         let isas_json: Vec<String> = tested_isas.iter().map(|s| format!("\"{s}\"")).collect();
@@ -795,9 +986,13 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
             Some(e) => format!("\"{}\"", json_escape(e)),
             None => "null".to_string(),
         };
+        let vk_self_json = match &vk_probe {
+            Some((j, _)) => j.as_str(),
+            None => "null",
+        };
 
         #[cfg(feature = "vulkan")]
-        let vk_json = match tm_vulkan::VulkanContext::list_devices() {
+        let vk_devs_json = match tm_vulkan::VulkanContext::list_devices() {
             Ok(devs) => {
                 let items: Vec<String> = devs
                     .iter()
@@ -824,7 +1019,7 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
             Err(_) => "[]".to_string(),
         };
         #[cfg(not(feature = "vulkan"))]
-        let vk_json = "[]".to_string();
+        let vk_devs_json = "[]".to_string();
 
         println!(
             "{{\"schema_version\":1,\"device_model\":\"{}\",\"os\":\"{}\",\"arch\":\"{}\",\
@@ -834,7 +1029,7 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
             \"process_rss_bytes\":{},\"process_peak_rss_bytes\":{},\
             \"process_private_dirty_bytes\":{},\"process_pss_anon_bytes\":{},\
             \"kernel_self_check\":{{\"passed\":{},\"error\":{}}},\
-            \"vulkan_devices\":{},\
+            \"vulkan\":{},\"vulkan_devices\":{},\
             \"stream_bw\":{},\"telemetry\":{}}}",
             json_escape(&model_name),
             std::env::consts::OS,
@@ -855,7 +1050,8 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
             opt_u64_json(mem_stats.pss_anon_bytes),
             self_ok,
             err_json,
-            vk_json,
+            vk_self_json,
+            vk_devs_json,
             stream_json,
             telemetry.to_json()
         );
@@ -919,6 +1115,9 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
                     d.device_local_bytes as f64 / 1048576.0
                 );
             }
+        }
+        if let Some((_, ref vk_sum)) = vk_probe {
+            println!("Vulkan GPU: {vk_sum}");
         }
         if let Some((mib, rgbs, cgbs)) = stream {
             println!(

@@ -1,0 +1,18 @@
+[package]
+name = "tm-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Unified inference Session, LayerState management, and LRU PrefixCache (F-13) for tinymodel"
+
+[dependencies]
+thiserror = "2"
+tm-core = { path = "../tm-core" }
+tm-cpu = { path = "../tm-cpu", default-features = false }
+tm-gguf = { path = "../tm-gguf" }
+tm-models = { path = "../tm-models" }
+
+[dev-dependencies]
+tm-tokenizer = { path = "../tm-tokenizer" }

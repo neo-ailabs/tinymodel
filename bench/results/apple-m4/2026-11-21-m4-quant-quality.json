@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "source_model": "SmolLM2-360M-Instruct-Q4_0.gguf",
+  "reference": "SmolLM2-360M-Instruct-Q4_0 (Q8_0 baseline)",
+  "tokens_file": "bench/data/quality/eval_tokens_smollm2.txt",
+  "num_tokens": 61,
+  "lm_head_quant": "q8_0",
+  "results": [
+    {
+      "format": "q4_0x4",
+      "lm_head_quant": "q8_0",
+      "size_mib": 218.5,
+      "size_ratio_vs_src": 0.9973,
+      "top1_agreement": 0.8852,
+      "top5_overlap": 0.941,
+      "mean_kl": 0.012261,
+      "max_kl": 0.107987,
+      "mean_mae": 0.191758
+    },
+    {
+      "format": "iq4_nl",
+      "lm_head_quant": "q8_0",
+      "size_mib": 218.5,
+      "size_ratio_vs_src": 0.9973,
+      "top1_agreement": 0.6885,
+      "top5_overlap": 0.7508,
+      "mean_kl": 0.264389,
+      "max_kl": 8.018591,
+      "mean_mae": 0.764894
+    },
+    {
+      "format": "iq3_xxs",
+      "lm_head_quant": "q8_0",
+      "size_mib": 205.03,
+      "size_ratio_vs_src": 0.9358,
+      "top1_agreement": 0.4754,
+      "top5_overlap": 0.5115,
+      "mean_kl": 0.814426,
+      "max_kl": 6.339743,
+      "mean_mae": 1.450733
+    },
+    {
+      "format": "q2_0",
+      "lm_head_quant": "q8_0",
+      "size_mib": 134.13,
+      "size_ratio_vs_src": 0.6122,
+      "top1_agreement": 0.0164,
+      "top5_overlap": 0.0295,
+      "mean_kl": 7.62783,
+      "max_kl": 14.485793,
+      "mean_mae": 4.974234
+    },
+    {
+      "format": "iq2_xxs",
+      "lm_head_quant": "q8_0",
+      "size_mib": 132.37,
+      "size_ratio_vs_src": 0.6042,
+      "top1_agreement": 0.0,
+      "top5_overlap": 0.0492,
+      "mean_kl": 8.229043,
+      "max_kl": 15.988269,
+      "mean_mae": 4.851225
+    },
+    {
+      "format": "tq2_0",
+      "lm_head_quant": "q8_0",
+      "size_mib": 132.37,
+      "size_ratio_vs_src": 0.6042,
+      "top1_agreement": 0.0492,
+      "top5_overlap": 0.0787,
+      "mean_kl": 6.569652,
+      "max_kl": 12.267489,
+      "mean_mae": 4.471178
+    }
+  ]
+}

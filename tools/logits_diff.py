@@ -272,18 +272,20 @@ def compare_dumps(label: str, ref_toks, cand_toks, ref_mat, cand_mat, verbose: b
     worst_diff = max(max_diffs)
     mean_mae = sum(maes) / n_steps
 
-    print("-" * 76)
-    print(
-        f"Summary ({label}): steps={n_steps} | Top-1={top1_hits}/{n_steps} ({top1_rate * 100:.1f}%) | "
-        f"Top-5={mean_top5 * 100:.1f}% | mean_KL={mean_kl:.3e} | max_KL={max_kl:.3e} | "
-        f"max|dL|={worst_diff:.4f} | MAE={mean_mae:.5f}"
-    )
+    if verbose:
+        print("-" * 76)
+        print(
+            f"Summary ({label}): steps={n_steps} | Top-1={top1_hits}/{n_steps} ({top1_rate * 100:.1f}%) | "
+            f"Top-5={mean_top5 * 100:.1f}% | mean_KL={mean_kl:.3e} | max_KL={max_kl:.3e} | "
+            f"max|dL|={worst_diff:.4f} | MAE={mean_mae:.5f}"
+        )
     return {
         "mean_kl": mean_kl,
         "max_kl": max_kl,
         "top1_rate": top1_rate,
         "top5_overlap": mean_top5,
         "max_diff": worst_diff,
+        "mean_mae": mean_mae,
     }
 
 

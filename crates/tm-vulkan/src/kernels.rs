@@ -70,6 +70,84 @@ pub(crate) fn dtype_code(dt: DType) -> Result<u32, VulkanError> {
     }
 }
 
+/// Normalizes a 2D `[rows, cols]` GGUF weight slice into a GPU-native dtype:
+/// - `Q4_0 / Q4_1 / Q8_0 / Q5K / Q6K / F32`: zero-copy borrowed slice.
+/// - `Q4_0x4` (M3 offline 4-row interleaved `Q4_0`): 0-ULP lossless byte uninterleave back to `Q4_0`
+///   so `CoopMatF16`, `CoopMatI8`, and fused QKV/SwiGLU GEMV run at full native speed.
+/// - `F16 / BF16 / Q2_0 / TQ2_0 / Iq2Xxs / Iq3Xxs / Iq4Nl`: load-time dequantization to `F32`
+///   so M2/M4 converted or pruned GGUFs also execute seamlessly on Vulkan.
+pub(crate) fn normalize_vk_mat_bytes<'a>(
+    dtype: DType,
+    bytes: &'a [u8],
+    rows: usize,
+    cols: usize,
+) -> Result<(DType, std::borrow::Cow<'a, [u8]>), VulkanError> {
+    match dtype {
+        DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q5K | DType::Q6K | DType::F32 => {
+            Ok((dtype, std::borrow::Cow::Borrowed(bytes)))
+        }
+        DType::Q4_0x4 => {
+            if !rows.is_multiple_of(4) || !cols.is_multiple_of(QK4_0) {
+                return Err(VulkanError::InvalidDimensions(format!(
+                    "Q4_0x4 matrix {rows}x{cols} must have rows%4==0 and cols%32==0"
+                )));
+            }
+            let cols_blocks = cols / QK4_0;
+            let row_stride = cols_blocks * 18;
+            let mut dst = vec![0u8; rows * row_stride];
+            for rg in 0..(rows / 4) {
+                let src_g = &bytes[rg * cols_blocks * 72..(rg + 1) * cols_blocks * 72];
+                for ib in 0..cols_blocks {
+                    let sb = &src_g[ib * 72..(ib + 1) * 72];
+                    let off0 = (rg * 4) * row_stride + ib * 18;
+                    let off1 = (rg * 4 + 1) * row_stride + ib * 18;
+                    let off2 = (rg * 4 + 2) * row_stride + ib * 18;
+                    let off3 = (rg * 4 + 3) * row_stride + ib * 18;
+                    dst[off0..off0 + 2].copy_from_slice(&sb[0..2]);
+                    dst[off0 + 2..off0 + 10].copy_from_slice(&sb[8..16]);
+                    dst[off0 + 10..off0 + 18].copy_from_slice(&sb[24..32]);
+
+                    dst[off1..off1 + 2].copy_from_slice(&sb[2..4]);
+                    dst[off1 + 2..off1 + 10].copy_from_slice(&sb[16..24]);
+                    dst[off1 + 10..off1 + 18].copy_from_slice(&sb[32..40]);
+
+                    dst[off2..off2 + 2].copy_from_slice(&sb[4..6]);
+                    dst[off2 + 2..off2 + 10].copy_from_slice(&sb[40..48]);
+                    dst[off2 + 10..off2 + 18].copy_from_slice(&sb[56..64]);
+
+                    dst[off3..off3 + 2].copy_from_slice(&sb[6..8]);
+                    dst[off3 + 2..off3 + 10].copy_from_slice(&sb[48..56]);
+                    dst[off3 + 10..off3 + 18].copy_from_slice(&sb[64..72]);
+                }
+            }
+            Ok((DType::Q4_0, std::borrow::Cow::Owned(dst)))
+        }
+        DType::F16
+        | DType::BF16
+        | DType::Q2_0
+        | DType::TQ2_0
+        | DType::Iq2Xxs
+        | DType::Iq3Xxs
+        | DType::Iq4Nl => {
+            let rb = dtype.row_bytes(cols);
+            let mut f32_vals = vec![0.0f32; rows * cols];
+            for r in 0..rows {
+                tm_core::dequantize_row_bytes(
+                    dtype,
+                    &bytes[r * rb..(r + 1) * rb],
+                    &mut f32_vals[r * cols..(r + 1) * cols],
+                );
+            }
+            let mut out = Vec::with_capacity(f32_vals.len() * 4);
+            for &v in &f32_vals {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            Ok((DType::F32, std::borrow::Cow::Owned(out)))
+        }
+        other => Err(VulkanError::UnsupportedDType(other)),
+    }
+}
+
 impl VulkanContext {
     /// Uploads a row-major `rows x cols` Q4_0 matrix (`cols % 32 == 0`).
     pub fn upload_q4_0(

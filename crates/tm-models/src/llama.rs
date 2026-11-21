@@ -4,20 +4,25 @@
 //! `qwen3` (NeoX RoPE + per-head QK-Norm `attn_q_norm` / `attn_k_norm`).
 
 use thiserror::Error;
-use tm_core::{DType, dequantize_row_bytes};
+use tm_core::{BlockQ8_0, DType, KvType, QK8_0, dequantize_row_bytes};
 use tm_cpu::{
     KernelTable, MAX_CPU_BATCH, MatvecScratch, RopeType, ThreadPool,
-    gqa_attention_f16_kv_batch_parallel, gqa_attention_f16_kv_parallel, matmul_f32, matvec_f32,
-    matvec_pair_f32, matvec_triple_f32, rms_norm, rms_norm_batch_parallel, rope_compute_cos_sin,
-    rope_inplace_tables, swiglu_inplace_parallel,
+    gqa_attention_f16_kv_batch_parallel, gqa_attention_f16_kv_parallel,
+    gqa_attention_q8_0_kv_ext_batch_parallel, gqa_attention_q8_0_kv_ext_parallel, matmul_f32,
+    matmul_pair_f32, matmul_triple_f32, matvec_f32, matvec_pair_f32, matvec_triple_f32, rms_norm,
+    rms_norm_batch_parallel, rope_compute_cos_sin, rope_inplace_tables, swiglu_inplace_parallel,
 };
 use tm_gguf::{GgufError, GgufFile};
+
+use crate::state::{MAX_SPEC_WINDOW, SpecVerifyBuf, decode_embedding_row};
 
 #[derive(Debug, Error)]
 pub enum ModelError {
     #[error(transparent)]
     Gguf(#[from] GgufError),
-    #[error("unsupported model architecture '{0}' (supports 'llama', 'qwen3', and 'qwen35')")]
+    #[error(
+        "unsupported model architecture '{0}' (supports 'llama', 'qwen3', 'qwen35', 'gemma4', and 'lfm2')"
+    )]
     UnsupportedArch(String),
     #[error("position {pos} exceeds configured max_ctx {max_ctx}")]
     ContextOverflow { pos: usize, max_ctx: usize },
@@ -81,10 +86,16 @@ pub struct LlamaModel<'a> {
 /// Zero heap allocations occur inside `LlamaModel::forward_token`.
 pub struct LlamaState {
     pub max_ctx: usize,
-    /// Per-layer F16 K cache: `layers[l]` has `[max_ctx, n_head_kv * head_dim]`.
-    k_cache: Vec<Vec<u16>>,
-    /// Per-layer F16 V cache: `layers[l]` has `[max_ctx, n_head_kv * head_dim]`.
-    v_cache: Vec<Vec<u16>>,
+    pub kv_dim: usize,
+    pub kv_type: KvType,
+    /// Per-layer F16 K cache (`kv_type == KvType::F16`): `layers[l]` has `[max_ctx, n_head_kv * head_dim]`.
+    pub k_cache: Vec<Vec<u16>>,
+    /// Per-layer F16 V cache (`kv_type == KvType::F16`): `layers[l]` has `[max_ctx, n_head_kv * head_dim]`.
+    pub v_cache: Vec<Vec<u16>>,
+    /// Per-layer Q8_0 K cache (`kv_type == KvType::Q8_0`): `layers[l]` has `[max_ctx, kv_dim / 32]`.
+    pub k_q8: Vec<Vec<BlockQ8_0>>,
+    /// Per-layer Q8_0 V cache (`kv_type == KvType::Q8_0`): `layers[l]` has `[max_ctx, kv_dim / 32]`.
+    pub v_q8: Vec<Vec<BlockQ8_0>>,
     x: Vec<f32>,
     xb: Vec<f32>,
     xb2: Vec<f32>,
@@ -97,26 +108,56 @@ pub struct LlamaState {
     rope_sin: Vec<f32>,
     scores: Vec<f32>,
     logits: Vec<f32>,
+    last_hidden: Vec<f32>,
     mv_scratch: MatvecScratch,
 }
 
 impl LlamaState {
-    /// Allocates KV cache and all working buffers up front for `max_ctx` tokens.
+    /// Allocates F16 KV cache and all working buffers up front for `max_ctx` tokens.
     pub fn new(cfg: &LlamaConfig, max_ctx: usize) -> Self {
+        Self::new_with_kv_type(cfg, max_ctx, KvType::F16)
+    }
+
+    /// Allocates KV cache in the requested `KvType` (`F16` or `Q8_0`) and working buffers up front.
+    pub fn new_with_kv_type(cfg: &LlamaConfig, max_ctx: usize, kv_type: KvType) -> Self {
         let kv_dim = cfg.n_head_kv * cfg.head_dim;
         let q_dim = cfg.n_head * cfg.head_dim;
-        let k_cache = (0..cfg.n_layers)
-            .map(|_| vec![0u16; max_ctx * kv_dim])
-            .collect();
-        let v_cache = (0..cfg.n_layers)
-            .map(|_| vec![0u16; max_ctx * kv_dim])
-            .collect();
+        let (k_cache, v_cache, k_q8, v_q8) = match kv_type {
+            KvType::F16 => (
+                (0..cfg.n_layers)
+                    .map(|_| vec![0u16; max_ctx * kv_dim])
+                    .collect(),
+                (0..cfg.n_layers)
+                    .map(|_| vec![0u16; max_ctx * kv_dim])
+                    .collect(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            KvType::Q8_0 => {
+                assert_eq!(kv_dim % QK8_0, 0, "Q8_0 KV cache requires kv_dim % 32 == 0");
+                let blks = max_ctx * (kv_dim / QK8_0);
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    (0..cfg.n_layers)
+                        .map(|_| vec![BlockQ8_0 { d: 0, qs: [0; 32] }; blks])
+                        .collect(),
+                    (0..cfg.n_layers)
+                        .map(|_| vec![BlockQ8_0 { d: 0, qs: [0; 32] }; blks])
+                        .collect(),
+                )
+            }
+        };
         let max_cols = cfg.n_embd.max(cfg.n_ff).max(q_dim);
 
         Self {
             max_ctx,
+            kv_dim,
+            kv_type,
             k_cache,
             v_cache,
+            k_q8,
+            v_q8,
             x: vec![0.0; MAX_CPU_BATCH * cfg.n_embd],
             xb: vec![0.0; MAX_CPU_BATCH * cfg.n_embd.max(q_dim)],
             xb2: vec![0.0; MAX_CPU_BATCH * cfg.n_embd],
@@ -129,12 +170,32 @@ impl LlamaState {
             rope_sin: vec![0.0; cfg.rope_dim / 2],
             scores: vec![0.0; cfg.n_head * max_ctx],
             logits: vec![0.0; cfg.vocab_size],
+            last_hidden: vec![0.0; cfg.n_embd],
             mv_scratch: MatvecScratch::new(max_cols),
+        }
+    }
+
+    pub fn reset(&mut self) {
+        for k in &mut self.k_cache {
+            k.fill(0);
+        }
+        for v in &mut self.v_cache {
+            v.fill(0);
+        }
+        for k in &mut self.k_q8 {
+            k.fill(BlockQ8_0 { d: 0, qs: [0; 32] });
+        }
+        for v in &mut self.v_q8 {
+            v.fill(BlockQ8_0 { d: 0, qs: [0; 32] });
         }
     }
 
     pub fn logits(&self) -> &[f32] {
         &self.logits
+    }
+
+    pub fn last_hidden(&self) -> &[f32] {
+        &self.last_hidden
     }
 }
 
@@ -383,10 +444,14 @@ impl<'a> LlamaModel<'a> {
             &mut state.rope_sin,
         );
 
-        // 1. Token embedding lookup (zero-copy row slice -> f32)
-        let row_bytes = self.token_embd.dtype.row_bytes(n_embd);
-        let emb_row = &self.token_embd.bytes[tid * row_bytes..(tid + 1) * row_bytes];
-        dequantize_row_bytes(self.token_embd.dtype, emb_row, &mut state.x[..n_embd]);
+        // 1. Token embedding lookup (zero-copy row slice -> f32; supports both standard and Q4_0x4!)
+        decode_embedding_row(
+            self.token_embd.dtype,
+            self.token_embd.bytes,
+            n_embd,
+            tid,
+            &mut state.x[..n_embd],
+        );
 
         // 2. Transformer layers
         for (l, layer) in self.layers.iter().enumerate() {
@@ -454,32 +519,62 @@ impl<'a> LlamaModel<'a> {
                 self.cfg.rope_type,
             );
 
-            // Store K, V into F16 KV cache at position `pos` via ISA-dispatched `fcvtn`
-            let kv_off = pos * kv_dim;
-            (kt.f32_to_f16_slice)(
-                &state.k[..kv_dim],
-                &mut state.k_cache[l][kv_off..kv_off + kv_dim],
-            );
-            (kt.f32_to_f16_slice)(
-                &state.v[..kv_dim],
-                &mut state.v_cache[l][kv_off..kv_off + kv_dim],
-            );
-
-            // GQA attention over 0..=pos (hardware NEON `fcvt` + parallel across heads for long ctx)
-            gqa_attention_f16_kv_parallel(
-                pool,
-                kt,
-                &mut state.xb[..q_dim],
-                &state.q[..q_dim],
-                &state.k_cache[l],
-                &state.v_cache[l],
-                self.cfg.n_head,
-                self.cfg.n_head_kv,
-                self.cfg.head_dim,
-                pos + 1,
-                state.max_ctx,
-                &mut state.scores,
-            );
+            // Store K, V into KV cache (`F16` or `Q8_0`) at position `pos` and run GQA attention
+            match state.kv_type {
+                KvType::F16 => {
+                    let kv_off = pos * kv_dim;
+                    (kt.f32_to_f16_slice)(
+                        &state.k[..kv_dim],
+                        &mut state.k_cache[l][kv_off..kv_off + kv_dim],
+                    );
+                    (kt.f32_to_f16_slice)(
+                        &state.v[..kv_dim],
+                        &mut state.v_cache[l][kv_off..kv_off + kv_dim],
+                    );
+                    gqa_attention_f16_kv_parallel(
+                        pool,
+                        kt,
+                        &mut state.xb[..q_dim],
+                        &state.q[..q_dim],
+                        &state.k_cache[l],
+                        &state.v_cache[l],
+                        self.cfg.n_head,
+                        self.cfg.n_head_kv,
+                        self.cfg.head_dim,
+                        pos + 1,
+                        state.max_ctx,
+                        &mut state.scores,
+                    );
+                }
+                KvType::Q8_0 => {
+                    let blks = kv_dim / QK8_0;
+                    let kv_off = pos * blks;
+                    (kt.quantize_q8_0)(
+                        &state.k[..kv_dim],
+                        &mut state.k_q8[l][kv_off..kv_off + blks],
+                    );
+                    (kt.quantize_q8_0)(
+                        &state.v[..kv_dim],
+                        &mut state.v_q8[l][kv_off..kv_off + blks],
+                    );
+                    gqa_attention_q8_0_kv_ext_parallel(
+                        pool,
+                        kt,
+                        &mut state.xb[..q_dim],
+                        &state.q[..q_dim],
+                        &state.k_q8[l],
+                        &state.v_q8[l],
+                        self.cfg.n_head,
+                        self.cfg.n_head_kv,
+                        self.cfg.head_dim,
+                        pos,
+                        1.0 / (self.cfg.head_dim as f32).sqrt(),
+                        None,
+                        state.max_ctx,
+                        &mut state.scores,
+                    );
+                }
+            }
 
             // Output projection + residual
             matvec_f32(
@@ -536,7 +631,8 @@ impl<'a> LlamaModel<'a> {
             }
         }
 
-        // 3. Final norm + LM head
+        // 3. Save final hidden state (for MTP) + Final norm + LM head
+        state.last_hidden.copy_from_slice(&state.x[..n_embd]);
         if compute_logits {
             rms_norm(
                 &mut state.xb[..n_embd],
@@ -676,12 +772,13 @@ impl<'a> LlamaModel<'a> {
 
             // 1. Batched embedding lookup
             let t0 = prof.as_ref().map(|_| Instant::now());
+            let _ = row_bytes;
             for (t, &tok) in chunk.iter().enumerate() {
-                let tid = tok as usize;
-                let emb_row = &self.token_embd.bytes[tid * row_bytes..(tid + 1) * row_bytes];
-                dequantize_row_bytes(
+                decode_embedding_row(
                     self.token_embd.dtype,
-                    emb_row,
+                    self.token_embd.bytes,
+                    n_embd,
+                    tok as usize,
                     &mut state.x[t * n_embd..(t + 1) * n_embd],
                 );
             }
@@ -689,7 +786,7 @@ impl<'a> LlamaModel<'a> {
                 p.embed_ns += ts.elapsed().as_nanos() as u64;
             }
 
-            // 2. Transformer layers with multi-token GEMM
+            // 2. Transformer layers with fused multi-token GEMM
             for (l, layer) in self.layers.iter().enumerate() {
                 let t0 = prof.as_ref().map(|_| Instant::now());
                 rms_norm_batch_parallel(
@@ -707,39 +804,23 @@ impl<'a> LlamaModel<'a> {
                 }
 
                 let t0 = prof.as_ref().map(|_| Instant::now());
-                matmul_f32(
+                matmul_triple_f32(
                     pool,
                     kt,
                     layer.wq.dtype,
                     layer.wq.bytes,
-                    &state.xb[..b * n_embd],
-                    &mut state.mv_scratch,
-                    &mut state.q[..b * q_dim],
                     q_dim,
-                    n_embd,
-                    b,
-                );
-                matmul_f32(
-                    pool,
-                    kt,
+                    &mut state.q[..b * q_dim],
                     layer.wk.dtype,
                     layer.wk.bytes,
-                    &state.xb[..b * n_embd],
-                    &mut state.mv_scratch,
-                    &mut state.k[..b * kv_dim],
                     kv_dim,
-                    n_embd,
-                    b,
-                );
-                matmul_f32(
-                    pool,
-                    kt,
+                    &mut state.k[..b * kv_dim],
                     layer.wv.dtype,
                     layer.wv.bytes,
+                    kv_dim,
+                    &mut state.v[..b * kv_dim],
                     &state.xb[..b * n_embd],
                     &mut state.mv_scratch,
-                    &mut state.v[..b * kv_dim],
-                    kv_dim,
                     n_embd,
                     b,
                 );
@@ -797,9 +878,25 @@ impl<'a> LlamaModel<'a> {
                         self.cfg.rope_type,
                     );
 
-                    let kv_off = pos * kv_dim;
-                    (kt.f32_to_f16_slice)(kt_vec, &mut state.k_cache[l][kv_off..kv_off + kv_dim]);
-                    (kt.f32_to_f16_slice)(vt_vec, &mut state.v_cache[l][kv_off..kv_off + kv_dim]);
+                    match state.kv_type {
+                        KvType::F16 => {
+                            let kv_off = pos * kv_dim;
+                            (kt.f32_to_f16_slice)(
+                                kt_vec,
+                                &mut state.k_cache[l][kv_off..kv_off + kv_dim],
+                            );
+                            (kt.f32_to_f16_slice)(
+                                vt_vec,
+                                &mut state.v_cache[l][kv_off..kv_off + kv_dim],
+                            );
+                        }
+                        KvType::Q8_0 => {
+                            let blks = kv_dim / QK8_0;
+                            let kv_off = pos * blks;
+                            (kt.quantize_q8_0)(kt_vec, &mut state.k_q8[l][kv_off..kv_off + blks]);
+                            (kt.quantize_q8_0)(vt_vec, &mut state.v_q8[l][kv_off..kv_off + blks]);
+                        }
+                    }
                 }
                 if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
                     p.rope_kv_ns += ts.elapsed().as_nanos() as u64;
@@ -807,21 +904,44 @@ impl<'a> LlamaModel<'a> {
 
                 // Causal GQA attention for all `b` tokens in a single parallel dispatch
                 let t0 = prof.as_ref().map(|_| Instant::now());
-                gqa_attention_f16_kv_batch_parallel(
-                    pool,
-                    kt,
-                    &mut state.xb[..b * q_dim],
-                    &state.q[..b * q_dim],
-                    &state.k_cache[l],
-                    &state.v_cache[l],
-                    self.cfg.n_head,
-                    self.cfg.n_head_kv,
-                    self.cfg.head_dim,
-                    chunk_pos,
-                    b,
-                    state.max_ctx,
-                    &mut state.scores,
-                );
+                match state.kv_type {
+                    KvType::F16 => {
+                        gqa_attention_f16_kv_batch_parallel(
+                            pool,
+                            kt,
+                            &mut state.xb[..b * q_dim],
+                            &state.q[..b * q_dim],
+                            &state.k_cache[l],
+                            &state.v_cache[l],
+                            self.cfg.n_head,
+                            self.cfg.n_head_kv,
+                            self.cfg.head_dim,
+                            chunk_pos,
+                            b,
+                            state.max_ctx,
+                            &mut state.scores,
+                        );
+                    }
+                    KvType::Q8_0 => {
+                        gqa_attention_q8_0_kv_ext_batch_parallel(
+                            pool,
+                            kt,
+                            &mut state.xb[..b * q_dim],
+                            &state.q[..b * q_dim],
+                            &state.k_q8[l],
+                            &state.v_q8[l],
+                            self.cfg.n_head,
+                            self.cfg.n_head_kv,
+                            self.cfg.head_dim,
+                            chunk_pos,
+                            b,
+                            1.0 / (self.cfg.head_dim as f32).sqrt(),
+                            None,
+                            state.max_ctx,
+                            &mut state.scores,
+                        );
+                    }
+                }
                 if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
                     p.gqa_attn_ns += ts.elapsed().as_nanos() as u64;
                 }
@@ -864,27 +984,19 @@ impl<'a> LlamaModel<'a> {
                 }
 
                 let t0 = prof.as_ref().map(|_| Instant::now());
-                matmul_f32(
+                matmul_pair_f32(
                     pool,
                     kt,
                     layer.w_gate.dtype,
                     layer.w_gate.bytes,
-                    &state.xb[..b * n_embd],
-                    &mut state.mv_scratch,
-                    &mut state.hb[..b * n_ff],
                     n_ff,
-                    n_embd,
-                    b,
-                );
-                matmul_f32(
-                    pool,
-                    kt,
+                    &mut state.hb[..b * n_ff],
                     layer.w_up.dtype,
                     layer.w_up.bytes,
+                    n_ff,
+                    &mut state.hb2[..b * n_ff],
                     &state.xb[..b * n_embd],
                     &mut state.mv_scratch,
-                    &mut state.hb2[..b * n_ff],
-                    n_ff,
                     n_embd,
                     b,
                 );
@@ -919,6 +1031,10 @@ impl<'a> LlamaModel<'a> {
                 }
             }
 
+            if is_last {
+                let last_x = &state.x[(b - 1) * n_embd..b * n_embd];
+                state.last_hidden.copy_from_slice(last_x);
+            }
             if is_last && compute_last_logits {
                 let t0 = prof.as_ref().map(|_| Instant::now());
                 let last_x = &state.x[(b - 1) * n_embd..b * n_embd];
@@ -1001,11 +1117,15 @@ impl<'a> LlamaModel<'a> {
             &mut state.rope_cos,
             &mut state.rope_sin,
         );
-        let row_bytes = self.token_embd.dtype.row_bytes(n_embd);
-        let emb_row = &self.token_embd.bytes[tid * row_bytes..(tid + 1) * row_bytes];
-        dequantize_row_bytes(self.token_embd.dtype, emb_row, &mut state.x[..n_embd]);
+        decode_embedding_row(
+            self.token_embd.dtype,
+            self.token_embd.bytes,
+            n_embd,
+            tid,
+            &mut state.x[..n_embd],
+        );
         prof.embed_ns += t0.elapsed().as_nanos() as u64;
-        prof.embed_bytes += (row_bytes + n_embd * 4) as u64;
+        prof.embed_bytes += (self.token_embd.dtype.row_bytes(n_embd) + n_embd * 4) as u64;
 
         for (l, layer) in self.layers.iter().enumerate() {
             let t0 = Instant::now();
@@ -1081,34 +1201,73 @@ impl<'a> LlamaModel<'a> {
                 &state.rope_sin,
                 self.cfg.rope_type,
             );
-            let kv_off = pos * kv_dim;
-            (kt.f32_to_f16_slice)(
-                &state.k[..kv_dim],
-                &mut state.k_cache[l][kv_off..kv_off + kv_dim],
-            );
-            (kt.f32_to_f16_slice)(
-                &state.v[..kv_dim],
-                &mut state.v_cache[l][kv_off..kv_off + kv_dim],
-            );
+            match state.kv_type {
+                KvType::F16 => {
+                    let kv_off = pos * kv_dim;
+                    (kt.f32_to_f16_slice)(
+                        &state.k[..kv_dim],
+                        &mut state.k_cache[l][kv_off..kv_off + kv_dim],
+                    );
+                    (kt.f32_to_f16_slice)(
+                        &state.v[..kv_dim],
+                        &mut state.v_cache[l][kv_off..kv_off + kv_dim],
+                    );
+                }
+                KvType::Q8_0 => {
+                    let blks = kv_dim / QK8_0;
+                    let kv_off = pos * blks;
+                    (kt.quantize_q8_0)(
+                        &state.k[..kv_dim],
+                        &mut state.k_q8[l][kv_off..kv_off + blks],
+                    );
+                    (kt.quantize_q8_0)(
+                        &state.v[..kv_dim],
+                        &mut state.v_q8[l][kv_off..kv_off + blks],
+                    );
+                }
+            }
             prof.rope_kv_ns += t0.elapsed().as_nanos() as u64;
 
             let t0 = Instant::now();
-            gqa_attention_f16_kv_parallel(
-                pool,
-                kt,
-                &mut state.xb[..q_dim],
-                &state.q[..q_dim],
-                &state.k_cache[l],
-                &state.v_cache[l],
-                self.cfg.n_head,
-                self.cfg.n_head_kv,
-                self.cfg.head_dim,
-                pos + 1,
-                state.max_ctx,
-                &mut state.scores,
-            );
+            match state.kv_type {
+                KvType::F16 => {
+                    gqa_attention_f16_kv_parallel(
+                        pool,
+                        kt,
+                        &mut state.xb[..q_dim],
+                        &state.q[..q_dim],
+                        &state.k_cache[l],
+                        &state.v_cache[l],
+                        self.cfg.n_head,
+                        self.cfg.n_head_kv,
+                        self.cfg.head_dim,
+                        pos + 1,
+                        state.max_ctx,
+                        &mut state.scores,
+                    );
+                    prof.gqa_kv_bytes += ((pos + 1) * kv_dim * 2 * 2) as u64;
+                }
+                KvType::Q8_0 => {
+                    gqa_attention_q8_0_kv_ext_parallel(
+                        pool,
+                        kt,
+                        &mut state.xb[..q_dim],
+                        &state.q[..q_dim],
+                        &state.k_q8[l],
+                        &state.v_q8[l],
+                        self.cfg.n_head,
+                        self.cfg.n_head_kv,
+                        self.cfg.head_dim,
+                        pos,
+                        1.0 / (self.cfg.head_dim as f32).sqrt(),
+                        None,
+                        state.max_ctx,
+                        &mut state.scores,
+                    );
+                    prof.gqa_kv_bytes += ((pos + 1) * (kv_dim / QK8_0) * 34 * 2) as u64;
+                }
+            }
             prof.gqa_attn_ns += t0.elapsed().as_nanos() as u64;
-            prof.gqa_kv_bytes += ((pos + 1) * kv_dim * 2 * 2) as u64;
 
             let t0 = Instant::now();
             matvec_f32(
@@ -1179,6 +1338,8 @@ impl<'a> LlamaModel<'a> {
             prof.ffn_down_bytes += layer.w_down.bytes.len() as u64;
         }
 
+        state.last_hidden.copy_from_slice(&state.x[..n_embd]);
+
         if compute_logits {
             let t0 = Instant::now();
             rms_norm(
@@ -1212,6 +1373,127 @@ impl<'a> LlamaModel<'a> {
 
     pub fn lm_head_dtype(&self) -> DType {
         self.output.dtype
+    }
+
+    /// Evaluates a speculative verification window `window_tokens` (`1 <= W <= MAX_SPEC_WINDOW`)
+    /// in a single shared-weight forward pass, populating `spec_buf.hidden_win[..W * n_embd]`
+    /// and `spec_buf.logits_win[..W * vocab_size]`.
+    pub fn verify_speculative(
+        &self,
+        state: &mut LlamaState,
+        spec_buf: &mut SpecVerifyBuf,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        window_tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<(), ModelError> {
+        let w = window_tokens.len();
+        assert!((1..=MAX_SPEC_WINDOW).contains(&w));
+        let end_pos = start_pos.saturating_add(w);
+        if end_pos > state.max_ctx {
+            return Err(ModelError::ContextOverflow {
+                pos: end_pos - 1,
+                max_ctx: state.max_ctx,
+            });
+        }
+        for &tid in window_tokens {
+            if (tid as usize) >= self.cfg.vocab_size {
+                return Err(ModelError::TokenOutOfRange {
+                    token_id: tid,
+                    vocab_size: self.cfg.vocab_size,
+                });
+            }
+        }
+
+        // Run Transformer body for `w <= 9` (`<= MAX_CPU_BATCH = 32`) without computing single-row logits
+        self.forward_batch_inner(state, pool, kt, window_tokens, start_pos, false, None)?;
+        let n_embd = self.cfg.n_embd;
+        let vocab = self.cfg.vocab_size;
+        spec_buf.last_window_len = w;
+        spec_buf.hidden_win[..w * n_embd].copy_from_slice(&state.x[..w * n_embd]);
+
+        rms_norm_batch_parallel(
+            pool,
+            kt,
+            &mut spec_buf.norm_win[..w * n_embd],
+            &spec_buf.hidden_win[..w * n_embd],
+            &self.output_norm,
+            self.cfg.rms_eps,
+            n_embd,
+            w,
+        );
+        matmul_f32(
+            pool,
+            kt,
+            self.output.dtype,
+            self.output.bytes,
+            &spec_buf.norm_win[..w * n_embd],
+            &mut state.mv_scratch,
+            &mut spec_buf.logits_win[..w * vocab],
+            self.output.rows,
+            self.output.cols,
+            w,
+        );
+        Ok(())
+    }
+
+    /// Commits `committed` (`1 <= committed <= W`) tokens from the last `verify_speculative` call.
+    /// KV cache positions `>= start_pos + committed` require no rollback (overwritten on next step).
+    pub fn commit_speculative(
+        &self,
+        state: &mut LlamaState,
+        spec_buf: &SpecVerifyBuf,
+        committed: usize,
+    ) {
+        assert!((1..=spec_buf.last_window_len).contains(&committed));
+        let idx = committed - 1;
+        let vocab = self.cfg.vocab_size;
+        let n_embd = self.cfg.n_embd;
+        state.logits.copy_from_slice(spec_buf.logits_at(idx, vocab));
+        state
+            .last_hidden
+            .copy_from_slice(spec_buf.hidden_at(idx, n_embd));
+    }
+
+    /// Projects a single hidden vector `[n_embd]` through `output_norm` + `output` (`lm_head`),
+    /// used by MTP heads that share the base model's `token_embd` and `output` weights.
+    pub fn project_logits_from_hidden(
+        &self,
+        state: &mut LlamaState,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        hidden: &[f32],
+        out_logits: &mut [f32],
+    ) {
+        let n_embd = self.cfg.n_embd;
+        rms_norm(
+            &mut state.xb[..n_embd],
+            hidden,
+            &self.output_norm,
+            self.cfg.rms_eps,
+        );
+        matvec_f32(
+            pool,
+            kt,
+            self.output.dtype,
+            self.output.bytes,
+            &state.xb[..n_embd],
+            &mut state.mv_scratch,
+            out_logits,
+            self.output.rows,
+            self.output.cols,
+        );
+    }
+
+    /// Decodes a single token's input embedding `[n_embd]` (used by MTP cells).
+    pub fn embed_token(&self, token_id: u32, out_emb: &mut [f32]) {
+        decode_embedding_row(
+            self.token_embd.dtype,
+            self.token_embd.bytes,
+            self.cfg.n_embd,
+            token_id as usize,
+            out_emb,
+        );
     }
 }
 

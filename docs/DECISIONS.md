@@ -55,17 +55,44 @@
 - **决策**：项目以 `MIT OR Apache-2.0` 双许可发布，许可证文本放在仓库根目录的 `LICENSE-MIT` 和 `LICENSE-APACHE`；每个 crate 的 `Cargo.toml` 都写 `license = "MIT OR Apache-2.0"`。
 - **后果**：移植的文件要保留上游的版权声明；第三方声明汇总在 `THIRD_PARTY_NOTICES.md` 中（第一次移植代码时创建）。
 
-### ADR-010 AMD GPU 支持走 Vulkan 后端，HIP 推迟到 M5
-- **状态**：Accepted（2026-11-21，用户确认）
-- **背景**：开发主机有 AMD Radeon RX 9060 XT（RDNA4/gfx1200，8 GiB），可选 Vulkan（RADV）或 HIP/ROCm 7.1.1。分析见 `research/11-amdgpu.md`。
-- **决策**：AMD 显卡通过 `tm-vulkan`（ash + GLSL→SPIR-V）支持，本机作为 Vulkan 主力开发机；HIP 不单独立项，等 V3 拿到 prefill 差距数据后，再评估是否在 M5 和 `tm-cuda` 共用 kernel 源码。
-- **后果**：Vulkan 后端从 M3 提前开始；kernel 需要兼容 subgroup 宽度 16/32/64；CI 用 lavapipe 跑对齐测试；普通构建不能强制依赖 `glslc`（需要提交预编译的 SPIR-V）。
-
-### ADR-011 V6 决策门结论：维持 `tm-vulkan` 为 AMD 与跨平台主力后端，HIP 留至 M5 与 `tm-cuda` 共源评估
+### ADR-010 M2 混合模型状态管理、混合前缀缓存与 Gemma 4 PLE 按需查表
 - **状态**：Accepted（2026-11-21）
-- **背景**：完成 V0–V5（见 `research/11-amdgpu.md`）后，我们在 AMD Radeon RX 9060 XT（RDNA4，Mesa 25.2.8 vs ROCm 7.1.1）和 Intel UHD 770（ANV）上拿到了全基准模型集的 5 轮实测数据：
-  1. **Decode（`tg128`）全面超越 HIP**：在全部 5 个基准模型上，`tinymodel --vulkan` 均同时超越 `llama.cpp` Vulkan（`104%–183%`）和 **ROCm 7.1.1 HIP（`108%–226%`）**（其中 `SmolLM2-360M` 达 `608.8 tok/s = 225.9%` HIP、`Qwen3.5-0.8B` 达 `366.5 tok/s = 217.8%` HIP、`Qwen3.5-2B` 达 `184.5 tok/s = 137.4%` HIP、`Qwen3-8B` 达 `64.0 tok/s = 108.0%` HIP）。
-  2. **Prefill（`pp512`）追平乃至反超 HIP**：引入 `16×16×16` FP16 Cooperative Matrix、零溢出 `4×2` warp 分块、融合 `Gate+Up+SwiGLU`（`31.1 TFLOP/s`）、`fa_coopmat`（`16.5 KB` LDS）与 LDS 预取 GDN 递推后，`pp512` 达 `llama.cpp` Vulkan 的 **`96.5%–474.9%`**、ROCm HIP 的 **`66.9%–116.3%`**（GPU 硬件时间戳热态达 HIP 的 **`82.7%–116.3%`**，其中 `Qwen3.5-0.8B` 以 `13566.6 tok/s` 直接反超 HIP `16.3%`）。
-  3. **单后端跨厂商复用收益显著**：同一套 `tm-vulkan` 已在 subgroup 宽度 `8 / 16 / 32 / 64` 上实机验证通过，在 **Intel UHD 770** 上 Decode 超越 `llama.cpp` Vulkan **`18.2%–50.0%`**，并无修改通过 `aarch64-linux-android`（Pixel 8）和 `aarch64-unknown-linux-gnu`（RK3588 / Pi 5）交叉编译。
-- **决策**：**不单独提前开辟 HIP 后端**，`tm-vulkan` 作为 AMD 独显/APU、Intel 核显/独显及 Arm 端侧 GPU 的正式主力后端。到 M5 实现 `tm-cuda` 时，仅针对需要极致稠密 Prefill 吞吐的主机/服务端场景，再按需通过条件宏让 `.cu` 内核同时支持 `nvcc` 与 `hipcc`。
-- **后果**：省去在 M3/M4 维护第三套 GPU 后端的工程负担与 `~2 GiB` ROCm 运行时依赖；集中精力推进 M3 投机解码、KV 量化与 M4 低比特内核。
+- **背景**：M2 引入三类异构层结构——`Qwen3.5`（GDN 线性注意力递归状态 + Conv1d 历史）、`Gemma 4`（262k 词表 × 35 层 = 1.27GB 的 `per_layer_token_embd` PLE 词表、4:1 滑动窗口 SWA/比例 RoPE 全注意力、20 层跨层共享 KV 缓存 `shared_kv_layers`、`BF16` 模型投影）以及 `LFM2`（门控因果 `ShortConv` + QK-Norm GQA）。在 4GB–8GB 手机/SBC 上，全量解压 PLE 词表或为共享层重复分配 KV 缓存会直接突破内存上限；而递归层无法像标准 KV 那样任意截断回退。
+- **决策**：
+  1. 在 `tm-models::LayerState` 统一建模 `Kv { window }`、`SharedKv { source_layer, window }`、`DeltaNet { state, conv_hist }`、`ShortConv { conv_hist }` 四种变体，跨层共享层零重复 KV 分配，且在 Prefill 进入 `n_layer_kv_from_start` 时自动裁剪非输出 token 行。
+  2. 在 `tm-runtime` 实现带内存字节硬上限的 LRU `PrefixCache`：对纯注意力/SWA/共享 KV 模型支持**任意最长公共前缀截断复用**；对包含 `DeltaNet`/`ShortConv` 递归层的混合模型支持**精确检查点（含定期 `checkpoint_every` 边界快照）恢复**，保证多轮会话与未缓存全量 Prefill **逐位一致（bit-exact）**。
+  3. `Gemma 4` 的 `per_layer_token_embd` 保持 GGUF mmap 原位不解压，CPU 与 Metal 均仅按当前输入 token ID 按需读取单行（约 5KB/token），省下 ~1.2GB 常驻内存。
+- **后果**：`Gemma 4 E2B` 在 Pixel 8 真机总 RSS 仅 1.47GiB、匿名堆内存仅 55.6MiB 即可流畅运行；`tm-runtime` 作为上层 CLI/Server/FFI 的统一会话入口。
+
+### ADR-011 M3 零膨胀离线权重重排 `Q4_0x4`、自适应投机解码与纯 Rust 编译期 SPIR-V Vulkan 后端
+- **状态**：Accepted（2026-11-21）
+- **背景**：M3 需要同时提升端侧 CPU 的 Prefill GEMM 与有效 Decode 吞吐，并落地跨平台 Vulkan 后端。`llama.cpp` 默认的运行时 KleidiAI 重排（`--repack 1`）虽能加速 GEMM，但会将全部权重复制进匿名堆内存导致 RSS 翻倍（在 Pixel 8 上多占 `613 MiB – 1.30 GiB`，在 512MB Zero 2W 上直接 OOM）；同时 Vulkan 若在构建期依赖外部 C++ `shaderc`/`glslc`，会破坏 `cargo zigbuild` 单命令交叉编译体验。
+- **决策**：
+  1. **零膨胀离线交错布局 `DType::Q4_0x4`（`GGML_TYPE_TM_Q4_0X4 = 100`）**：通过 `tinymodel convert` 离线将 4 行乘数对齐的 `Q4_0` 二维权重重排为 72 字节 `BlockQ4_0x4`（`4×f16` 缩放因子 + `2×2` 半块交错的 64B 半字节负载，文件字节数与原 GGUF 完全相同），推理时直接 0 拷贝 `mmap` 映射进 `i8mm` `smmla` / `dotprod` `sdot` / `neon_v80` / Vulkan 内核，且保证与原始 `Q4_0` **0 ULP 逐位一致**。
+  2. **在线收益门控投机解码（`--spec auto`）与 `Q8_0` KV 缓存（`--kv-type q8_0`）**：在 `tm-runtime` 实现固定容量（384 KiB）4 路组相联 4-gram/3-gram/2-gram `SuffixDrafter`、`MtpDrafter`/`LinearMtpHead` 与在线 EMA `SpecController`（预期净收益 `< 5%` 自动进入冷却关闭）；底层全部五类模型结构严格遵循 `ADR-005` 只读验证 + `commit_speculative` 重放提交，确保投机开关不影响贪心输出的任何一个 token。
+  3. **纯 Rust 编译期 SPIR-V 1.0 Vulkan 后端（`tm-vulkan`）**：使用 `ash` 运行时动态 `dlopen` `libvulkan`，构建期使用纯 Rust `naga` 将 GLSL 450 着色器编译为不依赖可选 8/16-bit SSBO 扩展的 SPIR-V 1.0（工作组统一 `≤ 256` 以兼容 Pi 5 V3DV），并在 `build.rs` 修正 `naga` 24 的 `Barrier::SUB_GROUP` 作用域降级问题、展平多维共享数组，UMA 设备优先选择 `HOST_CACHED` 内存类型。
+- **后果**：Pixel 8 上 `Llama-3.2-1B` 零拷贝 Prefill 达 `1.56×` `llama.cpp (--repack 0)` 且省 `810 MiB` 内存，`Qwen3.5-0.8B` 与 `SmolLM2-360M` Decode 反超 `llama.cpp KleidiAI`；结构化任务有效 Decode 提速 `1.30×–1.33×`；`tm-vulkan` 在无 Vulkan SDK 环境下可直接交叉编译至 Linux musl 与 Android Bionic，并在 Mali-G715 真机通过 `Qwen3.5` GDN 多 token 端到端验证（`mean_KL = 8.88e-9`）。
+
+### ADR-012 M4 `micro` 档：16 行 T-MAC 二补数有符号 `TBL` 激活查表、低比特码本与 BPE 闭包离线词表裁剪
+- **状态**：Accepted（2026-11-21）
+- **背景**：M4 面向 `micro` 档极限硬件（Raspberry Pi Zero 2W：`512 MB` LPDDR2 可用约 `350 MB`、持续带宽 `~2 GB/s`、四核顺序执行 Cortex-A53 仅有纯 ARMv8.0 NEON，**无 `dotprod`、无 `i8mm`、无硬件 FP16 运算**）。在该档位上：① 传统逐元素解包乘加（`SMULL`/`SMLAL`）对 2-bit / BitNet b1.58 三值权重的指令开销高；② 小模型（如 `SmolLM2-360M` 49k 词表、`Qwen3.5-0.8B` 248k 词表）的嵌入与 LM Head 占总权重体积的 `20%–50%`；③ 纯静态二进制体积必须 `≤ 2 MB`（`N-05`），且全内核仍须满足 `ADR-006` 与标量参考 `0-ULP` 逐位一致。
+- **决策**：
+  1. **16 行 T-MAC 二补数有符号 `vqtbl1q` 激活查表内核（`tm-cpu::aarch64::lut`）**：针对 `Q2_0`（2.25 bpw）与 BitNet b1.58 三值 `TQ2_0`（2.06 bpw），每个 K-tile 在栈上（`8–16 KiB`，零堆分配，完全常驻 Cortex-A53 的 `32 KiB` L1D）将量化激活对 `(y0, y1)` 预计算为 16 项二补数拆分的 `(lo: u8, hi: i8)` 表（满足恒等式 `(hi as i16) * 256 + (lo as i16) == val`，无需零点偏移补偿）；内层对 16 行权重做 `vld1q_u8` 连续读取 + 寄存器内 `16×16` 字节转置后，仅靠 `vqtbl1q_u8`/`vqtbl1q_s8` 与 `vaddl_u8`/`vaddl_s8` 宽加完成 16 行累加（**内层权重循环 0 条乘法指令**，且与 `generic` **0-ULP 逐位一致**）。
+  2. **低比特码本内核（`IQ2_XXS` / `IQ3_XXS` / `IQ4_NL`）**：在 `tm-core::iq_tables` 移植 `IQ2XXS_GRID`、`IQ3XXS_GRID`、`KSIGNS64` 奇偶校验符号表与 `KVALUES_IQ4NL` 非线性码本；ARMv8.0 端用无分支二补数异或 `(g ^ sm) - sm` 与单指令 `vqtbl1q_s8` 16 项非线性查表实现，同时提供 `dotprod` `sdot` 加速路径；`tinymodel convert` 在张量列数非 256 整数倍时（如 `SmolLM2-360M` `n_embd=960`）自动按张量回退至 `Q2_0`（64 块）或 `IQ4_NL`（32 块）。
+  3. **BPE 闭包离线词表裁剪（`tinymodel convert --prune-vocab <N> [--vocab-corpus <file>]`）**：强制保留特殊控制 token 与全部 256 个 GPT-2 字节级回退单字符 / `<0xXX>` token（占用 `< 350` 槽位，数学保证任意语言 UTF-8 输入 **0% UNK 无损编码**），对语料高频词与剩余预算按 BPE merge 排名递归补齐祖先闭包，同步裁剪并重映射 `tokenizer.ggml.{tokens,merges,scores,token_type}` 与 `token_embd`/`output`/`per_layer_token_embd` 行，保持 32 字节对齐零拷贝 `mmap`。
+- **后果**：`micro` 档 `aarch64-unknown-linux-musl` 纯静态 stripped ELF 仅 `1.2 MB` 且经机器码全量扫描确认含 `0` 条 `sdot`/`udot`/`smmla`/`ummla` 指令；`TQ2_0` 在纯 ARMv8.0 NEON 下较标量提速 `11.3×`；`SmolLM2-360M` 在 `micro` 配置下峰值 RSS 控制在 `190–248 MiB`（远低于 Zero 2W 的 `350 MB` 红线）。
+
+### ADR-013 AMD GPU 支持走 Vulkan 1.2/1.3 预编译 SPIR-V + Cooperative Matrix 架构（升级 ADR-011 第 3 条）
+- **状态**：Accepted（2026-11-21，用户确认）
+- **背景**：x86 开发主机配备 AMD Radeon RX 9060 XT（RDNA4/`gfx1200`，8 GiB）与 Intel UHD 770（ANV），可选 Vulkan 或 HIP/ROCm 7.1.1（分析见 `research/11-amdgpu.md`）。`ADR-011` 第 3 条的 `naga` SPIR-V 1.0 过渡方案无法生成 `VK_KHR_cooperative_matrix`、`subgroupAdd`、`subgroupShuffleXor` 与 16/8-bit 算术指令，且引入 239 个构建期依赖 crate。
+- **决策**：AMD 显卡通过 `tm-vulkan`（`ash` + GLSL 450 → SPIR-V 1.2）一等公民支持；仓库直接提交经 `spirv-val` 校验的 28 个预编译 `spv/*.spv`（本机有 `glslc` 时自动重编，无 Vulkan SDK 时零外部依赖直接构建，同时彻底移除 `naga` 构建依赖）；实现预录制 Decode 命令缓冲、`16×16×16` FP16/INT8 Cooperative Matrix Prefill、融合 SwiGLU、`fa_coopmat`、LDS 预取 GDN 递推、Subgroup `8/16/32/64` 全适配（AMD 默认 `wave32`、Intel 默认 `SIMD16`）、Pi 5 `V3DV` 无 Shuffle `gdn_recurrence_lds` 退回，以及 `Q4_0x4` / 低比特权重的加载期无损解交错兼容。
+- **后果**：保持普通 `cargo build` 与 `aarch64` 交叉编译零 SDK 依赖，同时解锁硬件矩阵与 Subgroup 原语；CI 通过 `lavapipe` 跑全套对齐测试。
+
+### ADR-014 V6 决策门结论：维持 `tm-vulkan` 为 AMD 与跨平台主力后端，HIP 留至 M5 与 `tm-cuda` 共源评估
+- **状态**：Accepted（2026-11-21）
+- **背景**：完成 V0–V5（见 `research/11-amdgpu.md`）后，在 AMD Radeon RX 9060 XT（Mesa 25.2.8 vs ROCm 7.1.1）和 Intel UHD 770（ANV）上的 5 轮实测显示：
+  1. **Decode（`tg128`）全面超越 HIP**：全部 5 个基准模型上 `tinymodel --vulkan` 同时击败 `llama.cpp` Vulkan（`104%–183%`）和 **ROCm 7.1.1 HIP（`108%–226%`）**（`SmolLM2-360M` `608.8 tok/s = 225.9%` HIP、`Qwen3.5-0.8B` `366.5 tok/s = 217.8%` HIP、`Qwen3.5-2B` `184.5 tok/s = 137.4%` HIP、`Qwen3-8B` `64.0 tok/s = 108.0%` HIP）。
+  2. **Prefill（`pp512`）追平乃至反超 HIP**：达 `llama.cpp` Vulkan 的 **`96.5%–474.9%`**、ROCm HIP 的 **`66.9%–116.3%`**（GPU 硬件时间戳热态达 HIP 的 **`82.7%–116.3%`**，其中 `Qwen3.5-0.8B` `13566.6 tok/s` 直接反超 HIP `16.3%`）。
+  3. **单后端跨厂商复用**：同一套 `tm-vulkan` 在 **Intel UHD 770** 核显上 Decode 超越 `llama.cpp` Vulkan **`18.2%–50.0%`**，且通过 `aarch64-linux-android` 与 `aarch64-unknown-linux-gnu` 交叉编译检查。
+- **决策**：**不单独提前开辟 HIP 后端**，`tm-vulkan` 作为 AMD、Intel 及 Arm 端侧 GPU 的正式主力后端；待 M5 建设 `tm-cuda` 时，再按需评估 `.cu` 内核对 `hipcc` 的共源复用。
+- **后果**：省去维护第三套 GPU 后端及 `~2 GiB` ROCm 运行时依赖，直接衔接 M5 服务层与 `tm-cuda`。

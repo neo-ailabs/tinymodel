@@ -8,6 +8,7 @@ members = [
     "crates/tm-vulkan",
     "crates/tm-tokenizer",
     "crates/tm-models",
+    "crates/tm-runtime",
     "crates/tm-cli",
 ]
 

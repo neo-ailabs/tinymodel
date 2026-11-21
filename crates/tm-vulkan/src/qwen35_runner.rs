@@ -21,7 +21,7 @@ use tm_core::{DType, dequantize_row_bytes};
 use tm_gguf::{GgufError, GgufFile};
 
 use crate::context::{Pipeline, VkBuffer, VkPrefillMode, VulkanContext};
-use crate::kernels::dtype_code;
+use crate::kernels::{dtype_code, normalize_vk_mat_bytes};
 use crate::llama_runner::{VkProfileReport, VkStageStat};
 use crate::{VkResultExt, VulkanError};
 
@@ -413,7 +413,7 @@ pub struct Qwen35VkRunner {
 
 struct PendingMat<'a> {
     slice: VkSlice,
-    bytes: &'a [u8],
+    bytes: std::borrow::Cow<'a, [u8]>,
     imported: bool,
     mat: VkMat,
 }
@@ -446,13 +446,19 @@ fn plan_mat<'a>(
     cols: usize,
     rows: usize,
 ) -> Result<PendingMat<'a>, VulkanError> {
-    let (info, bytes) = gguf.req_tensor(name, layer, &[cols, rows])?;
-    let _ = dtype_code(info.dtype)?;
-    let row_bytes = info.dtype.row_bytes(cols);
+    let (info, raw_bytes) = gguf.req_tensor(name, layer, &[cols, rows])?;
+    let (eff_dtype, bytes) = normalize_vk_mat_bytes(info.dtype, raw_bytes, rows, cols)?;
+    let _ = dtype_code(eff_dtype)?;
+    let row_bytes = eff_dtype.row_bytes(cols);
     let file_off = gguf.tensor_file_offset(info) as u64;
-    let (slice, imported) = match planner.try_import_slice(file_off, bytes.len() as u64) {
-        Some(s) => (s, true),
-        None => (planner.reserve(bytes.len() as u64)?, false),
+    let can_import = matches!(&bytes, std::borrow::Cow::Borrowed(_));
+    let (slice, imported) = if can_import {
+        match planner.try_import_slice(file_off, bytes.len() as u64) {
+            Some(s) => (s, true),
+            None => (planner.reserve(bytes.len() as u64)?, false),
+        }
+    } else {
+        (planner.reserve(bytes.len() as u64)?, false)
     };
     Ok(PendingMat {
         slice,
@@ -460,7 +466,7 @@ fn plan_mat<'a>(
         imported,
         mat: VkMat {
             slice,
-            dtype: info.dtype,
+            dtype: eff_dtype,
             rows,
             cols,
             row_bytes,
@@ -648,6 +654,7 @@ impl Qwen35VkRunner {
         let state_bytes = (ssm_dt_rank * ssm_state_size * ssm_state_size * 4) as u64;
         let conv_hist_bytes = (conv_dim * hist_len * 4) as u64;
 
+        #[allow(clippy::large_enum_variant)]
         enum PendingAttn<'a> {
             Gdn {
                 wqkv: PendingMat<'a>,
@@ -974,7 +981,7 @@ impl Qwen35VkRunner {
             if pm.imported {
                 return Ok(());
             }
-            ctx.write_bytes(&slabs[pm.slice.slab], pm.slice.offset, pm.bytes)
+            ctx.write_bytes(&slabs[pm.slice.slab], pm.slice.offset, &pm.bytes)
         };
 
         write_mat(&p_token_embd)?;

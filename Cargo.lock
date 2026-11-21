@@ -185,6 +185,7 @@ dependencies = [
  "tm-gguf",
  "tm-metal",
  "tm-models",
+ "tm-runtime",
  "tm-tokenizer",
  "tm-vulkan",
 ]
@@ -229,6 +230,18 @@ dependencies = [
  "tm-core",
  "tm-cpu",
  "tm-gguf",
+]
+
+[[package]]
+name = "tm-runtime"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "tm-core",
+ "tm-cpu",
+ "tm-gguf",
+ "tm-models",
+ "tm-tokenizer",
 ]
 
 [[package]]

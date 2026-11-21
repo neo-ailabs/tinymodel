@@ -11,25 +11,142 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use tm_core::probe_process_memory_stats;
+use tm_core::{DType, KvType, probe_process_memory_stats};
 use tm_cpu::{ThreadPool, active_kernels};
-use tm_gguf::GgufFile;
+use tm_gguf::{ConvertOptions, GgufFile};
 use tm_models::{
     CpuDecodeProfile, LlamaModel, LlamaState, Qwen35DecodeProfile, Qwen35Model, Qwen35State,
     Sampler, SamplerConfig, argmax,
 };
+use tm_runtime::{CpuModel, Session, SpecController, SpecMode, SuffixDrafter};
 use tm_tokenizer::Tokenizer;
 
 fn print_usage() {
     eprintln!(
         "Usage:
-  tinymodel probe [-t <threads>] [--stream-mib <mib>] [--no-stream] [--json]
+  tinymodel probe [-t <threads>] [--stream-mib <mib>] [--no-stream] [--vulkan] [--json]
   tinymodel inspect <model.gguf>
-  tinymodel run -m <model.gguf> [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]
-  tinymodel bench -m <model.gguf> [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--vulkan | --metal | --gpu <vulkan|metal|cpu>] [--json]
+  tinymodel convert -i <in.gguf> -o <out.gguf> [--quant q4_0x4|q4_0|q8_0|iq4_nl|iq3_xxs|q2_0|iq2_xxs|tq2_0] [--lm-head-quant <fmt>] [--prune-vocab <N>] [--vocab-corpus <file>]
+  tinymodel run -m <model.gguf> [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--spec off|auto|suffix] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]
+  tinymodel bench -m <model.gguf> [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--spec off|auto|suffix] [--vulkan | --metal | --gpu <vulkan|metal|cpu>] [--json]
   tinymodel profile -m <model.gguf> [-n <tokens>] [-t <threads>] [-c <ctx>] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]
-  tinymodel logits -m <model.gguf> -o <out.bin> [-p <prompt> | --tokens 1,2,3] [-t <threads>] [-c <ctx>] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]"
+  tinymodel logits -m <model.gguf> -o <out.bin> [-p <prompt> | --tokens 1,2,3] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]"
     );
+}
+
+fn parse_convert_dtype(flag: &str, raw: &str) -> Result<DType> {
+    let dt = DType::from_cli_name(raw).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unsupported {flag} '{raw}' (expected q4_0x4, q4_0, q8_0, iq4_nl, iq3_xxs, q2_0, iq2_xxs, tq2_0, f16, f32)"
+        )
+    })?;
+    if !matches!(
+        dt,
+        DType::Q4_0x4
+            | DType::Q4_0
+            | DType::Q8_0
+            | DType::Iq4Nl
+            | DType::Iq3Xxs
+            | DType::Q2_0
+            | DType::Iq2Xxs
+            | DType::TQ2_0
+            | DType::F16
+            | DType::F32
+    ) {
+        bail!("unsupported target quantization {flag} '{raw}'");
+    }
+    Ok(dt)
+}
+
+fn cmd_convert(args: &[String]) -> Result<()> {
+    let mut input: Option<PathBuf> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut opts = ConvertOptions::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-i" | "--input" | "-m" | "--model" => {
+                i += 1;
+                input = Some(PathBuf::from(
+                    args.get(i).context("missing value for -i/--input")?,
+                ));
+            }
+            "-o" | "--output" => {
+                i += 1;
+                output = Some(PathBuf::from(
+                    args.get(i).context("missing value for -o/--output")?,
+                ));
+            }
+            "-q" | "--quant" => {
+                i += 1;
+                let raw = args.get(i).context("missing value for --quant")?;
+                opts.quant = Some(parse_convert_dtype("--quant", raw)?);
+            }
+            "--lm-head-quant" => {
+                i += 1;
+                let raw = args.get(i).context("missing value for --lm-head-quant")?;
+                opts.lm_head_quant = Some(parse_convert_dtype("--lm-head-quant", raw)?);
+            }
+            "--prune-vocab" => {
+                i += 1;
+                opts.prune_vocab = Some(
+                    args.get(i)
+                        .context("missing value for --prune-vocab")?
+                        .parse()
+                        .context("invalid --prune-vocab")?,
+                );
+            }
+            "--vocab-corpus" => {
+                i += 1;
+                let cpath = args.get(i).context("missing value for --vocab-corpus")?;
+                opts.vocab_corpus = Some(
+                    std::fs::read_to_string(cpath)
+                        .with_context(|| format!("failed to read --vocab-corpus '{cpath}'"))?,
+                );
+            }
+            other => bail!("unknown convert argument: {other}"),
+        }
+        i += 1;
+    }
+    let in_path = input.context("convert requires -i <in.gguf>")?;
+    let out_path = output.context("convert requires -o <out.gguf>")?;
+    let t0 = Instant::now();
+    let gguf = GgufFile::open(&in_path)?;
+    let rep = gguf.convert_with_options(&out_path, &opts)?;
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    let in_mib = rep.input_file_bytes as f64 / (1024.0 * 1024.0);
+    let out_mib = rep.output_file_bytes as f64 / (1024.0 * 1024.0);
+    let pct = 100.0 * out_mib / in_mib.max(1e-9);
+    if rep.old_vocab_size != rep.new_vocab_size {
+        println!(
+            "convert: {} -> {} | converted {}/{} tensors | vocab {} -> {} (merges {} -> {}) | {:.2} MiB -> {:.2} MiB ({:.1}%) in {:.1} ms",
+            in_path.display(),
+            out_path.display(),
+            rep.converted_tensors,
+            rep.total_tensors,
+            rep.old_vocab_size,
+            rep.new_vocab_size,
+            rep.old_merges,
+            rep.kept_merges,
+            in_mib,
+            out_mib,
+            pct,
+            ms
+        );
+    } else {
+        println!(
+            "convert: {} -> {} | converted {}/{} tensors | {:.2} MiB -> {:.2} MiB ({:.1}%) in {:.1} ms",
+            in_path.display(),
+            out_path.display(),
+            rep.converted_tensors,
+            rep.total_tensors,
+            in_mib,
+            out_mib,
+            pct,
+            ms
+        );
+    }
+    Ok(())
 }
 
 fn cmd_inspect(path: PathBuf) -> Result<()> {
@@ -67,6 +184,9 @@ struct RunOpts {
     n_predict: usize,
     threads: usize,
     max_ctx: usize,
+    prefix_cache_mib: usize,
+    kv_type: KvType,
+    spec_mode: SpecMode,
     use_metal: bool,
     use_vulkan: bool,
     json: bool,
@@ -82,6 +202,9 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
     let mut n_predict = 64usize;
     let mut threads = tm_cpu::recommended_threads();
     let mut max_ctx = 2048usize;
+    let mut prefix_cache_mib = 0usize;
+    let mut kv_type = KvType::F16;
+    let mut spec_mode = SpecMode::Off;
     let mut use_metal = false;
     let mut use_vulkan = false;
     let mut json = false;
@@ -223,12 +346,34 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
                     other => bail!("unknown --gpu backend '{other}' (expected vulkan, metal, cpu)"),
                 }
             }
+            "--kv-type" => {
+                i += 1;
+                let raw = args.get(i).context("missing value for --kv-type")?;
+                kv_type = raw.parse::<KvType>().map_err(|e| anyhow::anyhow!(e))?;
+            }
+            "--spec" => {
+                i += 1;
+                let raw = args.get(i).context("missing value for --spec")?;
+                spec_mode = raw.parse::<SpecMode>().map_err(|e| anyhow::anyhow!(e))?;
+            }
+            "--prefix-cache-mib" => {
+                i += 1;
+                prefix_cache_mib = args
+                    .get(i)
+                    .context("missing value for --prefix-cache-mib")?
+                    .parse()
+                    .context("invalid --prefix-cache-mib")?;
+            }
             "--json" => {
                 json = true;
             }
             other => bail!("unknown argument: {other}"),
         }
         i += 1;
+    }
+
+    if use_metal && use_vulkan {
+        bail!("cannot specify both --metal and --vulkan");
     }
 
     let model = model.context("missing required -m <model.gguf>")?;
@@ -241,6 +386,9 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
         n_predict,
         threads,
         max_ctx,
+        prefix_cache_mib,
+        kv_type,
+        spec_mode,
         use_metal,
         use_vulkan,
         json,
@@ -365,98 +513,29 @@ fn print_metal_profile_report(
 fn cmd_run_metal(opts: RunOpts) -> Result<()> {
     let t_load = Instant::now();
     let gguf = std::sync::Arc::new(GgufFile::open(&opts.model)?);
-    let arch = gguf.req_str("general.architecture")?.to_string();
     let tok = Tokenizer::from_gguf(&gguf)?;
     let prompt_ids = resolve_prompt_ids(&opts, &tok)?;
     let is_pure_greedy =
         opts.sampler.temperature <= 0.0 && (opts.sampler.repeat_penalty - 1.0).abs() < 1e-6;
 
-    if arch == "qwen35" {
-        let mut runner = tm_metal::Qwen35MetalRunner::from_gguf(gguf, opts.max_ctx)?;
-        let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
-        eprintln!(
-            "[tinymodel] arch=qwen35 backend=metal ({}) weights={} load={:.1}ms prompt_tokens={} vocab={} layers={}",
-            runner.device_name(),
-            if runner.is_zero_copy_weights() {
-                "zero-copy"
-            } else {
-                "copied"
-            },
-            load_ms,
-            prompt_ids.len(),
-            runner.cfg.vocab_size,
-            runner.cfg.n_layers
-        );
-
-        let mut sampler = Sampler::new(opts.sampler, runner.cfg.vocab_size);
-        let mut history = prompt_ids.clone();
-
-        let t_pp = Instant::now();
-        runner.forward_batch(&prompt_ids, 0, true)?;
-        let mut next_id = sampler.sample(runner.logits(), &history);
-        let pp_sec = t_pp.elapsed().as_secs_f64();
-
-        let mut stdout = io::stdout().lock();
-        let mut pos = prompt_ids.len();
-        let mut generated = 0usize;
-        let t_gen = Instant::now();
-        while generated < opts.n_predict {
-            if tok.eos_id == Some(next_id) {
-                break;
-            }
-            stdout.write_all(&tok.decode_token_bytes(next_id))?;
-            stdout.flush()?;
-            history.push(next_id);
-            generated += 1;
-            if generated >= opts.n_predict {
-                break;
-            }
-            if is_pure_greedy {
-                next_id = runner.forward_token_greedy(next_id, pos)?;
-            } else {
-                runner.forward_token(next_id, pos, true)?;
-                next_id = sampler.sample(runner.logits(), &history);
-            }
-            pos += 1;
-        }
-        let gen_sec = t_gen.elapsed().as_secs_f64();
-        writeln!(stdout)?;
-        let pp_tps = (prompt_ids.len() as f64) / pp_sec.max(1e-9);
-        let tg_runs = generated.saturating_sub(1);
-        let tg_tps = if tg_runs > 0 {
-            (tg_runs as f64) / gen_sec.max(1e-9)
-        } else {
-            0.0
-        };
-        eprintln!(
-            "[tinymodel] prompt: {:.2} ms / {} tok ({:.2} tok/s) | eval: {:.2} ms / {} runs ({:.2} tok/s)",
-            pp_sec * 1e3,
-            prompt_ids.len(),
-            pp_tps,
-            gen_sec * 1e3,
-            tg_runs,
-            tg_tps
-        );
-        return Ok(());
-    }
-
-    let mut runner = tm_metal::LlamaMetalRunner::from_gguf(gguf, opts.max_ctx)?;
+    let mut runner = tm_metal::MetalRunner::from_gguf(gguf, opts.max_ctx)?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
     eprintln!(
-        "[tinymodel] backend=metal ({}) weights={} load={:.1}ms prompt_tokens={} vocab={} layers={}",
+        "[tinymodel] arch={} backend=metal ({}) weights={} load={:.1}ms prompt_tokens={} vocab={} layers={}",
+        runner.arch(),
         runner.device_name(),
-        if runner.is_zero_copy() {
+        if runner.is_zero_copy_weights() {
             "zero-copy"
         } else {
             "copied"
         },
         load_ms,
         prompt_ids.len(),
-        runner.cfg.vocab_size,
-        runner.cfg.n_layers
+        runner.vocab_size(),
+        runner.n_layers()
     );
 
-    let mut sampler = Sampler::new(opts.sampler, runner.cfg.vocab_size);
+    let mut sampler = Sampler::new(opts.sampler, runner.vocab_size());
     let mut history = prompt_ids.clone();
 
     let t_pp = Instant::now();
@@ -470,7 +549,7 @@ fn cmd_run_metal(opts: RunOpts) -> Result<()> {
 
     let t_gen = Instant::now();
     while generated < opts.n_predict {
-        if tok.eos_id == Some(next_id) {
+        if tok.is_stop_token(next_id) {
             break;
         }
         stdout.write_all(&tok.decode_token_bytes(next_id))?;
@@ -518,6 +597,16 @@ fn compute_active_decode_bytes(gguf: &GgufFile) -> u64 {
         if let Some(info) = gguf.tensor_info(name) {
             if has_separate_output && name == "token_embd.weight" {
                 // In decode, untied `token_embd.weight` only reads 1 row; exclude from streaming weight bytes.
+                if let Some(&cols) = info.dims.first() {
+                    total += info.dtype.row_bytes(cols) as u64;
+                }
+                continue;
+            }
+            if name == "per_layer_token_embd.weight" {
+                // Gemma 4 PLE lookup table only reads 1 row per token (`ARCHITECTURE.md` §1)!
+                if let Some(&cols) = info.dims.first() {
+                    total += info.dtype.row_bytes(cols) as u64;
+                }
                 continue;
             }
             total += info.byte_len as u64;
@@ -643,97 +732,15 @@ fn cmd_bench_metal(opts: RunOpts) -> Result<()> {
         .unwrap_or("?")
         .to_string();
 
-    if arch == "qwen35" {
-        let mut runner = tm_metal::Qwen35MetalRunner::from_gguf(gguf, opts.max_ctx)?;
-        let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
-
-        runner.forward_token(1, 0, true)?;
-        let warmup_ids = [1u32; 8];
-        runner.reset_state();
-        runner.forward_batch(&warmup_ids, 0, false)?;
-
-        runner.reset_state();
-        let t_pp = Instant::now();
-        runner.forward_batch(&pp_ids, 0, corpus_mode)?;
-        let first_tok = if corpus_mode {
-            argmax(runner.logits())
-        } else {
-            0
-        };
-        let pp_sec = t_pp.elapsed().as_secs_f64();
-        let pp_tps = (n_pp as f64) / pp_sec.max(1e-9);
-
-        let n_gen = opts.n_predict;
-        let mut gen_tokens = Vec::with_capacity(n_gen + 1);
-        let (mut tok, base_pos) = if corpus_mode {
-            (first_tok, n_pp)
-        } else {
-            runner.reset_state();
-            (runner.forward_token_greedy(1, 0)?, 1)
-        };
-        gen_tokens.push(tok);
-        let t0 = Instant::now();
-        for step in 0..n_gen {
-            tok = runner.forward_token_greedy(tok, base_pos + step)?;
-            gen_tokens.push(tok);
-        }
-        let sec = t0.elapsed().as_secs_f64();
-        let tps = (n_gen as f64) / sec.max(1e-9);
-        let tel_after = probe::collect_telemetry();
-        let dev_name = runner.device_name();
-        let wmode = if runner.is_zero_copy_weights() {
-            "zero-copy"
-        } else {
-            "copied"
-        };
-        if opts.json {
-            BenchMetrics {
-                model_name: &model_name,
-                arch: &arch,
-                backend: "metal",
-                isa: "metal",
-                device_name: &dev_name,
-                weights_mode: wmode,
-                threads: 1,
-                max_ctx: opts.max_ctx,
-                corpus_mode,
-                active_decode_bytes,
-                load_ms,
-                ttft_ms: pp_sec * 1e3,
-                n_pp,
-                pp_ms: pp_sec * 1e3,
-                n_gen,
-                tg_ms: sec * 1e3,
-                last_tok: tok,
-                greedy_hash: probe::hash_token_sequence(&gen_tokens),
-                tel_before,
-                tel_after,
-            }
-            .print_json();
-        } else {
-            println!(
-                "bench: model={} backend=metal ({}) weights={} load={:.1}ms pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
-                model_name,
-                dev_name,
-                wmode,
-                load_ms,
-                n_pp,
-                pp_tps,
-                n_gen,
-                tps,
-                (sec * 1e3) / (n_gen as f64),
-                tok
-            );
-        }
-        return Ok(());
-    }
-
-    let mut runner = tm_metal::LlamaMetalRunner::from_gguf(gguf, opts.max_ctx)?;
+    let mut runner = tm_metal::MetalRunner::from_gguf(gguf, opts.max_ctx)?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
-    let _ = runner.forward_token(1, 0, true)?;
+    let _ = runner.forward_token_greedy(1, 0)?;
+    let _ = runner.forward_token_greedy(2, 1)?;
+    runner.reset_state();
     let warmup_ids = [1u32; 8];
-    let _ = runner.forward_batch(&warmup_ids, 0, false)?;
+    let _ = runner.forward_batch(&warmup_ids, 0, true)?;
+    runner.reset_state();
 
     let t_pp = Instant::now();
     let pp_logits = runner.forward_batch(&pp_ids, 0, corpus_mode)?;
@@ -746,6 +753,7 @@ fn cmd_bench_metal(opts: RunOpts) -> Result<()> {
     let (mut tok, base_pos) = if corpus_mode {
         (first_tok, n_pp)
     } else {
+        runner.reset_state();
         (runner.forward_token_greedy(1, 0)?, 1)
     };
     gen_tokens.push(tok);
@@ -758,7 +766,7 @@ fn cmd_bench_metal(opts: RunOpts) -> Result<()> {
     let tps = (n_gen as f64) / sec.max(1e-9);
     let tel_after = probe::collect_telemetry();
     let dev_name = runner.device_name();
-    let wmode = if runner.is_zero_copy() {
+    let wmode = if runner.is_zero_copy_weights() {
         "zero-copy"
     } else {
         "copied"
@@ -789,8 +797,9 @@ fn cmd_bench_metal(opts: RunOpts) -> Result<()> {
         .print_json();
     } else {
         println!(
-            "bench: model={} backend=metal ({}) weights={} load={:.1}ms pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
+            "bench: model={} arch={} backend=metal ({}) weights={} load={:.1}ms pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
             model_name,
+            arch,
             dev_name,
             wmode,
             load_ms,
@@ -835,22 +844,6 @@ fn estimate_llama_dirty_bytes(cfg: &tm_models::LlamaConfig, max_ctx: usize) -> u
             as u64;
     let scratch_bytes = ((cfg.vocab_size + 36 * (cfg.n_embd + cfg.n_ff)) * 4) as u64;
     kv_bytes + scratch_bytes
-}
-
-fn estimate_qwen35_dirty_bytes(model: &Qwen35Model, max_ctx: usize) -> u64 {
-    let c = &model.cfg;
-    let kv_bytes = (2
-        * model.num_full_attn_layers()
-        * max_ctx
-        * c.n_head_kv
-        * c.head_dim
-        * core::mem::size_of::<u16>()) as u64;
-    let gdn_per_layer = (c.ssm_dt_rank * c.ssm_state_size * c.ssm_state_size
-        + c.conv_dim() * c.ssm_conv_kernel)
-        * 4;
-    let gdn_bytes = (model.num_gdn_layers() * gdn_per_layer) as u64;
-    let scratch_bytes = ((c.vocab_size + 36 * (c.n_embd + c.n_ff)) * 4) as u64;
-    kv_bytes + gdn_bytes + scratch_bytes
 }
 
 #[cfg(feature = "vulkan")]
@@ -989,7 +982,7 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
         let mut generated = 0usize;
         let t_gen = Instant::now();
         while generated < opts.n_predict {
-            if tok.eos_id == Some(next_id) {
+            if tok.is_stop_token(next_id) {
                 break;
             }
             stdout.write_all(&tok.decode_token_bytes(next_id))?;
@@ -1056,7 +1049,7 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
 
     let t_gen = Instant::now();
     while generated < opts.n_predict {
-        if tok.eos_id == Some(next_id) {
+        if tok.is_stop_token(next_id) {
             break;
         }
         stdout.write_all(&tok.decode_token_bytes(next_id))?;
@@ -1300,142 +1293,127 @@ fn cmd_profile_vulkan(opts: RunOpts) -> Result<()> {
 }
 
 fn cmd_run(opts: RunOpts) -> Result<()> {
-    if opts.use_vulkan {
-        #[cfg(feature = "vulkan")]
-        return cmd_run_vulkan(opts);
-        #[cfg(not(feature = "vulkan"))]
-        bail!("--vulkan requires compiling with feature 'vulkan'");
-    }
     if opts.use_metal {
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         return cmd_run_metal(opts);
         #[cfg(not(all(feature = "metal", target_vendor = "apple")))]
         bail!("--metal requires compiling with feature 'metal' on Apple Silicon");
     }
+    if opts.use_vulkan {
+        #[cfg(feature = "vulkan")]
+        return cmd_run_vulkan(opts);
+        #[cfg(not(feature = "vulkan"))]
+        bail!("--vulkan requires compiling with feature 'vulkan'");
+    }
     let t_load = Instant::now();
     let gguf = GgufFile::open(&opts.model)?;
-    let arch = gguf.req_str("general.architecture")?.to_string();
     let tok = Tokenizer::from_gguf(&gguf)?;
     let prompt_ids = resolve_prompt_ids(&opts, &tok)?;
     let pool = ThreadPool::new(opts.threads);
     let kt = active_kernels();
 
-    if arch == "qwen35" {
-        let model = Qwen35Model::from_gguf(&gguf)?;
-        check_linux_dirty_budget(
-            estimate_qwen35_dirty_bytes(&model, opts.max_ctx),
-            opts.max_ctx,
-        )?;
-        let mut state = Qwen35State::new(&model, opts.max_ctx);
-        let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
+    let model = CpuModel::from_gguf(&gguf)?;
+    check_linux_dirty_budget(
+        model.estimate_dirty_bytes_with_kv(opts.max_ctx, opts.kv_type),
+        opts.max_ctx,
+    )?;
+    let cache_bytes = opts.prefix_cache_mib * 1024 * 1024;
+    let mut session = Session::new_with_options(&model, opts.max_ctx, cache_bytes, opts.kv_type);
+    if opts.spec_mode != SpecMode::Off {
+        session.enable_speculation();
+    }
+    let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
+    eprintln!(
+        "[tinymodel] arch={} isa={} threads={} kv={} spec={} load={:.1}ms prompt_tokens={} vocab={} layers={} prefix_cache_mib={}",
+        model.arch(),
+        kt.isa.name(),
+        pool.num_threads(),
+        opts.kv_type.as_str(),
+        opts.spec_mode.as_str(),
+        load_ms,
+        prompt_ids.len(),
+        model.vocab_size(),
+        model.n_layers(),
+        opts.prefix_cache_mib
+    );
+
+    let t_pp = Instant::now();
+    let rep = session.prefill_with_cache(&pool, &prompt_ids, (cache_bytes > 0).then_some(64))?;
+    if cache_bytes > 0 && rep.cached_tokens > 0 {
         eprintln!(
-            "[tinymodel] arch=qwen35 isa={} threads={} load={:.1}ms prompt_tokens={} vocab={} layers={} (gdn={}, full={})",
-            kt.isa.name(),
-            pool.num_threads(),
-            load_ms,
-            prompt_ids.len(),
-            model.cfg.vocab_size,
-            model.cfg.n_layers,
-            model.num_gdn_layers(),
-            model.num_full_attn_layers()
+            "[tinymodel] prefix_cache hit: reused {}/{} tokens",
+            rep.cached_tokens, rep.total_tokens
         );
+    }
+    let pp_sec = t_pp.elapsed().as_secs_f64();
 
-        let t_pp = Instant::now();
-        model.forward_batch(&mut state, &pool, kt, &prompt_ids, 0, true)?;
-        let pp_sec = t_pp.elapsed().as_secs_f64();
+    let mut stdout = io::stdout().lock();
+    let is_pure_greedy =
+        opts.sampler.temperature <= 0.0 && (opts.sampler.repeat_penalty - 1.0).abs() < 1e-6;
 
-        let mut stdout = io::stdout().lock();
-        let mut sampler = Sampler::new(opts.sampler, model.cfg.vocab_size);
+    let (generated, gen_sec, spec_note) = if opts.spec_mode != SpecMode::Off && is_pure_greedy {
+        let mut suffix = SuffixDrafter::default();
+        let mut ctrl = SpecController::default();
+        let t_gen = Instant::now();
+        let (tokens, stats) = session.generate_greedy_speculative(
+            &pool,
+            &prompt_ids,
+            opts.n_predict,
+            opts.spec_mode,
+            &mut suffix,
+            None,
+            &mut ctrl,
+            |_, tid| tok.is_stop_token(tid),
+        )?;
+        let elapsed = t_gen.elapsed().as_secs_f64();
+        let mut emitted = 0usize;
+        for &tid in &tokens {
+            if tok.is_stop_token(tid) {
+                break;
+            }
+            stdout.write_all(&tok.decode_token_bytes(tid))?;
+            emitted += 1;
+        }
+        stdout.flush()?;
+        (
+            emitted,
+            elapsed,
+            format!(
+                " | spec: accepted={}/{} ({:.1}%, verify_calls={}, auto_off={})",
+                stats.accepted_tokens,
+                stats.drafted_tokens,
+                stats.acceptance_rate() * 100.0,
+                stats.verify_calls,
+                stats.auto_disabled_steps
+            ),
+        )
+    } else {
+        let mut sampler = Sampler::new(opts.sampler, model.vocab_size());
         let mut history = prompt_ids.clone();
-        let mut next_id = sampler.sample(state.logits(), &history);
+        let mut next_id = sampler.sample(session.logits(), &history);
         let mut pos = prompt_ids.len();
-        let mut generated = 0usize;
+        let mut count = 0usize;
 
         let t_gen = Instant::now();
-        while generated < opts.n_predict {
-            if tok.eos_id == Some(next_id) {
+        while count < opts.n_predict {
+            if tok.is_stop_token(next_id) {
                 break;
             }
             stdout.write_all(&tok.decode_token_bytes(next_id))?;
             stdout.flush()?;
             history.push(next_id);
-            generated += 1;
-            if generated >= opts.n_predict {
+            count += 1;
+
+            if count >= opts.n_predict {
                 break;
             }
-            model.forward_token(&mut state, &pool, kt, next_id, pos, true)?;
-            next_id = sampler.sample(state.logits(), &history);
+            model.forward_token(&mut session.state, &pool, kt, next_id, pos, true)?;
+            next_id = sampler.sample(session.logits(), &history);
             pos += 1;
         }
-        let gen_sec = t_gen.elapsed().as_secs_f64();
-        writeln!(stdout)?;
-        let pp_tps = (prompt_ids.len() as f64) / pp_sec.max(1e-9);
-        let tg_runs = generated.saturating_sub(1);
-        let tg_tps = if tg_runs > 0 {
-            (tg_runs as f64) / gen_sec.max(1e-9)
-        } else {
-            0.0
-        };
-        eprintln!(
-            "[tinymodel] prompt: {:.2} ms / {} tok ({:.2} tok/s) | eval: {:.2} ms / {} runs ({:.2} tok/s)",
-            pp_sec * 1e3,
-            prompt_ids.len(),
-            pp_tps,
-            gen_sec * 1e3,
-            tg_runs,
-            tg_tps
-        );
-        return Ok(());
-    }
-
-    let model = LlamaModel::from_gguf(&gguf)?;
-    check_linux_dirty_budget(
-        estimate_llama_dirty_bytes(&model.cfg, opts.max_ctx),
-        opts.max_ctx,
-    )?;
-    let mut state = LlamaState::new(&model.cfg, opts.max_ctx);
-    let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
-
-    eprintln!(
-        "[tinymodel] isa={} threads={} load={:.1}ms prompt_tokens={} vocab={} layers={}",
-        kt.isa.name(),
-        pool.num_threads(),
-        load_ms,
-        prompt_ids.len(),
-        model.cfg.vocab_size,
-        model.cfg.n_layers
-    );
-
-    let t_pp = Instant::now();
-    model.forward_batch(&mut state, &pool, kt, &prompt_ids, 0, true)?;
-    let pp_sec = t_pp.elapsed().as_secs_f64();
-
-    let mut stdout = io::stdout().lock();
-    let mut sampler = Sampler::new(opts.sampler, model.cfg.vocab_size);
-    let mut history = prompt_ids.clone();
-    let mut next_id = sampler.sample(state.logits(), &history);
-    let mut pos = prompt_ids.len();
-    let mut generated = 0usize;
-
-    let t_gen = Instant::now();
-    while generated < opts.n_predict {
-        if tok.eos_id == Some(next_id) {
-            break;
-        }
-        stdout.write_all(&tok.decode_token_bytes(next_id))?;
-        stdout.flush()?;
-        history.push(next_id);
-        generated += 1;
-
-        if generated >= opts.n_predict {
-            break;
-        }
-        model.forward_token(&mut state, &pool, kt, next_id, pos, true)?;
-        next_id = sampler.sample(state.logits(), &history);
-        pos += 1;
-    }
-    let gen_sec = t_gen.elapsed().as_secs_f64();
+        (count, t_gen.elapsed().as_secs_f64(), String::new())
+    };
 
     writeln!(stdout)?;
     let pp_tps = (prompt_ids.len() as f64) / pp_sec.max(1e-9);
@@ -1446,13 +1424,14 @@ fn cmd_run(opts: RunOpts) -> Result<()> {
         0.0
     };
     eprintln!(
-        "[tinymodel] prompt: {:.2} ms / {} tok ({:.2} tok/s) | eval: {:.2} ms / {} runs ({:.2} tok/s)",
+        "[tinymodel] prompt: {:.2} ms / {} tok ({:.2} tok/s) | eval: {:.2} ms / {} runs ({:.2} tok/s){}",
         pp_sec * 1e3,
         prompt_ids.len(),
         pp_tps,
         gen_sec * 1e3,
         tg_runs,
-        tg_tps
+        tg_tps,
+        spec_note
     );
 
     Ok(())
@@ -1488,106 +1467,31 @@ fn cmd_bench(opts: RunOpts) -> Result<()> {
         .unwrap_or("?")
         .to_string();
 
-    if arch == "qwen35" {
-        let model = Qwen35Model::from_gguf(&gguf)?;
-        check_linux_dirty_budget(
-            estimate_qwen35_dirty_bytes(&model, opts.max_ctx),
-            opts.max_ctx,
-        )?;
-        let mut state = Qwen35State::new(&model, opts.max_ctx);
-        let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
-
-        model.forward_token(&mut state, &pool, kt, 1, 0, true)?;
-        state.reset();
-        model.forward_batch(&mut state, &pool, kt, &[1u32; 8], 0, false)?;
-
-        state.reset();
-        let t_pp = Instant::now();
-        model.forward_batch(&mut state, &pool, kt, &pp_ids, 0, corpus_mode)?;
-        let first_tok = if corpus_mode {
-            argmax(state.logits())
-        } else {
-            0
-        };
-        let pp_sec = t_pp.elapsed().as_secs_f64();
-        let pp_tps = (n_pp as f64) / pp_sec.max(1e-9);
-
-        let n_gen = opts.n_predict;
-        let mut gen_tokens = Vec::with_capacity(n_gen + 1);
-        let (mut tok, base_pos) = if corpus_mode {
-            (first_tok, n_pp)
-        } else {
-            state.reset();
-            model.forward_token(&mut state, &pool, kt, 1, 0, true)?;
-            (argmax(state.logits()), 1)
-        };
-        gen_tokens.push(tok);
-        let t0 = Instant::now();
-        for step in 0..n_gen {
-            model.forward_token(&mut state, &pool, kt, tok, base_pos + step, true)?;
-            tok = argmax(state.logits());
-            gen_tokens.push(tok);
-        }
-        let sec = t0.elapsed().as_secs_f64();
-        let tps = (n_gen as f64) / sec.max(1e-9);
-        let tel_after = probe::collect_telemetry();
-        if opts.json {
-            BenchMetrics {
-                model_name: &model_name,
-                arch: &arch,
-                backend: "cpu",
-                isa: kt.isa.name(),
-                device_name: &dev_model_name,
-                weights_mode: "mmap",
-                threads: pool.num_threads(),
-                max_ctx: opts.max_ctx,
-                corpus_mode,
-                active_decode_bytes,
-                load_ms,
-                ttft_ms: pp_sec * 1e3,
-                n_pp,
-                pp_ms: pp_sec * 1e3,
-                n_gen,
-                tg_ms: sec * 1e3,
-                last_tok: tok,
-                greedy_hash: probe::hash_token_sequence(&gen_tokens),
-                tel_before,
-                tel_after,
-            }
-            .print_json();
-        } else {
-            println!(
-                "bench: model={} isa={} threads={} pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
-                model_name,
-                kt.isa.name(),
-                pool.num_threads(),
-                n_pp,
-                pp_tps,
-                n_gen,
-                tps,
-                (sec * 1e3) / (n_gen as f64),
-                tok
-            );
-        }
-        return Ok(());
-    }
-
-    let model = LlamaModel::from_gguf(&gguf)?;
+    let model = CpuModel::from_gguf(&gguf)?;
     check_linux_dirty_budget(
-        estimate_llama_dirty_bytes(&model.cfg, opts.max_ctx),
+        model.estimate_dirty_bytes_with_kv(opts.max_ctx, opts.kv_type),
         opts.max_ctx,
     )?;
-    let mut state = LlamaState::new(&model.cfg, opts.max_ctx);
+    let mut session = Session::new_with_options(&model, opts.max_ctx, 0, opts.kv_type);
+    if opts.spec_mode != SpecMode::Off {
+        session.enable_speculation();
+    }
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
-    model.forward_token(&mut state, &pool, kt, 1, 0, true)?;
-    let warm_ids = [1u32; 8];
-    model.forward_batch(&mut state, &pool, kt, &warm_ids, 0, false)?;
+    // Warm up mmap pages & thread pool
+    model.forward_token(&mut session.state, &pool, kt, 1, 0, true)?;
+    session.state.reset();
+    model.forward_batch(&mut session.state, &pool, kt, &[1u32; 8], 0, false)?;
+    session.state.reset();
 
     let t_pp = Instant::now();
-    model.forward_batch(&mut state, &pool, kt, &pp_ids, 0, corpus_mode)?;
-    let first_tok = if corpus_mode {
-        argmax(state.logits())
+    if opts.spec_mode != SpecMode::Off {
+        session.prefill_with_cache(&pool, &pp_ids, None)?;
+    } else {
+        model.forward_batch(&mut session.state, &pool, kt, &pp_ids, 0, corpus_mode)?;
+    }
+    let first_tok = if corpus_mode || opts.spec_mode != SpecMode::Off {
+        argmax(session.logits())
     } else {
         0
     };
@@ -1596,23 +1500,66 @@ fn cmd_bench(opts: RunOpts) -> Result<()> {
 
     let n_gen = opts.n_predict;
     let mut gen_tokens = Vec::with_capacity(n_gen + 1);
-    let (mut tok, base_pos) = if corpus_mode {
-        (first_tok, n_pp)
+    let mut spec_summary = String::new();
+    let (tok, sec) = if opts.spec_mode != SpecMode::Off {
+        let mut suffix = SuffixDrafter::default();
+        let mut ctrl = SpecController::default();
+        if !corpus_mode {
+            session.prefill_with_cache(&pool, &[1u32], None)?;
+        }
+        let seed_prompt: &[u32] = if corpus_mode { &pp_ids } else { &[1u32] };
+        let t0 = Instant::now();
+        let (toks, stats) = session.generate_greedy_speculative(
+            &pool,
+            seed_prompt,
+            n_gen + 1,
+            opts.spec_mode,
+            &mut suffix,
+            None,
+            &mut ctrl,
+            |_, _| false,
+        )?;
+        let elapsed = t0.elapsed().as_secs_f64();
+        let last = toks.last().copied().unwrap_or(first_tok);
+        gen_tokens = toks;
+        spec_summary = format!(
+            " spec={}({}/{})",
+            opts.spec_mode.as_str(),
+            stats.accepted_tokens,
+            stats.drafted_tokens
+        );
+        (last, elapsed)
     } else {
-        model.forward_token(&mut state, &pool, kt, 1, 0, true)?;
-        (argmax(state.logits()), 1)
+        let (mut cur_tok, base_pos) = if corpus_mode {
+            (first_tok, n_pp)
+        } else {
+            session.state.reset();
+            model.forward_token(&mut session.state, &pool, kt, 1, 0, true)?;
+            (argmax(session.logits()), 1)
+        };
+        gen_tokens.push(cur_tok);
+        let t0 = Instant::now();
+        for step in 0..n_gen {
+            model.forward_token(
+                &mut session.state,
+                &pool,
+                kt,
+                cur_tok,
+                base_pos + step,
+                true,
+            )?;
+            cur_tok = argmax(session.logits());
+            gen_tokens.push(cur_tok);
+        }
+        (cur_tok, t0.elapsed().as_secs_f64())
     };
-    gen_tokens.push(tok);
-
-    let t0 = Instant::now();
-    for step in 0..n_gen {
-        model.forward_token(&mut state, &pool, kt, tok, base_pos + step, true)?;
-        tok = argmax(state.logits());
-        gen_tokens.push(tok);
-    }
-    let sec = t0.elapsed().as_secs_f64();
     let tps = (n_gen as f64) / sec.max(1e-9);
     let tel_after = probe::collect_telemetry();
+    let wmode = match (opts.kv_type, opts.spec_mode) {
+        (KvType::F16, SpecMode::Off) => "mmap".to_string(),
+        (kv, SpecMode::Off) => format!("mmap+kv_{}", kv.as_str()),
+        (kv, sp) => format!("mmap+kv_{}+spec_{}", kv.as_str(), sp.as_str()),
+    };
     if opts.json {
         BenchMetrics {
             model_name: &model_name,
@@ -1620,7 +1567,7 @@ fn cmd_bench(opts: RunOpts) -> Result<()> {
             backend: "cpu",
             isa: kt.isa.name(),
             device_name: &dev_model_name,
-            weights_mode: "mmap",
+            weights_mode: &wmode,
             threads: pool.num_threads(),
             max_ctx: opts.max_ctx,
             corpus_mode,
@@ -1639,10 +1586,13 @@ fn cmd_bench(opts: RunOpts) -> Result<()> {
         .print_json();
     } else {
         println!(
-            "bench: model={} isa={} threads={} pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
+            "bench: model={} arch={} isa={} threads={} kv={}{} pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
             model_name,
+            arch,
             kt.isa.name(),
             pool.num_threads(),
+            opts.kv_type.as_str(),
+            spec_summary,
             n_pp,
             pp_tps,
             n_gen,
@@ -1663,18 +1613,8 @@ fn cmd_profile_metal(opts: RunOpts) -> Result<()> {
         .unwrap_or("?")
         .to_string();
     let gguf = std::sync::Arc::new(GgufFile::open(&opts.model)?);
-    let arch = gguf.req_str("general.architecture")?.to_string();
     let n_runs = opts.n_predict.max(16);
-
-    if arch == "qwen35" {
-        let mut runner = tm_metal::Qwen35MetalRunner::from_gguf(gguf, opts.max_ctx)?;
-        let dev = runner.device_name();
-        let rep = runner.profile(n_runs, 512)?;
-        print_metal_profile_report(&model_name, &dev, &rep);
-        return Ok(());
-    }
-
-    let mut runner = tm_metal::LlamaMetalRunner::from_gguf(gguf, opts.max_ctx)?;
+    let mut runner = tm_metal::MetalRunner::from_gguf(gguf, opts.max_ctx)?;
     let dev = runner.device_name();
     let rep = runner.profile(n_runs, 512)?;
     print_metal_profile_report(&model_name, &dev, &rep);
@@ -1989,52 +1929,28 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
     if opts.use_metal {
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         {
-            if arch == "qwen35" {
-                let mut runner = tm_metal::Qwen35MetalRunner::from_gguf(gguf, opts.max_ctx)?;
-                let vocab = runner.cfg.vocab_size as u32;
-                writer.write_all(b"TMLG")?;
-                writer.write_all(&1u32.to_le_bytes())?;
-                writer.write_all(&(n_steps as u32).to_le_bytes())?;
-                writer.write_all(&vocab.to_le_bytes())?;
-                for &id in &input_ids {
-                    writer.write_all(&id.to_le_bytes())?;
-                }
-                for (pos, &id) in input_ids.iter().enumerate() {
-                    runner.forward_token(id, pos, true)?;
-                    write_f32_le(&mut writer, runner.logits())?;
-                }
-                writer.flush()?;
-                eprintln!(
-                    "[tinymodel logits] wrote {} steps x {} vocab (metal qwen35) -> {}",
-                    n_steps,
-                    vocab,
-                    out_path.display()
-                );
-                return Ok(());
-            } else {
-                let mut runner = tm_metal::LlamaMetalRunner::from_gguf(gguf, opts.max_ctx)?;
-                let vocab = runner.cfg.vocab_size as u32;
-                writer.write_all(b"TMLG")?;
-                writer.write_all(&1u32.to_le_bytes())?;
-                writer.write_all(&(n_steps as u32).to_le_bytes())?;
-                writer.write_all(&vocab.to_le_bytes())?;
-                for &id in &input_ids {
-                    writer.write_all(&id.to_le_bytes())?;
-                }
-                for (pos, &id) in input_ids.iter().enumerate() {
-                    let logits = runner.forward_token(id, pos, true)?;
-                    write_f32_le(&mut writer, logits)?;
-                }
-                writer.flush()?;
-                eprintln!(
-                    "[tinymodel logits] wrote {} steps x {} vocab (metal {}) -> {}",
-                    n_steps,
-                    vocab,
-                    arch,
-                    out_path.display()
-                );
-                return Ok(());
+            let mut runner = tm_metal::MetalRunner::from_gguf(gguf, opts.max_ctx)?;
+            let vocab = runner.vocab_size() as u32;
+            writer.write_all(b"TMLG")?;
+            writer.write_all(&1u32.to_le_bytes())?;
+            writer.write_all(&(n_steps as u32).to_le_bytes())?;
+            writer.write_all(&vocab.to_le_bytes())?;
+            for &id in &input_ids {
+                writer.write_all(&id.to_le_bytes())?;
             }
+            for (pos, &id) in input_ids.iter().enumerate() {
+                let logits = runner.forward_token(id, pos, true)?;
+                write_f32_le(&mut writer, logits)?;
+            }
+            writer.flush()?;
+            eprintln!(
+                "[tinymodel logits] wrote {} steps x {} vocab (metal {}) -> {}",
+                n_steps,
+                vocab,
+                arch,
+                out_path.display()
+            );
+            return Ok(());
         }
         #[cfg(not(all(feature = "metal", target_vendor = "apple")))]
         bail!("--metal requires compiling with feature 'metal' on Apple Silicon");
@@ -2042,40 +1958,13 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
 
     let pool = ThreadPool::new(opts.threads);
     let kt = active_kernels();
-
-    if arch == "qwen35" {
-        let model = Qwen35Model::from_gguf(&gguf)?;
-        let mut state = Qwen35State::new(&model, opts.max_ctx);
-        let vocab = model.cfg.vocab_size as u32;
-        writer.write_all(b"TMLG")?;
-        writer.write_all(&1u32.to_le_bytes())?;
-        writer.write_all(&(n_steps as u32).to_le_bytes())?;
-        writer.write_all(&vocab.to_le_bytes())?;
-        for &id in &input_ids {
-            writer.write_all(&id.to_le_bytes())?;
-        }
-        for (pos, &id) in input_ids.iter().enumerate() {
-            model.forward_token(&mut state, &pool, kt, id, pos, true)?;
-            write_f32_le(&mut writer, state.logits())?;
-        }
-        writer.flush()?;
-        eprintln!(
-            "[tinymodel logits] wrote {} steps x {} vocab (cpu/{} qwen35) -> {}",
-            n_steps,
-            vocab,
-            kt.isa.name(),
-            out_path.display()
-        );
-        return Ok(());
-    }
-
-    let model = LlamaModel::from_gguf(&gguf)?;
+    let model = CpuModel::from_gguf(&gguf)?;
     check_linux_dirty_budget(
-        estimate_llama_dirty_bytes(&model.cfg, opts.max_ctx),
+        model.estimate_dirty_bytes_with_kv(opts.max_ctx, opts.kv_type),
         opts.max_ctx,
     )?;
-    let mut state = LlamaState::new(&model.cfg, opts.max_ctx);
-    let vocab = model.cfg.vocab_size as u32;
+    let mut state = model.new_state_with_kv(opts.max_ctx, opts.kv_type);
+    let vocab = model.vocab_size() as u32;
     writer.write_all(b"TMLG")?;
     writer.write_all(&1u32.to_le_bytes())?;
     writer.write_all(&(n_steps as u32).to_le_bytes())?;
@@ -2112,6 +2001,7 @@ fn main() -> Result<()> {
             let p = args.get(2).context("missing <model.gguf>")?;
             cmd_inspect(PathBuf::from(p))
         }
+        "convert" => cmd_convert(&args[2..]),
         "run" => cmd_run(parse_run_opts(&args[2..])?),
         "bench" => cmd_bench(parse_run_opts(&args[2..])?),
         "profile" => cmd_profile(parse_run_opts(&args[2..])?),

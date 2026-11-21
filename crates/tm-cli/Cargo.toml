@@ -25,5 +25,6 @@ tm-cpu = { path = "../tm-cpu", default-features = false }
 tm-gguf = { path = "../tm-gguf" }
 tm-metal = { path = "../tm-metal", optional = true }
 tm-models = { path = "../tm-models" }
+tm-runtime = { path = "../tm-runtime" }
 tm-tokenizer = { path = "../tm-tokenizer" }
 tm-vulkan = { path = "../tm-vulkan", optional = true }

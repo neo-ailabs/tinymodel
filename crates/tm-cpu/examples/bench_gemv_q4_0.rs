@@ -5,8 +5,9 @@
 
 use std::time::Instant;
 use tm_core::{
-    BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, QK_K, QK4_0,
-    f32_to_f16, quantize_row_q8_1, quantize_row_q8_k,
+    BlockIQ2XXS, BlockIQ3XXS, BlockIQ4NL, BlockQ2_0, BlockQ4_0, BlockQ4_0x4, BlockQ4_1, BlockQ5K,
+    BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, BlockTQ2_0, QK_K, QK2_0, QK4_0, f32_to_f16,
+    quantize_row_q8_1, quantize_row_q8_k, repack_q4_0_to_q4_0x4,
 };
 use tm_cpu::isa::supported_isas;
 use tm_cpu::{ThreadPool, select_kernels};
@@ -434,12 +435,244 @@ fn main() {
         }
         let rms_us = t_r.elapsed().as_secs_f64() * 1e6 / 2000.0;
 
+        let bf16_row: Vec<u16> = (0..1536)
+            .map(|i| 0x3F00u16.wrapping_add(i as u16 & 0x7F))
+            .collect();
+        let t_bf = Instant::now();
+        let mut bf_acc = 0.0f32;
+        for _ in 0..2000 {
+            bf_acc += (kt.dot_f32_bf16)(&src_f32[..1536], &bf16_row);
+        }
+        let bf_us = t_bf.elapsed().as_secs_f64() * 1e6 / 2000.0;
+
         println!(
-            "{:<10} gdn_recur_16h={:>6.2} us/layer | rms_norm(2048)={:>5.3} us | chk={:.3}",
+            "{:<10} gdn_recur_16h={:>6.2} us/layer | rms_norm(2048)={:>5.3} us | dot_bf16(1536)={:>5.3} us | chk={:.3}",
             isa.name(),
             gdn_us,
             rms_us,
-            o_all[0] + rms_out[0]
+            bf_us,
+            o_all[0] + rms_out[0] + bf_acc * 1e-6
+        );
+    }
+
+    // M3 Benchmark: Repacked `Q4_0x4` (`Q4_0_4x8`) GEMV (1 tok) & Prefill GEMM (32 tok) + Q8_0 KV
+    let m3_rows = 4096usize;
+    let m3_cols = 4096usize;
+    let m3_nb = m3_cols / QK4_0;
+    let m3_ntok = 32usize;
+    let (w_raw, x_batch) = make_data(m3_rows, m3_nb, m3_ntok);
+    let mut w_rep = vec![
+        BlockQ4_0x4 {
+            d: [0; 4],
+            qs: [0; 64]
+        };
+        (m3_rows / 4) * m3_nb
+    ];
+    repack_q4_0_to_q4_0x4(&w_raw, &mut w_rep, m3_rows, m3_nb);
+    let m3_bytes = (w_rep.len() * core::mem::size_of::<BlockQ4_0x4>()) as f64;
+    let m3_ops_gemm = 2.0 * (m3_rows as f64) * (m3_cols as f64) * (m3_ntok as f64);
+
+    println!(
+        "\n--- M3 Repacked Q4_0x4 (4096x4096, 4 threads): GEMV (N=1) & Prefill GEMM (N=32) ---"
+    );
+    for &isa in &isas {
+        let kt = select_kernels(isa);
+        let mut out_v = vec![0.0f32; m3_rows];
+        let ov_ptr = out_v.as_mut_ptr() as usize;
+        let n_groups = m3_rows / 4;
+        let run_v = || {
+            pool4.parallel_for(n_groups, n_groups / 4, |g0, g1| {
+                let r0 = g0 * 4;
+                let len = (g1 - g0) * 4;
+                // SAFETY: Disjoint `[r0..r0+len)` slice per worker.
+                let o =
+                    unsafe { core::slice::from_raw_parts_mut((ov_ptr as *mut f32).add(r0), len) };
+                (kt.gemv_q4_0x4_q8_0)(
+                    &w_rep[g0 * m3_nb..g1 * m3_nb],
+                    &x_batch[..m3_nb],
+                    o,
+                    len,
+                    m3_nb,
+                );
+            });
+        };
+        run_v();
+        let iters = if isa == tm_cpu::Isa::Generic { 5 } else { 40 };
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            run_v();
+        }
+        let sec_v = t0.elapsed().as_secs_f64() / (iters as f64);
+
+        let mut out_m = vec![0.0f32; m3_ntok * m3_rows];
+        let om_ptr = out_m.as_mut_ptr() as usize;
+        let run_m = || {
+            pool4.parallel_for(n_groups, n_groups / 4, |g0, g1| {
+                let mut g = g0;
+                let mut tile = [0.0f32; 64 * 32];
+                while g < g1 {
+                    let bg = (g1 - g).min(16);
+                    let b_rows = bg * 4;
+                    let r = g * 4;
+                    (kt.gemm_q4_0x4_q8_0)(
+                        &w_rep[g * m3_nb..(g + bg) * m3_nb],
+                        &x_batch,
+                        &mut tile[..b_rows * m3_ntok],
+                        b_rows,
+                        m3_nb,
+                        m3_ntok,
+                    );
+                    for t in 0..m3_ntok {
+                        // SAFETY: Disjoint `[t * m3_rows + r .. + b_rows]` per worker.
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                (om_ptr as *mut f32).add(t * m3_rows + r),
+                                b_rows,
+                            )
+                        };
+                        dst.copy_from_slice(&tile[t * b_rows..(t + 1) * b_rows]);
+                    }
+                    g += bg;
+                }
+            });
+        };
+        run_m();
+        let iters_m = if isa == tm_cpu::Isa::Generic { 2 } else { 20 };
+        let t1 = Instant::now();
+        for _ in 0..iters_m {
+            run_m();
+        }
+        let sec_m = t1.elapsed().as_secs_f64() / (iters_m as f64);
+
+        let mut kv_acc = 0.0f32;
+        let t_kv8 = Instant::now();
+        for step in 0..512 {
+            kv_acc += (kt.dot_f32_q8_0)(
+                &src_f32[..64],
+                &dst_q80[(step % 128) * 2..(step % 128) * 2 + 2],
+            );
+        }
+        let kv8_us = t_kv8.elapsed().as_secs_f64() * 1e6;
+
+        println!(
+            "{:<10} GEMV={:>6.3} ms ({:>6.2} GB/s) | GEMM32={:>6.3} ms ({:>6.1} GOPS) | KV_Q8(512x64)={:>5.2} us | chk={:.1}",
+            isa.name(),
+            sec_v * 1e3,
+            (m3_bytes / sec_v) / 1e9,
+            sec_m * 1e3,
+            (m3_ops_gemm / sec_m) / 1e9,
+            kv8_us,
+            out_v[0] + out_m[0] + kv_acc * 1e-6
+        );
+    }
+
+    // M4 Benchmark: Low-Bit & T-MAC 16-row `TBL` Lookup Kernels (`Q2_0`, `TQ2_0`, `IQ2_XXS`, `IQ3_XXS`, `IQ4_NL`)
+    let m4_rows = 4096usize;
+    let m4_cols = 4096usize;
+    let nb_q2 = m4_cols / QK2_0;
+    let nb_qk = m4_cols / QK_K;
+    let nb_q4 = m4_cols / QK4_0;
+    let w_q20: Vec<BlockQ2_0> = (0..m4_rows * nb_q2)
+        .map(|i| BlockQ2_0 {
+            d: f32_to_f16(0.03125),
+            qs: [(i & 0xFF) as u8; 16],
+        })
+        .collect();
+    let w_tq20: Vec<BlockTQ2_0> = (0..m4_rows * nb_qk)
+        .map(|i| BlockTQ2_0 {
+            qs: [((i * 3) % 85) as u8; 64],
+            d: f32_to_f16(0.03125),
+        })
+        .collect();
+    let w_iq2: Vec<BlockIQ2XXS> = (0..m4_rows * nb_qk)
+        .map(|i| BlockIQ2XXS {
+            d: f32_to_f16(0.03125),
+            qs: [(i & 0x7FFF) as u16; 32],
+        })
+        .collect();
+    let w_iq3: Vec<BlockIQ3XXS> = (0..m4_rows * nb_qk)
+        .map(|i| BlockIQ3XXS {
+            d: f32_to_f16(0.03125),
+            qs: [(i & 0xFF) as u8; 96],
+        })
+        .collect();
+    let w_iq4: Vec<BlockIQ4NL> = (0..m4_rows * nb_q4)
+        .map(|i| BlockIQ4NL {
+            d: f32_to_f16(0.03125),
+            qs: [(i & 0xFF) as u8; 16],
+        })
+        .collect();
+    let mut x_q8k_4096 = vec![
+        BlockQ8K {
+            d: 0.0,
+            qs: [0; 256],
+            bsums: [0; 16]
+        };
+        nb_qk
+    ];
+    quantize_row_q8_k(&src_f32[..m4_cols], &mut x_q8k_4096);
+    let x_q80_4096 = dst_q80[..nb_q4].to_vec();
+
+    println!("\n--- M4 Low-Bit & T-MAC TBL Lookup GEMV (4096x4096, 4 threads) ---");
+    for &isa in &isas {
+        let kt = select_kernels(isa);
+        let iters = if isa == tm_cpu::Isa::Generic { 3 } else { 30 };
+        let mut out = vec![0.0f32; m4_rows];
+        let out_ptr = out.as_mut_ptr() as usize;
+
+        macro_rules! bench_fmt {
+            ($w_vec:expr, $nb:expr, $call:expr) => {{
+                let run = || {
+                    pool4.parallel_for(m4_rows, 1024, |r0, r1| {
+                        let len = r1 - r0;
+                        // SAFETY: Disjoint `[r0..r1)` per worker.
+                        let o = unsafe {
+                            core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(r0), len)
+                        };
+                        $call(&$w_vec[r0 * $nb..r1 * $nb], o, len, $nb);
+                    });
+                };
+                run();
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    run();
+                }
+                let sec = t0.elapsed().as_secs_f64() / (iters as f64);
+                let bytes = ($w_vec.len() * core::mem::size_of_val(&$w_vec[0])) as f64;
+                (sec * 1e3, (bytes / sec) / 1e9, out[0])
+            }};
+        }
+
+        let (ms_q2, bw_q2, c0) = bench_fmt!(w_q20, nb_q2, |ws, o, len, nb| {
+            (kt.gemv_q2_0_q8_0)(ws, &x_q80_4096, o, len, nb)
+        });
+        let (ms_tq2, bw_tq2, c1) = bench_fmt!(w_tq20, nb_qk, |ws, o, len, nb| {
+            (kt.gemv_tq2_0_q8_k)(ws, &x_q8k_4096, o, len, nb)
+        });
+        let (ms_iq2, bw_iq2, c2) = bench_fmt!(w_iq2, nb_qk, |ws, o, len, nb| {
+            (kt.gemv_iq2_xxs_q8_k)(ws, &x_q8k_4096, o, len, nb)
+        });
+        let (ms_iq3, bw_iq3, c3) = bench_fmt!(w_iq3, nb_qk, |ws, o, len, nb| {
+            (kt.gemv_iq3_xxs_q8_k)(ws, &x_q8k_4096, o, len, nb)
+        });
+        let (ms_iq4, bw_iq4, c4) = bench_fmt!(w_iq4, nb_q4, |ws, o, len, nb| {
+            (kt.gemv_iq4_nl_q8_0)(ws, &x_q80_4096, o, len, nb)
+        });
+
+        println!(
+            "{:<10} Q2_0={:>5.2}ms({:>5.1}GB/s) | TQ2_0={:>5.2}ms({:>5.1}GB/s) | IQ2={:>5.2}ms({:>5.1}GB/s) | IQ3={:>5.2}ms({:>5.1}GB/s) | IQ4_NL={:>5.2}ms({:>5.1}GB/s) | chk={:.1}",
+            isa.name(),
+            ms_q2,
+            bw_q2,
+            ms_tq2,
+            bw_tq2,
+            ms_iq2,
+            bw_iq2,
+            ms_iq3,
+            bw_iq3,
+            ms_iq4,
+            bw_iq4,
+            c0 + c1 + c2 + c3 + c4
         );
     }
 }
