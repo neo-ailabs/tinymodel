@@ -13,6 +13,40 @@ const STAGING_BYTES: u64 = 64 << 20;
 const DESC_POOL_SETS: u32 = 4096;
 const DESC_POOL_BUFFERS: u32 = 4096 * 8;
 
+/// Batched prefill kernel selection policy for [`VulkanContext`] / [`crate::LlamaVkRunner`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VkPrefillMode {
+    /// Automatically pick Cooperative Matrix (`16x16x16`) when supported by the device, else
+    /// fall back to portable subgroup/LDS tiled kernels.
+    Auto,
+    /// Force portable subgroup/LDS tiled fallback (`gemm_tiled` + `gemm_kquant` + `fa_gqa_tiled`).
+    Fallback,
+    /// Prefer `16x16x16 f16*f16+f32->f32` Cooperative Matrix GEMM + FlashAttention.
+    CoopMatF16,
+    /// Prefer `16x16x16 i8*i8+i32->i32` Cooperative Matrix GEMM (with dynamic `Q8_1` activation
+    /// quantization) for `Q4_0`/`Q4_1`/`Q8_0`, and `CoopMatF16` for remaining ops.
+    CoopMatI8,
+}
+
+impl VkPrefillMode {
+    pub fn from_env() -> Self {
+        match std::env::var("TM_VK_PREFILL")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            Some(s) if s.eq_ignore_ascii_case("fallback") || s == "0" => Self::Fallback,
+            Some(s) if s.eq_ignore_ascii_case("f16") || s.eq_ignore_ascii_case("coopmat_f16") => {
+                Self::CoopMatF16
+            }
+            Some(s) if s.eq_ignore_ascii_case("i8") || s.eq_ignore_ascii_case("coopmat_i8") => {
+                Self::CoopMatI8
+            }
+            _ => Self::Auto,
+        }
+    }
+}
+
 /// Capabilities of the selected Vulkan device (also used by `probe --json`).
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
@@ -43,6 +77,8 @@ pub struct DeviceInfo {
     pub storage_8bit: bool,
     pub int8_dot_accelerated: bool,
     pub cooperative_matrix: bool,
+    pub coopmat_f16_f32acc: bool,
+    pub coopmat_i8_i32acc: bool,
     pub coopmat_shapes: Vec<String>,
     pub shader_bfloat16: bool,
     pub shader_float8: bool,
@@ -143,6 +179,7 @@ pub struct VulkanContext {
     exec: Mutex<Exec>,
     pub(crate) pipelines: Mutex<HashMap<(&'static str, u32), Arc<Pipeline>>>,
     pub(crate) gemv_cfg: Mutex<(u32, u32)>,
+    prefill_mode: Mutex<VkPrefillMode>,
 }
 
 fn cstr_to_string(s: Result<&CStr, std::ffi::FromBytesUntilNulError>) -> String {
@@ -177,9 +214,12 @@ struct Probe {
     f12_int8: bool,
     f12_fp16: bool,
     f12_storage8: bool,
+    f12_vmm: bool,
+    f12_vmm_dev_scope: bool,
     f13_size_control: bool,
     f13_full_subgroups: bool,
     core_int16: bool,
+    enable_coopmat: bool,
 }
 
 fn comp_type_short(ty: vk::ComponentTypeKHR) -> &'static str {
@@ -233,6 +273,8 @@ fn probe_device(
                 .any(|e| e.extension_name_as_c_str().is_ok_and(|n| n == name))
         };
 
+        let has_cm_ext = has_ext(c"VK_KHR_cooperative_matrix");
+
         let mut sg = vk::PhysicalDeviceSubgroupProperties::default();
         let mut m3 = vk::PhysicalDeviceMaintenance3Properties::default();
         let mut drv = vk::PhysicalDeviceDriverProperties::default();
@@ -252,6 +294,7 @@ fn probe_device(
         let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
+        let mut f_cm = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
         let core_int16;
         {
             let mut f2 = vk::PhysicalDeviceFeatures2::default()
@@ -259,6 +302,9 @@ fn probe_device(
                 .push_next(&mut f12);
             if api_ge_13 {
                 f2 = f2.push_next(&mut f13);
+            }
+            if has_cm_ext {
+                f2 = f2.push_next(&mut f_cm);
             }
             instance.get_physical_device_features2(pdev, &mut f2);
             core_int16 = f2.features.shader_int16 == vk::TRUE;
@@ -292,20 +338,47 @@ fn probe_device(
         } else {
             (sg.subgroup_size, sg.subgroup_size)
         };
-        // AMD RDNA: wave32 is the better fit for GEMV-style kernels.
+        // AMD RDNA: wave32 is the native fit for GEMV and 16x16x16 WMMA cooperative matrix.
         let chosen_sg = if size_control && props.vendor_id == VENDOR_AMD && min_sg <= 32 {
             32
         } else {
             sg.subgroup_size
         };
 
-        let cooperative_matrix = has_ext(c"VK_KHR_cooperative_matrix");
+        let f12_vmm = f12.vulkan_memory_model == vk::TRUE;
+        let f12_vmm_dev_scope = f12.vulkan_memory_model_device_scope == vk::TRUE;
+        let enable_coopmat =
+            has_cm_ext && f_cm.cooperative_matrix == vk::TRUE && f12_vmm && f12_vmm_dev_scope;
         let mut coopmat_shapes = Vec::new();
-        if cooperative_matrix {
+        let mut coopmat_f16_f32acc = false;
+        let mut coopmat_i8_i32acc = false;
+        if enable_coopmat {
             let cm = ash::khr::cooperative_matrix::Instance::new(entry, instance);
             if let Ok(list) = cm.get_physical_device_cooperative_matrix_properties(pdev) {
                 for p in list {
                     if p.scope == vk::ScopeKHR::SUBGROUP {
+                        if p.m_size == 16
+                            && p.n_size == 16
+                            && p.k_size == 16
+                            && p.a_type == vk::ComponentTypeKHR::FLOAT16
+                            && p.b_type == vk::ComponentTypeKHR::FLOAT16
+                            && p.c_type == vk::ComponentTypeKHR::FLOAT32
+                            && p.result_type == vk::ComponentTypeKHR::FLOAT32
+                            && f12.shader_float16 == vk::TRUE
+                        {
+                            coopmat_f16_f32acc = true;
+                        }
+                        if p.m_size == 16
+                            && p.n_size == 16
+                            && p.k_size == 16
+                            && p.a_type == vk::ComponentTypeKHR::SINT8
+                            && p.b_type == vk::ComponentTypeKHR::SINT8
+                            && p.c_type == vk::ComponentTypeKHR::SINT32
+                            && p.result_type == vk::ComponentTypeKHR::SINT32
+                            && f12.shader_int8 == vk::TRUE
+                        {
+                            coopmat_i8_i32acc = true;
+                        }
                         coopmat_shapes.push(format!(
                             "{}x{}x{} {}*{}+{}->{}",
                             p.m_size,
@@ -352,7 +425,9 @@ fn probe_device(
             storage_8bit: f12.storage_buffer8_bit_access == vk::TRUE,
             int8_dot_accelerated: api_ge_13
                 && idp.integer_dot_product4x8_bit_packed_signed_accelerated == vk::TRUE,
-            cooperative_matrix,
+            cooperative_matrix: enable_coopmat,
+            coopmat_f16_f32acc,
+            coopmat_i8_i32acc,
             coopmat_shapes,
             shader_bfloat16: has_ext(c"VK_KHR_shader_bfloat16"),
             shader_float8: has_ext(c"VK_EXT_shader_float8"),
@@ -367,9 +442,12 @@ fn probe_device(
             f12_int8: f12.shader_int8 == vk::TRUE,
             f12_fp16: f12.shader_float16 == vk::TRUE,
             f12_storage8: f12.storage_buffer8_bit_access == vk::TRUE,
+            f12_vmm,
+            f12_vmm_dev_scope,
             f13_size_control: size_control,
             f13_full_subgroups: api_ge_13 && f13.compute_full_subgroups == vk::TRUE,
             core_int16,
+            enable_coopmat,
         })
     }
 }
@@ -447,6 +525,7 @@ impl VulkanContext {
                         crate::kernels::DEFAULT_GEMV_WG,
                         crate::kernels::DEFAULT_GEMV_NR,
                     )),
+                    prefill_mode: Mutex::new(VkPrefillMode::from_env()),
                 })
             }
             Err(e) => {
@@ -454,6 +533,21 @@ impl VulkanContext {
                 unsafe { instance.destroy_instance(None) };
                 Err(e)
             }
+        }
+    }
+
+    /// Returns the active batched-prefill execution policy.
+    pub fn prefill_mode(&self) -> VkPrefillMode {
+        self.prefill_mode
+            .lock()
+            .map(|m| *m)
+            .unwrap_or(VkPrefillMode::Auto)
+    }
+
+    /// Overrides the batched-prefill execution policy for subsequent runner creations.
+    pub fn set_prefill_mode(&self, mode: VkPrefillMode) {
+        if let Ok(mut m) = self.prefill_mode.lock() {
+            *m = mode;
         }
     }
 
@@ -526,21 +620,33 @@ impl VulkanContext {
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
             .shader_int8(probe.f12_int8)
             .shader_float16(probe.f12_fp16)
-            .storage_buffer8_bit_access(probe.f12_storage8);
+            .storage_buffer8_bit_access(probe.f12_storage8)
+            .vulkan_memory_model(probe.f12_vmm && probe.enable_coopmat)
+            .vulkan_memory_model_device_scope(probe.f12_vmm_dev_scope && probe.enable_coopmat);
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
             .subgroup_size_control(probe.f13_size_control)
             .compute_full_subgroups(probe.f13_full_subgroups && probe.f13_size_control);
+        let mut f_cm =
+            vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
+        let mut ext_names: Vec<*const core::ffi::c_char> = Vec::new();
+        if probe.enable_coopmat {
+            ext_names.push(c"VK_KHR_cooperative_matrix".as_ptr());
+        }
         let api_ge_13 = min >= 3 || maj > 1;
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
+            .enabled_extension_names(&ext_names)
             .enabled_features(&core)
             .push_next(&mut f11)
             .push_next(&mut f12);
         if api_ge_13 {
             dci = dci.push_next(&mut f13);
         }
-        // SAFETY: all create-info structs live until the call returns; enabled features
-        // were all reported as supported by `probe_device`.
+        if probe.enable_coopmat {
+            dci = dci.push_next(&mut f_cm);
+        }
+        // SAFETY: all create-info structs live until the call returns; enabled features and
+        // extensions were all reported as supported by `probe_device`.
         let device = unsafe { instance.create_device(pdev, &dci, None) }.ctx("vkCreateDevice")?;
         // SAFETY: queue family / index 0 were requested in `qci`.
         let queue = unsafe { device.get_device_queue(probe.queue_family, 0) };
@@ -869,7 +975,7 @@ impl VulkanContext {
                 limit: self.info.max_workgroup_invocations,
             });
         }
-        if wg % self.info.subgroup_size != 0 {
+        if !wg.is_multiple_of(self.info.subgroup_size) {
             return Err(VulkanError::InvalidDimensions(format!(
                 "workgroup {wg} of '{name}' is not a multiple of subgroup size {}",
                 self.info.subgroup_size
@@ -1010,13 +1116,25 @@ impl VulkanContext {
 }
 
 impl Recorder<'_> {
-    /// Records one dispatch followed by a compute→compute/transfer memory barrier.
+    /// Records one 1D dispatch followed by a compute→compute/transfer memory barrier.
     pub(crate) fn dispatch(
         &mut self,
         p: &Pipeline,
         bufs: &[&VkBuffer],
         push: &[u32],
         groups: u32,
+    ) -> Result<(), VulkanError> {
+        self.dispatch_xy(p, bufs, push, groups, 1)
+    }
+
+    /// Records one 2D dispatch `(gx, gy, 1)` followed by a compute→compute/transfer barrier.
+    pub(crate) fn dispatch_xy(
+        &mut self,
+        p: &Pipeline,
+        bufs: &[&VkBuffer],
+        push: &[u32],
+        gx: u32,
+        gy: u32,
     ) -> Result<(), VulkanError> {
         if bufs.len() as u32 != p.n_bindings {
             return Err(VulkanError::InvalidDimensions(format!(
@@ -1032,6 +1150,13 @@ impl Recorder<'_> {
                 requested: p.wg_size,
                 limit: self.ctx.info.max_workgroup_invocations,
             });
+        }
+        let lim = self.ctx.info.max_workgroup_count;
+        if gx > lim[0] || gy > lim[1] {
+            return Err(VulkanError::InvalidDimensions(format!(
+                "dispatch ({gx}, {gy}, 1) for '{}' exceeds maxComputeWorkGroupCount {:?}",
+                p.name, lim
+            )));
         }
         let d = &self.ctx.inner.device;
         let infos: Vec<vk::DescriptorBufferInfo> = bufs
@@ -1084,7 +1209,7 @@ impl Recorder<'_> {
                     &push_bytes,
                 );
             }
-            d.cmd_dispatch(self.cb, groups, 1, 1);
+            d.cmd_dispatch(self.cb, gx, gy, 1);
             let barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                 .dst_access_mask(

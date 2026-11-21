@@ -910,9 +910,44 @@ fn print_vulkan_profile_report(
     let pp_tps = (rep.prefill_tokens as f64) / (rep.prefill_wall_ms * 1e-3).max(1e-9);
     println!();
     println!(
-        "Prefill pp{}: wall={:.2} ms ({:.1} tok/s)",
-        rep.prefill_tokens, rep.prefill_wall_ms, pp_tps
+        "Prefill pp{} ({}): wall={:.2} ms ({:.1} tok/s)",
+        rep.prefill_tokens, rep.prefill_backend, rep.prefill_wall_ms, pp_tps
     );
+    if !rep.prefill_chunk_stages.is_empty() {
+        let sum_pp_us: f64 = rep.prefill_chunk_stages.iter().map(|s| s.gpu_us).sum();
+        println!(
+            "{:<28} {:>10} {:>8} {:>12} {:>14}",
+            "Prefill Stage", "GPU ms", "Share%", "Eff GB/s", "Eff TFLOP/s"
+        );
+        println!("{}", "-".repeat(76));
+        for st in &rep.prefill_chunk_stages {
+            let pct = 100.0 * st.gpu_us / sum_pp_us.max(1e-3);
+            let gbs = if st.bytes > 0 && st.gpu_us > 0.0 {
+                (st.bytes as f64 / 1e9) / (st.gpu_us * 1e-6)
+            } else {
+                0.0
+            };
+            let tflops = if st.flops > 0 && st.gpu_us > 0.0 {
+                (st.flops as f64 / 1e12) / (st.gpu_us * 1e-6)
+            } else {
+                0.0
+            };
+            println!(
+                "{:<28} {:>10.2} {:>7.1}% {:>12.2} {:>14.2}",
+                st.name,
+                st.gpu_us * 1e-3,
+                pct,
+                gbs,
+                tflops
+            );
+        }
+        println!(
+            "{:<28} {:>10.2} {:>7.1}%",
+            "Sum (timestamped)",
+            sum_pp_us * 1e-3,
+            100.0
+        );
+    }
 }
 
 #[cfg(feature = "vulkan")]
@@ -1010,9 +1045,15 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
     let mut runner = tm_vulkan::LlamaVkRunner::from_gguf(gguf, opts.max_ctx)?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
+    // Warm up both decode and batched prefill pipelines (>= 2 passes and >= 350 ms, matching
+    // `probe.rs` DVFS warmup and `llama-bench` steady-state SMU clock ramp).
     let _ = runner.forward_token_greedy(1, 0)?;
-    let warmup_ids = [1u32; 8];
-    let _ = runner.forward_batch(&warmup_ids, 0, false)?;
+    let t_warm = Instant::now();
+    let mut warm_iters = 0usize;
+    while warm_iters < 2 || t_warm.elapsed().as_secs_f64() < 0.35 {
+        let _ = runner.forward_batch(&pp_ids, 0, false)?;
+        warm_iters += 1;
+    }
 
     let t_pp = Instant::now();
     let pp_logits = runner.forward_batch(&pp_ids, 0, corpus_mode)?;

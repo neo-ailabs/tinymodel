@@ -15,7 +15,7 @@ use tm_core::{BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, f32_to_f16};
 use tm_cpu::{ThreadPool, active_kernels};
 use tm_gguf::GgufFile;
 use tm_models::{LlamaModel, LlamaState, argmax};
-use tm_vulkan::{LlamaVkRunner, VulkanContext};
+use tm_vulkan::{LlamaVkRunner, VkPrefillMode, VulkanContext};
 
 struct Rng(u64);
 impl Rng {
@@ -506,6 +506,9 @@ fn vk_mixed_quant_decode_vs_batch_and_cpu_kl_parity() {
         let Some(ctx2) = get_ctx_or_skip() else {
             return;
         };
+        ctx2.set_prefill_mode(VkPrefillMode::Fallback);
+        let has_cm_f16 = ctx1.info().coopmat_f16_f32acc;
+        let has_cm_i8 = ctx1.info().coopmat_i8_i32acc;
         let gguf = open_bytes_as_gguf(&format!("quant_{arch}"), &build_mixed_quant_gguf(arch));
 
         let cpu_model = LlamaModel::from_gguf(&gguf).unwrap();
@@ -561,5 +564,41 @@ fn vk_mixed_quant_decode_vs_batch_and_cpu_kl_parity() {
         let greedy_id = vk_dec.forward_token_greedy(next_tok, 35).unwrap();
         let full_logits = vk_bat.forward_token(next_tok, 35, true).unwrap();
         assert_eq!(greedy_id, argmax(full_logits));
+
+        // When Cooperative Matrix is available (`radv`), verify end-to-end batched prefill for
+        // BOTH `CoopMatF16` (including fused `gemm_pair_silu_coopmat_f16` + `fa_coopmat`) and `CoopMatI8`!
+        if has_cm_f16 {
+            let ctx_cm16 = get_ctx_or_skip().unwrap();
+            ctx_cm16.set_prefill_mode(VkPrefillMode::CoopMatF16);
+            let mut vk_cm16 =
+                LlamaVkRunner::from_gguf_with_context(ctx_cm16, gguf.clone(), 64).unwrap();
+            assert_eq!(vk_cm16.active_prefill_backend(), "coopmat-f16");
+            let cm16_final = vk_cm16.forward_batch(&batch_ids, 0, true).unwrap();
+            let kl16 = kl_div(&dec_final, cm16_final);
+            assert!(
+                kl16 < 2e-4,
+                "quant {arch} CoopMatF16 batch(35) KL vs decode too high: {kl16:.3e}"
+            );
+            for (i, (&b, &d)) in cm16_final.iter().zip(dec_final.iter()).enumerate() {
+                let rel = (b - d).abs() / norm;
+                assert!(
+                    rel <= 6e-4,
+                    "quant {arch} CoopMatF16 batch(35) i={i}: got={b} dec={d} rel={rel}"
+                );
+            }
+        }
+        if has_cm_i8 {
+            let ctx_cmi8 = get_ctx_or_skip().unwrap();
+            ctx_cmi8.set_prefill_mode(VkPrefillMode::CoopMatI8);
+            let mut vk_cmi8 =
+                LlamaVkRunner::from_gguf_with_context(ctx_cmi8, gguf.clone(), 64).unwrap();
+            assert_eq!(vk_cmi8.active_prefill_backend(), "coopmat-i8");
+            let cmi8_final = vk_cmi8.forward_batch(&batch_ids, 0, true).unwrap();
+            let kli8 = kl_div(&dec_final, cmi8_final);
+            assert!(
+                kli8 < 1.5e-3,
+                "quant {arch} CoopMatI8 batch(35) KL vs decode too high: {kli8:.3e}"
+            );
+        }
     }
 }

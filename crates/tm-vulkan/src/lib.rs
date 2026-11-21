@@ -11,7 +11,7 @@ mod context;
 mod kernels;
 pub mod llama_runner;
 
-pub use context::{DeviceInfo, VkBuffer, VulkanContext};
+pub use context::{DeviceInfo, VkBuffer, VkPrefillMode, VulkanContext};
 pub use kernels::{Q4Layout, VkMatQ4_0};
 pub use llama_runner::{LlamaVkConfig, LlamaVkRunner, VkProfileReport, VkStageStat};
 

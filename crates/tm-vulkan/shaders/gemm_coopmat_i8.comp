@@ -1,0 +1,216 @@
+#version 450
+// RDNA4 / Vulkan INT8 Cooperative Matrix (`16x16x16 i8*i8+i32->i32`) batched GEMM:
+//   Supports DTYPE = 0 (Q4_0), 1 (Q4_1), 2 (Q8_0) multiplied against Q8_1 quantized activations.
+//   Uses subgroup-scoped INT32 WMMA over each 32-element quant block (`2` `16x16x16` steps) and
+//   accumulates exact block-scaled FP32 sums in registers across K, with fused `add_residual`.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+
+layout(constant_id = 0) const uint WG = 128; // 4 * subgroup_size == 128 on wave32
+layout(constant_id = 1) const uint DTYPE = 0; // 0 = Q4_0, 1 = Q4_1, 2 = Q8_0
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer W  { uint16_t w16[]; };
+layout(std430, binding = 1) readonly buffer XQ { int x_q8[]; };
+layout(std430, binding = 2) readonly buffer XD { vec2 x_ds[]; };
+layout(std430, binding = 3) buffer Y           { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint n_in;
+    uint n_out;
+    uint n_tok;
+    uint add_residual;
+    uint row_u16s;
+} pc;
+
+const uint BM = 64u;
+const uint BN = 64u;
+// 32 int8s = 8 int32s; +4 int32s (16B) padding keeps 16B alignment and avoids LDS bank conflicts.
+const uint SH_STRIDE = 12u;
+const uint STAGE_STRIDE = 20u;
+
+shared int32_t X_i8[BM * SH_STRIDE];
+shared int32_t W_i8[BN * SH_STRIDE];
+shared vec2 X_ds_sh[BM];
+shared vec2 W_dm_sh[BN];
+shared int32_t stage_i32[4u * 16u * STAGE_STRIDE];
+
+int32_t pack_i8x4(int b0, int b1, int b2, int b3) {
+    uint u = (uint(b0) & 0xFFu)
+           | ((uint(b1) & 0xFFu) << 8u)
+           | ((uint(b2) & 0xFFu) << 16u)
+           | ((uint(b3) & 0xFFu) << 24u);
+    return int32_t(u);
+}
+
+void main() {
+    const uint r0 = gl_WorkGroupID.x * BN;
+    const uint t0 = gl_WorkGroupID.y * BM;
+    if (r0 >= pc.n_out || t0 >= pc.n_tok) return;
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sg = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg_size = gl_SubgroupSize;
+
+    const uint warp_m = sg >> 1u;
+    const uint warp_n = sg & 1u;
+
+    // On wave32 (or wave64), each lane holds at most 8 elements (`256 / 32 = 8`) per 16x16 output tile.
+    float acc[2][2][8];
+    [[unroll]] for (uint m = 0u; m < 2u; ++m) {
+        [[unroll]] for (uint n = 0u; n < 2u; ++n) {
+            [[unroll]] for (uint e = 0u; e < 8u; ++e) {
+                acc[m][n][e] = 0.0;
+            }
+        }
+    }
+
+    const uint row_step = WG >> 2u;
+    const uint load_row = tid >> 2u;
+    const uint sub = tid & 3u;
+    const uint nb = pc.n_in >> 5u;
+    const uint sg_stage = sg * 16u * STAGE_STRIDE;
+
+    for (uint ib = 0u; ib < nb; ++ib) {
+        // 1. Load Q8_1 activations [BM, 32]
+        for (uint m_base = 0u; m_base < BM; m_base += row_step) {
+            const uint m = m_base + load_row;
+            if (m < BM) {
+                const uint sh_row = m * SH_STRIDE + sub * 2u;
+                if (t0 + m < pc.n_tok) {
+                    const uint blk = (t0 + m) * nb + ib;
+                    X_i8[sh_row + 0u] = x_q8[blk * 8u + sub * 2u + 0u];
+                    X_i8[sh_row + 1u] = x_q8[blk * 8u + sub * 2u + 1u];
+                    if (sub == 0u) {
+                        X_ds_sh[m] = x_ds[blk];
+                    }
+                } else {
+                    X_i8[sh_row + 0u] = 0;
+                    X_i8[sh_row + 1u] = 0;
+                    if (sub == 0u) {
+                        X_ds_sh[m] = vec2(0.0);
+                    }
+                }
+            }
+        }
+
+        // 2. Load + unpack quantized weights [BN, 32] into signed int8
+        for (uint n_base = 0u; n_base < BN; n_base += row_step) {
+            const uint n = n_base + load_row;
+            if (n < BN) {
+                const uint sh_base = n * SH_STRIDE;
+                if (r0 + n < pc.n_out) {
+                    const uint row_b = (r0 + n) * pc.row_u16s;
+                    if (DTYPE == 0u) {
+                        const uint b = row_b + ib * 9u;
+                        if (sub == 0u) {
+                            W_dm_sh[n] = vec2(unpackHalf2x16(uint(w16[b])).x, 0.0);
+                        }
+                        const uint u0 = uint(w16[b + 1u + sub * 2u]);
+                        const uint u1 = uint(w16[b + 2u + sub * 2u]);
+                        const int b0 = int(u0 & 0xFFu), b1 = int(u0 >> 8u);
+                        const int b2 = int(u1 & 0xFFu), b3 = int(u1 >> 8u);
+                        W_i8[sh_base + sub]      = pack_i8x4((b0 & 15) - 8, (b1 & 15) - 8, (b2 & 15) - 8, (b3 & 15) - 8);
+                        W_i8[sh_base + 4u + sub] = pack_i8x4((b0 >> 4) - 8, (b1 >> 4) - 8, (b2 >> 4) - 8, (b3 >> 4) - 8);
+                    } else if (DTYPE == 1u) {
+                        const uint b = row_b + ib * 10u;
+                        if (sub == 0u) {
+                            W_dm_sh[n] = vec2(
+                                unpackHalf2x16(uint(w16[b])).x,
+                                unpackHalf2x16(uint(w16[b + 1u])).x
+                            );
+                        }
+                        const uint u0 = uint(w16[b + 2u + sub * 2u]);
+                        const uint u1 = uint(w16[b + 3u + sub * 2u]);
+                        const int b0 = int(u0 & 0xFFu), b1 = int(u0 >> 8u);
+                        const int b2 = int(u1 & 0xFFu), b3 = int(u1 >> 8u);
+                        W_i8[sh_base + sub]      = pack_i8x4(b0 & 15, b1 & 15, b2 & 15, b3 & 15);
+                        W_i8[sh_base + 4u + sub] = pack_i8x4(b0 >> 4, b1 >> 4, b2 >> 4, b3 >> 4);
+                    } else {
+                        const uint b = row_b + ib * 17u;
+                        if (sub == 0u) {
+                            W_dm_sh[n] = vec2(unpackHalf2x16(uint(w16[b])).x, 0.0);
+                        }
+                        [[unroll]] for (uint i = 0u; i < 2u; ++i) {
+                            const uint j = sub * 2u + i;
+                            const uint u0 = uint(w16[b + 1u + 2u * j]);
+                            const uint u1 = uint(w16[b + 2u + 2u * j]);
+                            W_i8[sh_base + j] = int32_t(u0 | (u1 << 16u));
+                        }
+                    }
+                } else {
+                    W_i8[sh_base + sub * 2u + 0u] = 0;
+                    W_i8[sh_base + sub * 2u + 1u] = 0;
+                    if (sub == 0u) {
+                        W_dm_sh[n] = vec2(0.0);
+                    }
+                }
+            }
+        }
+
+        barrier();
+
+        coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA[2][2];
+        coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB[2][2];
+        [[unroll]] for (uint kh = 0u; kh < 2u; ++kh) {
+            const uint k_off = kh * 4u;
+            coopMatLoad(matA[0][kh], X_i8, (warp_m * 32u + 0u)  * SH_STRIDE + k_off, SH_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(matA[1][kh], X_i8, (warp_m * 32u + 16u) * SH_STRIDE + k_off, SH_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(matB[0][kh], W_i8, (warp_n * 32u + 0u)  * SH_STRIDE + k_off, SH_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(matB[1][kh], W_i8, (warp_n * 32u + 16u) * SH_STRIDE + k_off, SH_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+        }
+
+        [[unroll]] for (uint cm_m = 0u; cm_m < 2u; ++cm_m) {
+            [[unroll]] for (uint cm_n = 0u; cm_n < 2u; ++cm_n) {
+                coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> isum =
+                    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+                isum = coopMatMulAdd(matA[cm_m][0], matB[cm_n][0], isum);
+                isum = coopMatMulAdd(matA[cm_m][1], matB[cm_n][1], isum);
+
+                coopMatStore(isum, stage_i32, sg_stage, STAGE_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+                controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+
+                uint e = 0u;
+                for (uint idx = lane; idx < 256u; idx += sg_size, ++e) {
+                    const uint r = idx >> 4u;
+                    const uint c = idx & 15u;
+                    const vec2 xds = X_ds_sh[warp_m * 32u + cm_m * 16u + r];
+                    const vec2 wdm = W_dm_sh[warp_n * 32u + cm_n * 16u + c];
+                    const float qsum = float(stage_i32[sg_stage + r * STAGE_STRIDE + c]);
+                    if (DTYPE == 1u) {
+                        acc[cm_m][cm_n][e] = fma(qsum, xds.x * wdm.x, fma(xds.y, wdm.y, acc[cm_m][cm_n][e]));
+                    } else {
+                        acc[cm_m][cm_n][e] = fma(qsum, xds.x * wdm.x, acc[cm_m][cm_n][e]);
+                    }
+                }
+                controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+            }
+        }
+
+        barrier();
+    }
+
+    [[unroll]] for (uint cm_m = 0u; cm_m < 2u; ++cm_m) {
+        [[unroll]] for (uint cm_n = 0u; cm_n < 2u; ++cm_n) {
+            uint e = 0u;
+            for (uint idx = lane; idx < 256u; idx += sg_size, ++e) {
+                const uint r = idx >> 4u;
+                const uint c = idx & 15u;
+                const uint gm = t0 + warp_m * 32u + cm_m * 16u + r;
+                const uint gn = r0 + warp_n * 32u + cm_n * 16u + c;
+                if (gm < pc.n_tok && gn < pc.n_out) {
+                    const uint yi = gm * pc.n_out + gn;
+                    const float val = acc[cm_m][cm_n][e];
+                    y[yi] = (pc.add_residual != 0u) ? (y[yi] + val) : val;
+                }
+            }
+        }
+    }
+}

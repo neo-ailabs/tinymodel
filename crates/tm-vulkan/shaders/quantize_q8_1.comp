@@ -1,0 +1,67 @@
+#version 450
+// Dynamic FP32 -> Q8_1 block quantizer (32 elements per block: `8` packed `int32`s + `vec2(d, sum)`).
+// Used to feed RDNA4 `16x16x16 i8*i8+i32->i32` Cooperative Matrix GEMM (`gemm_coopmat_i8.comp`).
+
+layout(constant_id = 0) const uint WG = 256;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer InX   { float x[]; };
+layout(std430, binding = 1) writeonly buffer OutQ { int q8_packed[]; };
+layout(std430, binding = 2) writeonly buffer OutD { vec2 d_sum[]; };
+
+layout(push_constant) uniform PC {
+    uint n_blocks;
+} pc;
+
+// 8 blocks of 32 floats per 256-thread workgroup (`sub_blk = tid >> 5u`, `lane32 = tid & 31u`).
+shared float sh_val[8][32];
+shared float sh_abs[8][32];
+shared float sh_sum[8][32];
+
+int pack_i8x4(int b0, int b1, int b2, int b3) {
+    uint u = (uint(b0) & 0xFFu)
+           | ((uint(b1) & 0xFFu) << 8u)
+           | ((uint(b2) & 0xFFu) << 16u)
+           | ((uint(b3) & 0xFFu) << 24u);
+    return int(u);
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint blk_local = tid >> 5u;
+    const uint lane32 = tid & 31u;
+    const uint blk = gl_WorkGroupID.x * 8u + blk_local;
+
+    const float v = (blk < pc.n_blocks) ? x[blk * 32u + lane32] : 0.0;
+    sh_val[blk_local][lane32] = v;
+    sh_abs[blk_local][lane32] = abs(v);
+    sh_sum[blk_local][lane32] = v;
+    barrier();
+
+    for (uint stride = 16u; stride > 0u; stride >>= 1u) {
+        if (lane32 < stride) {
+            sh_abs[blk_local][lane32] = max(sh_abs[blk_local][lane32], sh_abs[blk_local][lane32 + stride]);
+            sh_sum[blk_local][lane32] += sh_sum[blk_local][lane32 + stride];
+        }
+        barrier();
+    }
+
+    if (blk >= pc.n_blocks) return;
+
+    const float amax = sh_abs[blk_local][0];
+    const float sum_x = sh_sum[blk_local][0];
+    const float d = amax / 127.0;
+    const float inv_d = (amax > 0.0) ? (127.0 / amax) : 0.0;
+
+    if (lane32 == 0u) {
+        d_sum[blk] = vec2(d, sum_x);
+    }
+    if (lane32 < 8u) {
+        const uint k = lane32 * 4u;
+        const int q0 = clamp(int(roundEven(sh_val[blk_local][k + 0u] * inv_d)), -127, 127);
+        const int q1 = clamp(int(roundEven(sh_val[blk_local][k + 1u] * inv_d)), -127, 127);
+        const int q2 = clamp(int(roundEven(sh_val[blk_local][k + 2u] * inv_d)), -127, 127);
+        const int q3 = clamp(int(roundEven(sh_val[blk_local][k + 3u] * inv_d)), -127, 127);
+        q8_packed[blk * 8u + lane32] = pack_i8x4(q0, q1, q2, q3);
+    }
+}

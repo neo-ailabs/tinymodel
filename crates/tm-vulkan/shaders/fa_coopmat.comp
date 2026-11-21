@@ -1,0 +1,221 @@
+#version 450
+// Tiled Causal GQA FlashAttention using Vulkan `16x16x16 f16*f16+f32->f32` Cooperative Matrix.
+// - Workgroup size: `WG = 128` (`4` wave32 subgroups, `Br = 64` query tokens per workgroup, `16` per subgroup).
+// - KV tile size: `Bc = 16` tokens cooperatively staged in `KV_sh` (`< 17 KB` total shared memory,
+//   allowing 3 concurrent workgroups per CU on RDNA4 even at `head_dim = 256`).
+// - Both `S = Q * K^T` and `O += P * V` execute on hardware WMMA with FP32 online softmax rescaling.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+
+layout(constant_id = 0) const uint WG = 128; // 4 * 32
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer QBuf   { vec4 q4[]; };
+layout(std430, binding = 1) readonly buffer KCache { f16vec4 k_cache4[]; };
+layout(std430, binding = 2) readonly buffer VCache { f16vec4 v_cache4[]; };
+layout(std430, binding = 3) writeonly buffer OutBuf { vec4 out4[]; };
+
+layout(push_constant) uniform PC {
+    uint n_head;
+    uint n_head_kv;
+    uint head_dim;
+    uint base_pos;
+    uint n_tok;
+} pc;
+
+const uint BR = 64u;
+const uint BC = 16u;
+// Max head_dim = 256 = 64 f16vec4s; +4 f16vec4s (32B) skew eliminates bank conflicts.
+const uint KV_STRIDE4 = 68u;
+const uint STAGE_STRIDE = 20u;
+// 16 float16_t = 4 f16vec4s; +2 f16vec4s (16B) padding keeps 16B alignment.
+const uint P_STRIDE4 = 6u;
+
+shared f16vec4 KV_sh[BC * KV_STRIDE4];
+shared float stage_f32[4u * 16u * STAGE_STRIDE];
+shared f16vec4 P_sh[4u * 16u * P_STRIDE4];
+
+void main() {
+    const uint head = gl_WorkGroupID.x;
+    const uint tile_q0 = gl_WorkGroupID.y * BR;
+    if (head >= pc.n_head || tile_q0 >= pc.n_tok) return;
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sg = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID; // 0..31
+
+    const uint r = lane >> 1u;       // 0..15 query row within subgroup
+    const uint half_lane = lane & 1u; // 0 (cols 0..7) or 1 (cols 8..15)
+
+    const uint hd4 = pc.head_dim >> 2u;
+    const uint hd16 = pc.head_dim >> 4u;
+    const uint q_dim4 = pc.n_head * hd4;
+    const uint kv_dim4 = pc.n_head_kv * hd4;
+    const uint kv_h = head / (pc.n_head / pc.n_head_kv);
+    const float scale = inversesqrt(float(pc.head_dim));
+
+    const uint q_base = tile_q0 + sg * 16u;
+    const uint q_tok = q_base + r;
+    const bool valid_q = (q_tok < pc.n_tok);
+    const uint sg_p_base = sg * 16u * P_STRIDE4;
+    const uint sg_stage_base = sg * 16u * STAGE_STRIDE;
+
+    // 1. Preload scaled Q [16, head_dim] into subgroup CoopMat registers (`Q_reg[0..hd16-1]`).
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> Q_reg[16];
+    for (uint dk = 0u; dk < hd16; ++dk) {
+        const uint d4_base = dk * 4u + half_lane * 2u;
+        f16vec4 qv0 = f16vec4(float16_t(0.0));
+        f16vec4 qv1 = f16vec4(float16_t(0.0));
+        if (valid_q) {
+            const uint qb = q_tok * q_dim4 + head * hd4 + d4_base;
+            qv0 = f16vec4(q4[qb + 0u] * scale);
+            qv1 = f16vec4(q4[qb + 1u] * scale);
+        }
+        P_sh[sg_p_base + r * P_STRIDE4 + half_lane * 2u + 0u] = qv0;
+        P_sh[sg_p_base + r * P_STRIDE4 + half_lane * 2u + 1u] = qv1;
+        controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+        coopMatLoad(Q_reg[dk], P_sh, sg_p_base, P_STRIDE4, gl_CooperativeMatrixLayoutRowMajor);
+        controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+    }
+
+    // Per-lane online softmax state (`r = lane >> 1`) + FP32 output accumulators (`8` floats = `2` vec4s per `dk`).
+    float m_row = -1.0e30;
+    float l_row = 0.0;
+    vec4 o_acc0[16];
+    vec4 o_acc1[16];
+    for (uint dk = 0u; dk < hd16; ++dk) {
+        o_acc0[dk] = vec4(0.0);
+        o_acc1[dk] = vec4(0.0);
+    }
+
+    const uint max_q_in_wg = min(tile_q0 + BR, pc.n_tok) - 1u;
+    const uint max_kv_len = pc.base_pos + max_q_in_wg + 1u;
+
+    for (uint kv_t0 = 0u; kv_t0 < max_kv_len; kv_t0 += BC) {
+        // 2a. Cooperatively stage K [16, head_dim] into KV_sh
+        const uint total_kv4 = BC * hd4;
+        for (uint idx = tid; idx < total_kv4; idx += WG) {
+            const uint kc = idx / hd4;
+            const uint d4 = idx % hd4;
+            const uint kv_pos = kv_t0 + kc;
+            KV_sh[kc * KV_STRIDE4 + d4] = (kv_pos < max_kv_len)
+                ? k_cache4[kv_pos * kv_dim4 + kv_h * hd4 + d4]
+                : f16vec4(float16_t(0.0));
+        }
+        barrier();
+
+        const bool sg_active = (q_base < pc.n_tok) && (kv_t0 <= pc.base_pos + min(q_base + 16u, pc.n_tok) - 1u);
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> P_mat;
+
+        if (sg_active) {
+            // 2b. S = Q * K^T (`16x16` scores in FP32)
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> S_mat =
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            for (uint dk = 0u; dk < hd16; ++dk) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> K_mat;
+                coopMatLoad(K_mat, KV_sh, dk * 4u, KV_STRIDE4, gl_CooperativeMatrixLayoutColumnMajor);
+                S_mat = coopMatMulAdd(Q_reg[dk], K_mat, S_mat);
+            }
+
+            coopMatStore(S_mat, stage_f32, sg_stage_base, STAGE_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+            controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+
+            // 2c. Causal mask + row-wise online softmax across `kc = 0..15` (`2` lanes per row `r`)
+            float s_loc[8];
+            float row_max = -1.0e30;
+            const uint causal_limit = pc.base_pos + q_tok;
+            [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+                const uint kc = half_lane * 8u + j;
+                const uint kv_pos = kv_t0 + kc;
+                const bool ok = valid_q && (kv_pos < max_kv_len) && (kv_pos <= causal_limit);
+                const float sv = ok ? stage_f32[sg_stage_base + r * STAGE_STRIDE + kc] : -1.0e30;
+                s_loc[j] = sv;
+                row_max = max(row_max, sv);
+            }
+            row_max = max(row_max, subgroupShuffleXor(row_max, 1u));
+
+            float p_loc[8];
+            if (row_max > -1.0e29) {
+                const float m_new = max(m_row, row_max);
+                const float alpha = (l_row == 0.0) ? 0.0 : exp(m_row - m_new);
+                if (alpha != 1.0) {
+                    for (uint dk = 0u; dk < hd16; ++dk) {
+                        o_acc0[dk] *= alpha;
+                        o_acc1[dk] *= alpha;
+                    }
+                }
+                float p_sum = 0.0;
+                [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+                    const float pv = (s_loc[j] > -1.0e29) ? exp(s_loc[j] - m_new) : 0.0;
+                    p_loc[j] = pv;
+                    p_sum += pv;
+                }
+                p_sum += subgroupShuffleXor(p_sum, 1u);
+                l_row = l_row * alpha + p_sum;
+                m_row = m_new;
+            } else {
+                [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+                    p_loc[j] = 0.0;
+                }
+            }
+
+            P_sh[sg_p_base + r * P_STRIDE4 + half_lane * 2u + 0u] =
+                f16vec4(float16_t(p_loc[0]), float16_t(p_loc[1]), float16_t(p_loc[2]), float16_t(p_loc[3]));
+            P_sh[sg_p_base + r * P_STRIDE4 + half_lane * 2u + 1u] =
+                f16vec4(float16_t(p_loc[4]), float16_t(p_loc[5]), float16_t(p_loc[6]), float16_t(p_loc[7]));
+            controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+            coopMatLoad(P_mat, P_sh, sg_p_base, P_STRIDE4, gl_CooperativeMatrixLayoutRowMajor);
+            controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+        }
+
+        // Wait until all subgroups finish reading K from KV_sh before staging V.
+        barrier();
+
+        // 2d. Cooperatively stage V [16, head_dim] into KV_sh
+        for (uint idx = tid; idx < total_kv4; idx += WG) {
+            const uint kc = idx / hd4;
+            const uint d4 = idx % hd4;
+            const uint kv_pos = kv_t0 + kc;
+            KV_sh[kc * KV_STRIDE4 + d4] = (kv_pos < max_kv_len)
+                ? v_cache4[kv_pos * kv_dim4 + kv_h * hd4 + d4]
+                : f16vec4(float16_t(0.0));
+        }
+        barrier();
+
+        if (sg_active) {
+            for (uint dk = 0u; dk < hd16; ++dk) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> V_mat;
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> dO_mat =
+                    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+                coopMatLoad(V_mat, KV_sh, dk * 4u, KV_STRIDE4, gl_CooperativeMatrixLayoutRowMajor);
+                dO_mat = coopMatMulAdd(P_mat, V_mat, dO_mat);
+
+                coopMatStore(dO_mat, stage_f32, sg_stage_base, STAGE_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+                controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+
+                const uint c_base = sg_stage_base + r * STAGE_STRIDE + half_lane * 8u;
+                o_acc0[dk] += vec4(stage_f32[c_base + 0u], stage_f32[c_base + 1u], stage_f32[c_base + 2u], stage_f32[c_base + 3u]);
+                o_acc1[dk] += vec4(stage_f32[c_base + 4u], stage_f32[c_base + 5u], stage_f32[c_base + 6u], stage_f32[c_base + 7u]);
+                controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+            }
+        }
+
+        barrier();
+    }
+
+    if (valid_q) {
+        const float inv_l = (l_row > 0.0) ? (1.0 / l_row) : 0.0;
+        const uint ob = q_tok * q_dim4 + head * hd4;
+        for (uint dk = 0u; dk < hd16; ++dk) {
+            const uint d4_base = dk * 4u + half_lane * 2u;
+            out4[ob + d4_base + 0u] = o_acc0[dk] * inv_l;
+            out4[ob + d4_base + 1u] = o_acc1[dk] * inv_l;
+        }
+    }
+}

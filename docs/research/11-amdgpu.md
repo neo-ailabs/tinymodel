@@ -1,6 +1,6 @@
 # 11 AMD GPU 支持：分析与规划
 
-> 状态：路线已确认（ADR-010，2026-11-21）；**V0、V1、Mesa 25.2.8、V2 已完成**，见第 7 节。
+> 状态：路线已确认（ADR-010，2026-11-21）；**V0、V1、Mesa 25.2.8、V2、V3 已完成**，见第 7 节。
 > 相关：`DECISIONS.md` ADR-008（Metal → Vulkan → CUDA）、`ARCHITECTURE.md` 5.4 节、`08-pixel8.md`、`10-rk3588.md`。
 
 ## 1. 本机现状（实测）
@@ -120,4 +120,52 @@
 | **Qwen3-8B** | 41.4 | 58.5 | 59.2 | **63.84 tok/s**（峰值 64.00） | **109.1%** | **107.8%** | 252.5 tok/s |
 
   - `Qwen3-8B` 单步硬件剖析：`ffn_gate_up_silu` 实测有效带宽 **`314.1 GB/s`（理论峰值 320 GB/s 的 98.2%）**，`ffn_down+res` **`307.7 GB/s`（96.2%）**，`attn_qkv` **`299.7 GB/s`（93.7%）**。
-  - 下一步 **V3**：把 `gemm_tiled` 与批量注意力接入 Mesa 25.2.8 解锁的 **`16×16×16` INT8/FP16 `VK_KHR_cooperative_matrix`（WMMA）**，把 `pp512` 推高 5–8×。
+
+### V3（2026-11-21）✅ — Cooperative Matrix（FP16 / INT8）Prefill + Tiled FlashAttention 与 HIP 差距评估
+- **核心架构与内核实现**（新增 6 个着色器 + `tests/parity_vk_coopmat.rs` + `examples/bench_vk_gemm.rs`）：
+  1. **`gemm_coopmat_f16.comp`（全格式 `16×16×16 f16*f16+f32->f32` WMMA）**：覆盖 `Q4_0 / Q4_1 / Q8_0 / Q5_K / Q6_K / F32` 全部 6 种权重格式；采用 `WG=256`（`4×2` subgroup 排布、`BM=128, BN=128`）、每 subgroup 严格限制为 `2×4 = 8` 个累加矩阵（**64 VGPR，零寄存器溢出**，每 CU 可并发驻留 2 个 workgroup = 16 wave，总共享内存 30 KB），配合 128-bit `vec4` 激活加载、对齐内部块直接 `coopMatStore` 写回全局内存，以及边界/残差块的融合 `add_residual`。
+  2. **`gemm_pair_silu_coopmat_f16.comp`（融合 `Gate + Up + SwiGLU` CoopMat GEMM）**：`BM=128, BN=64, WG=256`，单次加载激活 `X`、双路 `16×16×16` FP32 累加并在寄存器中完成 `silu(g) * u`，彻底省去 `s_hb2` 写回与独立 `silu_mul` 访存（在 `Qwen3-8B` 上省去约 `3.46 GiB` 显存往返流量），实测有效算力达 **`30.4–31.1 TFLOP/s`**。
+  3. **`quantize_q8_1.comp` + `gemm_coopmat_i8.comp`（`16×16×16 i8*i8+i32->i32` INT8 WMMA）**：实现动态 `FP32 -> Q8_1` 激活量化与 `Q4_0 / Q4_1 / Q8_0` 整数 WMMA。**关键硬件/规范结论**：由于 Khronos `VK_KHR_cooperative_matrix` 规定 `coopmat` 元素到线程的映射不透明（opaque），`K=32` 量化块每经过两次 `16×16×16` INT8 WMMA 就必须 `coopMatStore` 到 subgroup 共享内存才能乘以逐行/逐 token 的 `d_w * d_x`，导致 INT8 路径实测吞吐限制在 `6.5–7.5 TOPS`；而 `f16*f16+f32->f32` 可将 FP32 累加器全程留在硬件 VGPR 中跑完整个 `K=4096..14336`，实测快 **3.2×–4.4×**（`21.6–31.1 TFLOP/s`），因此 `TM_VK_PREFILL=auto` 默认选用 `CoopMatF16`。
+  4. **双路径因果 FlashAttention（`fa_coopmat.comp` + `fa_gqa_tiled.comp`）**：
+     - `fa_coopmat.comp`（wave32 CoopMat）：将缩放后的 `Q` 常驻 subgroup `coopmat` 寄存器，`K/V` 复用同一块 `8.5 KB` LDS 缓冲（总共享内存仅 **`16.5 KB`**，即使 `head_dim=256` 也可每 CU 并发 3 个 workgroup），`Q*K^T` 与 `P*V` 均走 `16×16×16` WMMA，行内在线 Softmax 用 `subgroupShuffleXor`（单周期 DPP 指令）归约；
+     - `fa_gqa_tiled.comp`（通用退回路径）：`Br=8, Bc=16`，共享内存 `16 KB`（兼容 lavapipe `32 KB` 上限及 `subgroup_size ∈ {8,16,32,64}`）。
+  5. **单批 `MAX_BATCH = 512` 自适应规划**：按设备 `maxStorageBufferRange` 与显存预算自动选定批上限，使 `pp512` 在单次队列提交中完成。
+
+- **单算子微基准（`bench_vk_gemm`，RX 9060 XT，Mesa 25.2.8）**：
+
+| 算子 / 形状（`M=512`，`Q4_0`） | V2 `gemm_tiled` (FP32) | V3 `CoopMat INT8` (`Q8_1`) | V3 `CoopMat F16` (`128×128`) | 相对 V2 加速比 |
+|---|---:|---:|---:|---:|
+| `Llama1B wq (2048×512×2048)` | 1660 µs (2.6 T) | 1692 µs (2.5 T) | **282.8 µs (15.2 T)** | **5.87×** |
+| `Llama1B gate (8192×512×2048)` | 5098 µs (3.4 T) | 2452 µs (7.0 T) | **714.8 µs (24.0 T)** | **7.13×** |
+| `Qwen8B wq (4096×512×4096)` | 4259 µs (4.0 T) | 2930 µs (5.9 T) | **634.7 µs (27.1 T)** | **6.71×** |
+| `Qwen8B gate (12288×512×4096)` | 12448 µs (4.1 T) | 6867 µs (7.5 T) | **2384.4 µs (21.6 T)** | **5.22×** |
+| `Llama1B Fused Gate+Up+SwiGLU` | — | — | **1104.5 µs (31.11 TFLOP/s)** | 较 llama.cpp Vk 快 **4.38×** |
+| `Qwen8B Fused Gate+Up+SwiGLU` | — | — | **3388.2 µs (30.42 TFLOP/s)** | 较 llama.cpp Vk 快 **1.43×** |
+| `FlashAttention (1B, hd=64)` | 1806.5 µs (0.60 T, Tiled) | — | **195.0 µs (5.52 TFLOP/s)** | **9.26×**（较 llama.cpp Vk 快 **1.91×**） |
+| `FlashAttention (8B, hd=128)` | 1902.1 µs (1.13 T, Tiled) | — | **374.4 µs (5.75 TFLOP/s)** | **5.08×** |
+
+- **正确性验证**：
+  - **三驱动 L1/L1b/L3 测试**：`TM_VK_DEVICE=radv`（含 `CoopMatF16`、`CoopMatI8` **整数点积 `0.0` 逐位一致校验**及 `Fallback` 三路径）、`TM_VK_DEVICE=UHD`（Intel ANV）、`TM_VK_DEVICE=llvmpipe`（lavapipe wave8）全部通过。
+  - **多 token Logits 与贪心一致性**：`tools/logits_diff.py --vulkan` 在三模型上全部通过（`Qwen3-8B` **25/25 = 100.0% Top-1 一致**、`mean_KL = 7.99e-4`）；`f16 / i8 / fallback / cpu` 四条路径在 `Llama-3.2-1B` 上的贪心续写文本逐字符 100% 一致，5 轮 `bench` 的 `greedy_tokens_fnv1a64` 与 V2 完全相同。
+
+- **RX 9060 XT 5 轮中位数端到端基准（`pp512 / tg128`）**（原始数据：`bench/results/amd-rx9060xt/2026-11-21-v3-vulkan.json`）：
+
+| 模型（Q4_0） | V2 `pp512` | **V3 `pp512`**（峰值） | llama.cpp Vk 25.2.8 `pp512` | **相对 Vk 25.2.8** | llama.cpp HIP `pp512` | **相对 HIP** | **V3 `tg128`**（相对 Vk / HIP） |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **SmolLM2-360M** | 2798.6 | **20715.2 tok/s**（20948.4） | 4362 | **474.9% (4.75×)** | 21985 | **94.2%** | **608.8 tok/s**（**142.1%** / **225.9%**） |
+| **Llama-3.2-1B** | 1181.9 | **9329.6 tok/s**（9963.0¹） | 3420 | **272.8% (2.73×)** | 13941 | **66.9%** | **307.1 tok/s**（**104.0%** / **118.5%**） |
+| **Qwen3-8B** | 252.5 | **1737.9 tok/s**（1745.5²） | 1801 | **96.5% ✅** | 2548 | **68.2%** | **63.95 tok/s**（**109.3%** / **108.0%**） |
+
+  > ¹ `tinymodel profile` 持续热态下 `Llama-3.2-1B` 墙钟 `44.41 ms`（**`11528 tok/s` = HIP 的 82.7%**），GPU 时间戳总和 `41.96 ms`（**`12202 tok/s`**）。
+  > ² `Qwen3-8B` 持续热态墙钟 `287.21 ms`（**`1782.7 tok/s` = Vk 25.2.8 的 99.0%**），GPU 时间戳总和 `282.84 ms`（**`1810.2 tok/s`**，其中 `ffn_gate_up_silu = 29.84 TFLOP/s`、`attn_qkv_gemm = 27.01 TFLOP/s`，且未像 llama.cpp 那样裁剪末层的前 511 个 token）。
+
+- **全参考设备覆盖与影响分析（按 `AGENTS.md` 第 8 节固定参考设备规范）**：
+  - **AMD RX 9060 XT（RDNA4，host 独显）**：自动命中 `coopmat-f16` + `fa_coopmat`，`pp512` 提速 **6.9×–7.9×**，全面达成并大幅超越 `≥90% llama.cpp Vulkan` 验收线。即使强制 `TM_VK_PREFILL=fallback`，`SmolLM2-360M` 亦达 `4550.5 tok/s`（较 V2 提速 `+62.6%`）。
+  - **Intel UHD 770（Alder Lake GT1 核显，本机实测）**：无 `cooperative_matrix`，自动走 `tiled-fallback`（`gemm_tiled` + `fa_gqa_tiled`），`SmolLM2-360M` 端到端实测 `pp512 = 130.1 tok/s`、`tg64 = 28.4 tok/s`，贪心输出 token 与独显逐位一致（`last_tok=19975`）。
+  - **Apple M4（16GB，macOS）**：正式路径仍为原生 `tm-metal`（`simdgroup_matrix` + 零拷贝 UMA）；MoltenVK 仅作跨平台验证。
+  - **Google Pixel 8（Tensor G3，Mali-G715 MC7，Android Vulkan 1.3）**：Mali-G715 不暴露桌面 `16×16×16` `VK_KHR_cooperative_matrix`，运行时自动选 `tiled-fallback`（`fa_gqa_tiled` 共享内存仅 `16 KB`，契合 Mali Valhall/ Immortalis 的 32 KB threadgroup 预算与 wave16 subgroup）；Decode 仍建议优先走已调优的 `tm-cpu` ARMv8.2 i8mm + 自动大小核绑核，Vulkan 主要用于长 Prompt TTFT 卸载（V5 实测验证）。
+  - **Rockchip RK3588（4×A76 + 4×A55，Mali-G610 MP4，Linux SBC）**：Panthor + Mesa PanVK（或 BSP `libmali`）同样走 `tiled-fallback`（wave16，`16 KB` LDS），无任何扩展硬依赖，可在 4×A76 CPU 算力受限时分担 Prefill GEMM。
+  - **Raspberry Pi 5（VideoCore VII，V3DV）**：Vulkan 1.2 驱动仅支持 `subgroup_size=16`、无 coopmat，自动退回 `tiled-fallback` 作功能兼容；实际推理主路径仍为 4×A76 `dotprod` CPU。
+  - **Raspberry Pi 4B / Zero 2W（`micro` 档）**：`--no-default-features --features micro` 已校验零 Vulkan 依赖，保持 `<750 KB` 纯静态二进制。
+
+- **V6 HIP 决策门初步依据**：升级 Mesa 25.2.8 并在 V3 完成算子融合与零溢出 CoopMat 后，`tinymodel --vulkan` 在 **Decode 上比 ROCm HIP 快 `8%–126%`**，在 **Prefill 上已追至 HIP 的 `67%–94%`**（热态 1B 达 `83%`），彻底消除了 V0 时“Vulkan prefill 只有 HIP 23%”的短板。剩余约 20%–30% 的大矩阵 Prefill 差距主要来自 SPIR-V 抽象层无法直接调度 RDNA4 原生 LDS double-buffering / `s_barrier` 指令编排。因此**无需打破路线提前单做 HIP**，维持 ADR-010 计划：先推进 **V4（Qwen3.5 GDN Vulkan）** 与 **V5（跨设备实测）**，HIP 留到 M5 与 `tm-cuda` 共用 `.cu` 内核源码一并交付。

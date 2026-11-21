@@ -10,9 +10,11 @@
 //!   decode token writes 12 bytes (`token_id`, `pos`, `seq_len`) to a mapped step buffer and
 //!   calls `vkQueueSubmit` once — zero heap allocations, zero descriptor updates, and near-zero
 //!   host launch overhead.
-//! - **Per-tensor `DType` dispatch**: Supports mixed `Q4_0`, `Q4_1`, `Q8_0`, `Q5_K`, `Q6_K`,
-//!   and `F32` tensors within the same model, with fused QKV (`gemv_qkv_q4_0`), fused
-//!   Gate+Up+SwiGLU (`gemv_pair_silu_q4_0`), and fused residual adds.
+//! - **V3 Cooperative Matrix Prefill + Portable Fallback**: Automatically dispatches RDNA4 /
+//!   Vulkan `16×16×16` Cooperative Matrix (`VK_KHR_cooperative_matrix`) GEMM (including fused
+//!   `Gate+Up+SwiGLU`) and tiled causal FlashAttention (`fa_coopmat`), with automatic runtime
+//!   fallback to portable subgroup/LDS tiled kernels (`gemm_tiled` / `gemm_kquant` / `fa_gqa_tiled`)
+//!   on GPUs without cooperative matrix (`Intel ANV`, `lavapipe`, `Mali`).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -21,7 +23,8 @@ use ash::vk;
 use tm_core::{DType, dequantize_row_bytes};
 use tm_gguf::{GgufError, GgufFile};
 
-use crate::context::{Pipeline, VkBuffer, VulkanContext};
+use crate::context::{Pipeline, VkBuffer, VkPrefillMode, VulkanContext};
+use crate::kernels::dtype_code;
 use crate::{VkResultExt, VulkanError};
 
 const SPV_EMBED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/embed.spv"));
@@ -29,6 +32,8 @@ const SPV_RMS_NORM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm.s
 const SPV_QK_NORM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qk_norm.spv"));
 const SPV_ROPE_KV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_kv.spv"));
 const SPV_GQA_ATTN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gqa_attn.spv"));
+const SPV_FA_COOPMAT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_coopmat.spv"));
+const SPV_FA_GQA_TILED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_gqa_tiled.spv"));
 const SPV_GEMV_RES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_res.spv"));
 const SPV_GEMV_QKV_Q4_0: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_qkv_q4_0.spv"));
 const SPV_GEMV_PAIR_SILU_Q4_0: &[u8] =
@@ -36,12 +41,35 @@ const SPV_GEMV_PAIR_SILU_Q4_0: &[u8] =
 const SPV_SILU_MUL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silu_mul.spv"));
 const SPV_GEMM_TILED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_tiled.spv"));
 const SPV_GEMM_KQUANT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_kquant.spv"));
+const SPV_GEMM_COOPMAT_F16: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_f16.spv"));
+const SPV_GEMM_PAIR_SILU_COOPMAT_F16: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_pair_silu_coopmat_f16.spv"));
+const SPV_QUANTIZE_Q8_1: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quantize_q8_1.spv"));
+const SPV_GEMM_COOPMAT_I8: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_i8.spv"));
 const SPV_ARGMAX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/argmax.spv"));
 
-/// Maximum tokens per batched prefill chunk (zero heap allocation during `forward_batch`).
-const MAX_BATCH: usize = 128;
+/// Preferred maximum tokens per batched prefill submission (`pp512` executes in a single pass!).
+const PREFERRED_MAX_BATCH: usize = 512;
 /// Target maximum size per device-local `VkBuffer` slab (512 MiB).
 const TARGET_SLAB_BYTES: u64 = 512 << 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedPrefill {
+    Fallback,
+    CoopMatF16,
+    CoopMatI8,
+}
+
+impl ResolvedPrefill {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fallback => "tiled-fallback",
+            Self::CoopMatF16 => "coopmat-f16",
+            Self::CoopMatI8 => "coopmat-i8",
+        }
+    }
+}
 
 /// Model hyperparameters for [`LlamaVkRunner`].
 #[derive(Debug, Clone)]
@@ -76,6 +104,7 @@ pub struct VkProfileReport {
     pub decode_single_cb_wall_us: f64,
     pub decode_single_cb_gpu_us: f64,
     pub decode_stages: Vec<VkStageStat>,
+    pub prefill_backend: &'static str,
     pub prefill_tokens: usize,
     pub prefill_wall_ms: f64,
     pub prefill_chunk_stages: Vec<VkStageStat>,
@@ -95,6 +124,43 @@ struct VkMat {
     rows: usize,
     cols: usize,
     row_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+enum GemmFlavor {
+    Tiled32,
+    KQuantSubgroup,
+    CoopMatF16 { bm: u32, bn: u32 },
+    CoopMatI8,
+}
+
+struct BatchGemmEntry {
+    pipe: Arc<Pipeline>,
+    set: vk::DescriptorSet,
+    mat: VkMat,
+    flavor: GemmFlavor,
+}
+
+enum BatchFfnPlan {
+    FusedPairSiluCoopMat {
+        pipe: Arc<Pipeline>,
+        set: vk::DescriptorSet,
+        cols: usize,
+        rows: usize,
+        row_bytes: usize,
+    },
+    Separate {
+        gate: BatchGemmEntry,
+        up: BatchGemmEntry,
+        silu_set: vk::DescriptorSet,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum BatchAttnKind {
+    CoopMat64,
+    Tiled8,
+    Legacy1,
 }
 
 struct ArenaPlanner {
@@ -148,18 +214,6 @@ impl ArenaPlanner {
     }
 }
 
-fn dtype_code(dt: DType) -> Result<u32, VulkanError> {
-    match dt {
-        DType::Q4_0 => Ok(0),
-        DType::Q4_1 => Ok(1),
-        DType::Q8_0 => Ok(2),
-        DType::Q5K => Ok(3),
-        DType::Q6K => Ok(4),
-        DType::F32 => Ok(5),
-        other => Err(VulkanError::UnsupportedDType(other)),
-    }
-}
-
 fn gemv_nr(dt: DType) -> u32 {
     match dt {
         DType::Q8_0 | DType::Q6K => 4,
@@ -208,9 +262,9 @@ enum DecodeFfnSets {
 struct LayerPlan {
     attn_norm_set: vk::DescriptorSet,
     qkv_dec: DecodeQkvSets,
-    wq_batch: (Arc<Pipeline>, vk::DescriptorSet, VkMat),
-    wk_batch: (Arc<Pipeline>, vk::DescriptorSet, VkMat),
-    wv_batch: (Arc<Pipeline>, vk::DescriptorSet, VkMat),
+    wq_batch: BatchGemmEntry,
+    wk_batch: BatchGemmEntry,
+    wv_batch: BatchGemmEntry,
     q_norm_set: Option<vk::DescriptorSet>,
     k_norm_set: Option<vk::DescriptorSet>,
     rope_dec_set: vk::DescriptorSet,
@@ -218,14 +272,12 @@ struct LayerPlan {
     attn_dec_set: vk::DescriptorSet,
     attn_batch_set: vk::DescriptorSet,
     wo_dec: (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
-    wo_batch: (Arc<Pipeline>, vk::DescriptorSet, VkMat),
+    wo_batch: BatchGemmEntry,
     ffn_norm_set: vk::DescriptorSet,
     ffn_dec: DecodeFfnSets,
-    gate_batch: (Arc<Pipeline>, vk::DescriptorSet, VkMat),
-    up_batch: (Arc<Pipeline>, vk::DescriptorSet, VkMat),
-    silu_batch_set: vk::DescriptorSet,
+    ffn_batch: BatchFfnPlan,
     down_dec: (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
-    down_batch: (Arc<Pipeline>, vk::DescriptorSet, VkMat),
+    down_batch: BatchGemmEntry,
     // Byte sizes for stage bandwidth accounting in `profile`
     qkv_weight_bytes: u64,
     wo_weight_bytes: u64,
@@ -242,7 +294,9 @@ struct RunnerPipes {
     rope_batch: Arc<Pipeline>,
     attn_dec: Arc<Pipeline>,
     attn_batch: Arc<Pipeline>,
+    attn_batch_kind: BatchAttnKind,
     silu_mul: Arc<Pipeline>,
+    quant_q8_1: Option<Arc<Pipeline>>,
     argmax: Arc<Pipeline>,
 }
 
@@ -250,6 +304,8 @@ struct RunnerPipes {
 pub struct LlamaVkRunner {
     pub cfg: LlamaVkConfig,
     ctx: VulkanContext,
+    prefill_kind: ResolvedPrefill,
+    max_batch: usize,
     slabs: Vec<VkBuffer>,
     step_buf: VkBuffer,
     token_ids_buf: VkBuffer,
@@ -261,6 +317,8 @@ pub struct LlamaVkRunner {
     pipes: RunnerPipes,
     embed_dec_set: vk::DescriptorSet,
     embed_batch_set: vk::DescriptorSet,
+    quant_xb_set: Option<vk::DescriptorSet>,
+    quant_hb_set: Option<vk::DescriptorSet>,
     output_norm_set: vk::DescriptorSet,
     lm_head_dec: (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
     argmax_set: vk::DescriptorSet,
@@ -395,6 +453,38 @@ impl LlamaVkRunner {
             .unwrap_or_else(|| embd_info.dims.get(1).copied().unwrap_or(0));
 
         let info = ctx.info().clone();
+        let sg = info.subgroup_size;
+        let can_cm_f16 = info.coopmat_f16_f32acc && (sg == 32 || sg == 64);
+        let can_cm_i8 = info.coopmat_i8_i32acc && (sg == 32 || sg == 64);
+        let prefill_kind = match ctx.prefill_mode() {
+            VkPrefillMode::Fallback => ResolvedPrefill::Fallback,
+            VkPrefillMode::CoopMatF16 => {
+                if !can_cm_f16 {
+                    return Err(VulkanError::MissingFeature {
+                        device: info.name.clone(),
+                        feature: "16x16x16 f16*f16+f32->f32 cooperativeMatrix",
+                    });
+                }
+                ResolvedPrefill::CoopMatF16
+            }
+            VkPrefillMode::CoopMatI8 => {
+                if !can_cm_i8 {
+                    return Err(VulkanError::MissingFeature {
+                        device: info.name.clone(),
+                        feature: "16x16x16 i8*i8+i32->i32 cooperativeMatrix",
+                    });
+                }
+                ResolvedPrefill::CoopMatI8
+            }
+            VkPrefillMode::Auto => {
+                if can_cm_f16 {
+                    ResolvedPrefill::CoopMatF16
+                } else {
+                    ResolvedPrefill::Fallback
+                }
+            }
+        };
+
         let slab_cap = TARGET_SLAB_BYTES
             .min(info.max_alloc_bytes / 2)
             .max(64 << 20);
@@ -580,21 +670,41 @@ impl LlamaVkRunner {
             });
         }
 
-        let s_x = planner.reserve((MAX_BATCH * n_embd * 4) as u64)?;
-        let s_xb = planner.reserve((MAX_BATCH * n_embd.max(q_dim) * 4) as u64)?;
-        let s_q = planner.reserve((MAX_BATCH * q_dim * 4) as u64)?;
-        let s_k = planner.reserve((MAX_BATCH * kv_dim * 4) as u64)?;
-        let s_v = planner.reserve((MAX_BATCH * kv_dim * 4) as u64)?;
-        let s_hb = planner.reserve((MAX_BATCH * n_ff * 4) as u64)?;
-        let s_hb2 = planner.reserve((MAX_BATCH * n_ff * 4) as u64)?;
-        let logits_dev = planner.reserve((vocab_size * 4) as u64)?;
-
-        let total_needed = planner.total_bytes();
         let budget = if info.unified_memory {
             info.device_local_bytes * 90 / 100
         } else {
             info.device_local_bytes * 97 / 100
         };
+        let max_dim = n_ff.max(n_embd).max(q_dim);
+        let range_batch_cap =
+            ((info.max_storage_buffer_range as usize) / (max_dim * 4 * 2)).max(32);
+        let base_bytes = planner.total_bytes();
+        let per_tok_scratch =
+            ((n_embd + n_embd.max(q_dim) + q_dim + 2 * kv_dim + 2 * n_ff + max_dim) * 4) as u64;
+        let mut max_batch = PREFERRED_MAX_BATCH.min(range_batch_cap);
+        if max_batch > 128 && base_bytes + (max_batch as u64) * per_tok_scratch > budget {
+            max_batch = 128.min(range_batch_cap);
+        }
+
+        let s_x = planner.reserve((max_batch * n_embd * 4) as u64)?;
+        let s_xb = planner.reserve((max_batch * n_embd.max(q_dim) * 4) as u64)?;
+        let s_q = planner.reserve((max_batch * q_dim * 4) as u64)?;
+        let s_k = planner.reserve((max_batch * kv_dim * 4) as u64)?;
+        let s_v = planner.reserve((max_batch * kv_dim * 4) as u64)?;
+        let s_hb = planner.reserve((max_batch * n_ff * 4) as u64)?;
+        let s_hb2 = planner.reserve((max_batch * n_ff * 4) as u64)?;
+        let (s_xq, s_xd) = if prefill_kind == ResolvedPrefill::CoopMatI8 {
+            let max_blocks = (max_batch * max_dim) / 32;
+            (
+                Some(planner.reserve((max_blocks * 32) as u64)?),
+                Some(planner.reserve((max_blocks * 8) as u64)?),
+            )
+        } else {
+            (None, None)
+        };
+        let logits_dev = planner.reserve((vocab_size * 4) as u64)?;
+
+        let total_needed = planner.total_bytes();
         if total_needed > budget {
             return Err(VulkanError::OutOfDeviceMemory {
                 needed_mib: total_needed as f64 / (1024.0 * 1024.0),
@@ -609,7 +719,6 @@ impl LlamaVkRunner {
         for &sz in &planner.slab_sizes {
             slabs.push(ctx.create_device_slab(sz)?);
         }
-        // Zero-initialize all slabs first (clears KV caches, padding, and scratch buffers).
         ctx.run(|rec| {
             for slab in &slabs {
                 // SAFETY: `slab` is a valid transfer-dst buffer idle on the device.
@@ -658,21 +767,48 @@ impl LlamaVkRunner {
         }
 
         let step_buf = ctx.create_host_buffer(32)?;
-        let token_ids_buf = ctx.create_host_buffer((MAX_BATCH * 4) as u64)?;
+        let token_ids_buf = ctx.create_host_buffer((max_batch * 4) as u64)?;
         let argmax_buf = ctx.create_host_buffer(16)?;
         let logits_host = ctx.create_host_buffer((vocab_size * 4) as u64)?;
 
-        let step_whole = VkSlice {
-            slab: usize::MAX,
-            offset: 0,
-            len: 32,
-        };
-        let _ = step_whole;
-
         // 3. Build pipelines (each validates workgroup size against device limits).
-        let sg = info.subgroup_size;
         let emb_dt = dtype_code(p_token_embd.mat.dtype)?;
         let attn_wg = 8 * sg;
+        let (attn_batch, attn_batch_kind) = if prefill_kind != ResolvedPrefill::Fallback
+            && info.coopmat_f16_f32acc
+            && sg == 32
+            && head_dim.is_multiple_of(16)
+            && head_dim <= 256
+        {
+            (
+                ctx.pipeline("fa_coopmat", 128, SPV_FA_COOPMAT, 4, 20, &[128])?,
+                BatchAttnKind::CoopMat64,
+            )
+        } else if head_dim.is_multiple_of(4) && head_dim <= 256 {
+            (
+                ctx.pipeline("fa_gqa_tiled", attn_wg, SPV_FA_GQA_TILED, 4, 20, &[attn_wg])?,
+                BatchAttnKind::Tiled8,
+            )
+        } else {
+            (
+                ctx.pipeline(
+                    "attn_batch",
+                    attn_wg | 0x1000,
+                    SPV_GQA_ATTN,
+                    5,
+                    16,
+                    &[attn_wg, 1],
+                )?,
+                BatchAttnKind::Legacy1,
+            )
+        };
+
+        let quant_q8_1 = if prefill_kind == ResolvedPrefill::CoopMatI8 {
+            Some(ctx.pipeline("quantize_q8_1", 256, SPV_QUANTIZE_Q8_1, 3, 4, &[256])?)
+        } else {
+            None
+        };
+
         let pipes = RunnerPipes {
             embed_dec: ctx.pipeline("embed_dec", emb_dt, SPV_EMBED, 3, 8, &[64, emb_dt, 0])?,
             embed_batch: ctx.pipeline(
@@ -688,15 +824,10 @@ impl LlamaVkRunner {
             rope_dec: ctx.pipeline("rope_dec", 0, SPV_ROPE_KV, 7, 32, &[64, 0])?,
             rope_batch: ctx.pipeline("rope_batch", 1, SPV_ROPE_KV, 7, 32, &[64, 1])?,
             attn_dec: ctx.pipeline("attn_dec", attn_wg, SPV_GQA_ATTN, 5, 16, &[attn_wg, 0])?,
-            attn_batch: ctx.pipeline(
-                "attn_batch",
-                attn_wg | 0x1000,
-                SPV_GQA_ATTN,
-                5,
-                16,
-                &[attn_wg, 1],
-            )?,
+            attn_batch,
+            attn_batch_kind,
             silu_mul: ctx.pipeline("silu_mul", 0, SPV_SILU_MUL, 2, 4, &[256])?,
+            quant_q8_1,
             argmax: ctx.pipeline("argmax", 0, SPV_ARGMAX, 2, 4, &[256])?,
         };
 
@@ -717,21 +848,8 @@ impl LlamaVkRunner {
             Ok((p, groups, push))
         };
 
-        let gemm_pipe_for = |mat: &VkMat| -> Result<Arc<Pipeline>, VulkanError> {
-            let dt = dtype_code(mat.dtype)?;
-            match mat.dtype {
-                DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::F32 => {
-                    ctx.pipeline("gemm_tiled", dt, SPV_GEMM_TILED, 3, 20, &[128, dt])
-                }
-                DType::Q5K | DType::Q6K => {
-                    ctx.pipeline("gemm_kquant", dt, SPV_GEMM_KQUANT, 3, 20, &[128, dt])
-                }
-                other => Err(VulkanError::UnsupportedDType(other)),
-            }
-        };
-
         // 4. Allocate static descriptor pool, command pool, pre-bound descriptor sets.
-        let max_sets = (n_layers as u32) * 24 + 16;
+        let max_sets = (n_layers as u32) * 26 + 24;
         let max_desc = max_sets * 8;
         let d = &ctx.inner.device;
         let (desc_pool, cmd_pool, cbs, fence) = unsafe {
@@ -815,6 +933,129 @@ impl LlamaVkRunner {
                     d.update_descriptor_sets(&writes, &[]);
                     Ok(set)
                 }
+            };
+
+        let make_batch_gemm = |mat: VkMat,
+                               x_slice: VkSlice,
+                               y_slice: VkSlice|
+         -> Result<BatchGemmEntry, VulkanError> {
+            let dt = dtype_code(mat.dtype)?;
+            let cm_wg = 4 * sg;
+            if prefill_kind == ResolvedPrefill::CoopMatI8
+                && matches!(mat.dtype, DType::Q4_0 | DType::Q4_1 | DType::Q8_0)
+                && let (Some(xq), Some(xd)) = (s_xq, s_xd)
+            {
+                let pipe = ctx.pipeline(
+                    "gemm_coopmat_i8",
+                    dt | (cm_wg << 8),
+                    SPV_GEMM_COOPMAT_I8,
+                    4,
+                    20,
+                    &[cm_wg, dt],
+                )?;
+                let set = alloc_set(
+                    &pipe,
+                    &[
+                        Binding::Arena(mat.slice),
+                        Binding::Arena(xq),
+                        Binding::Arena(xd),
+                        Binding::Arena(y_slice),
+                    ],
+                )?;
+                return Ok(BatchGemmEntry {
+                    pipe,
+                    set,
+                    mat,
+                    flavor: GemmFlavor::CoopMatI8,
+                });
+            }
+
+            if prefill_kind != ResolvedPrefill::Fallback && can_cm_f16 {
+                let (wg_cm, bm, bn) =
+                    if mat.rows >= 512 && (8 * sg) <= info.max_workgroup_invocations {
+                        (8 * sg, 128u32, 128u32)
+                    } else {
+                        (4 * sg, 64u32, 64u32)
+                    };
+                let key = dt | (bn << 8) | (bm << 16) | (wg_cm << 24);
+                let pipe = ctx.pipeline(
+                    "gemm_coopmat_f16",
+                    key,
+                    SPV_GEMM_COOPMAT_F16,
+                    3,
+                    20,
+                    &[wg_cm, dt, bm, bn],
+                )?;
+                let set = alloc_set(
+                    &pipe,
+                    &[
+                        Binding::Arena(mat.slice),
+                        Binding::Arena(x_slice),
+                        Binding::Arena(y_slice),
+                    ],
+                )?;
+                return Ok(BatchGemmEntry {
+                    pipe,
+                    set,
+                    mat,
+                    flavor: GemmFlavor::CoopMatF16 { bm, bn },
+                });
+            }
+
+            match mat.dtype {
+                DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::F32 => {
+                    let pipe = ctx.pipeline("gemm_tiled", dt, SPV_GEMM_TILED, 3, 20, &[128, dt])?;
+                    let set = alloc_set(
+                        &pipe,
+                        &[
+                            Binding::Arena(mat.slice),
+                            Binding::Arena(x_slice),
+                            Binding::Arena(y_slice),
+                        ],
+                    )?;
+                    Ok(BatchGemmEntry {
+                        pipe,
+                        set,
+                        mat,
+                        flavor: GemmFlavor::Tiled32,
+                    })
+                }
+                DType::Q5K | DType::Q6K => {
+                    let pipe =
+                        ctx.pipeline("gemm_kquant", dt, SPV_GEMM_KQUANT, 3, 20, &[128, dt])?;
+                    let set = alloc_set(
+                        &pipe,
+                        &[
+                            Binding::Arena(mat.slice),
+                            Binding::Arena(x_slice),
+                            Binding::Arena(y_slice),
+                        ],
+                    )?;
+                    Ok(BatchGemmEntry {
+                        pipe,
+                        set,
+                        mat,
+                        flavor: GemmFlavor::KQuantSubgroup,
+                    })
+                }
+                other => Err(VulkanError::UnsupportedDType(other)),
+            }
+        };
+
+        let (quant_xb_set, quant_hb_set) =
+            if let (Some(qp), Some(xq), Some(xd)) = (&pipes.quant_q8_1, s_xq, s_xd) {
+                (
+                    Some(alloc_set(
+                        qp,
+                        &[Binding::Arena(s_xb), Binding::Arena(xq), Binding::Arena(xd)],
+                    )?),
+                    Some(alloc_set(
+                        qp,
+                        &[Binding::Arena(s_hb), Binding::Arena(xq), Binding::Arena(xd)],
+                    )?),
+                )
+            } else {
+                (None, None)
             };
 
         let token_embd = p_token_embd.mat;
@@ -940,33 +1181,9 @@ impl LlamaVkRunner {
                 }
             };
 
-            let wq_bp = gemm_pipe_for(&pl.wq.mat)?;
-            let wq_bs = alloc_set(
-                &wq_bp,
-                &[
-                    Binding::Arena(pl.wq.slice),
-                    Binding::Arena(s_xb),
-                    Binding::Arena(s_q),
-                ],
-            )?;
-            let wk_bp = gemm_pipe_for(&pl.wk.mat)?;
-            let wk_bs = alloc_set(
-                &wk_bp,
-                &[
-                    Binding::Arena(pl.wk.slice),
-                    Binding::Arena(s_xb),
-                    Binding::Arena(s_k),
-                ],
-            )?;
-            let wv_bp = gemm_pipe_for(&pl.wv.mat)?;
-            let wv_bs = alloc_set(
-                &wv_bp,
-                &[
-                    Binding::Arena(pl.wv.slice),
-                    Binding::Arena(s_xb),
-                    Binding::Arena(s_v),
-                ],
-            )?;
+            let wq_batch = make_batch_gemm(pl.wq.mat, s_xb, s_q)?;
+            let wk_batch = make_batch_gemm(pl.wk.mat, s_xb, s_k)?;
+            let wv_batch = make_batch_gemm(pl.wv.mat, s_xb, s_v)?;
 
             let q_norm_set = match pl.q_norm {
                 Some(ref qn) => Some(alloc_set(
@@ -995,18 +1212,40 @@ impl LlamaVkRunner {
             let rope_dec_set = alloc_set(&pipes.rope_dec, &rope_binds)?;
             let rope_batch_set = alloc_set(&pipes.rope_batch, &rope_binds)?;
 
-            let attn_binds = [
-                Binding::Arena(s_q),
-                Binding::Arena(pl.k_cache),
-                Binding::Arena(pl.v_cache),
-                Binding::Arena(s_xb),
-                Binding::Raw(&step_buf),
-            ];
-            let attn_dec_set = alloc_set(&pipes.attn_dec, &attn_binds)?;
-            let attn_batch_set = alloc_set(&pipes.attn_batch, &attn_binds)?;
+            let attn_dec_set = alloc_set(
+                &pipes.attn_dec,
+                &[
+                    Binding::Arena(s_q),
+                    Binding::Arena(pl.k_cache),
+                    Binding::Arena(pl.v_cache),
+                    Binding::Arena(s_xb),
+                    Binding::Raw(&step_buf),
+                ],
+            )?;
+            let attn_batch_set = match pipes.attn_batch_kind {
+                BatchAttnKind::CoopMat64 | BatchAttnKind::Tiled8 => alloc_set(
+                    &pipes.attn_batch,
+                    &[
+                        Binding::Arena(s_q),
+                        Binding::Arena(pl.k_cache),
+                        Binding::Arena(pl.v_cache),
+                        Binding::Arena(s_xb),
+                    ],
+                )?,
+                BatchAttnKind::Legacy1 => alloc_set(
+                    &pipes.attn_batch,
+                    &[
+                        Binding::Arena(s_q),
+                        Binding::Arena(pl.k_cache),
+                        Binding::Arena(pl.v_cache),
+                        Binding::Arena(s_xb),
+                        Binding::Raw(&step_buf),
+                    ],
+                )?,
+            };
 
             let (p_wo, g_wo, mut push_wo) = gemv_pipe_for(&pl.wo.mat)?;
-            push_wo[2] = 1; // add_residual = 1
+            push_wo[2] = 1;
             let s_wo = alloc_set(
                 &p_wo,
                 &[
@@ -1015,15 +1254,7 @@ impl LlamaVkRunner {
                     Binding::Arena(s_x),
                 ],
             )?;
-            let wo_bp = gemm_pipe_for(&pl.wo.mat)?;
-            let wo_bs = alloc_set(
-                &wo_bp,
-                &[
-                    Binding::Arena(pl.wo.slice),
-                    Binding::Arena(s_xb),
-                    Binding::Arena(s_x),
-                ],
-            )?;
+            let wo_batch = make_batch_gemm(pl.wo.mat, s_xb, s_x)?;
 
             let ffn_norm_set = alloc_set(
                 &pipes.rms_norm,
@@ -1091,31 +1322,49 @@ impl LlamaVkRunner {
                 }
             };
 
-            let gate_bp = gemm_pipe_for(&pl.w_gate.mat)?;
-            let gate_bs = alloc_set(
-                &gate_bp,
-                &[
-                    Binding::Arena(pl.w_gate.slice),
-                    Binding::Arena(s_xb),
-                    Binding::Arena(s_hb),
-                ],
-            )?;
-            let up_bp = gemm_pipe_for(&pl.w_up.mat)?;
-            let up_bs = alloc_set(
-                &up_bp,
-                &[
-                    Binding::Arena(pl.w_up.slice),
-                    Binding::Arena(s_xb),
-                    Binding::Arena(s_hb2),
-                ],
-            )?;
-            let silu_batch_set = alloc_set(
-                &pipes.silu_mul,
-                &[Binding::Arena(s_hb), Binding::Arena(s_hb2)],
-            )?;
+            let ffn_batch = if prefill_kind == ResolvedPrefill::CoopMatF16
+                && pl.w_gate.mat.dtype == pl.w_up.mat.dtype
+                && matches!(pl.w_gate.mat.dtype, DType::Q4_0 | DType::Q4_1 | DType::Q8_0)
+                && (8 * sg) <= info.max_workgroup_invocations
+            {
+                let dt = dtype_code(pl.w_gate.mat.dtype)?;
+                let cm_wg = 8 * sg;
+                let pipe = ctx.pipeline(
+                    "gemm_pair_silu_coopmat_f16",
+                    dt | (cm_wg << 8),
+                    SPV_GEMM_PAIR_SILU_COOPMAT_F16,
+                    4,
+                    16,
+                    &[cm_wg, dt],
+                )?;
+                let set = alloc_set(
+                    &pipe,
+                    &[
+                        Binding::Arena(pl.w_gate.slice),
+                        Binding::Arena(pl.w_up.slice),
+                        Binding::Arena(s_xb),
+                        Binding::Arena(s_hb),
+                    ],
+                )?;
+                BatchFfnPlan::FusedPairSiluCoopMat {
+                    pipe,
+                    set,
+                    cols: pl.w_gate.mat.cols,
+                    rows: pl.w_gate.mat.rows,
+                    row_bytes: pl.w_gate.mat.row_bytes,
+                }
+            } else {
+                let gate = make_batch_gemm(pl.w_gate.mat, s_xb, s_hb)?;
+                let up = make_batch_gemm(pl.w_up.mat, s_xb, s_hb2)?;
+                let silu_set = alloc_set(
+                    &pipes.silu_mul,
+                    &[Binding::Arena(s_hb), Binding::Arena(s_hb2)],
+                )?;
+                BatchFfnPlan::Separate { gate, up, silu_set }
+            };
 
             let (p_dn, g_dn, mut push_dn) = gemv_pipe_for(&pl.w_down.mat)?;
-            push_dn[2] = 1; // add_residual = 1
+            push_dn[2] = 1;
             let s_dn = alloc_set(
                 &p_dn,
                 &[
@@ -1124,22 +1373,14 @@ impl LlamaVkRunner {
                     Binding::Arena(s_x),
                 ],
             )?;
-            let down_bp = gemm_pipe_for(&pl.w_down.mat)?;
-            let down_bs = alloc_set(
-                &down_bp,
-                &[
-                    Binding::Arena(pl.w_down.slice),
-                    Binding::Arena(s_hb),
-                    Binding::Arena(s_x),
-                ],
-            )?;
+            let down_batch = make_batch_gemm(pl.w_down.mat, s_hb, s_x)?;
 
             layers.push(LayerPlan {
                 attn_norm_set,
                 qkv_dec,
-                wq_batch: (wq_bp, wq_bs, pl.wq.mat),
-                wk_batch: (wk_bp, wk_bs, pl.wk.mat),
-                wv_batch: (wv_bp, wv_bs, pl.wv.mat),
+                wq_batch,
+                wk_batch,
+                wv_batch,
                 q_norm_set,
                 k_norm_set,
                 rope_dec_set,
@@ -1147,14 +1388,12 @@ impl LlamaVkRunner {
                 attn_dec_set,
                 attn_batch_set,
                 wo_dec: (p_wo, s_wo, g_wo, push_wo),
-                wo_batch: (wo_bp, wo_bs, pl.wo.mat),
+                wo_batch,
                 ffn_norm_set,
                 ffn_dec,
-                gate_batch: (gate_bp, gate_bs, pl.w_gate.mat),
-                up_batch: (up_bp, up_bs, pl.w_up.mat),
-                silu_batch_set,
+                ffn_batch,
                 down_dec: (p_dn, s_dn, g_dn, push_dn),
-                down_batch: (down_bp, down_bs, pl.w_down.mat),
+                down_batch,
                 qkv_weight_bytes: pl.wq.slice.len + pl.wk.slice.len + pl.wv.slice.len,
                 wo_weight_bytes: pl.wo.slice.len,
                 gate_up_weight_bytes: pl.w_gate.slice.len + pl.w_up.slice.len,
@@ -1179,6 +1418,8 @@ impl LlamaVkRunner {
                 rope_type,
             },
             ctx,
+            prefill_kind,
+            max_batch,
             slabs,
             step_buf,
             token_ids_buf,
@@ -1190,6 +1431,8 @@ impl LlamaVkRunner {
             pipes,
             embed_dec_set,
             embed_batch_set,
+            quant_xb_set,
+            quant_hb_set,
             output_norm_set,
             lm_head_dec,
             argmax_set,
@@ -1213,6 +1456,10 @@ impl LlamaVkRunner {
 
     pub fn driver_info(&self) -> &str {
         &self.ctx.info().driver_info
+    }
+
+    pub fn active_prefill_backend(&self) -> &'static str {
+        self.prefill_kind.label()
     }
 
     pub fn is_zero_copy(&self) -> bool {
@@ -1458,12 +1705,13 @@ impl LlamaVkRunner {
                 DecodeFfnSets::Separate { gate, up, silu_set } => {
                     self.cmd_dispatch_set(cb, &gate.0, gate.1, &gate.3, gate.2, 1, false)?;
                     self.cmd_dispatch_set(cb, &up.0, up.1, &up.3, up.2, 1, true)?;
+                    let gx = (self.cfg.n_ff as u32).div_ceil(256).min(65535);
                     self.cmd_dispatch_set(
                         cb,
                         &self.pipes.silu_mul,
                         *silu_set,
                         &[self.cfg.n_ff as u32],
-                        (self.cfg.n_ff as u32).div_ceil(256),
+                        gx,
                         1,
                         true,
                     )?;
@@ -1503,7 +1751,6 @@ impl LlamaVkRunner {
                     1,
                     false,
                 )?;
-                // Flush shader write into host-visible `argmax_buf`.
                 let host_bar = vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::HOST_READ);
@@ -1521,7 +1768,6 @@ impl LlamaVkRunner {
                 }
             } else {
                 self.cmd_dispatch_set(cb, &lm.0, lm.1, &lm.3, lm.2, 1, false)?;
-                // Copy `[vocab_size]` logits from device-local slab to cached host-visible buffer.
                 let to_xfer = vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
@@ -1651,25 +1897,42 @@ impl LlamaVkRunner {
         Ok(unsafe { *ptr })
     }
 
+    fn cmd_quant_if_needed(
+        &self,
+        cb: vk::CommandBuffer,
+        set_opt: Option<vk::DescriptorSet>,
+        n_tok: u32,
+        cols: usize,
+        needs_i8: bool,
+    ) -> Result<(), VulkanError> {
+        if needs_i8 && let (Some(qp), Some(set)) = (&self.pipes.quant_q8_1, set_opt) {
+            let n_blocks = n_tok * (cols as u32) / 32;
+            let gx = n_blocks.div_ceil(8);
+            self.cmd_dispatch_set(cb, qp, set, &[n_blocks], gx, 1, true)?;
+        }
+        Ok(())
+    }
+
     fn cmd_gemm(
         &self,
         cb: vk::CommandBuffer,
-        entry: &(Arc<Pipeline>, vk::DescriptorSet, VkMat),
+        entry: &BatchGemmEntry,
         n_tok: u32,
         add_residual: bool,
         barrier_after: bool,
     ) -> Result<(), VulkanError> {
-        let (ref pipe, set, mat) = *entry;
         let sg = self.ctx.info().subgroup_size;
-        let (gx, gy) = match mat.dtype {
-            DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::F32 => {
-                ((mat.rows as u32).div_ceil(32), n_tok.div_ceil(32))
-            }
-            DType::Q5K | DType::Q6K => {
+        let mat = entry.mat;
+        let (gx, gy) = match entry.flavor {
+            GemmFlavor::Tiled32 => ((mat.rows as u32).div_ceil(32), n_tok.div_ceil(32)),
+            GemmFlavor::KQuantSubgroup => {
                 let rows_per_wg = (128 / sg).max(1);
                 ((mat.rows as u32).div_ceil(rows_per_wg), n_tok.div_ceil(8))
             }
-            other => return Err(VulkanError::UnsupportedDType(other)),
+            GemmFlavor::CoopMatF16 { bm, bn } => {
+                ((mat.rows as u32).div_ceil(bn), n_tok.div_ceil(bm))
+            }
+            GemmFlavor::CoopMatI8 => ((mat.rows as u32).div_ceil(64), n_tok.div_ceil(64)),
         };
         let push = [
             mat.cols as u32,
@@ -1678,10 +1941,74 @@ impl LlamaVkRunner {
             u32::from(add_residual),
             (mat.row_bytes / 2) as u32,
         ];
-        self.cmd_dispatch_set(cb, pipe, set, &push, gx, gy, barrier_after)
+        self.cmd_dispatch_set(cb, &entry.pipe, entry.set, &push, gx, gy, barrier_after)
     }
 
-    /// Executes a batched prompt prefill on Vulkan GPU in chunks of up to `MAX_BATCH` tokens.
+    fn cmd_attn_batch(
+        &self,
+        cb: vk::CommandBuffer,
+        set: vk::DescriptorSet,
+        chunk_pos: usize,
+        n_tok: u32,
+    ) -> Result<(), VulkanError> {
+        match self.pipes.attn_batch_kind {
+            BatchAttnKind::CoopMat64 => {
+                let push = [
+                    self.cfg.n_head as u32,
+                    self.cfg.n_head_kv as u32,
+                    self.cfg.head_dim as u32,
+                    chunk_pos as u32,
+                    n_tok,
+                ];
+                self.cmd_dispatch_set(
+                    cb,
+                    &self.pipes.attn_batch,
+                    set,
+                    &push,
+                    self.cfg.n_head as u32,
+                    n_tok.div_ceil(64),
+                    true,
+                )
+            }
+            BatchAttnKind::Tiled8 => {
+                let push = [
+                    self.cfg.n_head as u32,
+                    self.cfg.n_head_kv as u32,
+                    self.cfg.head_dim as u32,
+                    chunk_pos as u32,
+                    n_tok,
+                ];
+                self.cmd_dispatch_set(
+                    cb,
+                    &self.pipes.attn_batch,
+                    set,
+                    &push,
+                    self.cfg.n_head as u32,
+                    n_tok.div_ceil(8),
+                    true,
+                )
+            }
+            BatchAttnKind::Legacy1 => {
+                let push = [
+                    self.cfg.n_head as u32,
+                    self.cfg.n_head_kv as u32,
+                    self.cfg.head_dim as u32,
+                    (chunk_pos + 1) as u32,
+                ];
+                self.cmd_dispatch_set(
+                    cb,
+                    &self.pipes.attn_batch,
+                    set,
+                    &push,
+                    self.cfg.n_head as u32,
+                    n_tok,
+                    true,
+                )
+            }
+        }
+    }
+
+    /// Executes a batched prompt prefill on Vulkan GPU in chunks of up to `max_batch` tokens.
     /// Zero heap allocations occur on this path (`AGENTS.md` rule #4).
     pub fn forward_batch(
         &mut self,
@@ -1722,6 +2049,7 @@ impl LlamaVkRunner {
         let rope_total = ((self.cfg.n_head + self.cfg.n_head_kv) * half_rope)
             .max(self.cfg.n_head_kv * self.cfg.head_dim);
         let rope_groups_x = (rope_total as u32).div_ceil(64);
+        let q_dim = self.cfg.n_head * self.cfg.head_dim;
 
         let d = &self.ctx.inner.device;
         let cb = self.cb_batch;
@@ -1729,7 +2057,7 @@ impl LlamaVkRunner {
         let mut offset = 0usize;
 
         while offset < total {
-            let b = (total - offset).min(MAX_BATCH);
+            let b = (total - offset).min(self.max_batch);
             let b_u32 = b as u32;
             let chunk = &token_ids[offset..offset + b];
             let chunk_pos = start_pos + offset;
@@ -1740,7 +2068,7 @@ impl LlamaVkRunner {
                     .token_ids_buf
                     .mapped_ptr()
                     .expect("token_ids_buf mapped") as *mut u32;
-                // SAFETY: `token_ids_buf` holds `MAX_BATCH` u32s and GPU is idle.
+                // SAFETY: `token_ids_buf` holds `self.max_batch` u32s and GPU is idle.
                 unsafe {
                     core::ptr::copy_nonoverlapping(chunk.as_ptr(), dst, b);
                 }
@@ -1781,12 +2109,6 @@ impl LlamaVkRunner {
                 u32::from(self.has_rope_freqs),
                 self.cfg.rope_freq_base.to_bits(),
             ];
-            let attn_push = [
-                self.cfg.n_head as u32,
-                self.cfg.n_head_kv as u32,
-                self.cfg.head_dim as u32,
-                (chunk_pos + 1) as u32,
-            ];
 
             for layer in &self.layers {
                 self.cmd_dispatch_set(
@@ -1797,6 +2119,17 @@ impl LlamaVkRunner {
                     b_u32,
                     1,
                     true,
+                )?;
+
+                let qkv_needs_i8 = matches!(layer.wq_batch.flavor, GemmFlavor::CoopMatI8)
+                    || matches!(layer.wk_batch.flavor, GemmFlavor::CoopMatI8)
+                    || matches!(layer.wv_batch.flavor, GemmFlavor::CoopMatI8);
+                self.cmd_quant_if_needed(
+                    cb,
+                    self.quant_xb_set,
+                    b_u32,
+                    self.cfg.n_embd,
+                    qkv_needs_i8,
                 )?;
 
                 self.cmd_gemm(cb, &layer.wq_batch, b_u32, false, false)?;
@@ -1839,16 +2172,15 @@ impl LlamaVkRunner {
                     true,
                 )?;
 
-                self.cmd_dispatch_set(
-                    cb,
-                    &self.pipes.attn_batch,
-                    layer.attn_batch_set,
-                    &attn_push,
-                    self.cfg.n_head as u32,
-                    b_u32,
-                    true,
-                )?;
+                self.cmd_attn_batch(cb, layer.attn_batch_set, chunk_pos, b_u32)?;
 
+                self.cmd_quant_if_needed(
+                    cb,
+                    self.quant_xb_set,
+                    b_u32,
+                    q_dim,
+                    matches!(layer.wo_batch.flavor, GemmFlavor::CoopMatI8),
+                )?;
                 self.cmd_gemm(cb, &layer.wo_batch, b_u32, true, true)?;
 
                 self.cmd_dispatch_set(
@@ -1861,20 +2193,58 @@ impl LlamaVkRunner {
                     true,
                 )?;
 
-                self.cmd_gemm(cb, &layer.gate_batch, b_u32, false, false)?;
-                self.cmd_gemm(cb, &layer.up_batch, b_u32, false, true)?;
+                match &layer.ffn_batch {
+                    BatchFfnPlan::FusedPairSiluCoopMat {
+                        pipe,
+                        set,
+                        cols,
+                        rows,
+                        row_bytes,
+                    } => {
+                        let push = [*cols as u32, *rows as u32, b_u32, (*row_bytes / 2) as u32];
+                        self.cmd_dispatch_set(
+                            cb,
+                            pipe,
+                            *set,
+                            &push,
+                            (*rows as u32).div_ceil(64),
+                            b_u32.div_ceil(128),
+                            true,
+                        )?;
+                    }
+                    BatchFfnPlan::Separate { gate, up, silu_set } => {
+                        let gu_i8 = matches!(gate.flavor, GemmFlavor::CoopMatI8)
+                            || matches!(up.flavor, GemmFlavor::CoopMatI8);
+                        self.cmd_quant_if_needed(
+                            cb,
+                            self.quant_xb_set,
+                            b_u32,
+                            self.cfg.n_embd,
+                            gu_i8,
+                        )?;
+                        self.cmd_gemm(cb, gate, b_u32, false, false)?;
+                        self.cmd_gemm(cb, up, b_u32, false, true)?;
+                        let total_ff = (b * self.cfg.n_ff) as u32;
+                        let gx = total_ff.div_ceil(256).min(65535);
+                        self.cmd_dispatch_set(
+                            cb,
+                            &self.pipes.silu_mul,
+                            *silu_set,
+                            &[total_ff],
+                            gx,
+                            1,
+                            true,
+                        )?;
+                    }
+                }
 
-                let total_ff = (b * self.cfg.n_ff) as u32;
-                self.cmd_dispatch_set(
+                self.cmd_quant_if_needed(
                     cb,
-                    &self.pipes.silu_mul,
-                    layer.silu_batch_set,
-                    &[total_ff],
-                    total_ff.div_ceil(256),
-                    1,
-                    true,
+                    self.quant_hb_set,
+                    b_u32,
+                    self.cfg.n_ff,
+                    matches!(layer.down_batch.flavor, GemmFlavor::CoopMatI8),
                 )?;
-
                 self.cmd_gemm(cb, &layer.down_batch, b_u32, true, true)?;
             }
 
@@ -1953,22 +2323,28 @@ impl LlamaVkRunner {
             .max(1);
         let n_dec = decode_runs.max(1);
 
-        // Warmup clocks
+        // Warmup GPU SMU boost clocks (>= 2 passes / >= 350 ms sustained load so RDNA4 exits idle P-state)
+        let pp_ids: Vec<u32> = (0..n_pp).map(|i| ((i % 1000) + 1) as u32).collect();
+        let t_warm = Instant::now();
+        let mut warm_passes = 0usize;
+        while warm_passes < 2 || t_warm.elapsed().as_secs_f64() < 0.35 {
+            if n_pp >= 2 {
+                let _ = self.forward_batch(&pp_ids, 0, true)?;
+            } else {
+                let _ = self.forward_token_greedy(1, 0)?;
+            }
+            warm_passes += 1;
+        }
         for i in 0..4 {
             let _ = self.forward_token_greedy(1, i)?;
         }
-        let warm_ids = [1u32; 32];
-        if self.cfg.max_ctx >= 36 {
-            let _ = self.forward_batch(&warm_ids, 0, false)?;
-        }
 
         // 1. Measure prefill wall time
-        let pp_ids: Vec<u32> = (0..n_pp).map(|i| ((i % 1000) + 1) as u32).collect();
         let t_pp = Instant::now();
         let _ = self.forward_batch(&pp_ids, 0, true)?;
         let prefill_wall_ms = t_pp.elapsed().as_secs_f64() * 1e3;
 
-        // 2. Measure true 1-CB-per-token greedy decode wall time (and whole-CB GPU time if supported)
+        // 2. Measure true 1-CB-per-token greedy decode wall time
         let has_ts = self.ctx.info().timestamp_compute;
         let ns_per_tick = self.ctx.info().timestamp_period_ns as f64;
 
@@ -2025,6 +2401,7 @@ impl LlamaVkRunner {
 
         let mut stage_gpu_us = [0.0f64; N_STAGES];
         let mut decode_single_cb_gpu_us = decode_single_cb_wall_us;
+        let mut prefill_chunk_stages = Vec::new();
 
         if has_ts {
             let max_queries = (self.cfg.n_layers as u32) * 18 + 8;
@@ -2243,12 +2620,13 @@ impl LlamaVkRunner {
                         DecodeFfnSets::Separate { gate, up, silu_set } => {
                             self.cmd_dispatch_set(cb, &gate.0, gate.1, &gate.3, gate.2, 1, false)?;
                             self.cmd_dispatch_set(cb, &up.0, up.1, &up.3, up.2, 1, true)?;
+                            let gx = (self.cfg.n_ff as u32).div_ceil(256).min(65535);
                             self.cmd_dispatch_set(
                                 cb,
                                 &self.pipes.silu_mul,
                                 *silu_set,
                                 &[self.cfg.n_ff as u32],
-                                (self.cfg.n_ff as u32).div_ceil(256),
+                                gx,
                                 1,
                                 true,
                             )?;
@@ -2318,13 +2696,325 @@ impl LlamaVkRunner {
                 }
             }
 
-            // SAFETY: GPU is idle after `submit_and_wait`.
-            unsafe { d.destroy_query_pool(qp, None) };
-
             decode_single_cb_gpu_us = (total_gpu_ns * 1e-3) / (n_dec as f64);
             for i in 0..N_STAGES {
                 stage_gpu_us[i] = (stage_gpu_ns[i] * 1e-3) / (n_dec as f64);
             }
+
+            // 3. Timestamp-profile one batched prefill chunk (`min(n_pp, self.max_batch)`)
+            let b_pp = n_pp.min(self.max_batch);
+            if b_pp >= 2 {
+                let b_u32 = b_pp as u32;
+                {
+                    let dst = self
+                        .token_ids_buf
+                        .mapped_ptr()
+                        .expect("token_ids_buf mapped") as *mut u32;
+                    // SAFETY: `b_pp <= self.max_batch`, GPU is idle.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(pp_ids.as_ptr(), dst, b_pp);
+                    }
+                }
+                let mut q_idx = 0u32;
+                let mut pp_spans: Vec<(usize, u32, u32)> =
+                    Vec::with_capacity(self.cfg.n_layers * 9 + 2);
+                // SAFETY: `cb` is idle, `qp` has `max_queries` slots.
+                unsafe {
+                    d.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
+                        .ctx("vkResetCommandBuffer")?;
+                    d.begin_command_buffer(
+                        cb,
+                        &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )
+                    .ctx("vkBeginCommandBuffer")?;
+                    d.cmd_reset_query_pool(cb, qp, 0, max_queries);
+                    d.cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, qp, q_idx);
+                }
+                let q_start = q_idx;
+                q_idx += 1;
+                let mut mark_pp = |cb: vk::CommandBuffer| -> u32 {
+                    let cur = q_idx;
+                    q_idx += 1;
+                    // SAFETY: `cur < max_queries`.
+                    unsafe {
+                        d.cmd_write_timestamp(cb, vk::PipelineStageFlags::COMPUTE_SHADER, qp, cur);
+                    }
+                    cur
+                };
+
+                self.cmd_dispatch_set(
+                    cb,
+                    &self.pipes.embed_batch,
+                    self.embed_batch_set,
+                    &[
+                        self.cfg.n_embd as u32,
+                        (self.token_embd.row_bytes / 2) as u32,
+                    ],
+                    emb_items.div_ceil(64),
+                    b_u32,
+                    true,
+                )?;
+                let mut prev = mark_pp(cb);
+                pp_spans.push((0, q_start, prev));
+
+                for layer in &self.layers {
+                    self.cmd_dispatch_set(
+                        cb,
+                        &self.pipes.rms_norm,
+                        layer.attn_norm_set,
+                        &norm_push,
+                        b_u32,
+                        1,
+                        true,
+                    )?;
+                    let cur = mark_pp(cb);
+                    pp_spans.push((1, prev, cur));
+                    prev = cur;
+
+                    let qkv_i8 = matches!(layer.wq_batch.flavor, GemmFlavor::CoopMatI8)
+                        || matches!(layer.wk_batch.flavor, GemmFlavor::CoopMatI8)
+                        || matches!(layer.wv_batch.flavor, GemmFlavor::CoopMatI8);
+                    self.cmd_quant_if_needed(
+                        cb,
+                        self.quant_xb_set,
+                        b_u32,
+                        self.cfg.n_embd,
+                        qkv_i8,
+                    )?;
+                    self.cmd_gemm(cb, &layer.wq_batch, b_u32, false, false)?;
+                    self.cmd_gemm(cb, &layer.wk_batch, b_u32, false, false)?;
+                    self.cmd_gemm(cb, &layer.wv_batch, b_u32, false, true)?;
+                    let cur = mark_pp(cb);
+                    pp_spans.push((2, prev, cur));
+                    prev = cur;
+
+                    if layer.q_norm_set.is_some() || layer.k_norm_set.is_some() {
+                        if let Some(qns) = layer.q_norm_set {
+                            self.cmd_dispatch_set(
+                                cb,
+                                &self.pipes.qk_norm,
+                                qns,
+                                &qk_push,
+                                self.cfg.n_head as u32,
+                                b_u32,
+                                false,
+                            )?;
+                        }
+                        if let Some(kns) = layer.k_norm_set {
+                            self.cmd_dispatch_set(
+                                cb,
+                                &self.pipes.qk_norm,
+                                kns,
+                                &qk_push,
+                                self.cfg.n_head_kv as u32,
+                                b_u32,
+                                false,
+                            )?;
+                        }
+                        Self::cmd_compute_barrier(d, cb);
+                        let cur = mark_pp(cb);
+                        pp_spans.push((3, prev, cur));
+                        prev = cur;
+                    }
+
+                    self.cmd_dispatch_set(
+                        cb,
+                        &self.pipes.rope_batch,
+                        layer.rope_batch_set,
+                        &rope_push,
+                        rope_groups,
+                        b_u32,
+                        true,
+                    )?;
+                    let cur = mark_pp(cb);
+                    pp_spans.push((4, prev, cur));
+                    prev = cur;
+
+                    self.cmd_attn_batch(cb, layer.attn_batch_set, 0, b_u32)?;
+                    let cur = mark_pp(cb);
+                    pp_spans.push((5, prev, cur));
+                    prev = cur;
+
+                    self.cmd_quant_if_needed(
+                        cb,
+                        self.quant_xb_set,
+                        b_u32,
+                        q_dim,
+                        matches!(layer.wo_batch.flavor, GemmFlavor::CoopMatI8),
+                    )?;
+                    self.cmd_gemm(cb, &layer.wo_batch, b_u32, true, true)?;
+                    let cur = mark_pp(cb);
+                    pp_spans.push((6, prev, cur));
+                    prev = cur;
+
+                    self.cmd_dispatch_set(
+                        cb,
+                        &self.pipes.rms_norm,
+                        layer.ffn_norm_set,
+                        &norm_push,
+                        b_u32,
+                        1,
+                        true,
+                    )?;
+                    let cur = mark_pp(cb);
+                    pp_spans.push((7, prev, cur));
+                    prev = cur;
+
+                    match &layer.ffn_batch {
+                        BatchFfnPlan::FusedPairSiluCoopMat {
+                            pipe,
+                            set,
+                            cols,
+                            rows,
+                            row_bytes,
+                        } => {
+                            let push = [*cols as u32, *rows as u32, b_u32, (*row_bytes / 2) as u32];
+                            self.cmd_dispatch_set(
+                                cb,
+                                pipe,
+                                *set,
+                                &push,
+                                (*rows as u32).div_ceil(64),
+                                b_u32.div_ceil(64),
+                                true,
+                            )?;
+                        }
+                        BatchFfnPlan::Separate { gate, up, silu_set } => {
+                            let gu_i8 = matches!(gate.flavor, GemmFlavor::CoopMatI8)
+                                || matches!(up.flavor, GemmFlavor::CoopMatI8);
+                            self.cmd_quant_if_needed(
+                                cb,
+                                self.quant_xb_set,
+                                b_u32,
+                                self.cfg.n_embd,
+                                gu_i8,
+                            )?;
+                            self.cmd_gemm(cb, gate, b_u32, false, false)?;
+                            self.cmd_gemm(cb, up, b_u32, false, true)?;
+                            let total_ff = (b_pp * self.cfg.n_ff) as u32;
+                            let gx = total_ff.div_ceil(256).min(65535);
+                            self.cmd_dispatch_set(
+                                cb,
+                                &self.pipes.silu_mul,
+                                *silu_set,
+                                &[total_ff],
+                                gx,
+                                1,
+                                true,
+                            )?;
+                        }
+                    }
+                    let cur = mark_pp(cb);
+                    pp_spans.push((8, prev, cur));
+                    prev = cur;
+
+                    self.cmd_quant_if_needed(
+                        cb,
+                        self.quant_hb_set,
+                        b_u32,
+                        self.cfg.n_ff,
+                        matches!(layer.down_batch.flavor, GemmFlavor::CoopMatI8),
+                    )?;
+                    self.cmd_gemm(cb, &layer.down_batch, b_u32, true, true)?;
+                    let cur = mark_pp(cb);
+                    pp_spans.push((9, prev, cur));
+                    prev = cur;
+                }
+
+                let last_x_off = ((b_pp - 1) * self.cfg.n_embd) as u32;
+                self.cmd_dispatch_set(
+                    cb,
+                    &self.pipes.rms_norm,
+                    self.output_norm_set,
+                    &[self.cfg.n_embd as u32, last_x_off, eps_bits],
+                    1,
+                    1,
+                    true,
+                )?;
+                let lm = &self.lm_head_dec;
+                self.cmd_dispatch_set(cb, &lm.0, lm.1, &lm.3, lm.2, 1, false)?;
+                let cur = mark_pp(cb);
+                pp_spans.push((10, prev, cur));
+
+                // SAFETY: valid recording CB.
+                unsafe { d.end_command_buffer(cb) }.ctx("vkEndCommandBuffer")?;
+                self.submit_and_wait(cb)?;
+
+                let mut ts = vec![0u64; q_idx as usize];
+                // SAFETY: `submit_and_wait` completed; all `q_idx` queries are ready.
+                unsafe {
+                    d.get_query_pool_results(
+                        qp,
+                        0,
+                        &mut ts,
+                        vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                    )
+                    .ctx("vkGetQueryPoolResults")?;
+                }
+                let mut pp_ns = [0.0f64; N_STAGES];
+                for (st, a, b_q) in pp_spans {
+                    pp_ns[st] +=
+                        (ts[b_q as usize].saturating_sub(ts[a as usize])) as f64 * ns_per_tick;
+                }
+                let b_u64 = b_pp as u64;
+                let causal_pairs = b_u64 * (b_u64 + 1) / 2;
+                let pp_stage_names: [&'static str; N_STAGES] = [
+                    "embed",
+                    "attn_norm",
+                    "attn_qkv_gemm",
+                    "qk_norm",
+                    "rope_kv",
+                    "flash_attn",
+                    "attn_wo_gemm+res",
+                    "ffn_norm",
+                    "ffn_gate_up_silu",
+                    "ffn_down_gemm+res",
+                    "lm_head+norm",
+                ];
+                let mut pp_bytes = [0u64; N_STAGES];
+                let mut pp_flops = [0u64; N_STAGES];
+                pp_bytes[0] = b_u64 * (self.token_embd.row_bytes + self.cfg.n_embd * 4) as u64;
+                for l in &self.layers {
+                    pp_bytes[1] += b_u64 * (self.cfg.n_embd * 8) as u64;
+                    pp_bytes[2] += l.qkv_weight_bytes
+                        + b_u64 * ((self.cfg.n_embd + q_dim + 2 * kv_dim) * 4) as u64;
+                    pp_flops[2] += b_u64 * (2 * self.cfg.n_embd * (q_dim + 2 * kv_dim)) as u64;
+                    if l.q_norm_set.is_some() || l.k_norm_set.is_some() {
+                        pp_bytes[3] += b_u64 * ((q_dim + kv_dim) * 8) as u64;
+                    }
+                    pp_bytes[4] += b_u64 * ((q_dim + 2 * kv_dim) * 4 + 2 * kv_dim * 2) as u64;
+                    pp_bytes[5] += b_u64 * ((2 * q_dim * 4 + 2 * kv_dim * 2) as u64);
+                    pp_flops[5] += 4 * causal_pairs * (q_dim as u64);
+                    pp_bytes[6] +=
+                        l.wo_weight_bytes + b_u64 * ((q_dim + 2 * self.cfg.n_embd) * 4) as u64;
+                    pp_flops[6] += b_u64 * (2 * q_dim * self.cfg.n_embd) as u64;
+                    pp_bytes[7] += b_u64 * (self.cfg.n_embd * 8) as u64;
+                    pp_bytes[8] += l.gate_up_weight_bytes
+                        + b_u64 * ((self.cfg.n_embd + self.cfg.n_ff) * 4) as u64;
+                    pp_flops[8] += b_u64 * (4 * self.cfg.n_embd * self.cfg.n_ff) as u64;
+                    pp_bytes[9] += l.down_weight_bytes
+                        + b_u64 * ((self.cfg.n_ff + 2 * self.cfg.n_embd) * 4) as u64;
+                    pp_flops[9] += b_u64 * (2 * self.cfg.n_ff * self.cfg.n_embd) as u64;
+                }
+                pp_bytes[10] = self.out_mat.slice.len;
+                pp_flops[10] = (2 * self.cfg.n_embd * self.cfg.vocab_size) as u64;
+
+                for i in 0..N_STAGES {
+                    if i == 3 && pp_bytes[i] == 0 {
+                        continue;
+                    }
+                    prefill_chunk_stages.push(VkStageStat {
+                        name: pp_stage_names[i],
+                        gpu_us: pp_ns[i] * 1e-3,
+                        bytes: pp_bytes[i],
+                        flops: pp_flops[i],
+                    });
+                }
+            }
+
+            // SAFETY: GPU is idle after `submit_and_wait`.
+            unsafe { d.destroy_query_pool(qp, None) };
         }
 
         let mut decode_stages = Vec::new();
@@ -2346,9 +3036,10 @@ impl LlamaVkRunner {
             decode_single_cb_wall_us,
             decode_single_cb_gpu_us,
             decode_stages,
+            prefill_backend: self.active_prefill_backend(),
             prefill_tokens: n_pp,
             prefill_wall_ms,
-            prefill_chunk_stages: Vec::new(),
+            prefill_chunk_stages,
         })
     }
 }

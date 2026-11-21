@@ -1,12 +1,22 @@
-//! Quantized matrix kernels (V1: Q4_0 x F32 GEMV / shared-weight multi-token GEMV).
+//! Quantized matrix and attention kernels (V1 GEMV + V3 Cooperative Matrix & tiled FlashAttention).
 
-use tm_core::{BlockQ4_0, QK4_0};
+use tm_core::{BlockQ4_0, DType, QK4_0};
 
 use crate::VulkanError;
 use crate::context::{VkBuffer, VulkanContext};
 
 const SPV_Q4_0_SOA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_q4_0_soa.spv"));
 const SPV_Q4_0_AOS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_q4_0_aos.spv"));
+const SPV_GEMM_TILED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_tiled.spv"));
+const SPV_GEMM_KQUANT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_kquant.spv"));
+const SPV_GEMM_COOPMAT_F16: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_f16.spv"));
+const SPV_GEMM_PAIR_SILU_COOPMAT_F16: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_pair_silu_coopmat_f16.spv"));
+const SPV_QUANTIZE_Q8_1: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quantize_q8_1.spv"));
+const SPV_GEMM_COOPMAT_I8: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_i8.spv"));
+const SPV_FA_COOPMAT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_coopmat.spv"));
+const SPV_FA_GQA_TILED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_gqa_tiled.spv"));
 
 /// Maximum tokens per shared-weight GEMV dispatch (matches the Metal backend).
 pub const MAX_NTOK: usize = 8;
@@ -45,6 +55,18 @@ impl VkMatQ4_0 {
     /// Bytes read from VRAM per full pass over the matrix.
     pub fn weight_bytes(&self) -> u64 {
         (self.rows * self.cols / QK4_0 * core::mem::size_of::<BlockQ4_0>()) as u64
+    }
+}
+
+pub(crate) fn dtype_code(dt: DType) -> Result<u32, VulkanError> {
+    match dt {
+        DType::Q4_0 => Ok(0),
+        DType::Q4_1 => Ok(1),
+        DType::Q8_0 => Ok(2),
+        DType::Q5K => Ok(3),
+        DType::Q6K => Ok(4),
+        DType::F32 => Ok(5),
+        other => Err(VulkanError::UnsupportedDType(other)),
     }
 }
 
@@ -154,6 +176,274 @@ impl VulkanContext {
         self.run(|rec| {
             for _ in 0..repeat.max(1) {
                 rec.dispatch(&pipe, &bufs, &push, groups)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Portable LDS/subgroup batched GEMM fallback (`gemm_tiled` / `gemm_kquant`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fallback_raw(
+        &self,
+        dtype: DType,
+        w: &VkBuffer,
+        x: &VkBuffer,
+        y: &VkBuffer,
+        rows: usize,
+        cols: usize,
+        n_tok: usize,
+        add_residual: bool,
+        repeat: usize,
+    ) -> Result<(), VulkanError> {
+        let dt = dtype_code(dtype)?;
+        let row_bytes = dtype.row_bytes(cols);
+        let sg = self.info().subgroup_size;
+        let (pipe, gx, gy) = match dtype {
+            DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::F32 => (
+                self.pipeline("gemm_tiled", dt, SPV_GEMM_TILED, 3, 20, &[128, dt])?,
+                (rows as u32).div_ceil(32),
+                (n_tok as u32).div_ceil(32),
+            ),
+            DType::Q5K | DType::Q6K => {
+                let rows_per_wg = (128 / sg).max(1);
+                (
+                    self.pipeline("gemm_kquant", dt, SPV_GEMM_KQUANT, 3, 20, &[128, dt])?,
+                    (rows as u32).div_ceil(rows_per_wg),
+                    (n_tok as u32).div_ceil(8),
+                )
+            }
+            other => return Err(VulkanError::UnsupportedDType(other)),
+        };
+        let push = [
+            cols as u32,
+            rows as u32,
+            n_tok as u32,
+            u32::from(add_residual),
+            (row_bytes / 2) as u32,
+        ];
+        self.run(|rec| {
+            for _ in 0..repeat.max(1) {
+                rec.dispatch_xy(&pipe, &[w, x, y], &push, gx, gy)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// `16x16x16 f16*f16+f32->f32` Cooperative Matrix batched GEMM (`bn` in `{64, 128}`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_coopmat_f16_raw(
+        &self,
+        dtype: DType,
+        w: &VkBuffer,
+        x: &VkBuffer,
+        y: &VkBuffer,
+        rows: usize,
+        cols: usize,
+        n_tok: usize,
+        bn: u32,
+        add_residual: bool,
+        repeat: usize,
+    ) -> Result<(), VulkanError> {
+        if !self.info().coopmat_f16_f32acc {
+            return Err(VulkanError::MissingFeature {
+                device: self.info().name.clone(),
+                feature: "16x16x16 f16*f16+f32->f32 cooperativeMatrix",
+            });
+        }
+        if bn != 64 && bn != 128 {
+            return Err(VulkanError::InvalidDimensions(format!(
+                "coopmat_f16 bn={bn} (must be 64 or 128)"
+            )));
+        }
+        let dt = dtype_code(dtype)?;
+        let (wg, bm, eff_bn) = if bn == 128 {
+            (8 * self.info().subgroup_size, 128u32, 128u32)
+        } else {
+            (4 * self.info().subgroup_size, 64u32, 64u32)
+        };
+        let key = dt | (eff_bn << 8) | (bm << 16) | (wg << 24);
+        let pipe = self.pipeline(
+            "gemm_coopmat_f16",
+            key,
+            SPV_GEMM_COOPMAT_F16,
+            3,
+            20,
+            &[wg, dt, bm, eff_bn],
+        )?;
+        let row_bytes = dtype.row_bytes(cols);
+        let push = [
+            cols as u32,
+            rows as u32,
+            n_tok as u32,
+            u32::from(add_residual),
+            (row_bytes / 2) as u32,
+        ];
+        let gx = (rows as u32).div_ceil(eff_bn);
+        let gy = (n_tok as u32).div_ceil(bm);
+        self.run(|rec| {
+            for _ in 0..repeat.max(1) {
+                rec.dispatch_xy(&pipe, &[w, x, y], &push, gx, gy)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Fused `Gate + Up + SwiGLU` `16x16x16 f16*f16+f32->f32` Cooperative Matrix GEMM.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_pair_silu_coopmat_f16_raw(
+        &self,
+        dtype: DType,
+        w_gate: &VkBuffer,
+        w_up: &VkBuffer,
+        x: &VkBuffer,
+        y: &VkBuffer,
+        rows: usize,
+        cols: usize,
+        n_tok: usize,
+        repeat: usize,
+    ) -> Result<(), VulkanError> {
+        if !self.info().coopmat_f16_f32acc {
+            return Err(VulkanError::MissingFeature {
+                device: self.info().name.clone(),
+                feature: "16x16x16 f16*f16+f32->f32 cooperativeMatrix",
+            });
+        }
+        if !matches!(dtype, DType::Q4_0 | DType::Q4_1 | DType::Q8_0) {
+            return Err(VulkanError::UnsupportedDType(dtype));
+        }
+        let dt = dtype_code(dtype)?;
+        let wg = 8 * self.info().subgroup_size;
+        let key = dt | (wg << 8);
+        let pipe = self.pipeline(
+            "gemm_pair_silu_coopmat_f16",
+            key,
+            SPV_GEMM_PAIR_SILU_COOPMAT_F16,
+            4,
+            16,
+            &[wg, dt],
+        )?;
+        let row_bytes = dtype.row_bytes(cols);
+        let push = [
+            cols as u32,
+            rows as u32,
+            n_tok as u32,
+            (row_bytes / 2) as u32,
+        ];
+        let gx = (rows as u32).div_ceil(64);
+        let gy = (n_tok as u32).div_ceil(128);
+        self.run(|rec| {
+            for _ in 0..repeat.max(1) {
+                rec.dispatch_xy(&pipe, &[w_gate, w_up, x, y], &push, gx, gy)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Dynamic `FP32 -> Q8_1` activation quantization + `16x16x16 i8*i8+i32->i32` Cooperative Matrix GEMM.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_coopmat_i8_raw(
+        &self,
+        dtype: DType,
+        w: &VkBuffer,
+        x: &VkBuffer,
+        x_q8: &VkBuffer,
+        x_ds: &VkBuffer,
+        y: &VkBuffer,
+        rows: usize,
+        cols: usize,
+        n_tok: usize,
+        add_residual: bool,
+        repeat: usize,
+    ) -> Result<(), VulkanError> {
+        if !self.info().coopmat_i8_i32acc {
+            return Err(VulkanError::MissingFeature {
+                device: self.info().name.clone(),
+                feature: "16x16x16 i8*i8+i32->i32 cooperativeMatrix",
+            });
+        }
+        if !matches!(dtype, DType::Q4_0 | DType::Q4_1 | DType::Q8_0) {
+            return Err(VulkanError::UnsupportedDType(dtype));
+        }
+        let dt = dtype_code(dtype)?;
+        let wg = 4 * self.info().subgroup_size;
+        let q_pipe = self.pipeline("quantize_q8_1", 256, SPV_QUANTIZE_Q8_1, 3, 4, &[256])?;
+        let m_pipe = self.pipeline(
+            "gemm_coopmat_i8",
+            dt | (wg << 8),
+            SPV_GEMM_COOPMAT_I8,
+            4,
+            20,
+            &[wg, dt],
+        )?;
+        let n_blocks = ((n_tok * cols) / 32) as u32;
+        let q_groups = n_blocks.div_ceil(8);
+        let row_bytes = dtype.row_bytes(cols);
+        let push = [
+            cols as u32,
+            rows as u32,
+            n_tok as u32,
+            u32::from(add_residual),
+            (row_bytes / 2) as u32,
+        ];
+        let gx = (rows as u32).div_ceil(64);
+        let gy = (n_tok as u32).div_ceil(64);
+        self.run(|rec| {
+            for _ in 0..repeat.max(1) {
+                rec.dispatch(&q_pipe, &[x, x_q8, x_ds], &[n_blocks], q_groups)?;
+                rec.dispatch_xy(&m_pipe, &[w, x_q8, x_ds, y], &push, gx, gy)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Batched causal GQA FlashAttention (`use_coopmat = true` -> `fa_coopmat`, `false` -> `fa_gqa_tiled`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_batch_raw(
+        &self,
+        q: &VkBuffer,
+        k_cache: &VkBuffer,
+        v_cache: &VkBuffer,
+        out: &VkBuffer,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        base_pos: usize,
+        n_tok: usize,
+        use_coopmat: bool,
+        repeat: usize,
+    ) -> Result<(), VulkanError> {
+        let sg = self.info().subgroup_size;
+        let push = [
+            n_head as u32,
+            n_head_kv as u32,
+            head_dim as u32,
+            base_pos as u32,
+            n_tok as u32,
+        ];
+        let (pipe, gx, gy) = if use_coopmat {
+            if !self.info().coopmat_f16_f32acc || sg != 32 || !head_dim.is_multiple_of(16) {
+                return Err(VulkanError::MissingFeature {
+                    device: self.info().name.clone(),
+                    feature: "wave32 16x16x16 f16 cooperativeMatrix FlashAttention",
+                });
+            }
+            let wg = 128u32;
+            (
+                self.pipeline("fa_coopmat", wg, SPV_FA_COOPMAT, 4, 20, &[wg])?,
+                n_head as u32,
+                (n_tok as u32).div_ceil(64),
+            )
+        } else {
+            let wg = 8 * sg;
+            (
+                self.pipeline("fa_gqa_tiled", wg, SPV_FA_GQA_TILED, 4, 20, &[wg])?,
+                n_head as u32,
+                (n_tok as u32).div_ceil(8),
+            )
+        };
+        self.run(|rec| {
+            for _ in 0..repeat.max(1) {
+                rec.dispatch_xy(&pipe, &[q, k_cache, v_cache, out], &push, gx, gy)?;
             }
             Ok(())
         })

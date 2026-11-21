@@ -60,6 +60,6 @@
   . ~/.local/mesa-25.2.8/env.sh
   for d in radv UHD llvmpipe; do TM_VK_DEVICE=$d cargo test -p tm-vulkan; done
   ```
-- **微基准**：`cargo run --release -p tm-vulkan --example bench_vk_gemv_q4_0 [wg nr]`。RX 9060 XT 有 32 MB Infinity Cache，**小于 32 MB 的形状测的是缓存带宽**；带宽利用率要看 ≥64 MB 的形状（例如 `65536x4096`、`151936x1024`）。
+- **微基准**：`cargo run --release -p tm-vulkan --example bench_vk_gemv_q4_0 [wg nr]`（Decode GEMV）与 `cargo run --release -p tm-vulkan --example bench_vk_gemm`（V3 Prefill：对比 `gemm_tiled`、`gemm_coopmat_f16` 64×64/128×128、融合 `gemm_pair_silu_coopmat_f16`、`gemm_coopmat_i8` 及 `fa_gqa_tiled` / `fa_coopmat`）。可通过 `TM_VK_PREFILL=auto|f16|i8|fallback` 切换端到端 Prefill 路径。RX 9060 XT 有 32 MB Infinity Cache，**小于 32 MB 的形状测的是缓存带宽**；带宽利用率要看 ≥64 MB 的形状（例如 `65536x4096`、`151936x1024`）。
 - **基线**：`bench/run_amd_gpu_baseline.sh <out.json>`（llama.cpp Vulkan + HIP，`-p 512 -n 128 -r 5 -ngl 99 -fa 1`）。
 - **Shader 编译**：改了 `shaders/*.comp` 之后运行 `crates/tm-vulkan/gen_spv.sh`，把重新生成的 `spv/` 一起提交。
