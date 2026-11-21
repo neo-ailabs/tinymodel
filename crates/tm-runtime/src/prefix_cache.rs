@@ -3,19 +3,23 @@
 //! Supports BOTH:
 //! 1. **Prefix-truncatable KV/SWA models** (`Llama`, `Qwen3`, `Gemma 4`): any cached entry
 //!    can satisfy a *shorter* or *longer* common prefix `0..common_len` by slicing `[0..common_len]`
-//!    of each `LayerState::Kv` (`SharedKv` layers cost 0 bytes!).
+//!    of each `LayerState::Kv` (`F16` or `Q8_0` `F-14`, while `SharedKv` layers cost 0 bytes!).
 //! 2. **Hybrid recurrent models** (`Qwen3.5` with `DeltaNet`, `LFM2` with `ShortConv`):
 //!    recurrent states cannot be truncated arbitrarily, so checkpoints saved at system-prompt
 //!    end, turn boundaries, or every `K` tokens are restored only at exact checkpoint length `L <= query.len()`.
 
+use tm_core::{BlockQ8_0, KvType, QK8_0};
 use tm_models::{LayerState, LlamaState};
 
 /// Compact snapshot of a single layer at `prefix_len` tokens.
 #[derive(Clone, Debug)]
 pub enum CachedLayer {
     Kv {
+        kv_type: KvType,
         k_prefix: Vec<u16>,
         v_prefix: Vec<u16>,
+        k_q8_prefix: Vec<BlockQ8_0>,
+        v_q8_prefix: Vec<BlockQ8_0>,
         kv_dim: usize,
     },
     SharedKv,
@@ -32,8 +36,15 @@ impl CachedLayer {
     pub fn byte_size(&self) -> usize {
         match self {
             CachedLayer::Kv {
-                k_prefix, v_prefix, ..
-            } => (k_prefix.len() + v_prefix.len()) * core::mem::size_of::<u16>(),
+                k_prefix,
+                v_prefix,
+                k_q8_prefix,
+                v_q8_prefix,
+                ..
+            } => {
+                (k_prefix.len() + v_prefix.len()) * core::mem::size_of::<u16>()
+                    + (k_q8_prefix.len() + v_q8_prefix.len()) * core::mem::size_of::<BlockQ8_0>()
+            }
             CachedLayer::SharedKv => 0,
             CachedLayer::DeltaNet { state, conv_hist } => {
                 (state.len() + conv_hist.len()) * core::mem::size_of::<f32>()
@@ -47,6 +58,7 @@ impl CachedLayer {
 struct CacheEntry {
     tokens: Vec<u32>,
     has_recurrent: bool,
+    kv_type: Option<KvType>,
     layers: Vec<CachedLayer>,
     bytes: usize,
     last_used_tick: u64,
@@ -92,25 +104,48 @@ impl PrefixCache {
         self.used_bytes = 0;
     }
 
-    /// Snapshots `LlamaState` at `tokens[..prefix_len]` into the LRU cache.
+    /// Snapshots `LlamaState` at `tokens[..prefix_len]` into the LRU cache (`F16` or `Q8_0`).
     pub fn save_llama(&mut self, tokens: &[u32], state: &LlamaState) {
         let prefix_len = tokens.len();
         if prefix_len == 0 || prefix_len > state.max_ctx || self.max_bytes == 0 {
             return;
         }
         let kv_dim = state.kv_dim;
-        let elems = prefix_len * kv_dim;
-        let layers: Vec<CachedLayer> = state
-            .k_cache
-            .iter()
-            .zip(state.v_cache.iter())
-            .map(|(k, v)| CachedLayer::Kv {
-                k_prefix: k[..elems].to_vec(),
-                v_prefix: v[..elems].to_vec(),
-                kv_dim,
-            })
-            .collect();
-        self.insert_entry(tokens.to_vec(), false, layers);
+        let layers: Vec<CachedLayer> = match state.kv_type {
+            KvType::F16 => {
+                let elems = prefix_len * kv_dim;
+                state
+                    .k_cache
+                    .iter()
+                    .zip(state.v_cache.iter())
+                    .map(|(k, v)| CachedLayer::Kv {
+                        kv_type: KvType::F16,
+                        k_prefix: k[..elems].to_vec(),
+                        v_prefix: v[..elems].to_vec(),
+                        k_q8_prefix: Vec::new(),
+                        v_q8_prefix: Vec::new(),
+                        kv_dim,
+                    })
+                    .collect()
+            }
+            KvType::Q8_0 => {
+                let blks = prefix_len * (kv_dim / QK8_0);
+                state
+                    .k_q8
+                    .iter()
+                    .zip(state.v_q8.iter())
+                    .map(|(k, v)| CachedLayer::Kv {
+                        kv_type: KvType::Q8_0,
+                        k_prefix: Vec::new(),
+                        v_prefix: Vec::new(),
+                        k_q8_prefix: k[..blks].to_vec(),
+                        v_q8_prefix: v[..blks].to_vec(),
+                        kv_dim,
+                    })
+                    .collect()
+            }
+        };
+        self.insert_entry(tokens.to_vec(), false, Some(state.kv_type), layers);
     }
 
     /// Snapshots heterogeneous `&[LayerState]` (`Qwen3.5`, `Gemma 4`, `LFM2`) at `tokens` into the LRU cache.
@@ -120,20 +155,43 @@ impl PrefixCache {
             return;
         }
         let has_recurrent = layers_state.iter().any(|l| l.is_recurrent());
+        let mut detected_kv_type = None;
         let layers: Vec<CachedLayer> = layers_state
             .iter()
             .map(|ls| match ls {
                 LayerState::Kv {
+                    kv_type,
                     k_cache,
                     v_cache,
+                    k_q8,
+                    v_q8,
                     kv_dim,
                     ..
                 } => {
-                    let elems = prefix_len * *kv_dim;
-                    CachedLayer::Kv {
-                        k_prefix: k_cache[..elems].to_vec(),
-                        v_prefix: v_cache[..elems].to_vec(),
-                        kv_dim: *kv_dim,
+                    detected_kv_type = Some(*kv_type);
+                    match kv_type {
+                        KvType::F16 => {
+                            let elems = prefix_len * *kv_dim;
+                            CachedLayer::Kv {
+                                kv_type: KvType::F16,
+                                k_prefix: k_cache[..elems].to_vec(),
+                                v_prefix: v_cache[..elems].to_vec(),
+                                k_q8_prefix: Vec::new(),
+                                v_q8_prefix: Vec::new(),
+                                kv_dim: *kv_dim,
+                            }
+                        }
+                        KvType::Q8_0 => {
+                            let blks = prefix_len * (*kv_dim / QK8_0);
+                            CachedLayer::Kv {
+                                kv_type: KvType::Q8_0,
+                                k_prefix: Vec::new(),
+                                v_prefix: Vec::new(),
+                                k_q8_prefix: k_q8[..blks].to_vec(),
+                                v_q8_prefix: v_q8[..blks].to_vec(),
+                                kv_dim: *kv_dim,
+                            }
+                        }
                     }
                 }
                 LayerState::SharedKv { .. } => CachedLayer::SharedKv,
@@ -146,7 +204,7 @@ impl PrefixCache {
                 },
             })
             .collect();
-        self.insert_entry(tokens.to_vec(), has_recurrent, layers);
+        self.insert_entry(tokens.to_vec(), has_recurrent, detected_kv_type, layers);
     }
 
     /// Restores the longest cached prefix `<= max_restore_len` into `LlamaState`, returning `matched_len`.
@@ -160,7 +218,9 @@ impl PrefixCache {
         if cap == 0 {
             return 0;
         }
-        let Some((best_idx, matched_len)) = self.find_best_match(query_tokens, cap) else {
+        let Some((best_idx, matched_len)) =
+            self.find_best_match(query_tokens, cap, Some(state.kv_type))
+        else {
             return 0;
         };
         self.tick += 1;
@@ -169,14 +229,27 @@ impl PrefixCache {
 
         for (il, cl) in entry.layers.iter().enumerate() {
             if let CachedLayer::Kv {
+                kv_type,
                 k_prefix,
                 v_prefix,
+                k_q8_prefix,
+                v_q8_prefix,
                 kv_dim,
             } = cl
             {
-                let elems = matched_len * *kv_dim;
-                state.k_cache[il][..elems].copy_from_slice(&k_prefix[..elems]);
-                state.v_cache[il][..elems].copy_from_slice(&v_prefix[..elems]);
+                match (state.kv_type, kv_type) {
+                    (KvType::F16, KvType::F16) => {
+                        let elems = matched_len * *kv_dim;
+                        state.k_cache[il][..elems].copy_from_slice(&k_prefix[..elems]);
+                        state.v_cache[il][..elems].copy_from_slice(&v_prefix[..elems]);
+                    }
+                    (KvType::Q8_0, KvType::Q8_0) => {
+                        let blks = matched_len * (*kv_dim / QK8_0);
+                        state.k_q8[il][..blks].copy_from_slice(&k_q8_prefix[..blks]);
+                        state.v_q8[il][..blks].copy_from_slice(&v_q8_prefix[..blks]);
+                    }
+                    _ => {}
+                }
             }
         }
         matched_len
@@ -194,7 +267,12 @@ impl PrefixCache {
         if cap == 0 {
             return 0;
         }
-        let Some((best_idx, matched_len)) = self.find_best_match(query_tokens, cap) else {
+        let target_kv = layers_state.iter().find_map(|ls| match ls {
+            LayerState::Kv { kv_type, .. } => Some(*kv_type),
+            _ => None,
+        });
+        let Some((best_idx, matched_len)) = self.find_best_match(query_tokens, cap, target_kv)
+        else {
             return 0;
         };
         self.tick += 1;
@@ -205,19 +283,35 @@ impl PrefixCache {
             match (ls, cl) {
                 (
                     LayerState::Kv {
+                        kv_type: dst_kv,
                         k_cache,
                         v_cache,
+                        k_q8,
+                        v_q8,
                         kv_dim,
                         ..
                     },
                     CachedLayer::Kv {
-                        k_prefix, v_prefix, ..
+                        kv_type: src_kv,
+                        k_prefix,
+                        v_prefix,
+                        k_q8_prefix,
+                        v_q8_prefix,
+                        ..
                     },
-                ) => {
-                    let elems = matched_len * *kv_dim;
-                    k_cache[..elems].copy_from_slice(&k_prefix[..elems]);
-                    v_cache[..elems].copy_from_slice(&v_prefix[..elems]);
-                }
+                ) => match (*dst_kv, *src_kv) {
+                    (KvType::F16, KvType::F16) => {
+                        let elems = matched_len * *kv_dim;
+                        k_cache[..elems].copy_from_slice(&k_prefix[..elems]);
+                        v_cache[..elems].copy_from_slice(&v_prefix[..elems]);
+                    }
+                    (KvType::Q8_0, KvType::Q8_0) => {
+                        let blks = matched_len * (*kv_dim / QK8_0);
+                        k_q8[..blks].copy_from_slice(&k_q8_prefix[..blks]);
+                        v_q8[..blks].copy_from_slice(&v_q8_prefix[..blks]);
+                    }
+                    _ => {}
+                },
                 (LayerState::SharedKv { .. }, CachedLayer::SharedKv) => {}
                 (
                     LayerState::DeltaNet { state, conv_hist },
@@ -242,11 +336,16 @@ impl PrefixCache {
         &self,
         query_tokens: &[u32],
         max_restore_len: usize,
+        required_kv: Option<KvType>,
     ) -> Option<(usize, usize)> {
         let mut best: Option<(usize, usize, u64)> = None;
         for (idx, entry) in self.entries.iter().enumerate() {
+            if let (Some(req), Some(ent_kv)) = (required_kv, entry.kv_type)
+                && req != ent_kv
+            {
+                continue;
+            }
             let mlen = if entry.has_recurrent {
-                // Recurrent states (`DeltaNet`, `ShortConv`) can ONLY restore at exact checkpoint length!
                 let elen = entry.tokens.len();
                 if elen <= max_restore_len && query_tokens[..elen] == entry.tokens[..] {
                     elen
@@ -254,7 +353,6 @@ impl PrefixCache {
                     0
                 }
             } else {
-                // Pure KV / SWA models can truncate any cached prefix down to common prefix `<= max_restore_len`!
                 let limit = entry.tokens.len().min(max_restore_len);
                 common_prefix_len(&entry.tokens[..limit], &query_tokens[..limit])
             };
@@ -274,20 +372,28 @@ impl PrefixCache {
         best.map(|(i, len, _)| (i, len))
     }
 
-    fn insert_entry(&mut self, tokens: Vec<u32>, has_recurrent: bool, layers: Vec<CachedLayer>) {
+    fn insert_entry(
+        &mut self,
+        tokens: Vec<u32>,
+        has_recurrent: bool,
+        kv_type: Option<KvType>,
+        layers: Vec<CachedLayer>,
+    ) {
         let layer_bytes: usize = layers.iter().map(|l| l.byte_size()).sum();
         let entry_bytes = layer_bytes + tokens.len() * core::mem::size_of::<u32>();
         if entry_bytes > self.max_bytes {
             return;
         }
 
-        // Deduplicate exact same token sequence if already present
-        if let Some(existing_idx) = self.entries.iter().position(|e| e.tokens == tokens) {
+        if let Some(existing_idx) = self
+            .entries
+            .iter()
+            .position(|e| e.tokens == tokens && e.kv_type == kv_type)
+        {
             let removed = self.entries.swap_remove(existing_idx);
             self.used_bytes = self.used_bytes.saturating_sub(removed.bytes);
         }
 
-        // Evict least-recently-used entries until `used_bytes + entry_bytes <= max_bytes`
         while !self.entries.is_empty() && self.used_bytes + entry_bytes > self.max_bytes {
             if let Some((lru_idx, _)) = self
                 .entries
@@ -305,6 +411,7 @@ impl PrefixCache {
         self.entries.push(CacheEntry {
             tokens,
             has_recurrent,
+            kv_type,
             layers,
             bytes: entry_bytes,
             last_used_tick: self.tick,

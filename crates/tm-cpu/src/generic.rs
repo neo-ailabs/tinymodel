@@ -6,8 +6,8 @@
 //! Upstream reference: llama.cpp `ggml/src/ggml-cpu/quants.c` (commit `3cf03257`).
 
 use tm_core::{
-    BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, QK_K, QK8_0, QK8_1,
-    f16_to_f32, unpack_q5k_scales_mins,
+    BlockQ4_0, BlockQ4_0x4, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, QK_K,
+    QK8_0, QK8_1, f16_to_f32, unpack_q5k_scales_mins,
 };
 
 /// Scalar dot product between one row of `BlockQ4_0` and one vector of `BlockQ8_0`.
@@ -465,5 +465,165 @@ pub fn gdn_recurrence_head(
         }
 
         o_h[j] = sum_oq * scale;
+    }
+}
+
+/// Scalar reference 4-row GEMV for `BlockQ4_0x4 x BlockQ8_0`.
+///
+/// Accumulates exact 32-element `i32` dot products per super-block with `f32::mul_add` so
+/// `generic`, `neon_v80`, `dotprod`, and `i8mm` (`smmla`) are **100% bit-for-bit identical**
+/// across all scales and all batch widths (`1..=MAX_CPU_BATCH`).
+pub fn gemv_q4_0x4_q8_0(
+    w: &[BlockQ4_0x4],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+) {
+    assert_eq!(rows % 4, 0);
+    assert_eq!(w.len(), (rows / 4) * cols_blocks);
+    assert_eq!(x.len(), cols_blocks);
+    assert_eq!(out.len(), rows);
+
+    for rg in 0..(rows / 4) {
+        let w_group = &w[rg * cols_blocks..(rg + 1) * cols_blocks];
+        let mut acc = [0.0f32; 4];
+
+        for (sb, by) in w_group.iter().zip(x.iter()) {
+            let dy = f16_to_f32(by.d);
+            for (m, acc_m) in acc.iter_mut().enumerate() {
+                let pair_off = if m < 2 { 0 } else { 32 };
+                let lane_off = if m % 2 == 0 { 0 } else { 8 };
+                let mut sumi: i32 = 0;
+                for j in 0..8 {
+                    let b_lo = sb.qs[pair_off + lane_off + j];
+                    let b_hi = sb.qs[pair_off + 16 + lane_off + j];
+                    let q0 = ((b_lo & 0x0F) as i32) - 8;
+                    let q1 = ((b_hi & 0x0F) as i32) - 8;
+                    let q2 = ((b_lo >> 4) as i32) - 8;
+                    let q3 = ((b_hi >> 4) as i32) - 8;
+                    sumi += q0 * (by.qs[j] as i32)
+                        + q1 * (by.qs[8 + j] as i32)
+                        + q2 * (by.qs[16 + j] as i32)
+                        + q3 * (by.qs[24 + j] as i32);
+                }
+                let scale = f16_to_f32(sb.d[m]) * dy;
+                *acc_m = (sumi as f32).mul_add(scale, *acc_m);
+            }
+        }
+
+        out[rg * 4..rg * 4 + 4].copy_from_slice(&acc);
+    }
+}
+
+/// Scalar reference multi-token GEMM for `BlockQ4_0x4 x BlockQ8_0` (`out` is `[n_tokens, rows]`).
+pub fn gemm_q4_0x4_q8_0(
+    w: &[BlockQ4_0x4],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+    n_tokens: usize,
+) {
+    assert_eq!(rows % 4, 0);
+    assert_eq!(w.len(), (rows / 4) * cols_blocks);
+    assert_eq!(x.len(), n_tokens * cols_blocks);
+    assert_eq!(out.len(), n_tokens * rows);
+
+    for t in 0..n_tokens {
+        let xt = &x[t * cols_blocks..(t + 1) * cols_blocks];
+        let ot = &mut out[t * rows..(t + 1) * rows];
+        gemv_q4_0x4_q8_0(w, xt, ot, rows, cols_blocks);
+    }
+}
+
+/// Scalar multi-token shared-weight GEMM for `Q8_0 x Q8_0`.
+pub fn gemm_q8_0_q8_0(
+    w: &[BlockQ8_0],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+    n_tokens: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), n_tokens * cols_blocks);
+    assert_eq!(out.len(), n_tokens * rows);
+    for t in 0..n_tokens {
+        gemv_q8_0_q8_0(
+            w,
+            &x[t * cols_blocks..(t + 1) * cols_blocks],
+            &mut out[t * rows..(t + 1) * rows],
+            rows,
+            cols_blocks,
+        );
+    }
+}
+
+/// Scalar multi-token shared-weight GEMM for `Q6_K x Q8_K`.
+pub fn gemm_q6_k_q8_k(
+    w: &[BlockQ6K],
+    x: &[BlockQ8K],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+    n_tokens: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), n_tokens * cols_blocks);
+    assert_eq!(out.len(), n_tokens * rows);
+    for t in 0..n_tokens {
+        gemv_q6_k_q8_k(
+            w,
+            &x[t * cols_blocks..(t + 1) * cols_blocks],
+            &mut out[t * rows..(t + 1) * rows],
+            rows,
+            cols_blocks,
+        );
+    }
+}
+
+/// Scalar `f32 -> Q8_K` activation quantization.
+#[inline]
+pub fn quantize_q8_k(src: &[f32], dst: &mut [BlockQ8K]) {
+    tm_core::quantize_row_q8_k(src, dst);
+}
+
+/// Scalar `f32 x BlockQ8_0` dot product (for `Q8_0` quantized KV cache attention)
+/// using 8-wide pairwise FMA per 32-element block so SIMD matches bit-for-bit.
+#[inline]
+pub fn dot_f32_q8_0(q: &[f32], k_q8: &[BlockQ8_0]) -> f32 {
+    assert_eq!(q.len(), k_q8.len() * QK8_0);
+    let mut total = 0.0f32;
+    for (ib, blk) in k_q8.iter().enumerate() {
+        let q_blk = &q[ib * QK8_0..(ib + 1) * QK8_0];
+        let mut acc0 = [0.0f32; 4];
+        let mut acc1 = [0.0f32; 4];
+        for c in 0..4 {
+            let base = c * 8;
+            for lane in 0..4 {
+                acc0[lane] = (blk.qs[base + lane] as f32).mul_add(q_blk[base + lane], acc0[lane]);
+                acc1[lane] =
+                    (blk.qs[base + 4 + lane] as f32).mul_add(q_blk[base + 4 + lane], acc1[lane]);
+            }
+        }
+        let bsum = ((acc0[0] + acc1[0]) + (acc0[1] + acc1[1]))
+            + ((acc0[2] + acc1[2]) + (acc0[3] + acc1[3]));
+        total = bsum.mul_add(f16_to_f32(blk.d), total);
+    }
+    total
+}
+
+/// Scalar `out[d] += w * dequant(v_q8[d])` (for `Q8_0` quantized V cache aggregation),
+/// matching NEON `vfmaq_f32` bit-for-bit.
+#[inline]
+pub fn axpy_f32_q8_0(out: &mut [f32], w: f32, v_q8: &[BlockQ8_0]) {
+    assert_eq!(out.len(), v_q8.len() * QK8_0);
+    for (ib, blk) in v_q8.iter().enumerate() {
+        let scale = w * f16_to_f32(blk.d);
+        let o_blk = &mut out[ib * QK8_0..(ib + 1) * QK8_0];
+        for (o, &vq) in o_blk.iter_mut().zip(blk.qs.iter()) {
+            *o = (vq as f32).mul_add(scale, *o);
+        }
     }
 }

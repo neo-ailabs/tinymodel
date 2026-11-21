@@ -685,6 +685,7 @@ pub struct ProbeOpts {
     pub threads: usize,
     pub stream_mib: Option<usize>,
     pub skip_stream: bool,
+    pub use_vulkan: bool,
     pub json: bool,
 }
 
@@ -692,6 +693,7 @@ pub fn parse_probe_opts(args: &[String]) -> Result<ProbeOpts> {
     let mut threads = tm_cpu::recommended_threads();
     let mut stream_mib: Option<usize> = None;
     let mut skip_stream = false;
+    let mut use_vulkan = false;
     let mut json = false;
 
     let mut i = 0;
@@ -717,6 +719,9 @@ pub fn parse_probe_opts(args: &[String]) -> Result<ProbeOpts> {
             "--no-stream" => {
                 skip_stream = true;
             }
+            "--vulkan" => {
+                use_vulkan = true;
+            }
             "--json" => {
                 json = true;
             }
@@ -729,8 +734,133 @@ pub fn parse_probe_opts(args: &[String]) -> Result<ProbeOpts> {
         threads: threads.max(1),
         stream_mib,
         skip_stream,
+        use_vulkan,
         json,
     })
+}
+
+#[cfg(feature = "vulkan")]
+fn run_vulkan_probe_and_self_check() -> Result<(String, String)> {
+    use tm_core::{DType, dequantize_row_bytes, repack_q4_0_bytes_to_q4_0x4};
+    use tm_vulkan::context::as_bytes;
+    use tm_vulkan::pipelines::{GemmPush, GemvPush};
+    use tm_vulkan::{DescriptorArena, GpuBuffer, VulkanContext, VulkanPipelines};
+
+    let ctx = VulkanContext::new()?;
+    let pipes = VulkanPipelines::new(&ctx)?;
+    let arena = DescriptorArena::new(&ctx, 16, 64)?;
+
+    // Run live GPU L1 parity self-check on `Q4_0` + `Q4_0x4` GEMV & GEMM (`8 x 128`, `4` tokens)
+    let rows = 8usize;
+    let cols = 128usize;
+    let nb = cols / 32;
+    let n_tok = 4usize;
+    let mut q4_bytes = Vec::with_capacity(rows * nb * 18);
+    for r in 0..rows {
+        for ib in 0..nb {
+            let mut qs = [0u8; 16];
+            for (j, q) in qs.iter_mut().enumerate() {
+                *q = (((r * 3 + ib * 5 + j) & 0xF) as u8)
+                    | ((((15 - ((r * 7 + ib + j * 3) & 0xF)) & 0xF) as u8) << 4);
+            }
+            let d = f32_to_f16(0.0625 * ((r as f32) - 3.5) + 0.03125 * (ib as f32));
+            q4_bytes.extend_from_slice(&d.to_le_bytes());
+            q4_bytes.extend_from_slice(&qs);
+        }
+    }
+    let mut q4x4_bytes = vec![0u8; q4_bytes.len()];
+    repack_q4_0_bytes_to_q4_0x4(&q4_bytes, &mut q4x4_bytes, rows, cols);
+    let x_vec: Vec<f32> = (0..n_tok * cols)
+        .map(|i| (((i * 19 + 7) % 89) as f32 - 44.0) * 0.05)
+        .collect();
+
+    let mut ref_out = vec![0.0f32; n_tok * rows];
+    let mut w_row = vec![0.0f32; cols];
+    for r in 0..rows {
+        let rb = DType::Q4_0.row_bytes(cols);
+        dequantize_row_bytes(DType::Q4_0, &q4_bytes[r * rb..(r + 1) * rb], &mut w_row);
+        for t in 0..n_tok {
+            ref_out[t * rows + r] = w_row
+                .iter()
+                .zip(&x_vec[t * cols..(t + 1) * cols])
+                .map(|(a, b)| a * b)
+                .sum();
+        }
+    }
+
+    let w_q4 = GpuBuffer::from_bytes_device_optimal(&ctx, &q4_bytes)?;
+    let w_q4x4 = GpuBuffer::from_bytes_device_optimal(&ctx, &q4x4_bytes)?;
+    let x_buf = GpuBuffer::from_f32_slice(&ctx, &x_vec)?;
+    let out_buf = GpuBuffer::new_host_visible(&ctx, n_tok * rows * 4)?;
+
+    let ds_gv = arena.alloc_and_write(&pipes.gemv_q4_0, &[&w_q4, &x_buf, &out_buf])?;
+    let gv_pc = GemvPush {
+        n_in: cols as u32,
+        n_out: rows as u32,
+        row_bytes: DType::Q4_0.row_bytes(cols) as u32,
+        add_residual: 0,
+        out_offset: 0,
+    };
+    ctx.submit_and_wait(|cmd| {
+        pipes
+            .gemv_q4_0
+            .cmd_dispatch(cmd, ds_gv, as_bytes(&gv_pc), 2, 1, 1)
+    })?;
+    let mut got_gv = vec![0.0f32; rows];
+    out_buf.read_f32_slice(0, &mut got_gv);
+    for r in 0..rows {
+        let err = (got_gv[r] - ref_out[r]).abs();
+        if err > 1e-4 {
+            bail!(
+                "Vulkan L1 gemv_q4_0 mismatch at row {r}: got={} ref={}",
+                got_gv[r],
+                ref_out[r]
+            );
+        }
+    }
+
+    let ds_gm = arena.alloc_and_write(&pipes.gemm_q4_0x4, &[&w_q4x4, &x_buf, &out_buf])?;
+    let gm_pc = GemmPush {
+        n_in: cols as u32,
+        n_out: rows as u32,
+        n_tok: n_tok as u32,
+        row_bytes: DType::Q4_0.row_bytes(cols) as u32,
+        add_residual: 0,
+        out_stride: rows as u32,
+        out_col_offset: 0,
+    };
+    ctx.submit_and_wait(|cmd| {
+        pipes
+            .gemm_q4_0x4
+            .cmd_dispatch(cmd, ds_gm, as_bytes(&gm_pc), 2, 1, 1)
+    })?;
+    let mut got_gm = vec![0.0f32; n_tok * rows];
+    out_buf.read_f32_slice(0, &mut got_gm);
+    for i in 0..got_gm.len() {
+        let err = (got_gm[i] - ref_out[i]).abs();
+        if err > 1e-4 {
+            bail!(
+                "Vulkan L1 gemm_q4_0x4 mismatch at {i}: got={} ref={}",
+                got_gm[i],
+                ref_out[i]
+            );
+        }
+    }
+
+    let summary = format!(
+        "{} (Vulkan {}.{}.{}, UMA={}, subgroup={}, arith={}, coopmat={}, max_wg={}, max_ssbo={} MiB) — L1 GPU Self-Check PASSED",
+        ctx.caps.device_name,
+        ctx.caps.api_version_major,
+        ctx.caps.api_version_minor,
+        ctx.caps.api_version_patch,
+        ctx.caps.is_uma,
+        ctx.caps.subgroup_size,
+        ctx.caps.subgroup_arithmetic,
+        ctx.caps.has_cooperative_matrix,
+        ctx.caps.max_workgroup_invocations,
+        ctx.caps.max_storage_buffer_range / (1024 * 1024),
+    );
+    Ok((ctx.caps.to_json(), summary))
 }
 
 pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
@@ -755,6 +885,18 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
     };
     let mem_stats = probe_process_memory_stats();
     let telemetry = collect_telemetry();
+    let vk_probe: Option<(String, String)> = if opts.use_vulkan {
+        #[cfg(feature = "vulkan")]
+        {
+            Some(run_vulkan_probe_and_self_check()?)
+        }
+        #[cfg(not(feature = "vulkan"))]
+        {
+            bail!("--vulkan requires compiling with feature 'vulkan'");
+        }
+    } else {
+        None
+    };
 
     if opts.json {
         let isas_json: Vec<String> = tested_isas.iter().map(|s| format!("\"{s}\"")).collect();
@@ -795,6 +937,10 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
             Some(e) => format!("\"{}\"", json_escape(e)),
             None => "null".to_string(),
         };
+        let vk_json = match &vk_probe {
+            Some((j, _)) => j.as_str(),
+            None => "null",
+        };
 
         println!(
             "{{\"schema_version\":1,\"device_model\":\"{}\",\"os\":\"{}\",\"arch\":\"{}\",\
@@ -804,7 +950,7 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
             \"process_rss_bytes\":{},\"process_peak_rss_bytes\":{},\
             \"process_private_dirty_bytes\":{},\"process_pss_anon_bytes\":{},\
             \"kernel_self_check\":{{\"passed\":{},\"error\":{}}},\
-            \"stream_bw\":{},\"telemetry\":{}}}",
+            \"vulkan\":{},\"stream_bw\":{},\"telemetry\":{}}}",
             json_escape(&model_name),
             std::env::consts::OS,
             std::env::consts::ARCH,
@@ -824,6 +970,7 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
             opt_u64_json(mem_stats.pss_anon_bytes),
             self_ok,
             err_json,
+            vk_json,
             stream_json,
             telemetry.to_json()
         );
@@ -866,6 +1013,9 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
             "Kernel L1 Self-Check: {}",
             if self_ok { "PASSED" } else { "FAILED" }
         );
+        if let Some((_, ref vk_sum)) = vk_probe {
+            println!("Vulkan GPU: {vk_sum}");
+        }
         if let Some((mib, rgbs, cgbs)) = stream {
             println!(
                 "STREAM Bandwidth ({} threads, {} MiB): Read={:.2} GB/s | Copy={:.2} GB/s",

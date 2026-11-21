@@ -1,0 +1,177 @@
+// Single-token Quantized GEMV (`out[n_out] = W[n_out, n_in] * x[n_in]`, optional `+ residual`).
+// Workgroup `(32, 4, 1)` = 128 invocations (`<= 256` Vulkan universal limit).
+
+layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
+
+layout(set = 0, binding = 1, std430) readonly buffer XBuf {
+    float x_f32[];
+};
+
+layout(set = 0, binding = 2, std430) buffer OutBuf {
+    float out_f32[];
+};
+
+layout(push_constant) uniform GemvPush {
+    uint n_in;
+    uint n_out;
+    uint row_bytes;
+    uint add_residual;
+    uint out_offset;
+} pc;
+
+shared float s_partial[128];
+
+// Direct register-only 32-element dot product (eliminates `float g_w32[32]` SPIR-V `Private` array
+// spills to per-invocation TLS memory on Arm Mali Valhall / Tile GPUs!).
+float dot_block32(uint row, uint row_bytes, uint cols_blocks32, uint blk32) {
+    uint x_base = blk32 * 32u;
+    float sum = 0.0;
+#if defined(DT_Q4_0)
+    uint boff = row * row_bytes + blk32 * 18u;
+    float d = w_load_f16(boff);
+    float s_lo = 0.0;
+    float s_hi = 0.0;
+    for (uint w = 0u; w < 4u; w++) {
+        uint pack = w_load_u32_unaligned(boff + 2u + w * 4u);
+        uint xb = x_base + w * 4u;
+        s_lo += float(int(pack & 0xFu) - 8) * x_f32[xb + 0u]
+              + float(int((pack >> 8u) & 0xFu) - 8) * x_f32[xb + 1u]
+              + float(int((pack >> 16u) & 0xFu) - 8) * x_f32[xb + 2u]
+              + float(int((pack >> 24u) & 0xFu) - 8) * x_f32[xb + 3u];
+        s_hi += float(int((pack >> 4u) & 0xFu) - 8) * x_f32[xb + 16u]
+              + float(int((pack >> 12u) & 0xFu) - 8) * x_f32[xb + 17u]
+              + float(int((pack >> 20u) & 0xFu) - 8) * x_f32[xb + 18u]
+              + float(int((pack >> 28u) & 0xFu) - 8) * x_f32[xb + 19u];
+    }
+    sum = (s_lo + s_hi) * d;
+#elif defined(DT_Q4_0X4)
+    uint rg = row >> 2u;
+    uint sub = row & 3u;
+    uint sb_w = (rg * cols_blocks32 + blk32) * 18u;
+    vec2 d_pair = unpackHalf2x16(w_u32[sb_w + (sub >> 1u)]);
+    float d = ((sub & 1u) == 0u) ? d_pair.x : d_pair.y;
+    uint half_base = sb_w + 2u + (sub >> 1u) * 8u + (sub & 1u) * 2u;
+    uint p0 = w_u32[half_base + 0u];
+    uint p1 = w_u32[half_base + 1u];
+    uint p2 = w_u32[half_base + 4u];
+    uint p3 = w_u32[half_base + 5u];
+    float s_q = 0.0;
+    s_q += float(int(p0 & 0xFu) - 8) * x_f32[x_base + 0u]
+         + float(int((p0 >> 8u) & 0xFu) - 8) * x_f32[x_base + 1u]
+         + float(int((p0 >> 16u) & 0xFu) - 8) * x_f32[x_base + 2u]
+         + float(int((p0 >> 24u) & 0xFu) - 8) * x_f32[x_base + 3u]
+         + float(int((p0 >> 4u) & 0xFu) - 8) * x_f32[x_base + 16u]
+         + float(int((p0 >> 12u) & 0xFu) - 8) * x_f32[x_base + 17u]
+         + float(int((p0 >> 20u) & 0xFu) - 8) * x_f32[x_base + 18u]
+         + float(int((p0 >> 28u) & 0xFu) - 8) * x_f32[x_base + 19u];
+    s_q += float(int(p1 & 0xFu) - 8) * x_f32[x_base + 4u]
+         + float(int((p1 >> 8u) & 0xFu) - 8) * x_f32[x_base + 5u]
+         + float(int((p1 >> 16u) & 0xFu) - 8) * x_f32[x_base + 6u]
+         + float(int((p1 >> 24u) & 0xFu) - 8) * x_f32[x_base + 7u]
+         + float(int((p1 >> 4u) & 0xFu) - 8) * x_f32[x_base + 20u]
+         + float(int((p1 >> 12u) & 0xFu) - 8) * x_f32[x_base + 21u]
+         + float(int((p1 >> 20u) & 0xFu) - 8) * x_f32[x_base + 22u]
+         + float(int((p1 >> 28u) & 0xFu) - 8) * x_f32[x_base + 23u];
+    s_q += float(int(p2 & 0xFu) - 8) * x_f32[x_base + 8u]
+         + float(int((p2 >> 8u) & 0xFu) - 8) * x_f32[x_base + 9u]
+         + float(int((p2 >> 16u) & 0xFu) - 8) * x_f32[x_base + 10u]
+         + float(int((p2 >> 24u) & 0xFu) - 8) * x_f32[x_base + 11u]
+         + float(int((p2 >> 4u) & 0xFu) - 8) * x_f32[x_base + 24u]
+         + float(int((p2 >> 12u) & 0xFu) - 8) * x_f32[x_base + 25u]
+         + float(int((p2 >> 20u) & 0xFu) - 8) * x_f32[x_base + 26u]
+         + float(int((p2 >> 28u) & 0xFu) - 8) * x_f32[x_base + 27u];
+    s_q += float(int(p3 & 0xFu) - 8) * x_f32[x_base + 12u]
+         + float(int((p3 >> 8u) & 0xFu) - 8) * x_f32[x_base + 13u]
+         + float(int((p3 >> 16u) & 0xFu) - 8) * x_f32[x_base + 14u]
+         + float(int((p3 >> 24u) & 0xFu) - 8) * x_f32[x_base + 15u]
+         + float(int((p3 >> 4u) & 0xFu) - 8) * x_f32[x_base + 28u]
+         + float(int((p3 >> 12u) & 0xFu) - 8) * x_f32[x_base + 29u]
+         + float(int((p3 >> 20u) & 0xFu) - 8) * x_f32[x_base + 30u]
+         + float(int((p3 >> 28u) & 0xFu) - 8) * x_f32[x_base + 31u];
+    sum = s_q * d;
+#elif defined(DT_Q6_K)
+    uint ib = blk32 >> 3u;
+    uint sub8 = blk32 & 7u;
+    uint boff = row * row_bytes + ib * 210u;
+    float d = w_load_f16(boff + 208u);
+    float sc0 = d * float(w_load_s8(boff + 192u + sub8 * 2u));
+    float sc1 = d * float(w_load_s8(boff + 192u + sub8 * 2u + 1u));
+    uint n128 = sub8 >> 2u;
+    uint q_idx = sub8 & 3u;
+    uint ql_base = boff + n128 * 64u + ((q_idx & 1u) * 32u);
+    uint ql_sh = (q_idx >= 2u) ? 4u : 0u;
+    uint qh_base = boff + 128u + n128 * 32u;
+    uint qh_sh = q_idx * 2u;
+    float s0 = 0.0;
+    float s1 = 0.0;
+    for (uint w = 0u; w < 4u; w++) {
+        uint ql_p = w_load_u32_unaligned(ql_base + w * 4u);
+        uint qh_p = w_load_u32_unaligned(qh_base + w * 4u);
+        uint xb = x_base + w * 4u;
+        for (uint c = 0u; c < 4u; c++) {
+            uint ql_b = (ql_p >> (c * 8u)) & 0xFFu;
+            uint qh_b = (qh_p >> (c * 8u)) & 0xFFu;
+            int q6 = int(((ql_b >> ql_sh) & 0xFu) | (((qh_b >> qh_sh) & 3u) << 4u)) - 32;
+            s0 += float(q6) * x_f32[xb + c];
+        }
+    }
+    for (uint w = 4u; w < 8u; w++) {
+        uint ql_p = w_load_u32_unaligned(ql_base + w * 4u);
+        uint qh_p = w_load_u32_unaligned(qh_base + w * 4u);
+        uint xb = x_base + w * 4u;
+        for (uint c = 0u; c < 4u; c++) {
+            uint ql_b = (ql_p >> (c * 8u)) & 0xFFu;
+            uint qh_b = (qh_p >> (c * 8u)) & 0xFFu;
+            int q6 = int(((ql_b >> ql_sh) & 0xFu) | (((qh_b >> qh_sh) & 3u) << 4u)) - 32;
+            s1 += float(q6) * x_f32[xb + c];
+        }
+    }
+    sum = sc0 * s0 + sc1 * s1;
+#else
+    dequant_block32(row, row_bytes, cols_blocks32, blk32);
+    for (uint j = 0u; j < 32u; j++) {
+        sum += g_w32[j] * x_f32[x_base + j];
+    }
+#endif
+    return sum;
+}
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    uint row = gl_WorkGroupID.x * 4u + ty;
+    uint cols_blocks32 = pc.n_in >> 5u;
+
+    float acc = 0.0;
+    if (row < pc.n_out) {
+        for (uint blk = tx; blk < cols_blocks32; blk += 32u) {
+            acc += dot_block32(row, pc.row_bytes, cols_blocks32, blk);
+        }
+    }
+
+    uint s_base = ty * 32u;
+    s_partial[s_base + tx] = acc;
+    barrier();
+
+    if (tx < 16u) {
+        s_partial[s_base + tx] += s_partial[s_base + tx + 16u];
+    }
+    barrier();
+    if (tx < 4u) {
+        s_partial[s_base + tx] += s_partial[s_base + tx + 4u]
+                                + s_partial[s_base + tx + 8u]
+                                + s_partial[s_base + tx + 12u];
+    }
+    barrier();
+
+    if (tx == 0u && row < pc.n_out) {
+        float sum = s_partial[s_base + 0u] + s_partial[s_base + 1u]
+                  + s_partial[s_base + 2u] + s_partial[s_base + 3u];
+        uint dst_idx = pc.out_offset + row;
+        if (pc.add_residual != 0u) {
+            out_f32[dst_idx] += sum;
+        } else {
+            out_f32[dst_idx] = sum;
+        }
+    }
+}

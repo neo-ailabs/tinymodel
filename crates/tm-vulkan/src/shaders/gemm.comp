@@ -1,0 +1,175 @@
+// Multi-token Tiled Shared-Weight GEMM (`out[n_tok, n_out] = x[n_tok, n_in] * W^T[n_out, n_in]`).
+// Workgroup `(32, 4, 1)` = 128 invocations (`TILE_M = 4` rows x `TILE_N = 8` tokens).
+
+layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
+
+layout(set = 0, binding = 1, std430) readonly buffer XBuf {
+    float x_f32[];
+};
+
+layout(set = 0, binding = 2, std430) buffer OutBuf {
+    float out_f32[];
+};
+
+layout(push_constant) uniform GemmPush {
+    uint n_in;
+    uint n_out;
+    uint n_tok;
+    uint row_bytes;
+    uint add_residual;
+    uint out_stride;
+    uint out_col_offset;
+} pc;
+
+// Flat 1D shared buffer `[ty (4) * 8 + t (8)] * 32 + tx (32)` = 1024 floats (4 KiB),
+// avoiding `naga` 24's reversed outer/inner array dimension bug on C-style `float a[A][B][C]`!
+shared float s_reduce[1024];
+
+void main() {
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    uint row = gl_WorkGroupID.x * 4u + ty;
+    uint tok_base = gl_WorkGroupID.y * 8u;
+    uint tile_toks = min(8u, (tok_base < pc.n_tok) ? (pc.n_tok - tok_base) : 0u);
+    uint cols_blocks32 = pc.n_in >> 5u;
+
+    float acc[8];
+    for (uint t = 0u; t < 8u; t++) {
+        acc[t] = 0.0;
+    }
+
+    if (row < pc.n_out && tile_toks > 0u) {
+        for (uint blk = tx; blk < cols_blocks32; blk += 32u) {
+            uint k_off = blk * 32u;
+#if defined(DT_Q4_0X4)
+            uint rg = row >> 2u;
+            uint sub = row & 3u;
+            uint sb_w = (rg * cols_blocks32 + blk) * 18u;
+            vec2 d_pair = unpackHalf2x16(w_u32[sb_w + (sub >> 1u)]);
+            float d = ((sub & 1u) == 0u) ? d_pair.x : d_pair.y;
+            uint half_base = sb_w + 2u + (sub >> 1u) * 8u + (sub & 1u) * 2u;
+            uint p0 = w_u32[half_base + 0u];
+            uint p1 = w_u32[half_base + 1u];
+            uint p2 = w_u32[half_base + 4u];
+            uint p3 = w_u32[half_base + 5u];
+            for (uint t = 0u; t < tile_toks; t++) {
+                uint xb = (tok_base + t) * pc.n_in + k_off;
+                float s = 0.0;
+                s += float(int(p0 & 0xFu) - 8) * x_f32[xb + 0u]
+                   + float(int((p0 >> 8u) & 0xFu) - 8) * x_f32[xb + 1u]
+                   + float(int((p0 >> 16u) & 0xFu) - 8) * x_f32[xb + 2u]
+                   + float(int((p0 >> 24u) & 0xFu) - 8) * x_f32[xb + 3u]
+                   + float(int((p0 >> 4u) & 0xFu) - 8) * x_f32[xb + 16u]
+                   + float(int((p0 >> 12u) & 0xFu) - 8) * x_f32[xb + 17u]
+                   + float(int((p0 >> 20u) & 0xFu) - 8) * x_f32[xb + 18u]
+                   + float(int((p0 >> 28u) & 0xFu) - 8) * x_f32[xb + 19u];
+                s += float(int(p1 & 0xFu) - 8) * x_f32[xb + 4u]
+                   + float(int((p1 >> 8u) & 0xFu) - 8) * x_f32[xb + 5u]
+                   + float(int((p1 >> 16u) & 0xFu) - 8) * x_f32[xb + 6u]
+                   + float(int((p1 >> 24u) & 0xFu) - 8) * x_f32[xb + 7u]
+                   + float(int((p1 >> 4u) & 0xFu) - 8) * x_f32[xb + 20u]
+                   + float(int((p1 >> 12u) & 0xFu) - 8) * x_f32[xb + 21u]
+                   + float(int((p1 >> 20u) & 0xFu) - 8) * x_f32[xb + 22u]
+                   + float(int((p1 >> 28u) & 0xFu) - 8) * x_f32[xb + 23u];
+                s += float(int(p2 & 0xFu) - 8) * x_f32[xb + 8u]
+                   + float(int((p2 >> 8u) & 0xFu) - 8) * x_f32[xb + 9u]
+                   + float(int((p2 >> 16u) & 0xFu) - 8) * x_f32[xb + 10u]
+                   + float(int((p2 >> 24u) & 0xFu) - 8) * x_f32[xb + 11u]
+                   + float(int((p2 >> 4u) & 0xFu) - 8) * x_f32[xb + 24u]
+                   + float(int((p2 >> 12u) & 0xFu) - 8) * x_f32[xb + 25u]
+                   + float(int((p2 >> 20u) & 0xFu) - 8) * x_f32[xb + 26u]
+                   + float(int((p2 >> 28u) & 0xFu) - 8) * x_f32[xb + 27u];
+                s += float(int(p3 & 0xFu) - 8) * x_f32[xb + 12u]
+                   + float(int((p3 >> 8u) & 0xFu) - 8) * x_f32[xb + 13u]
+                   + float(int((p3 >> 16u) & 0xFu) - 8) * x_f32[xb + 14u]
+                   + float(int((p3 >> 24u) & 0xFu) - 8) * x_f32[xb + 15u]
+                   + float(int((p3 >> 4u) & 0xFu) - 8) * x_f32[xb + 28u]
+                   + float(int((p3 >> 12u) & 0xFu) - 8) * x_f32[xb + 29u]
+                   + float(int((p3 >> 20u) & 0xFu) - 8) * x_f32[xb + 30u]
+                   + float(int((p3 >> 28u) & 0xFu) - 8) * x_f32[xb + 31u];
+                acc[t] += s * d;
+            }
+#elif defined(DT_Q4_0)
+            uint boff = row * pc.row_bytes + blk * 18u;
+            float d = w_load_f16(boff);
+            uint p0 = w_load_u32_unaligned(boff + 2u);
+            uint p1 = w_load_u32_unaligned(boff + 6u);
+            uint p2 = w_load_u32_unaligned(boff + 10u);
+            uint p3 = w_load_u32_unaligned(boff + 14u);
+            for (uint t = 0u; t < tile_toks; t++) {
+                uint xb = (tok_base + t) * pc.n_in + k_off;
+                float s = 0.0;
+                s += float(int(p0 & 0xFu) - 8) * x_f32[xb + 0u]
+                   + float(int((p0 >> 8u) & 0xFu) - 8) * x_f32[xb + 1u]
+                   + float(int((p0 >> 16u) & 0xFu) - 8) * x_f32[xb + 2u]
+                   + float(int((p0 >> 24u) & 0xFu) - 8) * x_f32[xb + 3u]
+                   + float(int((p0 >> 4u) & 0xFu) - 8) * x_f32[xb + 16u]
+                   + float(int((p0 >> 12u) & 0xFu) - 8) * x_f32[xb + 17u]
+                   + float(int((p0 >> 20u) & 0xFu) - 8) * x_f32[xb + 18u]
+                   + float(int((p0 >> 28u) & 0xFu) - 8) * x_f32[xb + 19u];
+                s += float(int(p1 & 0xFu) - 8) * x_f32[xb + 4u]
+                   + float(int((p1 >> 8u) & 0xFu) - 8) * x_f32[xb + 5u]
+                   + float(int((p1 >> 16u) & 0xFu) - 8) * x_f32[xb + 6u]
+                   + float(int((p1 >> 24u) & 0xFu) - 8) * x_f32[xb + 7u]
+                   + float(int((p1 >> 4u) & 0xFu) - 8) * x_f32[xb + 20u]
+                   + float(int((p1 >> 12u) & 0xFu) - 8) * x_f32[xb + 21u]
+                   + float(int((p1 >> 20u) & 0xFu) - 8) * x_f32[xb + 22u]
+                   + float(int((p1 >> 28u) & 0xFu) - 8) * x_f32[xb + 23u];
+                s += float(int(p2 & 0xFu) - 8) * x_f32[xb + 8u]
+                   + float(int((p2 >> 8u) & 0xFu) * 1 - 8) * x_f32[xb + 9u]
+                   + float(int((p2 >> 16u) & 0xFu) - 8) * x_f32[xb + 10u]
+                   + float(int((p2 >> 24u) & 0xFu) - 8) * x_f32[xb + 11u]
+                   + float(int((p2 >> 4u) & 0xFu) - 8) * x_f32[xb + 24u]
+                   + float(int((p2 >> 12u) & 0xFu) - 8) * x_f32[xb + 25u]
+                   + float(int((p2 >> 20u) & 0xFu) - 8) * x_f32[xb + 26u]
+                   + float(int((p2 >> 28u) & 0xFu) - 8) * x_f32[xb + 27u];
+                s += float(int(p3 & 0xFu) - 8) * x_f32[xb + 12u]
+                   + float(int((p3 >> 8u) & 0xFu) - 8) * x_f32[xb + 13u]
+                   + float(int((p3 >> 16u) & 0xFu) - 8) * x_f32[xb + 15u - 1u]
+                   + float(int((p3 >> 24u) & 0xFu) - 8) * x_f32[xb + 15u]
+                   + float(int((p3 >> 4u) & 0xFu) - 8) * x_f32[xb + 28u]
+                   + float(int((p3 >> 12u) & 0xFu) - 8) * x_f32[xb + 29u]
+                   + float(int((p3 >> 20u) & 0xFu) - 8) * x_f32[xb + 30u]
+                   + float(int((p3 >> 28u) & 0xFu) - 8) * x_f32[xb + 31u];
+                acc[t] += s * d;
+            }
+#else
+            dequant_block32(row, pc.row_bytes, cols_blocks32, blk);
+            for (uint t = 0u; t < tile_toks; t++) {
+                uint x_base = (tok_base + t) * pc.n_in + k_off;
+                float s = 0.0;
+                for (uint j = 0u; j < 32u; j++) {
+                    s += g_w32[j] * x_f32[x_base + j];
+                }
+                acc[t] += s;
+            }
+#endif
+        }
+    }
+
+    uint ty_base = ty * 256u;
+    for (uint t = 0u; t < 8u; t++) {
+        s_reduce[ty_base + t * 32u + tx] = acc[t];
+    }
+    barrier();
+
+    for (uint s = 16u; s > 0u; s >>= 1u) {
+        if (tx < s) {
+            for (uint t = 0u; t < tile_toks; t++) {
+                uint idx = ty_base + t * 32u + tx;
+                s_reduce[idx] += s_reduce[idx + s];
+            }
+        }
+        barrier();
+    }
+
+    if (tx < tile_toks && row < pc.n_out) {
+        float sum = s_reduce[ty_base + tx * 32u];
+        uint dst_idx = (tok_base + tx) * pc.out_stride + pc.out_col_offset + row;
+        if (pc.add_residual != 0u) {
+            out_f32[dst_idx] += sum;
+        } else {
+            out_f32[dst_idx] = sum;
+        }
+    }
+}

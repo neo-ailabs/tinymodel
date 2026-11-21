@@ -11,9 +11,11 @@ pub mod memprobe;
 
 pub use arena::Arena;
 pub use dtype::{
-    BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, DType, QK_K, QK4_0,
-    QK4_1, QK8_0, QK8_1, dequantize_row_bytes, dequantize_row_q4_0, quantize_row_q4_0,
-    quantize_row_q8_0, quantize_row_q8_1, quantize_row_q8_k, unpack_q5k_scales_mins,
+    BlockQ4_0, BlockQ4_0x4, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, DType,
+    GGML_TYPE_TM_Q4_0X4, KvType, QK_K, QK4_0, QK4_0X4, QK4_1, QK8_0, QK8_1,
+    dequantize_q4_0x4_single_row, dequantize_row_bytes, dequantize_row_q4_0, quantize_row_q4_0,
+    quantize_row_q8_0, quantize_row_q8_1, quantize_row_q8_k, repack_q4_0_bytes_to_q4_0x4,
+    repack_q4_0_to_q4_0x4, unpack_q5k_scales_mins,
 };
 pub use error::CoreError;
 pub use fp16::{f16_to_f32, f32_to_f16};

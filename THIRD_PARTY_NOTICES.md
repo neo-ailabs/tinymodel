@@ -15,4 +15,4 @@ This repository contains code ported from or directly inspired by the following 
 - **License**: MIT License
 - **Copyright**: Copyright (c) 2026 Niko1221 and the Strata contributors
 - **Upstream**: https://github.com/Niko1221/Strata
-- **Used in**: Runtime ISA probe design (`isa.rs`), kernel registry dispatch (`registry.rs`), epoch-CAS thread pool design (`pool.rs`), and power-of-two scale parity testing methodology.
+- **Used in**: Runtime ISA probe design (`isa.rs`), kernel registry dispatch (`registry.rs`), epoch-CAS thread pool design (`pool.rs`), speculative suffix drafter & EMA controller design (`crates/tm-runtime/src/spec.rs`), and power-of-two scale parity testing methodology.

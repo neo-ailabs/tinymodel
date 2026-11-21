@@ -11,17 +11,16 @@
 //!   and `attn_k_norm`, NeoX RoPE, and optional standard sliding window (`n_swa`).
 //! - Output RMSNorm tensor is `token_embd_norm.weight` (with fallback to `output_norm.weight`).
 
-use tm_core::{DType, dequantize_row_bytes};
+use tm_core::{DType, KvType, dequantize_row_bytes};
 use tm_cpu::{
-    KernelTable, MAX_CPU_BATCH, MatvecScratch, RopeType, ThreadPool,
-    gqa_attention_f16_kv_ext_batch_parallel, gqa_attention_f16_kv_ext_parallel, matmul_f32,
-    matvec_f32, matvec_pair_f32, matvec_triple_f32, rms_norm, rms_norm_batch_parallel,
-    rope_compute_cos_sin, rope_inplace_tables, swiglu_inplace_parallel,
+    KernelTable, MAX_CPU_BATCH, MatvecScratch, RopeType, ThreadPool, matmul_f32, matmul_pair_f32,
+    matmul_triple_f32, matvec_f32, matvec_pair_f32, matvec_triple_f32, rms_norm,
+    rms_norm_batch_parallel, rope_compute_cos_sin, rope_inplace_tables, swiglu_inplace_parallel,
 };
 use tm_gguf::{GgufError, GgufFile};
 
 use crate::llama::ModelError;
-use crate::state::LayerState;
+use crate::state::{LayerState, MAX_SPEC_WINDOW, SpecVerifyBuf, decode_embedding_row};
 
 /// Hyperparameters for `general.architecture == "lfm2"`.
 #[derive(Debug, Clone)]
@@ -118,11 +117,16 @@ pub struct Lfm2State {
     rope_sin: Vec<f32>,
     scores: Vec<f32>,
     logits: Vec<f32>,
+    pub last_hidden: Vec<f32>,
     mv_scratch: MatvecScratch,
 }
 
 impl Lfm2State {
     pub fn new(model: &Lfm2Model<'_>, max_ctx: usize) -> Self {
+        Self::new_with_kv_type(model, max_ctx, KvType::F16)
+    }
+
+    pub fn new_with_kv_type(model: &Lfm2Model<'_>, max_ctx: usize, kv_type: KvType) -> Self {
         let cfg = &model.cfg;
         let hist_len = cfg.shortconv_l_cache.saturating_sub(1);
         let mut layers = Vec::with_capacity(cfg.n_layers);
@@ -133,12 +137,7 @@ impl Lfm2State {
                 });
             } else {
                 let kv_dim = cfg.n_head_kv_per_layer[il] * cfg.head_dim;
-                layers.push(LayerState::Kv {
-                    k_cache: vec![0u16; max_ctx * kv_dim],
-                    v_cache: vec![0u16; max_ctx * kv_dim],
-                    kv_dim,
-                    window: cfg.n_swa,
-                });
+                layers.push(LayerState::new_kv(max_ctx, kv_dim, cfg.n_swa, kv_type));
             }
         }
 
@@ -164,6 +163,7 @@ impl Lfm2State {
             rope_sin: vec![0.0; cfg.rope_dim / 2],
             scores: vec![0.0; cfg.n_head.max(1) * max_ctx],
             logits: vec![0.0; cfg.vocab_size],
+            last_hidden: vec![0.0; cfg.n_embd],
             mv_scratch: MatvecScratch::new(max_cols),
         }
     }
@@ -455,6 +455,12 @@ impl<'a> Lfm2Model<'a> {
         })
     }
 
+    pub fn num_shortconv_layers(&self) -> usize {
+        (0..self.cfg.n_layers)
+            .filter(|&il| self.cfg.is_shortconv(il))
+            .count()
+    }
+
     /// Single-token forward pass. Validates bounds BEFORE mutating `LayerState` (`Rule #6`).
     pub fn forward_token(
         &self,
@@ -494,9 +500,13 @@ impl<'a> Lfm2Model<'a> {
             &mut state.rope_sin,
         );
 
-        let emb_row_bytes = self.token_embd.dtype.row_bytes(n_embd);
-        let emb_row = &self.token_embd.bytes[tid * emb_row_bytes..(tid + 1) * emb_row_bytes];
-        dequantize_row_bytes(self.token_embd.dtype, emb_row, &mut state.x[..n_embd]);
+        decode_embedding_row(
+            self.token_embd.dtype,
+            self.token_embd.bytes,
+            n_embd,
+            tid,
+            &mut state.x[..n_embd],
+        );
 
         for (il, layer) in self.layers.iter().enumerate() {
             rms_norm(
@@ -572,12 +582,7 @@ impl<'a> Lfm2Model<'a> {
                         wv,
                         wo,
                     },
-                    LayerState::Kv {
-                        k_cache,
-                        v_cache,
-                        window,
-                        ..
-                    },
+                    kv_state @ LayerState::Kv { .. },
                 ) => {
                     let kv_dim = *n_head_kv * hd;
                     matvec_triple_f32(
@@ -642,29 +647,19 @@ impl<'a> Lfm2Model<'a> {
                         RopeType::Neox,
                     );
 
-                    let cache_off = pos * kv_dim;
-                    (kt.f32_to_f16_slice)(
-                        &state.k_buf[..kv_dim],
-                        &mut k_cache[cache_off..cache_off + kv_dim],
-                    );
-                    (kt.f32_to_f16_slice)(
-                        &state.v_buf[..kv_dim],
-                        &mut v_cache[cache_off..cache_off + kv_dim],
-                    );
+                    kv_state.store_kv_at(kt, pos, &state.k_buf[..kv_dim], &state.v_buf[..kv_dim]);
 
-                    gqa_attention_f16_kv_ext_parallel(
+                    kv_state.attend_single(
                         pool,
                         kt,
                         &mut state.attn_out[..q_dim],
                         &state.q_buf[..q_dim],
-                        k_cache,
-                        v_cache,
                         self.cfg.n_head,
                         *n_head_kv,
                         hd,
                         pos,
                         attn_scale,
-                        *window,
+                        None,
                         state.max_ctx,
                         &mut state.scores,
                     );
@@ -726,6 +721,8 @@ impl<'a> Lfm2Model<'a> {
                 state.x[i] += state.xb2[i];
             }
         }
+
+        state.last_hidden.copy_from_slice(&state.x[..n_embd]);
 
         if compute_logits {
             rms_norm(
@@ -825,13 +822,12 @@ impl<'a> Lfm2Model<'a> {
         let hist_len = l_cache.saturating_sub(1);
         let attn_scale = 1.0 / (hd as f32).sqrt();
 
-        let emb_row_bytes = self.token_embd.dtype.row_bytes(n_embd);
         for (t, &tok) in tokens.iter().enumerate() {
-            let tid = tok as usize;
-            let emb_row = &self.token_embd.bytes[tid * emb_row_bytes..(tid + 1) * emb_row_bytes];
-            dequantize_row_bytes(
+            decode_embedding_row(
                 self.token_embd.dtype,
-                emb_row,
+                self.token_embd.bytes,
+                n_embd,
+                tok as usize,
                 &mut state.x[t * n_embd..(t + 1) * n_embd],
             );
         }
@@ -916,47 +912,26 @@ impl<'a> Lfm2Model<'a> {
                         wv,
                         wo,
                     },
-                    LayerState::Kv {
-                        k_cache,
-                        v_cache,
-                        window,
-                        ..
-                    },
+                    kv_state @ LayerState::Kv { .. },
                 ) => {
                     let kv_dim = *n_head_kv * hd;
-                    matmul_f32(
+                    matmul_triple_f32(
                         pool,
                         kt,
                         wq.dtype,
                         wq.bytes,
-                        &state.xb[..b * n_embd],
-                        &mut state.mv_scratch,
-                        &mut state.q_buf[..b * q_dim],
                         q_dim,
-                        n_embd,
-                        b,
-                    );
-                    matmul_f32(
-                        pool,
-                        kt,
+                        &mut state.q_buf[..b * q_dim],
                         wk.dtype,
                         wk.bytes,
-                        &state.xb[..b * n_embd],
-                        &mut state.mv_scratch,
-                        &mut state.k_buf[..b * kv_dim],
                         kv_dim,
-                        n_embd,
-                        b,
-                    );
-                    matmul_f32(
-                        pool,
-                        kt,
+                        &mut state.k_buf[..b * kv_dim],
                         wv.dtype,
                         wv.bytes,
+                        kv_dim,
+                        &mut state.v_buf[..b * kv_dim],
                         &state.xb[..b * n_embd],
                         &mut state.mv_scratch,
-                        &mut state.v_buf[..b * kv_dim],
-                        kv_dim,
                         n_embd,
                         b,
                     );
@@ -1010,25 +985,21 @@ impl<'a> Lfm2Model<'a> {
                             RopeType::Neox,
                         );
 
-                        let cache_off = pos * kv_dim;
-                        (kt.f32_to_f16_slice)(kt_vec, &mut k_cache[cache_off..cache_off + kv_dim]);
-                        (kt.f32_to_f16_slice)(vt_vec, &mut v_cache[cache_off..cache_off + kv_dim]);
+                        kv_state.store_kv_at(kt, pos, kt_vec, vt_vec);
                     }
 
-                    gqa_attention_f16_kv_ext_batch_parallel(
+                    kv_state.attend_batch(
                         pool,
                         kt,
                         &mut state.attn_out[..b * q_dim],
                         &state.q_buf[..b * q_dim],
-                        k_cache,
-                        v_cache,
                         self.cfg.n_head,
                         *n_head_kv,
                         hd,
                         start_pos,
                         b,
                         attn_scale,
-                        *window,
+                        None,
                         state.max_ctx,
                         &mut state.scores,
                     );
@@ -1063,27 +1034,19 @@ impl<'a> Lfm2Model<'a> {
                 n_embd,
                 b,
             );
-            matmul_f32(
+            matmul_pair_f32(
                 pool,
                 kt,
                 layer.w_gate.dtype,
                 layer.w_gate.bytes,
-                &state.xb[..b * n_embd],
-                &mut state.mv_scratch,
-                &mut state.hb[..b * n_ff],
                 n_ff,
-                n_embd,
-                b,
-            );
-            matmul_f32(
-                pool,
-                kt,
+                &mut state.hb[..b * n_ff],
                 layer.w_up.dtype,
                 layer.w_up.bytes,
+                n_ff,
+                &mut state.hb2[..b * n_ff],
                 &state.xb[..b * n_embd],
                 &mut state.mv_scratch,
-                &mut state.hb2[..b * n_ff],
-                n_ff,
                 n_embd,
                 b,
             );
@@ -1105,8 +1068,12 @@ impl<'a> Lfm2Model<'a> {
             }
         }
 
+        let last = (b - 1) * n_embd;
+        state
+            .last_hidden
+            .copy_from_slice(&state.x[last..last + n_embd]);
+
         if compute_last_logits {
-            let last = (b - 1) * n_embd;
             rms_norm(
                 &mut state.xb[..n_embd],
                 &state.x[last..last + n_embd],
@@ -1125,5 +1092,399 @@ impl<'a> Lfm2Model<'a> {
                 self.output.cols,
             );
         }
+    }
+
+    /// Evaluates a speculative verification window `window_tokens` (`1 <= W <= MAX_SPEC_WINDOW`)
+    /// while keeping `LayerState::ShortConv` **read-only** (`ADR-005`).
+    pub fn verify_speculative(
+        &self,
+        state: &mut Lfm2State,
+        spec_buf: &mut SpecVerifyBuf,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        window_tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<(), ModelError> {
+        let w = window_tokens.len();
+        assert!((1..=MAX_SPEC_WINDOW).contains(&w));
+        let end_pos = start_pos.saturating_add(w);
+        if end_pos > state.max_ctx {
+            return Err(ModelError::ContextOverflow {
+                pos: end_pos - 1,
+                max_ctx: state.max_ctx,
+            });
+        }
+        for &tid in window_tokens {
+            if (tid as usize) >= self.cfg.vocab_size {
+                return Err(ModelError::TokenOutOfRange {
+                    token_id: tid,
+                    vocab_size: self.cfg.vocab_size,
+                });
+            }
+        }
+
+        let n_embd = self.cfg.n_embd;
+        let n_ff = self.cfg.n_ff;
+        let hd = self.cfg.head_dim;
+        let q_dim = self.cfg.n_head * hd;
+        let l_cache = self.cfg.shortconv_l_cache;
+        let hist_len = l_cache.saturating_sub(1);
+        let attn_scale = 1.0 / (hd as f32).sqrt();
+        let vocab = self.cfg.vocab_size;
+
+        for (t, &tok) in window_tokens.iter().enumerate() {
+            decode_embedding_row(
+                self.token_embd.dtype,
+                self.token_embd.bytes,
+                n_embd,
+                tok as usize,
+                &mut state.x[t * n_embd..(t + 1) * n_embd],
+            );
+        }
+
+        let mut sc_idx = 0usize;
+        for (il, layer) in self.layers.iter().enumerate() {
+            rms_norm_batch_parallel(
+                pool,
+                kt,
+                &mut state.xb[..w * n_embd],
+                &state.x[..w * n_embd],
+                &layer.attn_norm,
+                self.cfg.rms_eps,
+                n_embd,
+                w,
+            );
+
+            match (&layer.op, &mut state.layers[il]) {
+                (
+                    Lfm2OpWeights::ShortConv {
+                        in_proj,
+                        conv,
+                        out_proj,
+                    },
+                    LayerState::ShortConv { conv_hist },
+                ) => {
+                    spec_buf.tmp_conv_hist[..conv_hist.len()].copy_from_slice(conv_hist);
+                    matmul_f32(
+                        pool,
+                        kt,
+                        in_proj.dtype,
+                        in_proj.bytes,
+                        &state.xb[..w * n_embd],
+                        &mut state.mv_scratch,
+                        &mut state.bcx_buf[..w * 3 * n_embd],
+                        3 * n_embd,
+                        n_embd,
+                        w,
+                    );
+
+                    let bx_layer_off = sc_idx * MAX_SPEC_WINDOW * n_embd;
+                    for t in 0..w {
+                        let bcx_t = &state.bcx_buf[t * 3 * n_embd..(t + 1) * 3 * n_embd];
+                        let y_t = &mut state.conv_y[t * n_embd..(t + 1) * n_embd];
+                        for ch in 0..n_embd {
+                            let bx_val = bcx_t[ch] * bcx_t[2 * n_embd + ch];
+                            spec_buf.sc_bx_win[bx_layer_off + t * n_embd + ch] = bx_val;
+                            let c_val = bcx_t[n_embd + ch];
+                            let h_slice =
+                                &mut spec_buf.tmp_conv_hist[ch * hist_len..(ch + 1) * hist_len];
+                            let w_slice = &conv[ch * l_cache..(ch + 1) * l_cache];
+                            let mut sum = 0.0f32;
+                            for tap in 0..hist_len {
+                                sum += h_slice[tap] * w_slice[tap];
+                            }
+                            sum += bx_val * w_slice[hist_len];
+                            for tap in 0..hist_len.saturating_sub(1) {
+                                h_slice[tap] = h_slice[tap + 1];
+                            }
+                            if hist_len > 0 {
+                                h_slice[hist_len - 1] = bx_val;
+                            }
+                            y_t[ch] = c_val * sum;
+                        }
+                    }
+                    sc_idx += 1;
+
+                    matmul_f32(
+                        pool,
+                        kt,
+                        out_proj.dtype,
+                        out_proj.bytes,
+                        &state.conv_y[..w * n_embd],
+                        &mut state.mv_scratch,
+                        &mut state.xb2[..w * n_embd],
+                        n_embd,
+                        n_embd,
+                        w,
+                    );
+                }
+                (
+                    Lfm2OpWeights::Gqa {
+                        n_head_kv,
+                        q_norm,
+                        k_norm,
+                        wq,
+                        wk,
+                        wv,
+                        wo,
+                    },
+                    kv_state @ LayerState::Kv { .. },
+                ) => {
+                    let kv_dim = *n_head_kv * hd;
+                    matmul_triple_f32(
+                        pool,
+                        kt,
+                        wq.dtype,
+                        wq.bytes,
+                        q_dim,
+                        &mut state.q_buf[..w * q_dim],
+                        wk.dtype,
+                        wk.bytes,
+                        kv_dim,
+                        &mut state.k_buf[..w * kv_dim],
+                        wv.dtype,
+                        wv.bytes,
+                        kv_dim,
+                        &mut state.v_buf[..w * kv_dim],
+                        &state.xb[..w * n_embd],
+                        &mut state.mv_scratch,
+                        n_embd,
+                        w,
+                    );
+
+                    for t in 0..w {
+                        let pos = start_pos + t;
+                        let qt = &mut state.q_buf[t * q_dim..(t + 1) * q_dim];
+                        let kt_vec = &mut state.k_buf[t * kv_dim..(t + 1) * kv_dim];
+                        let vt_vec = &state.v_buf[t * kv_dim..(t + 1) * kv_dim];
+
+                        for h in 0..self.cfg.n_head {
+                            let s = h * hd;
+                            let e = s + hd;
+                            rms_norm(&mut state.xb2[..hd], &qt[s..e], q_norm, self.cfg.rms_eps);
+                            qt[s..e].copy_from_slice(&state.xb2[..hd]);
+                        }
+                        for h in 0..*n_head_kv {
+                            let s = h * hd;
+                            let e = s + hd;
+                            rms_norm(
+                                &mut state.xb2[..hd],
+                                &kt_vec[s..e],
+                                k_norm,
+                                self.cfg.rms_eps,
+                            );
+                            kt_vec[s..e].copy_from_slice(&state.xb2[..hd]);
+                        }
+
+                        rope_compute_cos_sin(
+                            &self.rope_inv_freqs,
+                            pos,
+                            &mut state.rope_cos,
+                            &mut state.rope_sin,
+                        );
+                        rope_inplace_tables(
+                            qt,
+                            self.cfg.n_head,
+                            hd,
+                            self.cfg.rope_dim,
+                            &state.rope_cos,
+                            &state.rope_sin,
+                            RopeType::Neox,
+                        );
+                        rope_inplace_tables(
+                            kt_vec,
+                            *n_head_kv,
+                            hd,
+                            self.cfg.rope_dim,
+                            &state.rope_cos,
+                            &state.rope_sin,
+                            RopeType::Neox,
+                        );
+
+                        kv_state.store_kv_at(kt, pos, kt_vec, vt_vec);
+                    }
+
+                    kv_state.attend_batch(
+                        pool,
+                        kt,
+                        &mut state.attn_out[..w * q_dim],
+                        &state.q_buf[..w * q_dim],
+                        self.cfg.n_head,
+                        *n_head_kv,
+                        hd,
+                        start_pos,
+                        w,
+                        attn_scale,
+                        None,
+                        state.max_ctx,
+                        &mut state.scores,
+                    );
+
+                    matmul_f32(
+                        pool,
+                        kt,
+                        wo.dtype,
+                        wo.bytes,
+                        &state.attn_out[..w * q_dim],
+                        &mut state.mv_scratch,
+                        &mut state.xb2[..w * n_embd],
+                        n_embd,
+                        q_dim,
+                        w,
+                    );
+                }
+                _ => unreachable!("LayerState variant always matches Lfm2OpWeights"),
+            }
+
+            for i in 0..w * n_embd {
+                state.x[i] += state.xb2[i];
+            }
+
+            rms_norm_batch_parallel(
+                pool,
+                kt,
+                &mut state.xb[..w * n_embd],
+                &state.x[..w * n_embd],
+                &layer.ffn_norm,
+                self.cfg.rms_eps,
+                n_embd,
+                w,
+            );
+            matmul_pair_f32(
+                pool,
+                kt,
+                layer.w_gate.dtype,
+                layer.w_gate.bytes,
+                n_ff,
+                &mut state.hb[..w * n_ff],
+                layer.w_up.dtype,
+                layer.w_up.bytes,
+                n_ff,
+                &mut state.hb2[..w * n_ff],
+                &state.xb[..w * n_embd],
+                &mut state.mv_scratch,
+                n_embd,
+                w,
+            );
+            swiglu_inplace_parallel(pool, &mut state.hb[..w * n_ff], &state.hb2[..w * n_ff]);
+            matmul_f32(
+                pool,
+                kt,
+                layer.w_down.dtype,
+                layer.w_down.bytes,
+                &state.hb[..w * n_ff],
+                &mut state.mv_scratch,
+                &mut state.xb2[..w * n_embd],
+                n_embd,
+                n_ff,
+                w,
+            );
+            for i in 0..w * n_embd {
+                state.x[i] += state.xb2[i];
+            }
+        }
+
+        spec_buf.last_window_len = w;
+        spec_buf.hidden_win[..w * n_embd].copy_from_slice(&state.x[..w * n_embd]);
+        rms_norm_batch_parallel(
+            pool,
+            kt,
+            &mut spec_buf.norm_win[..w * n_embd],
+            &spec_buf.hidden_win[..w * n_embd],
+            &self.output_norm,
+            self.cfg.rms_eps,
+            n_embd,
+            w,
+        );
+        matmul_f32(
+            pool,
+            kt,
+            self.output.dtype,
+            self.output.bytes,
+            &spec_buf.norm_win[..w * n_embd],
+            &mut state.mv_scratch,
+            &mut spec_buf.logits_win[..w * vocab],
+            self.output.rows,
+            self.output.cols,
+            w,
+        );
+        Ok(())
+    }
+
+    /// Commits `committed` (`1 <= committed <= W`) tokens from `verify_speculative` by shifting
+    /// each `LayerState::ShortConv` history by `0..committed` (`ADR-005`).
+    pub fn commit_speculative(
+        &self,
+        state: &mut Lfm2State,
+        spec_buf: &SpecVerifyBuf,
+        committed: usize,
+    ) {
+        assert!((1..=spec_buf.last_window_len).contains(&committed));
+        let n_embd = self.cfg.n_embd;
+        let hist_len = self.cfg.shortconv_l_cache.saturating_sub(1);
+        let mut sc_idx = 0usize;
+        if hist_len > 0 {
+            for ls in &mut state.layers {
+                if let LayerState::ShortConv { conv_hist } = ls {
+                    let bx_layer_off = sc_idx * MAX_SPEC_WINDOW * n_embd;
+                    for t in 0..committed {
+                        for ch in 0..n_embd {
+                            let bx_val = spec_buf.sc_bx_win[bx_layer_off + t * n_embd + ch];
+                            let h_slice = &mut conv_hist[ch * hist_len..(ch + 1) * hist_len];
+                            for tap in 0..hist_len - 1 {
+                                h_slice[tap] = h_slice[tap + 1];
+                            }
+                            h_slice[hist_len - 1] = bx_val;
+                        }
+                    }
+                    sc_idx += 1;
+                }
+            }
+        }
+        let idx = committed - 1;
+        state
+            .logits
+            .copy_from_slice(spec_buf.logits_at(idx, self.cfg.vocab_size));
+        state
+            .last_hidden
+            .copy_from_slice(spec_buf.hidden_at(idx, n_embd));
+    }
+
+    pub fn project_logits_from_hidden(
+        &self,
+        state: &mut Lfm2State,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        hidden: &[f32],
+        out_logits: &mut [f32],
+    ) {
+        let n_embd = self.cfg.n_embd;
+        rms_norm(
+            &mut state.xb[..n_embd],
+            hidden,
+            &self.output_norm,
+            self.cfg.rms_eps,
+        );
+        matvec_f32(
+            pool,
+            kt,
+            self.output.dtype,
+            self.output.bytes,
+            &state.xb[..n_embd],
+            &mut state.mv_scratch,
+            out_logits,
+            self.output.rows,
+            self.output.cols,
+        );
+    }
+
+    pub fn embed_token(&self, token_id: u32, out_emb: &mut [f32]) {
+        decode_embedding_row(
+            self.token_embd.dtype,
+            self.token_embd.bytes,
+            self.cfg.n_embd,
+            token_id as usize,
+            out_emb,
+        );
     }
 }

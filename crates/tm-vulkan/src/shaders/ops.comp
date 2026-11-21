@@ -1,0 +1,753 @@
+// Non-matmul LLM compute shaders for Vulkan (`llama`, `qwen3`, `qwen35` hybrid GDN + Full-Attn).
+// All workgroup sizes are `<= 256` invocations and use pure `uint`/`float` SSBOs.
+
+#if defined(OP_EMBED)
+// Dequantizes `n_tok` token embeddings (`tok_ids[0..n_tok]`) of any GGUF dtype into `out_f32[n_tok, n_embd]`.
+// Binding 0: raw `token_embd.weight` (`uint[]`), Binding 1: `tok_ids` (`uint[]`), Binding 2: `out_f32` (`float[]`).
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer WeightBuf { uint w_u32[]; };
+layout(set = 0, binding = 1, std430) readonly buffer TokBuf { uint tok_ids[]; };
+layout(set = 0, binding = 2, std430) buffer OutBuf { float out_f32[]; };
+
+layout(push_constant) uniform EmbedPush {
+    uint n_embd;
+    uint row_bytes;
+    uint dtype_code;
+    uint n_tok;
+} pc;
+
+uint emb_u8(uint byte_off) {
+    return (w_u32[byte_off >> 2u] >> ((byte_off & 3u) * 8u)) & 0xFFu;
+}
+int emb_s8(uint byte_off) {
+    uint b = emb_u8(byte_off);
+    return (b >= 128u) ? (int(b) - 256) : int(b);
+}
+uint emb_u16(uint byte_off) {
+    uint idx = byte_off >> 2u;
+    uint rem = byte_off & 3u;
+    if (rem == 0u) return w_u32[idx] & 0xFFFFu;
+    if (rem == 2u) return w_u32[idx] >> 16u;
+    if (rem == 1u) return (w_u32[idx] >> 8u) & 0xFFFFu;
+    return (w_u32[idx] >> 24u) | ((w_u32[idx + 1u] & 0xFFu) << 8u);
+}
+float emb_f16(uint byte_off) { return unpackHalf2x16(emb_u16(byte_off)).x; }
+
+void main() {
+    uint col = gl_GlobalInvocationID.x;
+    uint t = gl_WorkGroupID.y;
+    if (col >= pc.n_embd || t >= pc.n_tok) {
+        return;
+    }
+    uint row = tok_ids[t];
+    float val = 0.0;
+    // dtype_code matches `DType::to_ggml_type()`: 0=F32, 1=F16, 2=Q4_0, 3=Q4_1, 8=Q8_0, 13=Q5_K, 14=Q6_K, 30=BF16, 100=Q4_0x4
+    if (pc.dtype_code == 2u) {
+        uint blk = col >> 5u;
+        uint lane = col & 31u;
+        uint boff = row * pc.row_bytes + blk * 18u;
+        float d = emb_f16(boff);
+        uint b = emb_u8(boff + 2u + (lane & 15u));
+        uint nib = (lane < 16u) ? (b & 0xFu) : (b >> 4u);
+        val = float(int(nib) - 8) * d;
+    } else if (pc.dtype_code == 100u) {
+        uint rg = row >> 2u;
+        uint sub = row & 3u;
+        uint cols_blocks = pc.n_embd >> 5u;
+        uint blk = col >> 5u;
+        uint lane = col & 31u;
+        uint sb_w = (rg * cols_blocks + blk) * 18u;
+        vec2 dp = unpackHalf2x16(w_u32[sb_w + (sub >> 1u)]);
+        float d = ((sub & 1u) == 0u) ? dp.x : dp.y;
+        uint j = lane & 15u;
+        uint byte_in_qs = (sub >> 1u) * 32u + ((j >= 8u) ? 16u : 0u) + (sub & 1u) * 8u + (j & 7u);
+        uint b = emb_u8(sb_w * 4u + 8u + byte_in_qs);
+        uint nib = (lane < 16u) ? (b & 0xFu) : (b >> 4u);
+        val = float(int(nib) - 8) * d;
+    } else if (pc.dtype_code == 8u) {
+        uint blk = col >> 5u;
+        uint lane = col & 31u;
+        uint boff = row * pc.row_bytes + blk * 34u;
+        val = float(emb_s8(boff + 2u + lane)) * emb_f16(boff);
+    } else if (pc.dtype_code == 14u) {
+        uint ib = col >> 8u;
+        uint rem = col & 255u;
+        uint n128 = rem >> 7u;
+        uint in128 = rem & 127u;
+        uint q_idx = in128 >> 5u;
+        uint l = in128 & 31u;
+        uint sub8 = (n128 * 4u) + q_idx;
+        uint boff = row * pc.row_bytes + ib * 210u;
+        float d = emb_f16(boff + 208u);
+        float sc = float(emb_s8(boff + 192u + sub8 * 2u + (l >> 4u)));
+        uint ql_b = emb_u8(boff + n128 * 64u + ((q_idx & 1u) * 32u) + l);
+        uint qh_b = emb_u8(boff + 128u + n128 * 32u + l);
+        uint ql_sh = (q_idx >= 2u) ? 4u : 0u;
+        uint qh_sh = q_idx * 2u;
+        int q6 = int(((ql_b >> ql_sh) & 0xFu) | (((qh_b >> qh_sh) & 3u) << 4u)) - 32;
+        val = d * sc * float(q6);
+    } else if (pc.dtype_code == 1u) {
+        val = emb_f16((row * pc.n_embd + col) * 2u);
+    } else if (pc.dtype_code == 30u) {
+        val = uintBitsToFloat(emb_u16((row * pc.n_embd + col) * 2u) << 16u);
+    } else if (pc.dtype_code == 0u) {
+        val = uintBitsToFloat(w_u32[row * pc.n_embd + col]);
+    } else if (pc.dtype_code == 3u) {
+        uint blk = col >> 5u;
+        uint lane = col & 31u;
+        uint bw = (row * (pc.n_embd >> 5u) + blk) * 5u;
+        vec2 dm = unpackHalf2x16(w_u32[bw]);
+        uint b = emb_u8(bw * 4u + 4u + (lane & 15u));
+        uint nib = (lane < 16u) ? (b & 0xFu) : (b >> 4u);
+        val = float(nib) * dm.x + dm.y;
+    } else if (pc.dtype_code == 13u) {
+        uint ib = col >> 8u;
+        uint rem = col & 255u;
+        uint is = rem >> 5u;
+        uint l = rem & 31u;
+        uint boff = row * pc.row_bytes + ib * 176u;
+        float d = emb_f16(boff);
+        float dmin = emb_f16(boff + 2u);
+        uint sc = (is < 4u) ? (emb_u8(boff + 4u + is) & 63u)
+                            : ((emb_u8(boff + 8u + is) & 0xFu) | ((emb_u8(boff + is) >> 6u) << 4u));
+        uint mn = (is < 4u) ? (emb_u8(boff + 8u + is) & 63u)
+                            : ((emb_u8(boff + 8u + is) >> 4u) | ((emb_u8(boff + 4u + is) >> 6u) << 4u));
+        uint chunk = is >> 1u;
+        uint hi_half = is & 1u;
+        uint ql_b = emb_u8(boff + 48u + chunk * 32u + l);
+        uint qh_b = emb_u8(boff + 16u + l);
+        uint nib = (hi_half == 0u) ? (ql_b & 0xFu) : (ql_b >> 4u);
+        uint hb = ((qh_b >> (chunk * 2u + hi_half)) & 1u) << 4u;
+        val = (d * float(sc)) * float(nib | hb) - (dmin * float(mn));
+    }
+    out_f32[t * pc.n_embd + col] = val;
+}
+
+#elif defined(OP_RMS_NORM)
+// Batched RMSNorm: 1 workgroup (`256` threads) per token `t = gl_WorkGroupID.x`.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InBuf { float x_in[]; };
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuf { float w_norm[]; };
+layout(set = 0, binding = 2, std430) buffer OutBuf { float y_out[]; };
+
+layout(push_constant) uniform NormPush {
+    uint n;
+    uint in_offset;
+    float eps;
+} pc;
+
+shared float s_sq[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint t = gl_WorkGroupID.x;
+    uint base_in = pc.in_offset + t * pc.n;
+    uint base_out = t * pc.n;
+
+    float sq = 0.0;
+    for (uint i = tid; i < pc.n; i += 256u) {
+        float v = x_in[base_in + i];
+        sq += v * v;
+    }
+    s_sq[tid] = sq;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            s_sq[tid] += s_sq[tid + s];
+        }
+        barrier();
+    }
+
+    float scale = inversesqrt(s_sq[0] / float(pc.n) + pc.eps);
+    for (uint i = tid; i < pc.n; i += 256u) {
+        y_out[base_out + i] = x_in[base_in + i] * scale * w_norm[i];
+    }
+}
+
+#elif defined(OP_QK_NORM)
+// Per-head in-place Q/K RMSNorm across `(n_heads, n_tok)`: `gl_WorkGroupID.x = head`, `gl_WorkGroupID.y = tok`.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer VecBuf { float vec_io[]; };
+layout(set = 0, binding = 1, std430) readonly buffer WeightBuf { float w_norm[]; };
+
+layout(push_constant) uniform QkNormPush {
+    uint n_heads;
+    uint head_dim;
+    float eps;
+} pc;
+
+shared float s_sq[64];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint h = gl_WorkGroupID.x;
+    uint t = gl_WorkGroupID.y;
+    if (h >= pc.n_heads) return;
+    uint base = (t * pc.n_heads + h) * pc.head_dim;
+
+    float sq = 0.0;
+    for (uint i = tid; i < pc.head_dim; i += 64u) {
+        float v = vec_io[base + i];
+        sq += v * v;
+    }
+    s_sq[tid] = sq;
+    barrier();
+
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            s_sq[tid] += s_sq[tid + s];
+        }
+        barrier();
+    }
+
+    float scale = inversesqrt(s_sq[0] / float(pc.head_dim) + pc.eps);
+    for (uint i = tid; i < pc.head_dim; i += 64u) {
+        vec_io[base + i] *= scale * w_norm[i];
+    }
+}
+
+#elif defined(OP_ROPE_KV)
+// Applies RoPE (`Normal` or `Neox`, full or partial `rope_dim`) to `q` and `k` across `n_tok` tokens,
+// AND packs `(k, v)` into F16 KV cache (`uint` SSBO via `packHalf2x16`, 2 F16 elements per `u32`!).
+// Workgroup `(64, 1, 1)` per `(head = wg_x, tok = wg_y)` so `barrier()` cleanly synchronizes Neox pairs
+// inside each head before packing contiguous `(2*p, 2*p+1)` pairs into `k_cache_u32` / `v_cache_u32`!
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer QBuf { float q_io[]; };
+layout(set = 0, binding = 1, std430) buffer KBuf { float k_io[]; };
+layout(set = 0, binding = 2, std430) readonly buffer VBuf { float v_in[]; };
+layout(set = 0, binding = 3, std430) buffer KCacheBuf { uint k_cache_u32[]; };
+layout(set = 0, binding = 4, std430) buffer VCacheBuf { uint v_cache_u32[]; };
+layout(set = 0, binding = 5, std430) readonly buffer FreqBuf { float freq_factors[]; };
+
+layout(push_constant) uniform RopeKvPush {
+    uint n_head;
+    uint n_head_kv;
+    uint head_dim;
+    uint rope_dim;
+    uint start_pos;
+    uint n_tok;
+    uint rope_type;
+    uint has_freq_factors;
+    float freq_base;
+} pc;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint h = gl_WorkGroupID.x;
+    uint t = gl_WorkGroupID.y;
+    if (h >= pc.n_head || t >= pc.n_tok) {
+        return;
+    }
+
+    uint pos = pc.start_pos + t;
+    uint half_hd = pc.head_dim >> 1u;
+    uint half_rope = pc.rope_dim >> 1u;
+    uint q_dim = pc.n_head * pc.head_dim;
+    uint kv_dim = pc.n_head_kv * pc.head_dim;
+    uint q_base = t * q_dim + h * pc.head_dim;
+    uint k_base = t * kv_dim + h * pc.head_dim;
+
+    for (uint p = tid; p < half_rope; p += 64u) {
+        float exponent = -2.0 * float(p) / float(pc.rope_dim);
+        float inv_freq = pow(pc.freq_base, exponent);
+        if (pc.has_freq_factors != 0u) {
+            inv_freq /= freq_factors[p];
+        }
+        float angle = float(pos) * inv_freq;
+        float cs = cos(angle);
+        float sn = sin(angle);
+
+        uint i0 = (pc.rope_type == 2u) ? p : (2u * p);
+        uint i1 = (pc.rope_type == 2u) ? (p + half_rope) : (2u * p + 1u);
+
+        float q0 = q_io[q_base + i0];
+        float q1 = q_io[q_base + i1];
+        q_io[q_base + i0] = q0 * cs - q1 * sn;
+        q_io[q_base + i1] = q0 * sn + q1 * cs;
+
+        if (h < pc.n_head_kv) {
+            float k0 = k_io[k_base + i0];
+            float k1 = k_io[k_base + i1];
+            k_io[k_base + i0] = k0 * cs - k1 * sn;
+            k_io[k_base + i1] = k0 * sn + k1 * cs;
+        }
+    }
+    barrier();
+
+    if (h < pc.n_head_kv) {
+        uint kv_u32_base = (pos * pc.n_head_kv + h) * half_hd;
+        for (uint p = tid; p < half_hd; p += 64u) {
+            vec2 kp = vec2(k_io[k_base + 2u * p], k_io[k_base + 2u * p + 1u]);
+            vec2 vp = vec2(v_in[k_base + 2u * p], v_in[k_base + 2u * p + 1u]);
+            k_cache_u32[kv_u32_base + p] = packHalf2x16(kp);
+            v_cache_u32[kv_u32_base + p] = packHalf2x16(vp);
+        }
+    }
+}
+
+#elif defined(OP_GQA_ATTN) || defined(OP_GQA_ATTN_BATCH)
+// Online-softmax Flash GQA Attention reading F16 KV cache (`uint[]` via `unpackHalf2x16`)!
+// Workgroup `(64, 1, 1)` per `(query_head = wg_x, tok_in_batch = wg_y)`.
+// Zero `max_ctx` score buffer needed — streams arbitrarily long KV contexts with online softmax!
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer QBuf { float q_in[]; };
+layout(set = 0, binding = 1, std430) readonly buffer KCacheBuf { uint k_cache_u32[]; };
+layout(set = 0, binding = 2, std430) readonly buffer VCacheBuf { uint v_cache_u32[]; };
+layout(set = 0, binding = 3, std430) buffer OutBuf { float attn_out[]; };
+
+layout(push_constant) uniform AttnPush {
+    uint n_head;
+    uint n_head_kv;
+    uint head_dim;
+    uint start_pos;
+    uint n_tok;
+    float scale;
+} pc;
+
+shared float s_dot[64];
+shared float s_q[256];
+shared float s_out[256];
+shared float s_m;
+shared float s_l;
+shared float s_alpha;
+shared float s_w;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint h = gl_WorkGroupID.x;
+    uint tb = gl_WorkGroupID.y;
+    if (h >= pc.n_head || tb >= pc.n_tok) {
+        return;
+    }
+
+    uint hd = pc.head_dim;
+    uint half_hd = hd >> 1u;
+    uint kv_half_stride = pc.n_head_kv * half_hd;
+    uint group = pc.n_head / pc.n_head_kv;
+    uint kv_h = h / group;
+    uint seq_len = pc.start_pos + tb + 1u;
+
+    uint q_base = (tb * pc.n_head + h) * hd;
+    for (uint d = tid; d < hd; d += 64u) {
+        s_q[d] = q_in[q_base + d];
+        s_out[d] = 0.0;
+    }
+    if (tid == 0u) {
+        s_m = -3.402823e38;
+        s_l = 0.0;
+    }
+    barrier();
+
+    for (uint step = 0u; step < seq_len; step++) {
+        uint kv_u32_base = step * kv_half_stride + kv_h * half_hd;
+        float partial = 0.0;
+        for (uint p = tid; p < half_hd; p += 64u) {
+            vec2 kp = unpackHalf2x16(k_cache_u32[kv_u32_base + p]);
+            partial += s_q[2u * p] * kp.x + s_q[2u * p + 1u] * kp.y;
+        }
+        s_dot[tid] = partial;
+        barrier();
+
+        for (uint s = 32u; s > 0u; s >>= 1u) {
+            if (tid < s) {
+                s_dot[tid] += s_dot[tid + s];
+            }
+            barrier();
+        }
+
+        if (tid == 0u) {
+            float score = s_dot[0] * pc.scale;
+            float m_prev = s_m;
+            float m_new = max(m_prev, score);
+            float alpha = exp(m_prev - m_new);
+            float w = exp(score - m_new);
+            s_m = m_new;
+            s_l = s_l * alpha + w;
+            s_alpha = alpha;
+            s_w = w;
+        }
+        barrier();
+
+        float alpha = s_alpha;
+        float w = s_w;
+        for (uint p = tid; p < half_hd; p += 64u) {
+            vec2 vp = unpackHalf2x16(v_cache_u32[kv_u32_base + p]);
+            s_out[2u * p] = s_out[2u * p] * alpha + w * vp.x;
+            s_out[2u * p + 1u] = s_out[2u * p + 1u] * alpha + w * vp.y;
+        }
+        barrier();
+    }
+
+    float inv_l = (s_l > 0.0) ? (1.0 / s_l) : 0.0;
+    for (uint d = tid; d < hd; d += 64u) {
+        attn_out[q_base + d] = s_out[d] * inv_l;
+    }
+}
+
+#elif defined(OP_SWIGLU)
+// In-place SwiGLU: `gate[i] = (gate[i] / (1 + exp(-gate[i]))) * up[i]`.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer GateBuf { float gate_io[]; };
+layout(set = 0, binding = 1, std430) readonly buffer UpBuf { float up_in[]; };
+
+layout(push_constant) uniform SwigluPush {
+    uint total_elems;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.total_elems) return;
+    float g = gate_io[idx];
+    gate_io[idx] = (g / (1.0 + exp(-g))) * up_in[idx];
+}
+
+#elif defined(OP_ADD_INPLACE)
+// Elementwise `dst[i] += src[i]`.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer DstBuf { float dst_io[]; };
+layout(set = 0, binding = 1, std430) readonly buffer SrcBuf { float src_in[]; };
+
+layout(push_constant) uniform AddPush {
+    uint total_elems;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.total_elems) return;
+    dst_io[idx] += src_in[idx];
+}
+
+#elif defined(OP_ARGMAX)
+// Single-workgroup GPU argmax over `logits[0..vocab_size]`, writing winning `uint` token ID to `out_id[0]`.
+// Eliminates copying 196 KB - 1 MB of logits over the bus during greedy decode!
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer LogitsBuf { float logits[]; };
+layout(set = 0, binding = 1, std430) buffer OutIdBuf { uint out_id[]; };
+
+layout(push_constant) uniform ArgmaxPush {
+    uint vocab_size;
+    uint logits_offset;
+} pc;
+
+shared float s_val[256];
+shared uint s_idx[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    float best_v = -3.402823e38;
+    uint best_i = 0u;
+    for (uint i = tid; i < pc.vocab_size; i += 256u) {
+        float v = logits[pc.logits_offset + i];
+        if (v > best_v || (v == best_v && i < best_i)) {
+            best_v = v;
+            best_i = i;
+        }
+    }
+    s_val[tid] = best_v;
+    s_idx[tid] = best_i;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            float v_other = s_val[tid + s];
+            uint i_other = s_idx[tid + s];
+            if (v_other > s_val[tid] || (v_other == s_val[tid] && i_other < s_idx[tid])) {
+                s_val[tid] = v_other;
+                s_idx[tid] = i_other;
+            }
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        out_id[0] = s_idx[0];
+    }
+}
+
+#elif defined(OP_SPLIT_QG_NORM)
+// Qwen3.5 full-attention Q+Gate de-interleave (`[Q_h (hd), Gate_h (hd)]`) + per-head Q RMSNorm.
+// Workgroup `(64, 1, 1)` per `(head = wg_x, tok = wg_y)`.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer QgBuf { float qg_in[]; };
+layout(set = 0, binding = 1, std430) readonly buffer QNormBuf { float q_norm[]; };
+layout(set = 0, binding = 2, std430) buffer QOutBuf { float q_out[]; };
+layout(set = 0, binding = 3, std430) buffer GateOutBuf { float gate_out[]; };
+
+layout(push_constant) uniform SplitQgPush {
+    uint n_head;
+    uint head_dim;
+    float eps;
+} pc;
+
+shared float s_sq[64];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint h = gl_WorkGroupID.x;
+    uint t = gl_WorkGroupID.y;
+    if (h >= pc.n_head) return;
+
+    uint hd = pc.head_dim;
+    uint qg_base = (t * pc.n_head + h) * 2u * hd;
+    uint out_base = (t * pc.n_head + h) * hd;
+
+    float sq = 0.0;
+    for (uint i = tid; i < hd; i += 64u) {
+        float qv = qg_in[qg_base + i];
+        sq += qv * qv;
+        gate_out[out_base + i] = qg_in[qg_base + hd + i];
+    }
+    s_sq[tid] = sq;
+    barrier();
+
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            s_sq[tid] += s_sq[tid + s];
+        }
+        barrier();
+    }
+
+    float scale = inversesqrt(s_sq[0] / float(hd) + pc.eps);
+    for (uint i = tid; i < hd; i += 64u) {
+        q_out[out_base + i] = qg_in[qg_base + i] * scale * q_norm[i];
+    }
+}
+
+#elif defined(OP_SIGMOID_GATE)
+// Qwen3.5 full-attention output gate: `attn_out[i] *= sigmoid(gate[i])`.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer AttnOutBuf { float attn_io[]; };
+layout(set = 0, binding = 1, std430) readonly buffer GateBuf { float gate_in[]; };
+
+layout(push_constant) uniform SigGatePush {
+    uint total_elems;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.total_elems) return;
+    float g = gate_in[idx];
+    attn_io[idx] *= 1.0 / (1.0 + exp(-g));
+}
+
+#elif defined(OP_GDN_GATES)
+// Qwen3.5 Gated DeltaNet scalar decay `g_exp = exp(softplus(alpha + dt_bias) * ssm_a)` and `beta = sigmoid(beta_raw)`.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer AlphaBuf { float alpha_in[]; };
+layout(set = 0, binding = 1, std430) buffer BetaBuf { float beta_io[]; };
+layout(set = 0, binding = 2, std430) readonly buffer SsmABuf { float ssm_a[]; };
+layout(set = 0, binding = 3, std430) readonly buffer DtBiasBuf { float dt_bias[]; };
+layout(set = 0, binding = 4, std430) buffer GExpBuf { float g_exp_out[]; };
+
+layout(push_constant) uniform GdnGatesPush {
+    uint n_v_heads;
+    uint n_tok;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = pc.n_v_heads * pc.n_tok;
+    if (idx >= total) return;
+    uint vh = idx % pc.n_v_heads;
+    float x = alpha_in[idx] + dt_bias[vh];
+    float sp = (x > 20.0) ? x : log(1.0 + exp(x));
+    g_exp_out[idx] = exp(sp * ssm_a[vh]);
+    float b = beta_io[idx];
+    beta_io[idx] = 1.0 / (1.0 + exp(-b));
+}
+
+#elif defined(OP_GDN_CONV_SILU_L2)
+// Qwen3.5 GDN causal depthwise `conv1d` (`kernel = 4`) + **SiLU BEFORE split** + per-head L2-norm on `q` and `k` ONLY (`AGENTS.md` §9)!
+// Launched with `1` workgroup (`128` threads) per `(group_item)` where:
+// - `wg_x in 0..n_k_heads`: Q head `h = wg_x` (channels `[h*s_dim .. (h+1)*s_dim)`) -> L2-normalized into `q_out`!
+// - `wg_x in n_k_heads..2*n_k_heads`: K head `h = wg_x - n_k_heads` (channels `[k_dim + h*s_dim ..)`) -> L2-normalized into `k_out`!
+// - `wg_x in 2*n_k_heads..2*n_k_heads + n_v_heads`: V head `vh` (channels `[2*k_dim + vh*s_dim ..)`) -> **NO L2 norm**, written to `v_out`!
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer QkvBuf { float qkv_in[]; };
+layout(set = 0, binding = 1, std430) buffer ConvHistBuf { float conv_hist[]; };
+layout(set = 0, binding = 2, std430) readonly buffer ConvWBuf { float conv_w[]; };
+layout(set = 0, binding = 3, std430) buffer QOutBuf { float q_out[]; };
+layout(set = 0, binding = 4, std430) buffer KOutBuf { float k_out[]; };
+layout(set = 0, binding = 5, std430) buffer VOutBuf { float v_out[]; };
+
+layout(push_constant) uniform GdnConvPush {
+    uint n_k_heads;
+    uint n_v_heads;
+    uint s_dim;
+    uint d_conv;
+    uint n_tok;
+    float eps;
+} pc;
+
+shared float s_sq[128];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wg = gl_WorkGroupID.x;
+    uint hk = pc.n_k_heads;
+    uint hv = pc.n_v_heads;
+    uint s_dim = pc.s_dim;
+    if (wg >= 2u * hk + hv) return;
+
+    uint k_dim = hk * s_dim;
+    uint v_dim = hv * s_dim;
+    uint conv_dim = 2u * k_dim + v_dim;
+    uint hist_len = pc.d_conv - 1u;
+    uint ch_base = wg * s_dim;
+
+    for (uint t = 0u; t < pc.n_tok; t++) {
+        float val = 0.0;
+        if (tid < s_dim) {
+            uint ch = ch_base + tid;
+            uint h_off = ch * hist_len;
+            uint w_off = ch * pc.d_conv;
+            float x_cur = qkv_in[t * conv_dim + ch];
+            float csum = 0.0;
+            for (uint tap = 0u; tap < hist_len; tap++) {
+                csum += conv_hist[h_off + tap] * conv_w[w_off + tap];
+            }
+            csum += x_cur * conv_w[w_off + hist_len];
+            for (uint tap = 0u; tap + 1u < hist_len; tap++) {
+                conv_hist[h_off + tap] = conv_hist[h_off + tap + 1u];
+            }
+            if (hist_len > 0u) {
+                conv_hist[h_off + hist_len - 1u] = x_cur;
+            }
+            // SiLU BEFORE q/k/v split (`AGENTS.md` §9)!
+            val = csum / (1.0 + exp(-csum));
+        }
+
+        if (wg < 2u * hk) {
+            s_sq[tid] = (tid < s_dim) ? (val * val) : 0.0;
+            barrier();
+            for (uint s = 64u; s > 0u; s >>= 1u) {
+                if (tid < s) {
+                    s_sq[tid] += s_sq[tid + s];
+                }
+                barrier();
+            }
+            float inv_norm = inversesqrt(s_sq[0] + pc.eps);
+            if (tid < s_dim) {
+                if (wg < hk) {
+                    q_out[(t * hk + wg) * s_dim + tid] = val * inv_norm;
+                } else {
+                    uint kh = wg - hk;
+                    k_out[(t * hk + kh) * s_dim + tid] = val * inv_norm;
+                }
+            }
+            barrier();
+        } else {
+            // V head: NEVER L2-normalize `v` (`AGENTS.md` §9)!
+            if (tid < s_dim) {
+                uint vh = wg - 2u * hk;
+                v_out[(t * hv + vh) * s_dim + tid] = val;
+            }
+        }
+    }
+}
+
+#elif defined(OP_GDN_RECUR_GATED)
+// Qwen3.5 Gated DeltaNet recurrence + per-head gated RMSNorm * SiLU(z)!
+// Workgroup `(128, 1, 1)` per value head `vh = gl_WorkGroupID.x` (`kh = vh % n_k_heads` tiled grouping!).
+// Transposed state layout `state[vh, j, i]` (`j = tid` owns its entire row `state[vh, tid, 0..s_dim]` in parallel
+// with ZERO inter-thread conflicts during the recurrence loop, then reduces `o_h[tid]^2` across `tid` for `ssm_norm`!).
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer QBuf { float q_in[]; };
+layout(set = 0, binding = 1, std430) readonly buffer KBuf { float k_in[]; };
+layout(set = 0, binding = 2, std430) readonly buffer VBuf { float v_in[]; };
+layout(set = 0, binding = 3, std430) readonly buffer GExpBuf { float g_exp[]; };
+layout(set = 0, binding = 4, std430) readonly buffer BetaBuf { float beta_in[]; };
+layout(set = 0, binding = 5, std430) buffer StateBuf { float ssm_state[]; };
+layout(set = 0, binding = 6, std430) readonly buffer ZGateBuf { float z_gate[]; };
+layout(set = 0, binding = 7, std430) readonly buffer SsmNormBuf { float ssm_norm[]; };
+layout(set = 0, binding = 8, std430) buffer OutBuf { float attn_out[]; };
+
+layout(push_constant) uniform GdnRecurPush {
+    uint n_k_heads;
+    uint n_v_heads;
+    uint s_dim;
+    uint n_tok;
+    float eps;
+} pc;
+
+shared float s_q[128];
+shared float s_k[128];
+shared float s_sq[128];
+
+void main() {
+    uint j = gl_LocalInvocationID.x;
+    uint vh = gl_WorkGroupID.x;
+    if (vh >= pc.n_v_heads) return;
+
+    uint hk = pc.n_k_heads;
+    uint hv = pc.n_v_heads;
+    uint s_dim = pc.s_dim;
+    // Tiled head grouping (`kh = vh % hk`, NEVER contiguous `vh / group` — `AGENTS.md` §9)!
+    uint kh = vh % hk;
+    float q_scale = inversesqrt(float(s_dim));
+    uint row_off = (vh * s_dim + j) * s_dim;
+
+    for (uint t = 0u; t < pc.n_tok; t++) {
+        if (j < s_dim) {
+            s_q[j] = q_in[(t * hk + kh) * s_dim + j];
+            s_k[j] = k_in[(t * hk + kh) * s_dim + j];
+        }
+        barrier();
+
+        float o_j = 0.0;
+        if (j < s_dim) {
+            float g = g_exp[t * hv + vh];
+            float beta = beta_in[t * hv + vh];
+            float v_j = v_in[(t * hv + vh) * s_dim + j];
+
+            float kv_j = 0.0;
+            for (uint i = 0u; i < s_dim; i++) {
+                float s_ij = ssm_state[row_off + i] * g;
+                ssm_state[row_off + i] = s_ij;
+                kv_j += s_ij * s_k[i];
+            }
+            float delta_j = (v_j - kv_j) * beta;
+            float acc_o = 0.0;
+            for (uint i = 0u; i < s_dim; i++) {
+                float s_ij = ssm_state[row_off + i] + delta_j * s_k[i];
+                ssm_state[row_off + i] = s_ij;
+                acc_o += s_ij * s_q[i];
+            }
+            o_j = acc_o * q_scale;
+        }
+
+        s_sq[j] = (j < s_dim) ? (o_j * o_j) : 0.0;
+        barrier();
+
+        for (uint s = 64u; s > 0u; s >>= 1u) {
+            if (j < s) {
+                s_sq[j] += s_sq[j + s];
+            }
+            barrier();
+        }
+
+        if (j < s_dim) {
+            float rms = inversesqrt(s_sq[0] / float(s_dim) + pc.eps);
+            uint out_idx = (t * hv + vh) * s_dim + j;
+            float z = z_gate[out_idx];
+            float silu_z = z / (1.0 + exp(-z));
+            attn_out[out_idx] = (o_j * rms * ssm_norm[j]) * silu_z;
+        }
+        barrier();
+    }
+}
+#endif

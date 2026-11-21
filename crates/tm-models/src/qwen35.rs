@@ -17,18 +17,19 @@
 
 use std::time::Instant;
 
-use tm_core::{DType, dequantize_row_bytes};
+use tm_core::{DType, KvType, dequantize_row_bytes};
 use tm_cpu::{
     KernelTable, MAX_CPU_BATCH, MatvecScratch, RopeType, ThreadPool,
-    gdn_conv1d_silu_split_parallel, gdn_recurrence_gated_parallel,
-    gqa_attention_f16_kv_batch_parallel, gqa_attention_f16_kv_parallel, matmul_f32, matvec_f32,
-    matvec_pair_f32, matvec_triple_f32, rms_norm, rms_norm_batch_parallel, rope_compute_cos_sin,
-    rope_inplace_tables, swiglu_inplace_parallel,
+    gdn_conv1d_silu_split_parallel, gdn_recurrence_gated_parallel, gdn_recurrence_parallel,
+    matmul_f32, matmul_pair_f32, matmul_triple_f32, matvec_f32, matvec_pair_f32, matvec_triple_f32,
+    rms_norm, rms_norm_batch_parallel, rope_compute_cos_sin, rope_inplace_tables,
+    swiglu_inplace_parallel,
 };
 use tm_gguf::{GgufError, GgufFile};
 
 use crate::llama::ModelError;
 pub use crate::state::LayerState;
+use crate::state::{MAX_SPEC_WINDOW, SpecVerifyBuf, decode_embedding_row};
 
 /// Hyperparameters for `general.architecture == "qwen35"`.
 #[derive(Debug, Clone)]
@@ -158,6 +159,7 @@ pub struct Qwen35State {
     rope_sin: Vec<f32>,
     scores: Vec<f32>,
     logits: Vec<f32>,
+    pub last_hidden: Vec<f32>,
     mv_scratch: MatvecScratch,
 }
 
@@ -165,6 +167,11 @@ impl Qwen35State {
     /// Allocates heterogeneous `LayerState`s (`Kv` only on full-attention layers, `DeltaNet`
     /// only on GDN layers) and all scratch buffers up front for `max_ctx` tokens.
     pub fn new(model: &Qwen35Model<'_>, max_ctx: usize) -> Self {
+        Self::new_with_kv_type(model, max_ctx, KvType::F16)
+    }
+
+    /// Allocates `Qwen35State` with configurable KV cache precision (`F16` or `Q8_0` `F-14`).
+    pub fn new_with_kv_type(model: &Qwen35Model<'_>, max_ctx: usize, kv_type: KvType) -> Self {
         let cfg = &model.cfg;
         let kv_dim = cfg.n_head_kv * cfg.head_dim;
         let q_dim = cfg.n_head * cfg.head_dim;
@@ -179,12 +186,7 @@ impl Qwen35State {
             .layers
             .iter()
             .map(|lw| match lw.attn {
-                AttnWeights::FullAttn { .. } => LayerState::Kv {
-                    k_cache: vec![0u16; max_ctx * kv_dim],
-                    v_cache: vec![0u16; max_ctx * kv_dim],
-                    kv_dim,
-                    window: None,
-                },
+                AttnWeights::FullAttn { .. } => LayerState::new_kv(max_ctx, kv_dim, None, kv_type),
                 AttnWeights::Gdn { .. } => LayerState::DeltaNet {
                     state: vec![0.0f32; state_elems],
                     conv_hist: vec![0.0f32; conv_dim * hist_len],
@@ -215,6 +217,7 @@ impl Qwen35State {
             rope_sin: vec![0.0; cfg.rope_dim / 2],
             scores: vec![0.0; cfg.n_head * max_ctx],
             logits: vec![0.0; cfg.vocab_size],
+            last_hidden: vec![0.0; cfg.n_embd],
             mv_scratch: MatvecScratch::new(max_cols),
         }
     }
@@ -603,9 +606,13 @@ impl<'a> Qwen35Model<'a> {
             &mut state.rope_sin,
         );
 
-        let row_bytes = self.token_embd.dtype.row_bytes(n_embd);
-        let emb_row = &self.token_embd.bytes[tid * row_bytes..(tid + 1) * row_bytes];
-        dequantize_row_bytes(self.token_embd.dtype, emb_row, &mut state.x[..n_embd]);
+        decode_embedding_row(
+            self.token_embd.dtype,
+            self.token_embd.bytes,
+            n_embd,
+            tid,
+            &mut state.x[..n_embd],
+        );
 
         for (l, layer) in self.layers.iter().enumerate() {
             rms_norm(
@@ -733,9 +740,7 @@ impl<'a> Qwen35Model<'a> {
                         wv,
                         wo,
                     },
-                    LayerState::Kv {
-                        k_cache, v_cache, ..
-                    },
+                    kv_state @ LayerState::Kv { .. },
                 ) => {
                     matvec_triple_f32(
                         pool,
@@ -802,27 +807,19 @@ impl<'a> Qwen35Model<'a> {
                         RopeType::Neox,
                     );
 
-                    let cache_off = pos * kv_dim;
-                    (kt.f32_to_f16_slice)(
-                        &state.k_buf[..kv_dim],
-                        &mut k_cache[cache_off..cache_off + kv_dim],
-                    );
-                    (kt.f32_to_f16_slice)(
-                        &state.v_buf[..kv_dim],
-                        &mut v_cache[cache_off..cache_off + kv_dim],
-                    );
+                    kv_state.store_kv_at(kt, pos, &state.k_buf[..kv_dim], &state.v_buf[..kv_dim]);
 
-                    gqa_attention_f16_kv_parallel(
+                    kv_state.attend_single(
                         pool,
                         kt,
                         &mut state.attn_out[..q_dim],
                         &state.q_buf[..q_dim],
-                        k_cache,
-                        v_cache,
                         self.cfg.n_head,
                         self.cfg.n_head_kv,
                         hd,
-                        pos + 1,
+                        pos,
+                        1.0 / (hd as f32).sqrt(),
+                        None,
                         state.max_ctx,
                         &mut state.scores,
                     );
@@ -892,6 +889,8 @@ impl<'a> Qwen35Model<'a> {
                 state.x[i] += state.xb2[i];
             }
         }
+
+        state.last_hidden.copy_from_slice(&state.x[..n_embd]);
 
         if compute_logits {
             rms_norm(
@@ -1054,13 +1053,12 @@ impl<'a> Qwen35Model<'a> {
         let d_conv = self.cfg.ssm_conv_kernel;
 
         let t_emb = prof.as_ref().map(|_| Instant::now());
-        let row_bytes = self.token_embd.dtype.row_bytes(n_embd);
         for (t, &tok) in tokens.iter().enumerate() {
-            let tid = tok as usize;
-            let emb_row = &self.token_embd.bytes[tid * row_bytes..(tid + 1) * row_bytes];
-            dequantize_row_bytes(
+            decode_embedding_row(
                 self.token_embd.dtype,
-                emb_row,
+                self.token_embd.bytes,
+                n_embd,
+                tok as usize,
                 &mut state.x[t * n_embd..(t + 1) * n_embd],
             );
         }
@@ -1103,51 +1101,35 @@ impl<'a> Qwen35Model<'a> {
                     },
                 ) => {
                     let tp = prof.as_ref().map(|_| Instant::now());
-                    matmul_f32(
+                    matmul_pair_f32(
                         pool,
                         kt,
                         wqkv.dtype,
                         wqkv.bytes,
-                        &state.xb[..b * n_embd],
-                        &mut state.mv_scratch,
-                        &mut state.qkv_buf[..b * conv_dim],
                         wqkv.rows,
-                        n_embd,
-                        b,
-                    );
-                    matmul_f32(
-                        pool,
-                        kt,
+                        &mut state.qkv_buf[..b * conv_dim],
                         wz.dtype,
                         wz.bytes,
+                        wz.rows,
+                        &mut state.gate_buf[..b * v_gdn_dim],
                         &state.xb[..b * n_embd],
                         &mut state.mv_scratch,
-                        &mut state.gate_buf[..b * v_gdn_dim],
-                        wz.rows,
                         n_embd,
                         b,
                     );
-                    matmul_f32(
+                    matmul_pair_f32(
                         pool,
                         kt,
                         w_alpha.dtype,
                         w_alpha.bytes,
-                        &state.xb[..b * n_embd],
-                        &mut state.mv_scratch,
-                        &mut state.alpha_buf[..b * hv],
                         w_alpha.rows,
-                        n_embd,
-                        b,
-                    );
-                    matmul_f32(
-                        pool,
-                        kt,
+                        &mut state.alpha_buf[..b * hv],
                         w_beta.dtype,
                         w_beta.bytes,
+                        w_beta.rows,
+                        &mut state.beta_buf[..b * hv],
                         &state.xb[..b * n_embd],
                         &mut state.mv_scratch,
-                        &mut state.beta_buf[..b * hv],
-                        w_beta.rows,
                         n_embd,
                         b,
                     );
@@ -1234,44 +1216,26 @@ impl<'a> Qwen35Model<'a> {
                         wv,
                         wo,
                     },
-                    LayerState::Kv {
-                        k_cache, v_cache, ..
-                    },
+                    kv_state @ LayerState::Kv { .. },
                 ) => {
                     let tq = prof.as_ref().map(|_| Instant::now());
-                    matmul_f32(
+                    matmul_triple_f32(
                         pool,
                         kt,
                         wqg.dtype,
                         wqg.bytes,
-                        &state.xb[..b * n_embd],
-                        &mut state.mv_scratch,
-                        &mut state.qkv_buf[..b * qg_dim],
                         wqg.rows,
-                        n_embd,
-                        b,
-                    );
-                    matmul_f32(
-                        pool,
-                        kt,
+                        &mut state.qkv_buf[..b * qg_dim],
                         wk.dtype,
                         wk.bytes,
-                        &state.xb[..b * n_embd],
-                        &mut state.mv_scratch,
-                        &mut state.k_buf[..b * kv_dim],
                         wk.rows,
-                        n_embd,
-                        b,
-                    );
-                    matmul_f32(
-                        pool,
-                        kt,
+                        &mut state.k_buf[..b * kv_dim],
                         wv.dtype,
                         wv.bytes,
+                        wv.rows,
+                        &mut state.v_buf[..b * kv_dim],
                         &state.xb[..b * n_embd],
                         &mut state.mv_scratch,
-                        &mut state.v_buf[..b * kv_dim],
-                        wv.rows,
                         n_embd,
                         b,
                     );
@@ -1330,23 +1294,21 @@ impl<'a> Qwen35Model<'a> {
                             RopeType::Neox,
                         );
 
-                        let cache_off = pos * kv_dim;
-                        (kt.f32_to_f16_slice)(k_t, &mut k_cache[cache_off..cache_off + kv_dim]);
-                        (kt.f32_to_f16_slice)(v_t, &mut v_cache[cache_off..cache_off + kv_dim]);
+                        kv_state.store_kv_at(kt, pos, k_t, v_t);
                     }
 
-                    gqa_attention_f16_kv_batch_parallel(
+                    kv_state.attend_batch(
                         pool,
                         kt,
                         &mut state.attn_out[..b * q_dim],
                         &state.q_buf[..b * q_dim],
-                        k_cache,
-                        v_cache,
                         self.cfg.n_head,
                         self.cfg.n_head_kv,
                         hd,
                         start_pos,
                         b,
+                        1.0 / (hd as f32).sqrt(),
+                        None,
                         state.max_ctx,
                         &mut state.scores,
                     );
@@ -1399,27 +1361,19 @@ impl<'a> Qwen35Model<'a> {
                 p.rms_norm_ns += ts.elapsed().as_nanos() as u64;
             }
             let t_gu = prof.as_ref().map(|_| Instant::now());
-            matmul_f32(
+            matmul_pair_f32(
                 pool,
                 kt,
                 layer.w_gate.dtype,
                 layer.w_gate.bytes,
-                &state.xb[..b * n_embd],
-                &mut state.mv_scratch,
-                &mut state.hb[..b * n_ff],
                 layer.w_gate.rows,
-                n_embd,
-                b,
-            );
-            matmul_f32(
-                pool,
-                kt,
+                &mut state.hb[..b * n_ff],
                 layer.w_up.dtype,
                 layer.w_up.bytes,
+                layer.w_up.rows,
+                &mut state.hb2[..b * n_ff],
                 &state.xb[..b * n_embd],
                 &mut state.mv_scratch,
-                &mut state.hb2[..b * n_ff],
-                layer.w_up.rows,
                 n_embd,
                 b,
             );
@@ -1447,6 +1401,11 @@ impl<'a> Qwen35Model<'a> {
                 p.ffn_down_ns += ts.elapsed().as_nanos() as u64;
             }
         }
+
+        let last = (b - 1) * n_embd;
+        state
+            .last_hidden
+            .copy_from_slice(&state.x[last..last + n_embd]);
 
         if compute_last_logits {
             let t_rn = prof.as_ref().map(|_| Instant::now());
@@ -1523,9 +1482,13 @@ impl<'a> Qwen35Model<'a> {
             &mut state.rope_cos,
             &mut state.rope_sin,
         );
-        let row_bytes = self.token_embd.dtype.row_bytes(n_embd);
-        let emb_row = &self.token_embd.bytes[tid * row_bytes..(tid + 1) * row_bytes];
-        dequantize_row_bytes(self.token_embd.dtype, emb_row, &mut state.x[..n_embd]);
+        decode_embedding_row(
+            self.token_embd.dtype,
+            self.token_embd.bytes,
+            n_embd,
+            tid,
+            &mut state.x[..n_embd],
+        );
         prof.embed_ns += t0.elapsed().as_nanos() as u64;
 
         for (l, layer) in self.layers.iter().enumerate() {
@@ -1657,9 +1620,7 @@ impl<'a> Qwen35Model<'a> {
                         wv,
                         wo,
                     },
-                    LayerState::Kv {
-                        k_cache, v_cache, ..
-                    },
+                    kv_state @ LayerState::Kv { .. },
                 ) => {
                     let tq = Instant::now();
                     matvec_triple_f32(
@@ -1723,26 +1684,18 @@ impl<'a> Qwen35Model<'a> {
                         &state.rope_sin,
                         RopeType::Neox,
                     );
-                    let cache_off = pos * kv_dim;
-                    (kt.f32_to_f16_slice)(
-                        &state.k_buf[..kv_dim],
-                        &mut k_cache[cache_off..cache_off + kv_dim],
-                    );
-                    (kt.f32_to_f16_slice)(
-                        &state.v_buf[..kv_dim],
-                        &mut v_cache[cache_off..cache_off + kv_dim],
-                    );
-                    gqa_attention_f16_kv_parallel(
+                    kv_state.store_kv_at(kt, pos, &state.k_buf[..kv_dim], &state.v_buf[..kv_dim]);
+                    kv_state.attend_single(
                         pool,
                         kt,
                         &mut state.attn_out[..q_dim],
                         &state.q_buf[..q_dim],
-                        k_cache,
-                        v_cache,
                         self.cfg.n_head,
                         self.cfg.n_head_kv,
                         hd,
-                        pos + 1,
+                        pos,
+                        1.0 / (hd as f32).sqrt(),
+                        None,
                         state.max_ctx,
                         &mut state.scores,
                     );
@@ -1821,6 +1774,7 @@ impl<'a> Qwen35Model<'a> {
             prof.ffn_down_ns += tf2.elapsed().as_nanos() as u64;
         }
 
+        state.last_hidden.copy_from_slice(&state.x[..n_embd]);
         let tlm = Instant::now();
         rms_norm(
             &mut state.xb[..n_embd],
@@ -1843,6 +1797,504 @@ impl<'a> Qwen35Model<'a> {
         prof.n_steps += 1;
 
         Ok(())
+    }
+
+    /// Evaluates a speculative verification window `window_tokens` (`1 <= W <= MAX_SPEC_WINDOW`)
+    /// while keeping `LayerState::DeltaNet` **100% read-only** (`ADR-005` & `ARCHITECTURE.md` §5.2).
+    pub fn verify_speculative(
+        &self,
+        state: &mut Qwen35State,
+        spec_buf: &mut SpecVerifyBuf,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        window_tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<(), ModelError> {
+        let w = window_tokens.len();
+        assert!((1..=MAX_SPEC_WINDOW).contains(&w));
+        let end_pos = start_pos.saturating_add(w);
+        if end_pos > state.max_ctx {
+            return Err(ModelError::ContextOverflow {
+                pos: end_pos - 1,
+                max_ctx: state.max_ctx,
+            });
+        }
+        for &tid in window_tokens {
+            if (tid as usize) >= self.cfg.vocab_size {
+                return Err(ModelError::TokenOutOfRange {
+                    token_id: tid,
+                    vocab_size: self.cfg.vocab_size,
+                });
+            }
+        }
+
+        let n_embd = self.cfg.n_embd;
+        let n_ff = self.cfg.n_ff;
+        let hd = self.cfg.head_dim;
+        let q_dim = self.cfg.n_head * hd;
+        let qg_dim = q_dim * 2;
+        let kv_dim = self.cfg.n_head_kv * hd;
+        let conv_dim = self.cfg.conv_dim();
+        let hk = self.cfg.ssm_n_group;
+        let hv = self.cfg.ssm_dt_rank;
+        let s_dim = self.cfg.ssm_state_size;
+        let k_gdn_dim = hk * s_dim;
+        let v_gdn_dim = self.cfg.ssm_d_inner;
+        let d_conv = self.cfg.ssm_conv_kernel;
+        let vocab = self.cfg.vocab_size;
+
+        for (t, &tok) in window_tokens.iter().enumerate() {
+            decode_embedding_row(
+                self.token_embd.dtype,
+                self.token_embd.bytes,
+                n_embd,
+                tok as usize,
+                &mut state.x[t * n_embd..(t + 1) * n_embd],
+            );
+        }
+
+        let mut gdn_idx = 0usize;
+        for (l, layer) in self.layers.iter().enumerate() {
+            rms_norm_batch_parallel(
+                pool,
+                kt,
+                &mut state.xb[..w * n_embd],
+                &state.x[..w * n_embd],
+                &layer.attn_norm,
+                self.cfg.rms_eps,
+                n_embd,
+                w,
+            );
+
+            match (&layer.attn, &mut state.layers[l]) {
+                (
+                    AttnWeights::Gdn {
+                        wqkv,
+                        wz,
+                        w_alpha,
+                        w_beta,
+                        conv1d,
+                        ssm_a,
+                        ssm_dt_bias,
+                        ssm_norm,
+                        w_out,
+                    },
+                    LayerState::DeltaNet {
+                        state: ssm_state,
+                        conv_hist,
+                    },
+                ) => {
+                    // Read-only verify (`ADR-005`): copy single-layer state into reusable scratch
+                    spec_buf.tmp_ssm_state[..ssm_state.len()].copy_from_slice(ssm_state);
+                    spec_buf.tmp_conv_hist[..conv_hist.len()].copy_from_slice(conv_hist);
+
+                    matmul_pair_f32(
+                        pool,
+                        kt,
+                        wqkv.dtype,
+                        wqkv.bytes,
+                        wqkv.rows,
+                        &mut state.qkv_buf[..w * conv_dim],
+                        wz.dtype,
+                        wz.bytes,
+                        wz.rows,
+                        &mut state.gate_buf[..w * v_gdn_dim],
+                        &state.xb[..w * n_embd],
+                        &mut state.mv_scratch,
+                        n_embd,
+                        w,
+                    );
+                    matmul_pair_f32(
+                        pool,
+                        kt,
+                        w_alpha.dtype,
+                        w_alpha.bytes,
+                        w_alpha.rows,
+                        &mut state.alpha_buf[..w * hv],
+                        w_beta.dtype,
+                        w_beta.bytes,
+                        w_beta.rows,
+                        &mut state.beta_buf[..w * hv],
+                        &state.xb[..w * n_embd],
+                        &mut state.mv_scratch,
+                        n_embd,
+                        w,
+                    );
+
+                    for t in 0..w {
+                        for vh in 0..hv {
+                            let idx = t * hv + vh;
+                            let sp = softplus_f32(state.alpha_buf[idx] + ssm_dt_bias[vh]);
+                            state.g_exp_buf[idx] = (sp * ssm_a[vh]).exp();
+                            state.beta_buf[idx] = sigmoid_f32(state.beta_buf[idx]);
+                        }
+                    }
+
+                    // Stash pre-conv QKV + scalar gates so `commit_speculative` can replay `0..committed`
+                    let qkv_off = gdn_idx * MAX_SPEC_WINDOW * conv_dim;
+                    spec_buf.gdn_qkv_win[qkv_off..qkv_off + w * conv_dim]
+                        .copy_from_slice(&state.qkv_buf[..w * conv_dim]);
+                    let gb_off = gdn_idx * MAX_SPEC_WINDOW * hv;
+                    spec_buf.gdn_g_win[gb_off..gb_off + w * hv]
+                        .copy_from_slice(&state.g_exp_buf[..w * hv]);
+                    spec_buf.gdn_beta_win[gb_off..gb_off + w * hv]
+                        .copy_from_slice(&state.beta_buf[..w * hv]);
+                    gdn_idx += 1;
+
+                    let ch_len = conv_hist.len();
+                    let ss_len = ssm_state.len();
+                    gdn_conv1d_silu_split_parallel(
+                        pool,
+                        kt,
+                        &state.qkv_buf[..w * conv_dim],
+                        &mut spec_buf.tmp_conv_hist[..ch_len],
+                        conv1d,
+                        &mut state.q_buf[..w * k_gdn_dim],
+                        &mut state.k_buf[..w * k_gdn_dim],
+                        &mut state.v_buf[..w * v_gdn_dim],
+                        d_conv,
+                        hk,
+                        s_dim,
+                        v_gdn_dim,
+                        self.cfg.rms_eps,
+                        w,
+                    );
+                    gdn_recurrence_gated_parallel(
+                        pool,
+                        kt,
+                        &state.q_buf[..w * k_gdn_dim],
+                        &state.k_buf[..w * k_gdn_dim],
+                        &state.v_buf[..w * v_gdn_dim],
+                        &state.g_exp_buf[..w * hv],
+                        &state.beta_buf[..w * hv],
+                        &mut spec_buf.tmp_ssm_state[..ss_len],
+                        &mut state.attn_out[..w * v_gdn_dim],
+                        &state.gate_buf[..w * v_gdn_dim],
+                        ssm_norm,
+                        self.cfg.rms_eps,
+                        hk,
+                        hv,
+                        s_dim,
+                        w,
+                    );
+                    matmul_f32(
+                        pool,
+                        kt,
+                        w_out.dtype,
+                        w_out.bytes,
+                        &state.attn_out[..w * v_gdn_dim],
+                        &mut state.mv_scratch,
+                        &mut state.xb2[..w * n_embd],
+                        w_out.rows,
+                        w_out.cols,
+                        w,
+                    );
+                }
+                (
+                    AttnWeights::FullAttn {
+                        q_norm,
+                        k_norm,
+                        wqg,
+                        wk,
+                        wv,
+                        wo,
+                    },
+                    kv_state @ LayerState::Kv { .. },
+                ) => {
+                    matmul_triple_f32(
+                        pool,
+                        kt,
+                        wqg.dtype,
+                        wqg.bytes,
+                        wqg.rows,
+                        &mut state.qkv_buf[..w * qg_dim],
+                        wk.dtype,
+                        wk.bytes,
+                        wk.rows,
+                        &mut state.k_buf[..w * kv_dim],
+                        wv.dtype,
+                        wv.bytes,
+                        wv.rows,
+                        &mut state.v_buf[..w * kv_dim],
+                        &state.xb[..w * n_embd],
+                        &mut state.mv_scratch,
+                        n_embd,
+                        w,
+                    );
+
+                    for t in 0..w {
+                        let pos = start_pos + t;
+                        let qg_t = &state.qkv_buf[t * qg_dim..(t + 1) * qg_dim];
+                        let q_t = &mut state.q_buf[t * q_dim..(t + 1) * q_dim];
+                        let g_t = &mut state.gate_buf[t * q_dim..(t + 1) * q_dim];
+                        let k_t = &mut state.k_buf[t * kv_dim..(t + 1) * kv_dim];
+                        let v_t = &state.v_buf[t * kv_dim..(t + 1) * kv_dim];
+
+                        for h in 0..self.cfg.n_head {
+                            rms_norm(
+                                &mut q_t[h * hd..(h + 1) * hd],
+                                &qg_t[h * 2 * hd..h * 2 * hd + hd],
+                                q_norm,
+                                self.cfg.rms_eps,
+                            );
+                            g_t[h * hd..(h + 1) * hd]
+                                .copy_from_slice(&qg_t[h * 2 * hd + hd..(h + 1) * 2 * hd]);
+                        }
+                        for h in 0..self.cfg.n_head_kv {
+                            let s = h * hd;
+                            let e = s + hd;
+                            rms_norm(&mut state.xb2[..hd], &k_t[s..e], k_norm, self.cfg.rms_eps);
+                            k_t[s..e].copy_from_slice(&state.xb2[..hd]);
+                        }
+                        rope_compute_cos_sin(
+                            &self.rope_inv_freqs,
+                            pos,
+                            &mut state.rope_cos,
+                            &mut state.rope_sin,
+                        );
+                        rope_inplace_tables(
+                            q_t,
+                            self.cfg.n_head,
+                            hd,
+                            self.cfg.rope_dim,
+                            &state.rope_cos,
+                            &state.rope_sin,
+                            RopeType::Neox,
+                        );
+                        rope_inplace_tables(
+                            k_t,
+                            self.cfg.n_head_kv,
+                            hd,
+                            self.cfg.rope_dim,
+                            &state.rope_cos,
+                            &state.rope_sin,
+                            RopeType::Neox,
+                        );
+                        kv_state.store_kv_at(kt, pos, k_t, v_t);
+                    }
+
+                    kv_state.attend_batch(
+                        pool,
+                        kt,
+                        &mut state.attn_out[..w * q_dim],
+                        &state.q_buf[..w * q_dim],
+                        self.cfg.n_head,
+                        self.cfg.n_head_kv,
+                        hd,
+                        start_pos,
+                        w,
+                        1.0 / (hd as f32).sqrt(),
+                        None,
+                        state.max_ctx,
+                        &mut state.scores,
+                    );
+                    for (o, &g) in state.attn_out[..w * q_dim]
+                        .iter_mut()
+                        .zip(state.gate_buf[..w * q_dim].iter())
+                    {
+                        *o *= sigmoid_f32(g);
+                    }
+                    matmul_f32(
+                        pool,
+                        kt,
+                        wo.dtype,
+                        wo.bytes,
+                        &state.attn_out[..w * q_dim],
+                        &mut state.mv_scratch,
+                        &mut state.xb2[..w * n_embd],
+                        wo.rows,
+                        wo.cols,
+                        w,
+                    );
+                }
+                _ => unreachable!("LayerState variant always matches Qwen35LayerWeights::attn"),
+            }
+
+            for i in 0..w * n_embd {
+                state.x[i] += state.xb2[i];
+            }
+
+            rms_norm_batch_parallel(
+                pool,
+                kt,
+                &mut state.xb[..w * n_embd],
+                &state.x[..w * n_embd],
+                &layer.post_attn_norm,
+                self.cfg.rms_eps,
+                n_embd,
+                w,
+            );
+            matmul_pair_f32(
+                pool,
+                kt,
+                layer.w_gate.dtype,
+                layer.w_gate.bytes,
+                layer.w_gate.rows,
+                &mut state.hb[..w * n_ff],
+                layer.w_up.dtype,
+                layer.w_up.bytes,
+                layer.w_up.rows,
+                &mut state.hb2[..w * n_ff],
+                &state.xb[..w * n_embd],
+                &mut state.mv_scratch,
+                n_embd,
+                w,
+            );
+            swiglu_inplace_parallel(pool, &mut state.hb[..w * n_ff], &state.hb2[..w * n_ff]);
+            matmul_f32(
+                pool,
+                kt,
+                layer.w_down.dtype,
+                layer.w_down.bytes,
+                &state.hb[..w * n_ff],
+                &mut state.mv_scratch,
+                &mut state.xb2[..w * n_embd],
+                layer.w_down.rows,
+                layer.w_down.cols,
+                w,
+            );
+            for i in 0..w * n_embd {
+                state.x[i] += state.xb2[i];
+            }
+        }
+
+        spec_buf.last_window_len = w;
+        spec_buf.hidden_win[..w * n_embd].copy_from_slice(&state.x[..w * n_embd]);
+        rms_norm_batch_parallel(
+            pool,
+            kt,
+            &mut spec_buf.norm_win[..w * n_embd],
+            &spec_buf.hidden_win[..w * n_embd],
+            &self.output_norm,
+            self.cfg.rms_eps,
+            n_embd,
+            w,
+        );
+        matmul_f32(
+            pool,
+            kt,
+            self.output.dtype,
+            self.output.bytes,
+            &spec_buf.norm_win[..w * n_embd],
+            &mut state.mv_scratch,
+            &mut spec_buf.logits_win[..w * vocab],
+            self.output.rows,
+            self.output.cols,
+            w,
+        );
+        Ok(())
+    }
+
+    /// Commits `committed` (`1 <= committed <= W`) tokens from `verify_speculative` by replaying
+    /// only the accepted prefix `0..committed` into each `LayerState::DeltaNet` (`ADR-005`).
+    pub fn commit_speculative(
+        &self,
+        state: &mut Qwen35State,
+        spec_buf: &mut SpecVerifyBuf,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        committed: usize,
+    ) {
+        assert!((1..=spec_buf.last_window_len).contains(&committed));
+        let conv_dim = self.cfg.conv_dim();
+        let hk = self.cfg.ssm_n_group;
+        let hv = self.cfg.ssm_dt_rank;
+        let s_dim = self.cfg.ssm_state_size;
+        let k_gdn_dim = hk * s_dim;
+        let v_gdn_dim = self.cfg.ssm_d_inner;
+        let d_conv = self.cfg.ssm_conv_kernel;
+
+        let mut gdn_idx = 0usize;
+        for (layer, ls) in self.layers.iter().zip(state.layers.iter_mut()) {
+            if let (
+                AttnWeights::Gdn { conv1d, .. },
+                LayerState::DeltaNet {
+                    state: ssm_state,
+                    conv_hist,
+                },
+            ) = (&layer.attn, ls)
+            {
+                let qkv_off = gdn_idx * MAX_SPEC_WINDOW * conv_dim;
+                let gb_off = gdn_idx * MAX_SPEC_WINDOW * hv;
+                gdn_conv1d_silu_split_parallel(
+                    pool,
+                    kt,
+                    &spec_buf.gdn_qkv_win[qkv_off..qkv_off + committed * conv_dim],
+                    conv_hist,
+                    conv1d,
+                    &mut spec_buf.replay_q[..committed * k_gdn_dim],
+                    &mut spec_buf.replay_k[..committed * k_gdn_dim],
+                    &mut spec_buf.replay_v[..committed * v_gdn_dim],
+                    d_conv,
+                    hk,
+                    s_dim,
+                    v_gdn_dim,
+                    self.cfg.rms_eps,
+                    committed,
+                );
+                gdn_recurrence_parallel(
+                    pool,
+                    &spec_buf.replay_q[..committed * k_gdn_dim],
+                    &spec_buf.replay_k[..committed * k_gdn_dim],
+                    &spec_buf.replay_v[..committed * v_gdn_dim],
+                    &spec_buf.gdn_g_win[gb_off..gb_off + committed * hv],
+                    &spec_buf.gdn_beta_win[gb_off..gb_off + committed * hv],
+                    ssm_state,
+                    &mut spec_buf.replay_out[..committed * v_gdn_dim],
+                    hk,
+                    hv,
+                    s_dim,
+                    committed,
+                );
+                gdn_idx += 1;
+            }
+        }
+
+        let idx = committed - 1;
+        state
+            .logits
+            .copy_from_slice(spec_buf.logits_at(idx, self.cfg.vocab_size));
+        state
+            .last_hidden
+            .copy_from_slice(spec_buf.hidden_at(idx, self.cfg.n_embd));
+    }
+
+    pub fn project_logits_from_hidden(
+        &self,
+        state: &mut Qwen35State,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        hidden: &[f32],
+        out_logits: &mut [f32],
+    ) {
+        let n_embd = self.cfg.n_embd;
+        rms_norm(
+            &mut state.xb[..n_embd],
+            hidden,
+            &self.output_norm,
+            self.cfg.rms_eps,
+        );
+        matvec_f32(
+            pool,
+            kt,
+            self.output.dtype,
+            self.output.bytes,
+            &state.xb[..n_embd],
+            &mut state.mv_scratch,
+            out_logits,
+            self.output.rows,
+            self.output.cols,
+        );
+    }
+
+    pub fn embed_token(&self, token_id: u32, out_emb: &mut [f32]) {
+        decode_embedding_row(
+            self.token_embd.dtype,
+            self.token_embd.bytes,
+            self.cfg.n_embd,
+            token_id as usize,
+            out_emb,
+        );
     }
 }
 

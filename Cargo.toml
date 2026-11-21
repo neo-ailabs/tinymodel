@@ -5,6 +5,7 @@ members = [
     "crates/tm-gguf",
     "crates/tm-cpu",
     "crates/tm-metal",
+    "crates/tm-vulkan",
     "crates/tm-tokenizer",
     "crates/tm-models",
     "crates/tm-runtime",

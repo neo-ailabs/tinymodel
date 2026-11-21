@@ -6,8 +6,8 @@
 
 use core::arch::aarch64::*;
 use tm_core::{
-    BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, QK8_0, QK8_1,
-    unpack_q5k_scales_mins,
+    BlockQ4_0, BlockQ4_0x4, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, QK_K,
+    QK8_0, QK8_1, unpack_q5k_scales_mins,
 };
 
 use super::asm::{cvt_f16x8_to_f32x4x2, cvt_f32x4x2_to_f16x8, f16_to_f32_hw, f32_to_f16_hw};
@@ -57,48 +57,28 @@ unsafe fn block_dot_v80(
 pub unsafe fn vec_dot_q4_0_q8_0(x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
     debug_assert_eq!(x.len(), y.len());
     let nb = x.len();
-    let mut ib = 0usize;
 
     // SAFETY: All pointer arithmetic stays strictly within `0..nb`.
     unsafe {
         let m4b = vdupq_n_u8(0x0F);
         let s8b = vdupq_n_s8(8);
-        let mut sumv0 = vdupq_n_f32(0.0);
-        let mut sumv1 = vdupq_n_f32(0.0);
+        let mut sumf = 0.0f32;
 
-        while ib + 1 < nb {
-            let x0 = x.get_unchecked(ib);
-            let x1 = x.get_unchecked(ib + 1);
-            let y0 = y.get_unchecked(ib);
-            let y1 = y.get_unchecked(ib + 1);
-
-            let p0 = block_dot_v80(x0, y0, m4b, s8b);
-            let p1 = block_dot_v80(x1, y1, m4b, s8b);
-
-            let d0 = f16_to_f32_hw(x0.d) * f16_to_f32_hw(y0.d);
-            let d1 = f16_to_f32_hw(x1.d) * f16_to_f32_hw(y1.d);
-
-            sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p0), d0);
-            sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(p1), d1);
-
-            ib += 2;
-        }
-
-        let mut sumf = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
-
-        if ib < nb {
+        for ib in 0..nb {
             let x0 = x.get_unchecked(ib);
             let y0 = y.get_unchecked(ib);
             let p0 = block_dot_v80(x0, y0, m4b, s8b);
             let d0 = f16_to_f32_hw(x0.d) * f16_to_f32_hw(y0.d);
-            sumf += (vaddvq_s32(p0) as f32) * d0;
+            sumf = (vaddvq_s32(p0) as f32).mul_add(d0, sumf);
         }
 
         sumf
     }
 }
 
-/// 4-row unrolled ARMv8.0 NEON GEMV: loads each `x` block once across 4 weight rows.
+/// 4-row unrolled ARMv8.0 NEON GEMV: loads each `x` block once across 4 weight rows
+/// and reduces each block's 32 int8 products in exact integer arithmetic before `vfmaq_f32`,
+/// matching `generic`, `dotprod`, `i8mm`, and `gemv_q4_0x4_q8_0` **bit-for-bit** (`to_bits()`).
 ///
 /// # Safety
 /// Caller must ensure `w.len() == rows * cols_blocks`, `x.len() == cols_blocks`,
@@ -127,10 +107,7 @@ pub unsafe fn gemv_q4_0_q8_0(
             let w2 = &w[(r + 2) * cols_blocks..(r + 3) * cols_blocks];
             let w3 = &w[(r + 3) * cols_blocks..(r + 4) * cols_blocks];
 
-            let mut acc0 = vdupq_n_f32(0.0);
-            let mut acc1 = vdupq_n_f32(0.0);
-            let mut acc2 = vdupq_n_f32(0.0);
-            let mut acc3 = vdupq_n_f32(0.0);
+            let mut acc4 = vdupq_n_f32(0.0);
 
             for ib in 0..cols_blocks {
                 let by = x.get_unchecked(ib);
@@ -146,16 +123,26 @@ pub unsafe fn gemv_q4_0_q8_0(
                 let p2 = block_dot_v80(b2, by, m4b, s8b);
                 let p3 = block_dot_v80(b3, by, m4b, s8b);
 
-                acc0 = vmlaq_n_f32(acc0, vcvtq_f32_s32(p0), f16_to_f32_hw(b0.d) * dy);
-                acc1 = vmlaq_n_f32(acc1, vcvtq_f32_s32(p1), f16_to_f32_hw(b1.d) * dy);
-                acc2 = vmlaq_n_f32(acc2, vcvtq_f32_s32(p2), f16_to_f32_hw(b2.d) * dy);
-                acc3 = vmlaq_n_f32(acc3, vcvtq_f32_s32(p3), f16_to_f32_hw(b3.d) * dy);
+                let sumi = [
+                    vaddvq_s32(p0),
+                    vaddvq_s32(p1),
+                    vaddvq_s32(p2),
+                    vaddvq_s32(p3),
+                ];
+                let scales = [
+                    f16_to_f32_hw(b0.d) * dy,
+                    f16_to_f32_hw(b1.d) * dy,
+                    f16_to_f32_hw(b2.d) * dy,
+                    f16_to_f32_hw(b3.d) * dy,
+                ];
+                acc4 = vfmaq_f32(
+                    acc4,
+                    vcvtq_f32_s32(vld1q_s32(sumi.as_ptr())),
+                    vld1q_f32(scales.as_ptr()),
+                );
             }
 
-            *out.get_unchecked_mut(r) = vaddvq_f32(acc0);
-            *out.get_unchecked_mut(r + 1) = vaddvq_f32(acc1);
-            *out.get_unchecked_mut(r + 2) = vaddvq_f32(acc2);
-            *out.get_unchecked_mut(r + 3) = vaddvq_f32(acc3);
+            vst1q_f32(out.as_mut_ptr().add(r), acc4);
             r += 4;
         }
 
@@ -1383,6 +1370,346 @@ pub unsafe fn gdn_recurrence_head(
             }
 
             *op.add(j) = sum_oq * scale;
+        }
+    }
+}
+
+/// Base ARMv8.0 NEON `gemv_q4_0x4_q8_0` (Pi Zero 2W / Pi 4B).
+///
+/// Matches `generic::gemv_q4_0x4_q8_0` **bit-for-bit** (`to_bits()`) across all scales.
+///
+/// # Safety
+/// Caller must ensure NEON is available and dimensions match.
+#[target_feature(enable = "neon")]
+pub unsafe fn gemv_q4_0x4_q8_0(
+    w: &[BlockQ4_0x4],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+) {
+    assert_eq!(rows % 4, 0);
+    assert_eq!(w.len(), (rows / 4) * cols_blocks);
+    assert_eq!(x.len(), cols_blocks);
+    assert_eq!(out.len(), rows);
+
+    // SAFETY: All group and block indices stay strictly within verified slice bounds.
+    unsafe {
+        let m4b = vdupq_n_u8(0x0F);
+        let s8b = vdupq_n_s8(8);
+
+        for rg in 0..(rows / 4) {
+            let w_group = &w[rg * cols_blocks..(rg + 1) * cols_blocks];
+            let mut acc4 = vdupq_n_f32(0.0);
+
+            for ib in 0..cols_blocks {
+                let sb = w_group.get_unchecked(ib);
+                let by = x.get_unchecked(ib);
+                let yl = vld1q_s8(by.qs.as_ptr());
+                let yh = vld1q_s8(by.qs.as_ptr().add(16));
+                let y0 = vget_low_s8(yl);
+                let y1 = vget_high_s8(yl);
+                let y2 = vget_low_s8(yh);
+                let y3 = vget_high_s8(yh);
+
+                let v0 = vld1q_u8(sb.qs.as_ptr());
+                let v1 = vld1q_u8(sb.qs.as_ptr().add(16));
+                let v2 = vld1q_u8(sb.qs.as_ptr().add(32));
+                let v3 = vld1q_u8(sb.qs.as_ptr().add(48));
+
+                let la0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v0, m4b)), s8b);
+                let la2 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v0)), s8b);
+                let la1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v1, m4b)), s8b);
+                let la3 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v1)), s8b);
+
+                let lb0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v2, m4b)), s8b);
+                let lb2 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v2)), s8b);
+                let lb1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v3, m4b)), s8b);
+                let lb3 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v3)), s8b);
+
+                // Max per-lane i16 magnitude: 4 * 8 * 128 = 4096 <= 32767 (zero overflow).
+                let p0 = vmlal_s8(
+                    vmlal_s8(
+                        vmlal_s8(vmull_s8(vget_low_s8(la0), y0), vget_low_s8(la1), y1),
+                        vget_low_s8(la2),
+                        y2,
+                    ),
+                    vget_low_s8(la3),
+                    y3,
+                );
+                let p1 = vmlal_s8(
+                    vmlal_s8(
+                        vmlal_s8(vmull_s8(vget_high_s8(la0), y0), vget_high_s8(la1), y1),
+                        vget_high_s8(la2),
+                        y2,
+                    ),
+                    vget_high_s8(la3),
+                    y3,
+                );
+                let p2 = vmlal_s8(
+                    vmlal_s8(
+                        vmlal_s8(vmull_s8(vget_low_s8(lb0), y0), vget_low_s8(lb1), y1),
+                        vget_low_s8(lb2),
+                        y2,
+                    ),
+                    vget_low_s8(lb3),
+                    y3,
+                );
+                let p3 = vmlal_s8(
+                    vmlal_s8(
+                        vmlal_s8(vmull_s8(vget_high_s8(lb0), y0), vget_high_s8(lb1), y1),
+                        vget_high_s8(lb2),
+                        y2,
+                    ),
+                    vget_high_s8(lb3),
+                    y3,
+                );
+
+                let sumi = [
+                    vaddlvq_s16(p0),
+                    vaddlvq_s16(p1),
+                    vaddlvq_s16(p2),
+                    vaddlvq_s16(p3),
+                ];
+                let dy = f16_to_f32_hw(by.d);
+                let scales = [
+                    f16_to_f32_hw(sb.d[0]) * dy,
+                    f16_to_f32_hw(sb.d[1]) * dy,
+                    f16_to_f32_hw(sb.d[2]) * dy,
+                    f16_to_f32_hw(sb.d[3]) * dy,
+                ];
+                acc4 = vfmaq_f32(
+                    acc4,
+                    vcvtq_f32_s32(vld1q_s32(sumi.as_ptr())),
+                    vld1q_f32(scales.as_ptr()),
+                );
+            }
+
+            vst1q_f32(out.as_mut_ptr().add(rg * 4), acc4);
+        }
+    }
+}
+
+/// Base ARMv8.0 NEON multi-token GEMM for `BlockQ4_0x4 x BlockQ8_0`.
+///
+/// # Safety
+/// Caller must ensure NEON is available and dimensions match.
+#[target_feature(enable = "neon")]
+pub unsafe fn gemm_q4_0x4_q8_0(
+    w: &[BlockQ4_0x4],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+    n_tokens: usize,
+) {
+    assert_eq!(rows % 4, 0);
+    assert_eq!(w.len(), (rows / 4) * cols_blocks);
+    assert_eq!(x.len(), n_tokens * cols_blocks);
+    assert_eq!(out.len(), n_tokens * rows);
+
+    // SAFETY: Verified slice lengths above.
+    unsafe {
+        for t in 0..n_tokens {
+            gemv_q4_0x4_q8_0(
+                w,
+                &x[t * cols_blocks..(t + 1) * cols_blocks],
+                &mut out[t * rows..(t + 1) * rows],
+                rows,
+                cols_blocks,
+            );
+        }
+    }
+}
+
+/// Base ARMv8.0 NEON multi-token GEMM for `Q8_0 x Q8_0`.
+///
+/// # Safety
+/// Caller must ensure NEON is available and dimensions match.
+#[target_feature(enable = "neon")]
+pub unsafe fn gemm_q8_0_q8_0(
+    w: &[BlockQ8_0],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+    n_tokens: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), n_tokens * cols_blocks);
+    assert_eq!(out.len(), n_tokens * rows);
+    // SAFETY: Verified slice lengths above.
+    unsafe {
+        for t in 0..n_tokens {
+            gemv_q8_0_q8_0(
+                w,
+                &x[t * cols_blocks..(t + 1) * cols_blocks],
+                &mut out[t * rows..(t + 1) * rows],
+                rows,
+                cols_blocks,
+            );
+        }
+    }
+}
+
+/// Base ARMv8.0 NEON multi-token GEMM for `Q6_K x Q8_K`.
+///
+/// # Safety
+/// Caller must ensure NEON is available and dimensions match.
+#[target_feature(enable = "neon")]
+pub unsafe fn gemm_q6_k_q8_k(
+    w: &[BlockQ6K],
+    x: &[BlockQ8K],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+    n_tokens: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), n_tokens * cols_blocks);
+    assert_eq!(out.len(), n_tokens * rows);
+    // SAFETY: Verified slice lengths above.
+    unsafe {
+        for t in 0..n_tokens {
+            gemv_q6_k_q8_k(
+                w,
+                &x[t * cols_blocks..(t + 1) * cols_blocks],
+                &mut out[t * rows..(t + 1) * rows],
+                rows,
+                cols_blocks,
+            );
+        }
+    }
+}
+
+/// Base ARMv8.0 NEON `f32 -> BlockQ8K` quantization, bit-for-bit identical to `tm_core::quantize_row_q8_k`.
+///
+/// # Safety
+/// Caller must ensure NEON is available and `src.len() == dst.len() * 256`.
+#[target_feature(enable = "neon")]
+pub unsafe fn quantize_q8_k(src: &[f32], dst: &mut [BlockQ8K]) {
+    assert_eq!(src.len(), dst.len() * QK_K);
+    // SAFETY: Each iteration reads 256 `f32`s and writes 256 `i8`s + 16 `i16`s strictly in bounds.
+    unsafe {
+        let sp_base = src.as_ptr();
+        for (ib, block) in dst.iter_mut().enumerate() {
+            let sp = sp_base.add(ib * QK_K);
+
+            // Fast vectorized max-abs reduction across 256 elements
+            let mut max_vec = vdupq_n_f32(0.0);
+            for c in 0..(QK_K / 16) {
+                let p = sp.add(c * 16);
+                let a01 = vmaxq_f32(vabsq_f32(vld1q_f32(p)), vabsq_f32(vld1q_f32(p.add(4))));
+                let a23 = vmaxq_f32(
+                    vabsq_f32(vld1q_f32(p.add(8))),
+                    vabsq_f32(vld1q_f32(p.add(12))),
+                );
+                max_vec = vmaxq_f32(max_vec, vmaxq_f32(a01, a23));
+            }
+            let amax = vmaxvq_f32(max_vec);
+            if amax == 0.0 {
+                block.d = 0.0;
+                block.qs = [0; QK_K];
+                block.bsums = [0; QK_K / 16];
+                continue;
+            }
+
+            // Locate first signed value attaining `amax` (exact sign match with `tm_core::quantize_row_q8_k`)
+            let mut max_v = 0.0f32;
+            let slice = core::slice::from_raw_parts(sp, QK_K);
+            for &v in slice {
+                if v.abs() == amax {
+                    max_v = v;
+                    break;
+                }
+            }
+
+            let iscale = -127.0 / max_v;
+            let viscale = vdupq_n_f32(iscale);
+            let qp = block.qs.as_mut_ptr();
+
+            for j in 0..(QK_K / 16) {
+                let p = sp.add(j * 16);
+                let i0 = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p), viscale));
+                let i1 = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p.add(4)), viscale));
+                let i2 = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p.add(8)), viscale));
+                let i3 = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p.add(12)), viscale));
+
+                let s01 = vcombine_s16(vqmovn_s32(i0), vqmovn_s32(i1));
+                let s23 = vcombine_s16(vqmovn_s32(i2), vqmovn_s32(i3));
+                let q16 = vcombine_s8(vqmovn_s16(s01), vqmovn_s16(s23));
+                vst1q_s8(qp.add(j * 16), q16);
+                block.bsums[j] = vaddlvq_s16(vpaddlq_s8(q16)) as i16;
+            }
+            block.d = 1.0 / iscale;
+        }
+    }
+}
+
+/// Base ARMv8.0 NEON `f32 x BlockQ8_0` dot product (for `Q8_0` KV cache attention),
+/// matching `generic::dot_f32_q8_0` **bit-for-bit** (`to_bits()`).
+///
+/// # Safety
+/// Caller must ensure NEON is available and `q.len() == k_q8.len() * 32`.
+#[target_feature(enable = "neon")]
+pub unsafe fn dot_f32_q8_0(q: &[f32], k_q8: &[BlockQ8_0]) -> f32 {
+    assert_eq!(q.len(), k_q8.len() * QK8_0);
+    // SAFETY: `q` has `k_q8.len() * 32` elements; all 32-element block loads are in bounds.
+    unsafe {
+        let qp_base = q.as_ptr();
+        let mut total = 0.0f32;
+
+        for (ib, blk) in k_q8.iter().enumerate() {
+            let qp = qp_base.add(ib * 32);
+            let kp = blk.qs.as_ptr();
+            let mut acc0 = vdupq_n_f32(0.0);
+            let mut acc1 = vdupq_n_f32(0.0);
+
+            for c in 0..4 {
+                let off = c * 8;
+                let k8 = vld1_s8(kp.add(off));
+                let k16 = vmovl_s8(k8);
+                let kf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(k16)));
+                let kf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(k16)));
+                let q0 = vld1q_f32(qp.add(off));
+                let q1 = vld1q_f32(qp.add(off + 4));
+                acc0 = vfmaq_f32(acc0, kf0, q0);
+                acc1 = vfmaq_f32(acc1, kf1, q1);
+            }
+
+            let bsum = hsum_pairwise_8wide_f32(acc0, acc1);
+            total = bsum.mul_add(f16_to_f32_hw(blk.d), total);
+        }
+        total
+    }
+}
+
+/// Base ARMv8.0 NEON `out[d] += w * dequant(v_q8[d])` (for `Q8_0` V cache aggregation),
+/// matching `generic::axpy_f32_q8_0` **bit-for-bit** (`to_bits()`).
+///
+/// # Safety
+/// Caller must ensure NEON is available and `out.len() == v_q8.len() * 32`.
+#[target_feature(enable = "neon")]
+pub unsafe fn axpy_f32_q8_0(out: &mut [f32], w: f32, v_q8: &[BlockQ8_0]) {
+    assert_eq!(out.len(), v_q8.len() * QK8_0);
+    // SAFETY: `out` has `v_q8.len() * 32` elements; all 32-element block loads/stores are in bounds.
+    unsafe {
+        let op_base = out.as_mut_ptr();
+        for (ib, blk) in v_q8.iter().enumerate() {
+            let vscale = vdupq_n_f32(w * f16_to_f32_hw(blk.d));
+            let op = op_base.add(ib * 32);
+            let vp = blk.qs.as_ptr();
+            for c in 0..4 {
+                let off = c * 8;
+                let v8 = vld1_s8(vp.add(off));
+                let v16 = vmovl_s8(v8);
+                let vf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(v16)));
+                let vf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(v16)));
+                let o0 = vld1q_f32(op.add(off));
+                let o1 = vld1q_f32(op.add(off + 4));
+                vst1q_f32(op.add(off), vfmaq_f32(o0, vf0, vscale));
+                vst1q_f32(op.add(off + 4), vfmaq_f32(o1, vf1, vscale));
+            }
         }
     }
 }

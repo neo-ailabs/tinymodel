@@ -4,11 +4,12 @@
 
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 use thiserror::Error;
-use tm_core::DType;
+use tm_core::{DType, QK4_0, repack_q4_0_bytes_to_q4_0x4};
 
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const DEFAULT_ALIGNMENT: usize = 32;
@@ -251,6 +252,8 @@ pub struct TensorInfo {
     pub offset: usize,
     /// Total size in bytes of this tensor's raw data.
     pub byte_len: usize,
+    /// Byte offset of the 4-byte `ggml_type` field inside the GGUF header (for zero-overhead offline conversion).
+    pub header_type_offset: usize,
 }
 
 enum Backing {
@@ -375,6 +378,7 @@ impl GgufFile {
                 })?;
                 dims.push(d);
             }
+            let header_type_offset = r.pos;
             let ggml_type = r.read_u32()?;
             let offset = usize::try_from(r.read_u64()?).map_err(|_| GgufError::UnexpectedEof {
                 path: path_str.clone(),
@@ -418,6 +422,7 @@ impl GgufFile {
                 dtype,
                 offset,
                 byte_len,
+                header_type_offset,
             });
         }
 
@@ -623,6 +628,131 @@ impl GgufFile {
         }
         Ok((info, bytes))
     }
+
+    /// Streams this GGUF file to `dst_path`, repacking eligible 2D `Q4_0` projection matrices
+    /// (`rows % 4 == 0`, `cols % 32 == 0`) into zero-overhead `DType::Q4_0x4` (`Q4_0_4x8`)
+    /// while preserving exact file size, alignment, metadata, and zero-copy `mmap` compatibility (`F-04`).
+    pub fn convert_to_q4_0x4<P: AsRef<Path>>(
+        &self,
+        dst_path: P,
+    ) -> Result<ConvertStats, GgufError> {
+        let out_path = dst_path.as_ref();
+        let out_str = out_path.display().to_string();
+        let raw = self.backing.as_slice();
+        let has_separate_output = self.tensors.contains_key("output.weight");
+
+        // 1. Copy header `[0..data_offset)` and patch 4-byte `ggml_type` on eligible tensors.
+        let mut header = raw[..self.data_offset].to_vec();
+        let mut repacked_spans: Vec<(usize, usize, usize, usize)> = Vec::new(); // (file_start, file_end, rows, cols)
+        let mut repacked_tensors = 0usize;
+        let mut repacked_bytes = 0usize;
+
+        for name in &self.tensor_order {
+            let info = &self.tensors[name];
+            if info.dtype != DType::Q4_0 || info.dims.len() != 2 {
+                continue;
+            }
+            if info.name == "per_layer_token_embd.weight" {
+                continue;
+            }
+            if info.name == "token_embd.weight" && has_separate_output {
+                continue;
+            }
+            let cols = info.dims[0];
+            let rows = info.dims[1];
+            if !cols.is_multiple_of(QK4_0) || !rows.is_multiple_of(4) {
+                continue;
+            }
+
+            let new_type = DType::Q4_0x4.to_ggml_type().to_le_bytes();
+            let off = info.header_type_offset;
+            header[off..off + 4].copy_from_slice(&new_type);
+
+            let f_start = self.data_offset + info.offset;
+            let f_end = f_start + info.byte_len;
+            repacked_spans.push((f_start, f_end, rows, cols));
+            repacked_tensors += 1;
+            repacked_bytes += info.byte_len;
+        }
+
+        repacked_spans.sort_by_key(|s| s.0);
+
+        let file = File::create(out_path).map_err(|source| GgufError::Io {
+            path: out_str.clone(),
+            source,
+        })?;
+        let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+        writer.write_all(&header).map_err(|source| GgufError::Io {
+            path: out_str.clone(),
+            source,
+        })?;
+
+        // 2. Stream data section `[data_offset..raw.len())`, repacking matched tensors row-group by row-group
+        //    with a tiny reusable scratch buffer (< 256 KiB peak heap).
+        let mut cursor = self.data_offset;
+        let mut group_scratch: Vec<u8> = Vec::new();
+        for (f_start, f_end, rows, cols) in repacked_spans {
+            if cursor < f_start {
+                writer
+                    .write_all(&raw[cursor..f_start])
+                    .map_err(|source| GgufError::Io {
+                        path: out_str.clone(),
+                        source,
+                    })?;
+            }
+            let cols_blocks = cols / QK4_0;
+            let group_bytes = cols_blocks * 72;
+            if group_scratch.len() < group_bytes {
+                group_scratch.resize(group_bytes, 0);
+            }
+            let src_tensor = &raw[f_start..f_end];
+            for rg in 0..(rows / 4) {
+                let s0 = rg * group_bytes;
+                repack_q4_0_bytes_to_q4_0x4(
+                    &src_tensor[s0..s0 + group_bytes],
+                    &mut group_scratch[..group_bytes],
+                    4,
+                    cols,
+                );
+                writer
+                    .write_all(&group_scratch[..group_bytes])
+                    .map_err(|source| GgufError::Io {
+                        path: out_str.clone(),
+                        source,
+                    })?;
+            }
+            cursor = f_end;
+        }
+
+        if cursor < raw.len() {
+            writer
+                .write_all(&raw[cursor..])
+                .map_err(|source| GgufError::Io {
+                    path: out_str.clone(),
+                    source,
+                })?;
+        }
+        writer.flush().map_err(|source| GgufError::Io {
+            path: out_str,
+            source,
+        })?;
+
+        Ok(ConvertStats {
+            total_tensors: self.tensor_order.len(),
+            repacked_tensors,
+            repacked_bytes,
+            total_file_bytes: raw.len(),
+        })
+    }
+}
+
+/// Summary statistics returned by `GgufFile::convert_to_q4_0x4`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConvertStats {
+    pub total_tensors: usize,
+    pub repacked_tensors: usize,
+    pub repacked_bytes: usize,
+    pub total_file_bytes: usize,
 }
 
 struct Cursor<'a> {

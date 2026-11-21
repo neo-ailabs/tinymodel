@@ -11,17 +11,17 @@
 //!   table is NEVER scanned or unpacked upfront — only active token row(s) are read);
 //! - State safety (`Rule #6`): validates all context bounds and token IDs BEFORE mutating `LayerState`.
 
-use tm_core::{DType, dequantize_row_bytes};
+use tm_core::{DType, KvType, dequantize_row_bytes};
 use tm_cpu::{
     KernelTable, MAX_CPU_BATCH, MatvecScratch, RopeType, ThreadPool, geglu_inplace_parallel,
-    gelu_tanh_f32, gqa_attention_f16_kv_ext_batch_parallel, gqa_attention_f16_kv_ext_parallel,
-    matmul_f32, matvec_f32, matvec_pair_f32, matvec_triple_f32, rms_norm, rms_norm_batch_parallel,
-    rms_norm_unit_inplace, rope_compute_cos_sin, rope_inplace_tables, softcap_inplace_parallel,
+    gelu_tanh_f32, matmul_f32, matmul_pair_f32, matmul_triple_f32, matvec_f32, matvec_pair_f32,
+    matvec_triple_f32, rms_norm, rms_norm_batch_parallel, rms_norm_unit_inplace,
+    rope_compute_cos_sin, rope_inplace_tables, softcap_inplace_parallel,
 };
 use tm_gguf::{GgufError, GgufFile};
 
 use crate::llama::ModelError;
-use crate::state::LayerState;
+use crate::state::{LayerState, MAX_SPEC_WINDOW, SpecVerifyBuf, decode_embedding_row};
 
 /// Hyperparameters for `general.architecture == "gemma4"`.
 #[derive(Debug, Clone)]
@@ -164,11 +164,16 @@ pub struct Gemma4State {
     rope_sin_swa: Vec<f32>,
     scores: Vec<f32>,
     logits: Vec<f32>,
+    pub last_hidden: Vec<f32>,
     mv_scratch: MatvecScratch,
 }
 
 impl Gemma4State {
     pub fn new(model: &Gemma4Model<'_>, max_ctx: usize) -> Self {
+        Self::new_with_kv_type(model, max_ctx, KvType::F16)
+    }
+
+    pub fn new_with_kv_type(model: &Gemma4Model<'_>, max_ctx: usize, kv_type: KvType) -> Self {
         let cfg = &model.cfg;
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for il in 0..cfg.n_layers {
@@ -180,12 +185,7 @@ impl Gemma4State {
                 None
             };
             if cfg.has_kv(il) {
-                layers.push(LayerState::Kv {
-                    k_cache: vec![0u16; max_ctx * kv_dim],
-                    v_cache: vec![0u16; max_ctx * kv_dim],
-                    kv_dim,
-                    window,
-                });
+                layers.push(LayerState::new_kv(max_ctx, kv_dim, window, kv_type));
             } else {
                 layers.push(LayerState::SharedKv {
                     source_layer: cfg.kv_source[il],
@@ -227,6 +227,7 @@ impl Gemma4State {
             rope_sin_swa: vec![0.0; cfg.rope_dim_swa / 2],
             scores: vec![0.0; cfg.n_head * max_ctx],
             logits: vec![0.0; cfg.vocab_size],
+            last_hidden: vec![0.0; cfg.n_embd],
             mv_scratch: MatvecScratch::new(max_cols),
         }
     }
@@ -657,10 +658,14 @@ impl<'a> Gemma4Model<'a> {
         let ple_dim = self.cfg.n_embd_per_layer;
         let ple_total = self.cfg.n_layers * ple_dim;
 
-        // 1.Scaled input token embedding (`sqrt(n_embd)`)
-        let emb_row_bytes = self.token_embd.dtype.row_bytes(n_embd);
-        let emb_row = &self.token_embd.bytes[tid * emb_row_bytes..(tid + 1) * emb_row_bytes];
-        dequantize_row_bytes(self.token_embd.dtype, emb_row, &mut state.x[..n_embd]);
+        // 1. Scaled input token embedding (`sqrt(n_embd)`)
+        decode_embedding_row(
+            self.token_embd.dtype,
+            self.token_embd.bytes,
+            n_embd,
+            tid,
+            &mut state.x[..n_embd],
+        );
         let emb_scale = (n_embd as f32).sqrt();
         for v in &mut state.x[..n_embd] {
             *v *= emb_scale;
@@ -668,11 +673,11 @@ impl<'a> Gemma4Model<'a> {
 
         // 2. Per-Layer Embeddings (PLE) on-demand row read + projection (`gemma4.cpp:189-198 & 537-560`)
         if let Some(ref ple_g) = self.ple_global {
-            let ple_row_bytes = ple_g.tok_embd.dtype.row_bytes(ple_total);
-            let ple_row = &ple_g.tok_embd.bytes[tid * ple_row_bytes..(tid + 1) * ple_row_bytes];
-            dequantize_row_bytes(
+            decode_embedding_row(
                 ple_g.tok_embd.dtype,
-                ple_row,
+                ple_g.tok_embd.bytes,
+                ple_total,
+                tid,
                 &mut state.ple_inputs[..ple_total],
             );
             let tok_ple_scale = (ple_dim as f32).sqrt() / 2.0f32.sqrt();
@@ -859,36 +864,21 @@ impl<'a> Gemma4Model<'a> {
                     RopeType::Neox,
                 );
 
-                if let LayerState::Kv {
-                    ref mut k_cache,
-                    ref mut v_cache,
-                    ..
-                } = state.layers[il]
-                {
-                    let off = pos * kv_dim;
-                    (kt.f32_to_f16_slice)(&state.k_buf[..kv_dim], &mut k_cache[off..off + kv_dim]);
-                    (kt.f32_to_f16_slice)(&state.v_buf[..kv_dim], &mut v_cache[off..off + kv_dim]);
-                }
+                state.layers[il].store_kv_at(
+                    kt,
+                    pos,
+                    &state.k_buf[..kv_dim],
+                    &state.v_buf[..kv_dim],
+                );
             }
 
             let kv_src = self.cfg.kv_source[il];
-            let (k_cache_ref, v_cache_ref) = match state.layers[kv_src] {
-                LayerState::Kv {
-                    ref k_cache,
-                    ref v_cache,
-                    ..
-                } => (k_cache.as_slice(), v_cache.as_slice()),
-                _ => unreachable!("kv_source always points to a LayerState::Kv layer"),
-            };
-
             // Gemma 4 uses `f_attention_scale = 1.0` (`gemma4.cpp:12`)
-            gqa_attention_f16_kv_ext_parallel(
+            state.layers[kv_src].attend_single(
                 pool,
                 kt,
                 &mut state.attn_out[..q_dim],
                 &state.q_buf[..q_dim],
-                k_cache_ref,
-                v_cache_ref,
                 self.cfg.n_head,
                 self.cfg.n_head_kv,
                 hd,
@@ -1010,6 +1000,8 @@ impl<'a> Gemma4Model<'a> {
             }
         }
 
+        state.last_hidden.copy_from_slice(&state.x[..n_embd]);
+
         if compute_logits {
             rms_norm(
                 &mut state.xb[..n_embd],
@@ -1087,12 +1079,14 @@ impl<'a> Gemma4Model<'a> {
                 &token_ids[offset..offset + b],
                 start_pos + offset,
                 is_last && compute_last_logits,
+                false,
             );
             offset += b;
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_chunk(
         &self,
         state: &mut Gemma4State,
@@ -1101,6 +1095,7 @@ impl<'a> Gemma4Model<'a> {
         tokens: &[u32],
         start_pos: usize,
         compute_last_logits: bool,
+        keep_all_rows: bool,
     ) {
         let b = tokens.len();
         let n_embd = self.cfg.n_embd;
@@ -1108,13 +1103,16 @@ impl<'a> Gemma4Model<'a> {
         let ple_total = self.cfg.n_layers * ple_dim;
 
         // 1. Batched input embedding + sqrt(n_embd)
-        let emb_row_bytes = self.token_embd.dtype.row_bytes(n_embd);
         let emb_scale = (n_embd as f32).sqrt();
         for (t, &tok) in tokens.iter().enumerate() {
-            let tid = tok as usize;
-            let emb_row = &self.token_embd.bytes[tid * emb_row_bytes..(tid + 1) * emb_row_bytes];
             let dst = &mut state.x[t * n_embd..(t + 1) * n_embd];
-            dequantize_row_bytes(self.token_embd.dtype, emb_row, dst);
+            decode_embedding_row(
+                self.token_embd.dtype,
+                self.token_embd.bytes,
+                n_embd,
+                tok as usize,
+                dst,
+            );
             for v in dst {
                 *v *= emb_scale;
             }
@@ -1122,13 +1120,16 @@ impl<'a> Gemma4Model<'a> {
 
         // 2. Batched PLE row lookup + single-pass BF16 `per_layer_model_proj` GEMM
         if let Some(ref ple_g) = self.ple_global {
-            let ple_row_bytes = ple_g.tok_embd.dtype.row_bytes(ple_total);
             let tok_ple_scale = (ple_dim as f32).sqrt() / 2.0f32.sqrt();
             for (t, &tok) in tokens.iter().enumerate() {
-                let tid = tok as usize;
-                let row = &ple_g.tok_embd.bytes[tid * ple_row_bytes..(tid + 1) * ple_row_bytes];
                 let dst = &mut state.ple_inputs[t * ple_total..(t + 1) * ple_total];
-                dequantize_row_bytes(ple_g.tok_embd.dtype, row, dst);
+                decode_embedding_row(
+                    ple_g.tok_embd.dtype,
+                    ple_g.tok_embd.bytes,
+                    ple_total,
+                    tok as usize,
+                    dst,
+                );
                 for v in dst {
                     *v *= tok_ple_scale;
                 }
@@ -1165,26 +1166,18 @@ impl<'a> Gemma4Model<'a> {
             }
         }
 
-        // 3. Layers (Note: for KV-shared layers `il >= n_layer_kv_from_start`, if `!compute_last_logits`
-        //    is false on the final chunk we still compute all `b` rows unless pruning; if `!compute_last_logits`
-        //    on intermediate chunks of a long prompt, KV-shared layers don't write KV cache at all!!
-        //    Wait: `gemma4.cpp:201` prunes non-output rows at `il == n_layer_kv_from_start`!
-        //    If `!compute_last_logits`, `n_outputs == 0` so layers `15..34` have ZERO side effects
-        //    on KV cache and can be skipped completely on intermediate chunks, and on the last chunk
-        //    only the last token `b - 1` needs to run through layers `15..34`!!).
         let mut active_rows = b;
         let mut row_pos_offset = start_pos;
 
         for (il, layer) in self.layers.iter().enumerate() {
-            if il == self.cfg.n_layer_kv_from_start
+            if !keep_all_rows
+                && il == self.cfg.n_layer_kv_from_start
                 && self.cfg.n_layer_kv_from_start < self.cfg.n_layers
             {
                 if !compute_last_logits {
-                    // Intermediate prefill chunk: layers `n_layer_kv_from_start..n_layers` write NO state!
                     return;
                 }
                 if active_rows > 1 {
-                    // Prune to only the final output token `(b - 1)` (`gemma4.cpp:211-228`)!
                     let last = b - 1;
                     state.x.copy_within(last * n_embd..(last + 1) * n_embd, 0);
                     if ple_total > 0 {
@@ -1216,49 +1209,61 @@ impl<'a> Gemma4Model<'a> {
                 active_rows,
             );
 
-            matmul_f32(
-                pool,
-                kt,
-                layer.wq.dtype,
-                layer.wq.bytes,
-                &state.xb[..active_rows * n_embd],
-                &mut state.mv_scratch,
-                &mut state.q_buf[..active_rows * q_dim],
-                q_dim,
-                n_embd,
-                active_rows,
-            );
-
             if let Some(ref kv_w) = layer.kv {
-                matmul_f32(
-                    pool,
-                    kt,
-                    kv_w.wk.dtype,
-                    kv_w.wk.bytes,
-                    &state.xb[..active_rows * n_embd],
-                    &mut state.mv_scratch,
-                    &mut state.k_buf[..active_rows * kv_dim],
-                    kv_dim,
-                    n_embd,
-                    active_rows,
-                );
                 if let Some(ref wv) = kv_w.wv {
-                    matmul_f32(
+                    matmul_triple_f32(
                         pool,
                         kt,
+                        layer.wq.dtype,
+                        layer.wq.bytes,
+                        q_dim,
+                        &mut state.q_buf[..active_rows * q_dim],
+                        kv_w.wk.dtype,
+                        kv_w.wk.bytes,
+                        kv_dim,
+                        &mut state.k_buf[..active_rows * kv_dim],
                         wv.dtype,
                         wv.bytes,
+                        kv_dim,
+                        &mut state.v_buf[..active_rows * kv_dim],
                         &state.xb[..active_rows * n_embd],
                         &mut state.mv_scratch,
-                        &mut state.v_buf[..active_rows * kv_dim],
-                        kv_dim,
                         n_embd,
                         active_rows,
                     );
                 } else {
+                    matmul_pair_f32(
+                        pool,
+                        kt,
+                        layer.wq.dtype,
+                        layer.wq.bytes,
+                        q_dim,
+                        &mut state.q_buf[..active_rows * q_dim],
+                        kv_w.wk.dtype,
+                        kv_w.wk.bytes,
+                        kv_dim,
+                        &mut state.k_buf[..active_rows * kv_dim],
+                        &state.xb[..active_rows * n_embd],
+                        &mut state.mv_scratch,
+                        n_embd,
+                        active_rows,
+                    );
                     state.v_buf[..active_rows * kv_dim]
                         .copy_from_slice(&state.k_buf[..active_rows * kv_dim]);
                 }
+            } else {
+                matmul_f32(
+                    pool,
+                    kt,
+                    layer.wq.dtype,
+                    layer.wq.bytes,
+                    &state.xb[..active_rows * n_embd],
+                    &mut state.mv_scratch,
+                    &mut state.q_buf[..active_rows * q_dim],
+                    q_dim,
+                    n_embd,
+                    active_rows,
+                );
             }
 
             for t in 0..active_rows {
@@ -1341,36 +1346,16 @@ impl<'a> Gemma4Model<'a> {
                         RopeType::Neox,
                     );
 
-                    if let LayerState::Kv {
-                        ref mut k_cache,
-                        ref mut v_cache,
-                        ..
-                    } = state.layers[il]
-                    {
-                        let off = pos * kv_dim;
-                        (kt.f32_to_f16_slice)(kt_vec, &mut k_cache[off..off + kv_dim]);
-                        (kt.f32_to_f16_slice)(vt_vec, &mut v_cache[off..off + kv_dim]);
-                    }
+                    state.layers[il].store_kv_at(kt, pos, kt_vec, vt_vec);
                 }
             }
 
             let kv_src = self.cfg.kv_source[il];
-            let (k_cache_ref, v_cache_ref) = match state.layers[kv_src] {
-                LayerState::Kv {
-                    ref k_cache,
-                    ref v_cache,
-                    ..
-                } => (k_cache.as_slice(), v_cache.as_slice()),
-                _ => unreachable!("kv_source always points to LayerState::Kv"),
-            };
-
-            gqa_attention_f16_kv_ext_batch_parallel(
+            state.layers[kv_src].attend_batch(
                 pool,
                 kt,
                 &mut state.attn_out[..active_rows * q_dim],
                 &state.q_buf[..active_rows * q_dim],
-                k_cache_ref,
-                v_cache_ref,
                 self.cfg.n_head,
                 self.cfg.n_head_kv,
                 hd,
@@ -1419,27 +1404,19 @@ impl<'a> Gemma4Model<'a> {
                 n_embd,
                 active_rows,
             );
-            matmul_f32(
+            matmul_pair_f32(
                 pool,
                 kt,
                 layer.w_gate.dtype,
                 layer.w_gate.bytes,
-                &state.xb[..active_rows * n_embd],
-                &mut state.mv_scratch,
-                &mut state.hb[..active_rows * n_ff],
                 n_ff,
-                n_embd,
-                active_rows,
-            );
-            matmul_f32(
-                pool,
-                kt,
+                &mut state.hb[..active_rows * n_ff],
                 layer.w_up.dtype,
                 layer.w_up.bytes,
+                n_ff,
+                &mut state.hb2[..active_rows * n_ff],
                 &state.xb[..active_rows * n_embd],
                 &mut state.mv_scratch,
-                &mut state.hb2[..active_rows * n_ff],
-                n_ff,
                 n_embd,
                 active_rows,
             );
@@ -1529,8 +1506,12 @@ impl<'a> Gemma4Model<'a> {
             }
         }
 
+        let last_off = (active_rows - 1) * n_embd;
+        state
+            .last_hidden
+            .copy_from_slice(&state.x[last_off..last_off + n_embd]);
+
         if compute_last_logits {
-            let last_off = (active_rows - 1) * n_embd;
             rms_norm(
                 &mut state.xb[..n_embd],
                 &state.x[last_off..last_off + n_embd],
@@ -1551,6 +1532,130 @@ impl<'a> Gemma4Model<'a> {
             if let Some(cap) = self.cfg.final_logit_softcapping {
                 softcap_inplace_parallel(pool, &mut state.logits, cap);
             }
+        }
+    }
+
+    pub fn verify_speculative(
+        &self,
+        state: &mut Gemma4State,
+        spec_buf: &mut SpecVerifyBuf,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        window_tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<(), ModelError> {
+        let w = window_tokens.len();
+        assert!((1..=MAX_SPEC_WINDOW).contains(&w));
+        let end_pos = start_pos.saturating_add(w);
+        if end_pos > state.max_ctx {
+            return Err(ModelError::ContextOverflow {
+                pos: end_pos - 1,
+                max_ctx: state.max_ctx,
+            });
+        }
+        for &tid in window_tokens {
+            if (tid as usize) >= self.cfg.vocab_size {
+                return Err(ModelError::TokenOutOfRange {
+                    token_id: tid,
+                    vocab_size: self.cfg.vocab_size,
+                });
+            }
+        }
+
+        // `keep_all_rows = true` ensures all `w` positions pass through KV-shared layers `15..34`
+        self.forward_chunk(state, pool, kt, window_tokens, start_pos, false, true);
+        let n_embd = self.cfg.n_embd;
+        let vocab = self.cfg.vocab_size;
+        spec_buf.last_window_len = w;
+        spec_buf.hidden_win[..w * n_embd].copy_from_slice(&state.x[..w * n_embd]);
+
+        rms_norm_batch_parallel(
+            pool,
+            kt,
+            &mut spec_buf.norm_win[..w * n_embd],
+            &spec_buf.hidden_win[..w * n_embd],
+            &self.output_norm,
+            self.cfg.rms_eps,
+            n_embd,
+            w,
+        );
+        matmul_f32(
+            pool,
+            kt,
+            self.output.dtype,
+            self.output.bytes,
+            &spec_buf.norm_win[..w * n_embd],
+            &mut state.mv_scratch,
+            &mut spec_buf.logits_win[..w * vocab],
+            self.output.rows,
+            self.output.cols,
+            w,
+        );
+        if let Some(cap) = self.cfg.final_logit_softcapping {
+            softcap_inplace_parallel(pool, &mut spec_buf.logits_win[..w * vocab], cap);
+        }
+        Ok(())
+    }
+
+    pub fn commit_speculative(
+        &self,
+        state: &mut Gemma4State,
+        spec_buf: &SpecVerifyBuf,
+        committed: usize,
+    ) {
+        assert!((1..=spec_buf.last_window_len).contains(&committed));
+        let idx = committed - 1;
+        state
+            .logits
+            .copy_from_slice(spec_buf.logits_at(idx, self.cfg.vocab_size));
+        state
+            .last_hidden
+            .copy_from_slice(spec_buf.hidden_at(idx, self.cfg.n_embd));
+    }
+
+    pub fn project_logits_from_hidden(
+        &self,
+        state: &mut Gemma4State,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        hidden: &[f32],
+        out_logits: &mut [f32],
+    ) {
+        let n_embd = self.cfg.n_embd;
+        rms_norm(
+            &mut state.xb[..n_embd],
+            hidden,
+            &self.output_norm,
+            self.cfg.rms_eps,
+        );
+        matvec_f32(
+            pool,
+            kt,
+            self.output.dtype,
+            self.output.bytes,
+            &state.xb[..n_embd],
+            &mut state.mv_scratch,
+            out_logits,
+            self.output.rows,
+            self.output.cols,
+        );
+        if let Some(cap) = self.cfg.final_logit_softcapping {
+            softcap_inplace_parallel(pool, out_logits, cap);
+        }
+    }
+
+    pub fn embed_token(&self, token_id: u32, out_emb: &mut [f32]) {
+        let n_embd = self.cfg.n_embd;
+        decode_embedding_row(
+            self.token_embd.dtype,
+            self.token_embd.bytes,
+            n_embd,
+            token_id as usize,
+            out_emb,
+        );
+        let emb_scale = (n_embd as f32).sqrt();
+        for v in out_emb {
+            *v *= emb_scale;
         }
     }
 }

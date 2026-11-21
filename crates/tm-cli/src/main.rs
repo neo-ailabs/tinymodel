@@ -11,26 +11,68 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use tm_core::probe_process_memory_stats;
+use tm_core::{KvType, probe_process_memory_stats};
 use tm_cpu::{ThreadPool, active_kernels};
 use tm_gguf::GgufFile;
 use tm_models::{
     CpuDecodeProfile, LlamaModel, LlamaState, Qwen35DecodeProfile, Qwen35Model, Qwen35State,
     Sampler, SamplerConfig, argmax,
 };
-use tm_runtime::{CpuModel, Session};
+use tm_runtime::{CpuModel, Session, SpecController, SpecMode, SuffixDrafter};
 use tm_tokenizer::Tokenizer;
 
 fn print_usage() {
     eprintln!(
         "Usage:
-  tinymodel probe [-t <threads>] [--stream-mib <mib>] [--no-stream] [--json]
+  tinymodel probe [-t <threads>] [--stream-mib <mib>] [--no-stream] [--vulkan] [--json]
   tinymodel inspect <model.gguf>
-  tinymodel run -m <model.gguf> [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--metal]
-  tinymodel bench -m <model.gguf> [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--metal] [--json]
+  tinymodel convert -i <in.gguf> -o <out.gguf>
+  tinymodel run -m <model.gguf> [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--spec off|auto|suffix] [--metal | --vulkan]
+  tinymodel bench -m <model.gguf> [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--spec off|auto|suffix] [--metal | --vulkan] [--json]
   tinymodel profile -m <model.gguf> [-n <tokens>] [-t <threads>] [-c <ctx>] [--metal]
-  tinymodel logits -m <model.gguf> -o <out.bin> [-p <prompt> | --tokens 1,2,3] [-t <threads>] [-c <ctx>] [--metal]"
+  tinymodel logits -m <model.gguf> -o <out.bin> [-p <prompt> | --tokens 1,2,3] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--metal | --vulkan]"
     );
+}
+
+fn cmd_convert(args: &[String]) -> Result<()> {
+    let mut input: Option<PathBuf> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-i" | "--input" | "-m" | "--model" => {
+                i += 1;
+                input = Some(PathBuf::from(
+                    args.get(i).context("missing value for -i/--input")?,
+                ));
+            }
+            "-o" | "--output" => {
+                i += 1;
+                output = Some(PathBuf::from(
+                    args.get(i).context("missing value for -o/--output")?,
+                ));
+            }
+            other => bail!("unknown convert argument: {other}"),
+        }
+        i += 1;
+    }
+    let in_path = input.context("convert requires -i <in.gguf>")?;
+    let out_path = output.context("convert requires -o <out.gguf>")?;
+    let t0 = Instant::now();
+    let gguf = GgufFile::open(&in_path)?;
+    let stats = gguf.convert_to_q4_0x4(&out_path)?;
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    println!(
+        "convert: {} -> {} | repacked {}/{} tensors ({:.2} MiB / {:.2} MiB total, zero size bloat) in {:.1} ms",
+        in_path.display(),
+        out_path.display(),
+        stats.repacked_tensors,
+        stats.total_tensors,
+        stats.repacked_bytes as f64 / (1024.0 * 1024.0),
+        stats.total_file_bytes as f64 / (1024.0 * 1024.0),
+        ms
+    );
+    Ok(())
 }
 
 fn cmd_inspect(path: PathBuf) -> Result<()> {
@@ -69,7 +111,10 @@ struct RunOpts {
     threads: usize,
     max_ctx: usize,
     prefix_cache_mib: usize,
+    kv_type: KvType,
+    spec_mode: SpecMode,
     use_metal: bool,
+    use_vulkan: bool,
     json: bool,
     sampler: SamplerConfig,
 }
@@ -84,7 +129,10 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
     let mut threads = tm_cpu::recommended_threads();
     let mut max_ctx = 2048usize;
     let mut prefix_cache_mib = 0usize;
+    let mut kv_type = KvType::F16;
+    let mut spec_mode = SpecMode::Off;
     let mut use_metal = false;
+    let mut use_vulkan = false;
     let mut json = false;
     let mut sampler = SamplerConfig::default();
 
@@ -200,6 +248,19 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
             "--metal" => {
                 use_metal = true;
             }
+            "--vulkan" => {
+                use_vulkan = true;
+            }
+            "--kv-type" => {
+                i += 1;
+                let raw = args.get(i).context("missing value for --kv-type")?;
+                kv_type = raw.parse::<KvType>().map_err(|e| anyhow::anyhow!(e))?;
+            }
+            "--spec" => {
+                i += 1;
+                let raw = args.get(i).context("missing value for --spec")?;
+                spec_mode = raw.parse::<SpecMode>().map_err(|e| anyhow::anyhow!(e))?;
+            }
             "--prefix-cache-mib" => {
                 i += 1;
                 prefix_cache_mib = args
@@ -216,6 +277,10 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
         i += 1;
     }
 
+    if use_metal && use_vulkan {
+        bail!("cannot specify both --metal and --vulkan");
+    }
+
     let model = model.context("missing required -m <model.gguf>")?;
     Ok(RunOpts {
         model,
@@ -227,7 +292,10 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
         threads,
         max_ctx,
         prefix_cache_mib,
+        kv_type,
+        spec_mode,
         use_metal,
+        use_vulkan,
         json,
         sampler,
     })
@@ -683,56 +751,41 @@ fn estimate_llama_dirty_bytes(cfg: &tm_models::LlamaConfig, max_ctx: usize) -> u
     kv_bytes + scratch_bytes
 }
 
-fn cmd_run(opts: RunOpts) -> Result<()> {
-    if opts.use_metal {
-        #[cfg(all(feature = "metal", target_vendor = "apple"))]
-        return cmd_run_metal(opts);
-        #[cfg(not(all(feature = "metal", target_vendor = "apple")))]
-        bail!("--metal requires compiling with feature 'metal' on Apple Silicon");
-    }
+#[cfg(feature = "vulkan")]
+fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
     let t_load = Instant::now();
     let gguf = GgufFile::open(&opts.model)?;
     let tok = Tokenizer::from_gguf(&gguf)?;
     let prompt_ids = resolve_prompt_ids(&opts, &tok)?;
-    let pool = ThreadPool::new(opts.threads);
-    let kt = active_kernels();
+    let is_pure_greedy =
+        opts.sampler.temperature <= 0.0 && (opts.sampler.repeat_penalty - 1.0).abs() < 1e-6;
 
-    let model = CpuModel::from_gguf(&gguf)?;
-    check_linux_dirty_budget(model.estimate_dirty_bytes(opts.max_ctx), opts.max_ctx)?;
-    let cache_bytes = opts.prefix_cache_mib * 1024 * 1024;
-    let mut session = Session::new(&model, opts.max_ctx, cache_bytes);
+    let mut runner = tm_vulkan::VulkanRunner::from_gguf(&gguf, opts.max_ctx)?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
-
     eprintln!(
-        "[tinymodel] arch={} isa={} threads={} load={:.1}ms prompt_tokens={} vocab={} layers={} prefix_cache_mib={}",
-        model.arch(),
-        kt.isa.name(),
-        pool.num_threads(),
+        "[tinymodel] arch={} backend=vulkan ({}) weights={} load={:.1}ms prompt_tokens={} vocab={} layers={}",
+        runner.arch(),
+        runner.device_name(),
+        if runner.is_uma() {
+            "uma-direct"
+        } else {
+            "vram-staged"
+        },
         load_ms,
         prompt_ids.len(),
-        model.vocab_size(),
-        model.n_layers(),
-        opts.prefix_cache_mib
+        runner.vocab_size(),
+        runner.n_layers()
     );
 
+    let mut sampler = Sampler::new(opts.sampler, runner.vocab_size());
+    let mut history = prompt_ids.clone();
+
     let t_pp = Instant::now();
-    if cache_bytes > 0 {
-        let rep = session.prefill_with_cache(&pool, &prompt_ids, Some(64))?;
-        if rep.cached_tokens > 0 {
-            eprintln!(
-                "[tinymodel] prefix_cache hit: reused {}/{} tokens",
-                rep.cached_tokens, rep.total_tokens
-            );
-        }
-    } else {
-        model.forward_batch(&mut session.state, &pool, kt, &prompt_ids, 0, true)?;
-    }
+    let logits = runner.forward_batch(&prompt_ids, 0, true)?;
+    let mut next_id = sampler.sample(logits, &history);
     let pp_sec = t_pp.elapsed().as_secs_f64();
 
     let mut stdout = io::stdout().lock();
-    let mut sampler = Sampler::new(opts.sampler, model.vocab_size());
-    let mut history = prompt_ids.clone();
-    let mut next_id = sampler.sample(session.logits(), &history);
     let mut pos = prompt_ids.len();
     let mut generated = 0usize;
 
@@ -749,8 +802,12 @@ fn cmd_run(opts: RunOpts) -> Result<()> {
         if generated >= opts.n_predict {
             break;
         }
-        model.forward_token(&mut session.state, &pool, kt, next_id, pos, true)?;
-        next_id = sampler.sample(session.logits(), &history);
+        if is_pure_greedy {
+            next_id = runner.forward_token_greedy(next_id, pos)?;
+        } else {
+            let logits = runner.forward_token(next_id, pos, true)?;
+            next_id = sampler.sample(logits, &history);
+        }
         pos += 1;
     }
     let gen_sec = t_gen.elapsed().as_secs_f64();
@@ -772,6 +829,248 @@ fn cmd_run(opts: RunOpts) -> Result<()> {
         tg_runs,
         tg_tps
     );
+    Ok(())
+}
+
+#[cfg(feature = "vulkan")]
+fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
+    let tel_before = probe::collect_telemetry();
+    let t_load = Instant::now();
+    let gguf = GgufFile::open(&opts.model)?;
+    let arch = gguf.req_str("general.architecture")?.to_string();
+    let active_decode_bytes = compute_active_decode_bytes(&gguf);
+    let (pp_ids, corpus_mode) = resolve_bench_pp_ids(&opts, &gguf)?;
+    let n_pp = pp_ids.len();
+    let model_name = opts
+        .model
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("?")
+        .to_string();
+
+    let mut runner = tm_vulkan::VulkanRunner::from_gguf(&gguf, opts.max_ctx)?;
+    let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
+
+    let _ = runner.forward_token_greedy(1, 0)?;
+    let _ = runner.forward_token_greedy(2, 1)?;
+    runner.reset_state();
+    let warmup_ids = [1u32; 8];
+    let _ = runner.forward_batch(&warmup_ids, 0, true)?;
+    runner.reset_state();
+
+    let t_pp = Instant::now();
+    let pp_logits = runner.forward_batch(&pp_ids, 0, corpus_mode)?;
+    let first_tok = if corpus_mode { argmax(pp_logits) } else { 0 };
+    let pp_sec = t_pp.elapsed().as_secs_f64();
+    let pp_tps = (n_pp as f64) / pp_sec.max(1e-9);
+
+    let n_gen = opts.n_predict;
+    let mut gen_tokens = Vec::with_capacity(n_gen + 1);
+    let (mut tok, base_pos) = if corpus_mode {
+        (first_tok, n_pp)
+    } else {
+        runner.reset_state();
+        (runner.forward_token_greedy(1, 0)?, 1)
+    };
+    gen_tokens.push(tok);
+    let t0 = Instant::now();
+    for step in 0..n_gen {
+        tok = runner.forward_token_greedy(tok, base_pos + step)?;
+        gen_tokens.push(tok);
+    }
+    let sec = t0.elapsed().as_secs_f64();
+    let tps = (n_gen as f64) / sec.max(1e-9);
+    let tel_after = probe::collect_telemetry();
+    let dev_name = runner.device_name().to_string();
+    let wmode = if runner.is_uma() {
+        "uma-direct"
+    } else {
+        "vram-staged"
+    };
+    if opts.json {
+        BenchMetrics {
+            model_name: &model_name,
+            arch: &arch,
+            backend: "vulkan",
+            isa: "vulkan",
+            device_name: &dev_name,
+            weights_mode: wmode,
+            threads: 1,
+            max_ctx: opts.max_ctx,
+            corpus_mode,
+            active_decode_bytes,
+            load_ms,
+            ttft_ms: pp_sec * 1e3,
+            n_pp,
+            pp_ms: pp_sec * 1e3,
+            n_gen,
+            tg_ms: sec * 1e3,
+            last_tok: tok,
+            greedy_hash: probe::hash_token_sequence(&gen_tokens),
+            tel_before,
+            tel_after,
+        }
+        .print_json();
+    } else {
+        println!(
+            "bench: model={} arch={} backend=vulkan ({}) weights={} load={:.1}ms pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
+            model_name,
+            arch,
+            dev_name,
+            wmode,
+            load_ms,
+            n_pp,
+            pp_tps,
+            n_gen,
+            tps,
+            (sec * 1e3) / (n_gen as f64),
+            tok
+        );
+    }
+    Ok(())
+}
+
+fn cmd_run(opts: RunOpts) -> Result<()> {
+    if opts.use_metal {
+        #[cfg(all(feature = "metal", target_vendor = "apple"))]
+        return cmd_run_metal(opts);
+        #[cfg(not(all(feature = "metal", target_vendor = "apple")))]
+        bail!("--metal requires compiling with feature 'metal' on Apple Silicon");
+    }
+    if opts.use_vulkan {
+        #[cfg(feature = "vulkan")]
+        return cmd_run_vulkan(opts);
+        #[cfg(not(feature = "vulkan"))]
+        bail!("--vulkan requires compiling with feature 'vulkan'");
+    }
+    let t_load = Instant::now();
+    let gguf = GgufFile::open(&opts.model)?;
+    let tok = Tokenizer::from_gguf(&gguf)?;
+    let prompt_ids = resolve_prompt_ids(&opts, &tok)?;
+    let pool = ThreadPool::new(opts.threads);
+    let kt = active_kernels();
+
+    let model = CpuModel::from_gguf(&gguf)?;
+    check_linux_dirty_budget(
+        model.estimate_dirty_bytes_with_kv(opts.max_ctx, opts.kv_type),
+        opts.max_ctx,
+    )?;
+    let cache_bytes = opts.prefix_cache_mib * 1024 * 1024;
+    let mut session = Session::new_with_options(&model, opts.max_ctx, cache_bytes, opts.kv_type);
+    if opts.spec_mode != SpecMode::Off {
+        session.enable_speculation();
+    }
+    let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
+
+    eprintln!(
+        "[tinymodel] arch={} isa={} threads={} kv={} spec={} load={:.1}ms prompt_tokens={} vocab={} layers={} prefix_cache_mib={}",
+        model.arch(),
+        kt.isa.name(),
+        pool.num_threads(),
+        opts.kv_type.as_str(),
+        opts.spec_mode.as_str(),
+        load_ms,
+        prompt_ids.len(),
+        model.vocab_size(),
+        model.n_layers(),
+        opts.prefix_cache_mib
+    );
+
+    let t_pp = Instant::now();
+    let rep = session.prefill_with_cache(&pool, &prompt_ids, (cache_bytes > 0).then_some(64))?;
+    if cache_bytes > 0 && rep.cached_tokens > 0 {
+        eprintln!(
+            "[tinymodel] prefix_cache hit: reused {}/{} tokens",
+            rep.cached_tokens, rep.total_tokens
+        );
+    }
+    let pp_sec = t_pp.elapsed().as_secs_f64();
+
+    let mut stdout = io::stdout().lock();
+    let is_pure_greedy =
+        opts.sampler.temperature <= 0.0 && (opts.sampler.repeat_penalty - 1.0).abs() < 1e-6;
+
+    let (generated, gen_sec, spec_note) = if opts.spec_mode != SpecMode::Off && is_pure_greedy {
+        let mut suffix = SuffixDrafter::default();
+        let mut ctrl = SpecController::default();
+        let t_gen = Instant::now();
+        let (tokens, stats) = session.generate_greedy_speculative(
+            &pool,
+            &prompt_ids,
+            opts.n_predict,
+            opts.spec_mode,
+            &mut suffix,
+            None,
+            &mut ctrl,
+            |_, tid| tok.is_stop_token(tid),
+        )?;
+        let elapsed = t_gen.elapsed().as_secs_f64();
+        let mut emitted = 0usize;
+        for &tid in &tokens {
+            if tok.is_stop_token(tid) {
+                break;
+            }
+            stdout.write_all(&tok.decode_token_bytes(tid))?;
+            emitted += 1;
+        }
+        stdout.flush()?;
+        (
+            emitted,
+            elapsed,
+            format!(
+                " | spec: accepted={}/{} ({:.1}%, verify_calls={}, auto_off={})",
+                stats.accepted_tokens,
+                stats.drafted_tokens,
+                stats.acceptance_rate() * 100.0,
+                stats.verify_calls,
+                stats.auto_disabled_steps
+            ),
+        )
+    } else {
+        let mut sampler = Sampler::new(opts.sampler, model.vocab_size());
+        let mut history = prompt_ids.clone();
+        let mut next_id = sampler.sample(session.logits(), &history);
+        let mut pos = prompt_ids.len();
+        let mut count = 0usize;
+
+        let t_gen = Instant::now();
+        while count < opts.n_predict {
+            if tok.is_stop_token(next_id) {
+                break;
+            }
+            stdout.write_all(&tok.decode_token_bytes(next_id))?;
+            stdout.flush()?;
+            history.push(next_id);
+            count += 1;
+
+            if count >= opts.n_predict {
+                break;
+            }
+            model.forward_token(&mut session.state, &pool, kt, next_id, pos, true)?;
+            next_id = sampler.sample(session.logits(), &history);
+            pos += 1;
+        }
+        (count, t_gen.elapsed().as_secs_f64(), String::new())
+    };
+
+    writeln!(stdout)?;
+    let pp_tps = (prompt_ids.len() as f64) / pp_sec.max(1e-9);
+    let tg_runs = generated.saturating_sub(1);
+    let tg_tps = if tg_runs > 0 {
+        (tg_runs as f64) / gen_sec.max(1e-9)
+    } else {
+        0.0
+    };
+    eprintln!(
+        "[tinymodel] prompt: {:.2} ms / {} tok ({:.2} tok/s) | eval: {:.2} ms / {} runs ({:.2} tok/s){}",
+        pp_sec * 1e3,
+        prompt_ids.len(),
+        pp_tps,
+        gen_sec * 1e3,
+        tg_runs,
+        tg_tps,
+        spec_note
+    );
 
     Ok(())
 }
@@ -782,6 +1081,12 @@ fn cmd_bench(opts: RunOpts) -> Result<()> {
         return cmd_bench_metal(opts);
         #[cfg(not(all(feature = "metal", target_vendor = "apple")))]
         bail!("--metal requires compiling with feature 'metal' on Apple Silicon");
+    }
+    if opts.use_vulkan {
+        #[cfg(feature = "vulkan")]
+        return cmd_bench_vulkan(opts);
+        #[cfg(not(feature = "vulkan"))]
+        bail!("--vulkan requires compiling with feature 'vulkan'");
     }
     let tel_before = probe::collect_telemetry();
     let t_load = Instant::now();
@@ -801,20 +1106,30 @@ fn cmd_bench(opts: RunOpts) -> Result<()> {
         .to_string();
 
     let model = CpuModel::from_gguf(&gguf)?;
-    check_linux_dirty_budget(model.estimate_dirty_bytes(opts.max_ctx), opts.max_ctx)?;
-    let mut state = model.new_state(opts.max_ctx);
+    check_linux_dirty_budget(
+        model.estimate_dirty_bytes_with_kv(opts.max_ctx, opts.kv_type),
+        opts.max_ctx,
+    )?;
+    let mut session = Session::new_with_options(&model, opts.max_ctx, 0, opts.kv_type);
+    if opts.spec_mode != SpecMode::Off {
+        session.enable_speculation();
+    }
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
     // Warm up mmap pages & thread pool
-    model.forward_token(&mut state, &pool, kt, 1, 0, true)?;
-    state.reset();
-    model.forward_batch(&mut state, &pool, kt, &[1u32; 8], 0, false)?;
-    state.reset();
+    model.forward_token(&mut session.state, &pool, kt, 1, 0, true)?;
+    session.state.reset();
+    model.forward_batch(&mut session.state, &pool, kt, &[1u32; 8], 0, false)?;
+    session.state.reset();
 
     let t_pp = Instant::now();
-    model.forward_batch(&mut state, &pool, kt, &pp_ids, 0, corpus_mode)?;
-    let first_tok = if corpus_mode {
-        argmax(state.logits())
+    if opts.spec_mode != SpecMode::Off {
+        session.prefill_with_cache(&pool, &pp_ids, None)?;
+    } else {
+        model.forward_batch(&mut session.state, &pool, kt, &pp_ids, 0, corpus_mode)?;
+    }
+    let first_tok = if corpus_mode || opts.spec_mode != SpecMode::Off {
+        argmax(session.logits())
     } else {
         0
     };
@@ -823,24 +1138,66 @@ fn cmd_bench(opts: RunOpts) -> Result<()> {
 
     let n_gen = opts.n_predict;
     let mut gen_tokens = Vec::with_capacity(n_gen + 1);
-    let (mut tok, base_pos) = if corpus_mode {
-        (first_tok, n_pp)
+    let mut spec_summary = String::new();
+    let (tok, sec) = if opts.spec_mode != SpecMode::Off {
+        let mut suffix = SuffixDrafter::default();
+        let mut ctrl = SpecController::default();
+        if !corpus_mode {
+            session.prefill_with_cache(&pool, &[1u32], None)?;
+        }
+        let seed_prompt: &[u32] = if corpus_mode { &pp_ids } else { &[1u32] };
+        let t0 = Instant::now();
+        let (toks, stats) = session.generate_greedy_speculative(
+            &pool,
+            seed_prompt,
+            n_gen + 1,
+            opts.spec_mode,
+            &mut suffix,
+            None,
+            &mut ctrl,
+            |_, _| false,
+        )?;
+        let elapsed = t0.elapsed().as_secs_f64();
+        let last = toks.last().copied().unwrap_or(first_tok);
+        gen_tokens = toks;
+        spec_summary = format!(
+            " spec={}({}/{})",
+            opts.spec_mode.as_str(),
+            stats.accepted_tokens,
+            stats.drafted_tokens
+        );
+        (last, elapsed)
     } else {
-        state.reset();
-        model.forward_token(&mut state, &pool, kt, 1, 0, true)?;
-        (argmax(state.logits()), 1)
+        let (mut cur_tok, base_pos) = if corpus_mode {
+            (first_tok, n_pp)
+        } else {
+            session.state.reset();
+            model.forward_token(&mut session.state, &pool, kt, 1, 0, true)?;
+            (argmax(session.logits()), 1)
+        };
+        gen_tokens.push(cur_tok);
+        let t0 = Instant::now();
+        for step in 0..n_gen {
+            model.forward_token(
+                &mut session.state,
+                &pool,
+                kt,
+                cur_tok,
+                base_pos + step,
+                true,
+            )?;
+            cur_tok = argmax(session.logits());
+            gen_tokens.push(cur_tok);
+        }
+        (cur_tok, t0.elapsed().as_secs_f64())
     };
-    gen_tokens.push(tok);
-
-    let t0 = Instant::now();
-    for step in 0..n_gen {
-        model.forward_token(&mut state, &pool, kt, tok, base_pos + step, true)?;
-        tok = argmax(state.logits());
-        gen_tokens.push(tok);
-    }
-    let sec = t0.elapsed().as_secs_f64();
     let tps = (n_gen as f64) / sec.max(1e-9);
     let tel_after = probe::collect_telemetry();
+    let wmode = match (opts.kv_type, opts.spec_mode) {
+        (KvType::F16, SpecMode::Off) => "mmap".to_string(),
+        (kv, SpecMode::Off) => format!("mmap+kv_{}", kv.as_str()),
+        (kv, sp) => format!("mmap+kv_{}+spec_{}", kv.as_str(), sp.as_str()),
+    };
     if opts.json {
         BenchMetrics {
             model_name: &model_name,
@@ -848,7 +1205,7 @@ fn cmd_bench(opts: RunOpts) -> Result<()> {
             backend: "cpu",
             isa: kt.isa.name(),
             device_name: &dev_model_name,
-            weights_mode: "mmap",
+            weights_mode: &wmode,
             threads: pool.num_threads(),
             max_ctx: opts.max_ctx,
             corpus_mode,
@@ -867,11 +1224,13 @@ fn cmd_bench(opts: RunOpts) -> Result<()> {
         .print_json();
     } else {
         println!(
-            "bench: model={} arch={} isa={} threads={} pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
+            "bench: model={} arch={} isa={} threads={} kv={}{} pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
             model_name,
             arch,
             kt.isa.name(),
             pool.num_threads(),
+            opts.kv_type.as_str(),
+            spec_summary,
             n_pp,
             pp_tps,
             n_gen,
@@ -1176,11 +1535,45 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
         bail!("--metal requires compiling with feature 'metal' on Apple Silicon");
     }
 
+    if opts.use_vulkan {
+        #[cfg(feature = "vulkan")]
+        {
+            let mut runner = tm_vulkan::VulkanRunner::from_gguf(&gguf, opts.max_ctx)?;
+            let vocab = runner.vocab_size() as u32;
+            writer.write_all(b"TMLG")?;
+            writer.write_all(&1u32.to_le_bytes())?;
+            writer.write_all(&(n_steps as u32).to_le_bytes())?;
+            writer.write_all(&vocab.to_le_bytes())?;
+            for &id in &input_ids {
+                writer.write_all(&id.to_le_bytes())?;
+            }
+            for (pos, &id) in input_ids.iter().enumerate() {
+                let logits = runner.forward_token(id, pos, true)?;
+                write_f32_le(&mut writer, logits)?;
+            }
+            writer.flush()?;
+            eprintln!(
+                "[tinymodel logits] wrote {} steps x {} vocab (vulkan/{} {}) -> {}",
+                n_steps,
+                vocab,
+                runner.device_name(),
+                arch,
+                out_path.display()
+            );
+            return Ok(());
+        }
+        #[cfg(not(feature = "vulkan"))]
+        bail!("--vulkan requires compiling with feature 'vulkan'");
+    }
+
     let pool = ThreadPool::new(opts.threads);
     let kt = active_kernels();
     let model = CpuModel::from_gguf(&gguf)?;
-    check_linux_dirty_budget(model.estimate_dirty_bytes(opts.max_ctx), opts.max_ctx)?;
-    let mut state = model.new_state(opts.max_ctx);
+    check_linux_dirty_budget(
+        model.estimate_dirty_bytes_with_kv(opts.max_ctx, opts.kv_type),
+        opts.max_ctx,
+    )?;
+    let mut state = model.new_state_with_kv(opts.max_ctx, opts.kv_type);
     let vocab = model.vocab_size() as u32;
     writer.write_all(b"TMLG")?;
     writer.write_all(&1u32.to_le_bytes())?;
@@ -1218,6 +1611,7 @@ fn main() -> Result<()> {
             let p = args.get(2).context("missing <model.gguf>")?;
             cmd_inspect(PathBuf::from(p))
         }
+        "convert" => cmd_convert(&args[2..]),
         "run" => cmd_run(parse_run_opts(&args[2..])?),
         "bench" => cmd_bench(parse_run_opts(&args[2..])?),
         "profile" => cmd_profile(parse_run_opts(&args[2..])?),

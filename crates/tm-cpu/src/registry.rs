@@ -3,7 +3,9 @@
 //! Design inspired by Strata `src/quant/registry.hpp` and `dispatch.cpp`
 //! (MIT License, Copyright (c) 2026 Niko1221 and the Strata contributors).
 
-use tm_core::{BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K};
+use tm_core::{
+    BlockQ4_0, BlockQ4_0x4, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K,
+};
 
 use crate::generic;
 use crate::isa::{Isa, detect_caps, effective_isa, isa_supported};
@@ -12,20 +14,27 @@ use crate::isa::{Isa, detect_caps, effective_isa, isa_supported};
 pub type VecDotQ4_0Fn = fn(&[BlockQ4_0], &[BlockQ8_0]) -> f32;
 pub type GemvQ4_0Fn = fn(&[BlockQ4_0], &[BlockQ8_0], &mut [f32], usize, usize);
 pub type GemmQ4_0Fn = fn(&[BlockQ4_0], &[BlockQ8_0], &mut [f32], usize, usize, usize);
+pub type GemvQ4_0x4Fn = fn(&[BlockQ4_0x4], &[BlockQ8_0], &mut [f32], usize, usize);
+pub type GemmQ4_0x4Fn = fn(&[BlockQ4_0x4], &[BlockQ8_0], &mut [f32], usize, usize, usize);
 pub type VecDotQ4_1Fn = fn(&[BlockQ4_1], &[BlockQ8_1]) -> f32;
 pub type GemvQ4_1Fn = fn(&[BlockQ4_1], &[BlockQ8_1], &mut [f32], usize, usize);
 pub type VecDotQ8_0Fn = fn(&[BlockQ8_0], &[BlockQ8_0]) -> f32;
 pub type GemvQ8_0Fn = fn(&[BlockQ8_0], &[BlockQ8_0], &mut [f32], usize, usize);
+pub type GemmQ8_0Fn = fn(&[BlockQ8_0], &[BlockQ8_0], &mut [f32], usize, usize, usize);
 pub type VecDotQ5KFn = fn(&[BlockQ5K], &[BlockQ8K]) -> f32;
 pub type GemvQ5KFn = fn(&[BlockQ5K], &[BlockQ8K], &mut [f32], usize, usize);
 pub type VecDotQ6KFn = fn(&[BlockQ6K], &[BlockQ8K]) -> f32;
 pub type GemvQ6KFn = fn(&[BlockQ6K], &[BlockQ8K], &mut [f32], usize, usize);
+pub type GemmQ6KFn = fn(&[BlockQ6K], &[BlockQ8K], &mut [f32], usize, usize, usize);
 pub type DotF32F16Fn = fn(&[f32], &[u16]) -> f32;
 pub type DotF32Bf16Fn = fn(&[f32], &[u16]) -> f32;
+pub type DotF32Q8_0Fn = fn(&[f32], &[BlockQ8_0]) -> f32;
 pub type AxpyF32F16Fn = fn(&mut [f32], f32, &[u16]);
+pub type AxpyF32Q8_0Fn = fn(&mut [f32], f32, &[BlockQ8_0]);
 pub type F32ToF16SliceFn = fn(&[f32], &mut [u16]);
 pub type QuantQ8_0Fn = fn(&[f32], &mut [BlockQ8_0]);
 pub type QuantQ8_1Fn = fn(&[f32], &mut [BlockQ8_1]);
+pub type QuantQ8KFn = fn(&[f32], &mut [BlockQ8K]);
 pub type RmsNormF32Fn = fn(&mut [f32], &[f32], &[f32], f32);
 pub type L2NormF32Fn = fn(&mut [f32], f32);
 pub type GdnRecurrenceHeadFn =
@@ -38,20 +47,27 @@ pub struct KernelTable {
     pub vec_dot_q4_0_q8_0: VecDotQ4_0Fn,
     pub gemv_q4_0_q8_0: GemvQ4_0Fn,
     pub gemm_q4_0_q8_0: GemmQ4_0Fn,
+    pub gemv_q4_0x4_q8_0: GemvQ4_0x4Fn,
+    pub gemm_q4_0x4_q8_0: GemmQ4_0x4Fn,
     pub vec_dot_q4_1_q8_1: VecDotQ4_1Fn,
     pub gemv_q4_1_q8_1: GemvQ4_1Fn,
     pub vec_dot_q8_0_q8_0: VecDotQ8_0Fn,
     pub gemv_q8_0_q8_0: GemvQ8_0Fn,
+    pub gemm_q8_0_q8_0: GemmQ8_0Fn,
     pub vec_dot_q5_k_q8_k: VecDotQ5KFn,
     pub gemv_q5_k_q8_k: GemvQ5KFn,
     pub vec_dot_q6_k_q8_k: VecDotQ6KFn,
     pub gemv_q6_k_q8_k: GemvQ6KFn,
+    pub gemm_q6_k_q8_k: GemmQ6KFn,
     pub dot_f32_f16: DotF32F16Fn,
     pub dot_f32_bf16: DotF32Bf16Fn,
+    pub dot_f32_q8_0: DotF32Q8_0Fn,
     pub axpy_f32_f16: AxpyF32F16Fn,
+    pub axpy_f32_q8_0: AxpyF32Q8_0Fn,
     pub f32_to_f16_slice: F32ToF16SliceFn,
     pub quantize_q8_0: QuantQ8_0Fn,
     pub quantize_q8_1: QuantQ8_1Fn,
+    pub quantize_q8_k: QuantQ8KFn,
     pub rms_norm_f32: RmsNormF32Fn,
     pub l2_norm_f32: L2NormF32Fn,
     pub gdn_recurrence_head: GdnRecurrenceHeadFn,
@@ -62,20 +78,27 @@ const GENERIC_TABLE: KernelTable = KernelTable {
     vec_dot_q4_0_q8_0: generic::vec_dot_q4_0_q8_0,
     gemv_q4_0_q8_0: generic::gemv_q4_0_q8_0,
     gemm_q4_0_q8_0: generic::gemm_q4_0_q8_0,
+    gemv_q4_0x4_q8_0: generic::gemv_q4_0x4_q8_0,
+    gemm_q4_0x4_q8_0: generic::gemm_q4_0x4_q8_0,
     vec_dot_q4_1_q8_1: generic::vec_dot_q4_1_q8_1,
     gemv_q4_1_q8_1: generic::gemv_q4_1_q8_1,
     vec_dot_q8_0_q8_0: generic::vec_dot_q8_0_q8_0,
     gemv_q8_0_q8_0: generic::gemv_q8_0_q8_0,
+    gemm_q8_0_q8_0: generic::gemm_q8_0_q8_0,
     vec_dot_q5_k_q8_k: generic::vec_dot_q5_k_q8_k,
     gemv_q5_k_q8_k: generic::gemv_q5_k_q8_k,
     vec_dot_q6_k_q8_k: generic::vec_dot_q6_k_q8_k,
     gemv_q6_k_q8_k: generic::gemv_q6_k_q8_k,
+    gemm_q6_k_q8_k: generic::gemm_q6_k_q8_k,
     dot_f32_f16: generic::dot_f32_f16,
     dot_f32_bf16: generic::dot_f32_bf16,
+    dot_f32_q8_0: generic::dot_f32_q8_0,
     axpy_f32_f16: generic::axpy_f32_f16,
+    axpy_f32_q8_0: generic::axpy_f32_q8_0,
     f32_to_f16_slice: generic::f32_to_f16_slice,
     quantize_q8_0: generic::quantize_q8_0,
     quantize_q8_1: generic::quantize_q8_1,
+    quantize_q8_k: generic::quantize_q8_k,
     rms_norm_f32: generic::rms_norm_f32,
     l2_norm_f32: generic::l2_norm_f32,
     gdn_recurrence_head: generic::gdn_recurrence_head,
@@ -372,25 +395,170 @@ mod aarch64_wrappers {
         unsafe { neon_v80::gdn_recurrence_head(q_h, k_h, v_h, g, beta, scale, s_vh, o_h, head_dim) }
     }
 
+    fn neon_v80_gemv_q4_0x4(
+        w: &[BlockQ4_0x4],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { neon_v80::gemv_q4_0x4_q8_0(w, x, out, rows, cols_blocks) }
+    }
+
+    fn neon_v80_gemm_q4_0x4(
+        w: &[BlockQ4_0x4],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { neon_v80::gemm_q4_0x4_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+
+    fn neon_v80_gemm_q8_0(
+        w: &[BlockQ8_0],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { neon_v80::gemm_q8_0_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+
+    fn neon_v80_gemm_q6_k(
+        w: &[BlockQ6K],
+        x: &[BlockQ8K],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { neon_v80::gemm_q6_k_q8_k(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+
+    #[cfg(feature = "dotprod")]
+    fn dotprod_gemv_q4_0x4(
+        w: &[BlockQ4_0x4],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: `DOTPROD_TABLE` is only selected after runtime `dotprod` detection.
+        unsafe { dotprod::gemv_q4_0x4_q8_0(w, x, out, rows, cols_blocks) }
+    }
+
+    #[cfg(feature = "dotprod")]
+    fn dotprod_gemm_q4_0x4(
+        w: &[BlockQ4_0x4],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: `DOTPROD_TABLE` is only selected after runtime `dotprod` detection.
+        unsafe { dotprod::gemm_q4_0x4_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+
+    #[cfg(feature = "dotprod")]
+    fn dotprod_gemm_q8_0(
+        w: &[BlockQ8_0],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: `DOTPROD_TABLE` is only selected after runtime `dotprod` detection.
+        unsafe { dotprod::gemm_q8_0_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+
+    #[cfg(feature = "dotprod")]
+    fn dotprod_gemm_q6_k(
+        w: &[BlockQ6K],
+        x: &[BlockQ8K],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: `DOTPROD_TABLE` is only selected after runtime `dotprod` detection.
+        unsafe { dotprod::gemm_q6_k_q8_k(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+
+    #[cfg(feature = "i8mm")]
+    fn i8mm_gemv_q4_0x4(
+        w: &[BlockQ4_0x4],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: `I8MM_TABLE` is only selected after runtime `i8mm` + `dotprod` detection.
+        unsafe { i8mm::gemv_q4_0x4_q8_0(w, x, out, rows, cols_blocks) }
+    }
+
+    #[cfg(feature = "i8mm")]
+    fn i8mm_gemm_q4_0x4(
+        w: &[BlockQ4_0x4],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: `I8MM_TABLE` is only selected after runtime `i8mm` + `dotprod` detection.
+        unsafe { i8mm::gemm_q4_0x4_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+
+    fn neon_quant_q8_k(src: &[f32], dst: &mut [BlockQ8K]) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { neon_v80::quantize_q8_k(src, dst) }
+    }
+
+    fn neon_dot_f32_q8_0(q: &[f32], k_q8: &[BlockQ8_0]) -> f32 {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { neon_v80::dot_f32_q8_0(q, k_q8) }
+    }
+
+    fn neon_axpy_f32_q8_0(out: &mut [f32], w: f32, v_q8: &[BlockQ8_0]) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { neon_v80::axpy_f32_q8_0(out, w, v_q8) }
+    }
+
     pub const NEON_V80_TABLE: KernelTable = KernelTable {
         isa: Isa::NeonV80,
         vec_dot_q4_0_q8_0: neon_v80_vec_dot,
         gemv_q4_0_q8_0: neon_v80_gemv,
         gemm_q4_0_q8_0: neon_v80_gemm,
+        gemv_q4_0x4_q8_0: neon_v80_gemv_q4_0x4,
+        gemm_q4_0x4_q8_0: neon_v80_gemm_q4_0x4,
         vec_dot_q4_1_q8_1: neon_v80_vec_dot_q4_1,
         gemv_q4_1_q8_1: neon_v80_gemv_q4_1,
         vec_dot_q8_0_q8_0: neon_v80_vec_dot_q8_0,
         gemv_q8_0_q8_0: neon_v80_gemv_q8_0,
+        gemm_q8_0_q8_0: neon_v80_gemm_q8_0,
         vec_dot_q5_k_q8_k: neon_v80_vec_dot_q5_k,
         gemv_q5_k_q8_k: neon_v80_gemv_q5_k,
         vec_dot_q6_k_q8_k: neon_v80_vec_dot_q6_k,
         gemv_q6_k_q8_k: neon_v80_gemv_q6_k,
+        gemm_q6_k_q8_k: neon_v80_gemm_q6_k,
         dot_f32_f16: neon_dot_f32_f16,
         dot_f32_bf16: neon_dot_f32_bf16,
+        dot_f32_q8_0: neon_dot_f32_q8_0,
         axpy_f32_f16: neon_axpy_f32_f16,
+        axpy_f32_q8_0: neon_axpy_f32_q8_0,
         f32_to_f16_slice: neon_f32_to_f16_slice,
         quantize_q8_0: neon_quant_q8_0,
         quantize_q8_1: neon_quant_q8_1,
+        quantize_q8_k: neon_quant_q8_k,
         rms_norm_f32: neon_rms_norm_f32,
         l2_norm_f32: neon_l2_norm_f32,
         gdn_recurrence_head: neon_gdn_recurrence_head,
@@ -402,20 +570,27 @@ mod aarch64_wrappers {
         vec_dot_q4_0_q8_0: dotprod_vec_dot,
         gemv_q4_0_q8_0: dotprod_gemv,
         gemm_q4_0_q8_0: dotprod_gemm,
+        gemv_q4_0x4_q8_0: dotprod_gemv_q4_0x4,
+        gemm_q4_0x4_q8_0: dotprod_gemm_q4_0x4,
         vec_dot_q4_1_q8_1: dotprod_vec_dot_q4_1,
         gemv_q4_1_q8_1: dotprod_gemv_q4_1,
         vec_dot_q8_0_q8_0: dotprod_vec_dot_q8_0,
         gemv_q8_0_q8_0: dotprod_gemv_q8_0,
+        gemm_q8_0_q8_0: dotprod_gemm_q8_0,
         vec_dot_q5_k_q8_k: dotprod_vec_dot_q5_k,
         gemv_q5_k_q8_k: dotprod_gemv_q5_k,
         vec_dot_q6_k_q8_k: dotprod_vec_dot_q6_k,
         gemv_q6_k_q8_k: dotprod_gemv_q6_k,
+        gemm_q6_k_q8_k: dotprod_gemm_q6_k,
         dot_f32_f16: neon_dot_f32_f16,
         dot_f32_bf16: neon_dot_f32_bf16,
+        dot_f32_q8_0: neon_dot_f32_q8_0,
         axpy_f32_f16: neon_axpy_f32_f16,
+        axpy_f32_q8_0: neon_axpy_f32_q8_0,
         f32_to_f16_slice: neon_f32_to_f16_slice,
         quantize_q8_0: neon_quant_q8_0,
         quantize_q8_1: neon_quant_q8_1,
+        quantize_q8_k: neon_quant_q8_k,
         rms_norm_f32: neon_rms_norm_f32,
         l2_norm_f32: neon_l2_norm_f32,
         gdn_recurrence_head: neon_gdn_recurrence_head,
@@ -427,20 +602,27 @@ mod aarch64_wrappers {
         vec_dot_q4_0_q8_0: i8mm_vec_dot,
         gemv_q4_0_q8_0: i8mm_gemv,
         gemm_q4_0_q8_0: i8mm_gemm,
+        gemv_q4_0x4_q8_0: i8mm_gemv_q4_0x4,
+        gemm_q4_0x4_q8_0: i8mm_gemm_q4_0x4,
         vec_dot_q4_1_q8_1: dotprod_vec_dot_q4_1,
         gemv_q4_1_q8_1: dotprod_gemv_q4_1,
         vec_dot_q8_0_q8_0: dotprod_vec_dot_q8_0,
         gemv_q8_0_q8_0: dotprod_gemv_q8_0,
+        gemm_q8_0_q8_0: dotprod_gemm_q8_0,
         vec_dot_q5_k_q8_k: dotprod_vec_dot_q5_k,
         gemv_q5_k_q8_k: dotprod_gemv_q5_k,
         vec_dot_q6_k_q8_k: dotprod_vec_dot_q6_k,
         gemv_q6_k_q8_k: dotprod_gemv_q6_k,
+        gemm_q6_k_q8_k: dotprod_gemm_q6_k,
         dot_f32_f16: neon_dot_f32_f16,
         dot_f32_bf16: neon_dot_f32_bf16,
+        dot_f32_q8_0: neon_dot_f32_q8_0,
         axpy_f32_f16: neon_axpy_f32_f16,
+        axpy_f32_q8_0: neon_axpy_f32_q8_0,
         f32_to_f16_slice: neon_f32_to_f16_slice,
         quantize_q8_0: neon_quant_q8_0,
         quantize_q8_1: neon_quant_q8_1,
+        quantize_q8_k: neon_quant_q8_k,
         rms_norm_f32: neon_rms_norm_f32,
         l2_norm_f32: neon_l2_norm_f32,
         gdn_recurrence_head: neon_gdn_recurrence_head,
