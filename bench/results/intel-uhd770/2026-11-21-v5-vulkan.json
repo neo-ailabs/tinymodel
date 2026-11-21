@@ -1,0 +1,1547 @@
+{
+  "schema_version": 1,
+  "milestone": "V5",
+  "device": "Intel(R) UHD Graphics 770 (ADL-S GT1)",
+  "driver": "Mesa 25.2.8 ANV (UMA, SIMD16, max_batch=64)",
+  "probe": {
+    "schema_version": 1,
+    "device_model": "linux-x86_64",
+    "os": "linux",
+    "arch": "x86_64",
+    "logical_cpus": 20,
+    "active_isa": "avx2",
+    "caps": {
+      "neon": false,
+      "dotprod": false,
+      "i8mm": false,
+      "avx2": true,
+      "avx512_vnni": false
+    },
+    "supported_isas": [
+      "generic",
+      "avx2"
+    ],
+    "clusters": [
+      {
+        "uarch": "12th Gen Intel(R) Core(TM) i7-12700",
+        "max_freq_mhz": 3600,
+        "count": 4,
+        "cpus": [
+          16,
+          17,
+          18,
+          19
+        ],
+        "cpu_mask_hex": "0xf0000"
+      },
+      {
+        "uarch": "12th Gen Intel(R) Core(TM) i7-12700",
+        "max_freq_mhz": 4800,
+        "count": 12,
+        "cpus": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          12,
+          13,
+          14,
+          15
+        ],
+        "cpu_mask_hex": "0xf0ff"
+      },
+      {
+        "uarch": "12th Gen Intel(R) Core(TM) i7-12700",
+        "max_freq_mhz": 4900,
+        "count": 4,
+        "cpus": [
+          8,
+          9,
+          10,
+          11
+        ],
+        "cpu_mask_hex": "0xf00"
+      }
+    ],
+    "memory": {
+      "total_bytes": 16524779520,
+      "available_bytes": 13799157760,
+      "cgroup_max_bytes": null
+    },
+    "process_rss_bytes": 2891776,
+    "process_peak_rss_bytes": 2891776,
+    "process_private_dirty_bytes": 245760,
+    "process_pss_anon_bytes": 245760,
+    "kernel_self_check": {
+      "passed": true,
+      "error": null
+    },
+    "vulkan_devices": [
+      {
+        "index": 0,
+        "name": "Intel(R) UHD Graphics 770 (ADL-S GT1)",
+        "type": "integrated",
+        "driver": "Mesa 25.2.8-0ubuntu0.24.04.5",
+        "subgroup": 16,
+        "min_subgroup": 8,
+        "max_subgroup": 32,
+        "subgroup_shuffle": true,
+        "coopmat": false,
+        "uma": true,
+        "ext_mem_host": true,
+        "vram_bytes": 12393584640
+      },
+      {
+        "index": 1,
+        "name": "AMD Radeon Graphics (RADV GFX1200)",
+        "type": "discrete",
+        "driver": "Mesa 25.2.8-0ubuntu0.24.04.5",
+        "subgroup": 32,
+        "min_subgroup": 32,
+        "max_subgroup": 64,
+        "subgroup_shuffle": true,
+        "coopmat": true,
+        "uma": false,
+        "ext_mem_host": true,
+        "vram_bytes": 8321499136
+      },
+      {
+        "index": 2,
+        "name": "llvmpipe (LLVM 20.1.2, 256 bits)",
+        "type": "cpu",
+        "driver": "Mesa 25.2.8-0ubuntu0.24.04.5 (LLVM 20.1.2)",
+        "subgroup": 8,
+        "min_subgroup": 8,
+        "max_subgroup": 8,
+        "subgroup_shuffle": true,
+        "coopmat": false,
+        "uma": true,
+        "ext_mem_host": true,
+        "vram_bytes": 16524779520
+      }
+    ],
+    "stream_bw": null,
+    "telemetry": {
+      "max_temp_c": 37.0,
+      "skin_temp_c": null,
+      "thermal_status": null,
+      "cur_freq_mhz_max": 4623.8,
+      "governor": "powersave",
+      "battery_power_mw": null,
+      "battery_status": null,
+      "zones": [
+        {
+          "zone": "x86_pkg_temp",
+          "temp_c": 37.0
+        },
+        {
+          "zone": "iwlwifi_1",
+          "temp_c": 32.0
+        },
+        {
+          "zone": "acpitz",
+          "temp_c": 27.8
+        },
+        {
+          "zone": "acpitz",
+          "temp_c": 16.8
+        }
+      ]
+    }
+  },
+  "models": [
+    {
+      "model": "SmolLM2-360M-Instruct-Q4_0.gguf",
+      "weights_mode": "uma-mapped",
+      "tinymodel_vulkan_uhd770": {
+        "load_ms_median": 177.97,
+        "pp512_tps_median": 299.95,
+        "pp512_tps_max": 300.17,
+        "tg64_tps_median": 75.0,
+        "tg64_tps_max": 75.08,
+        "decode_eff_bw_gbs_median": 17.1,
+        "rss_mib_max": 311.8,
+        "private_dirty_mib_max": 38.4,
+        "deterministic": true,
+        "greedy_tokens_fnv1a64": "6fc8ed5e636984b7",
+        "rounds": [
+          {
+            "schema_version": 1,
+            "model": "SmolLM2-360M-Instruct-Q4_0.gguf",
+            "arch": "llama",
+            "backend": "vulkan",
+            "isa": "vulkan",
+            "device_name": "Intel(R) UHD Graphics 770 (ADL-S GT1)",
+            "weights_mode": "uma-mapped",
+            "threads": 1,
+            "max_ctx": 1024,
+            "corpus_mode": false,
+            "active_decode_bytes": 227946240,
+            "load_ms": 177.97,
+            "ttft_ms": 1706.95,
+            "pp_tokens": 512,
+            "pp_ms": 1706.95,
+            "pp_tps": 299.95,
+            "tg_tokens": 64,
+            "tg_ms": 855.9,
+            "tg_tps": 74.78,
+            "ms_per_tok": 13.373,
+            "decode_eff_bw_gbs": 17.04,
+            "last_tok": 19975,
+            "greedy_tokens_fnv1a64": "6fc8ed5e636984b7",
+            "rss_bytes": 326578176,
+            "peak_rss_bytes": 326578176,
+            "private_dirty_bytes": 40222720,
+            "pss_anon_bytes": 40222720,
+            "telemetry_before": {
+              "max_temp_c": 33.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 4675.8,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 33.0
+                },
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 32.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            },
+            "telemetry_after": {
+              "max_temp_c": 32.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 1107.9,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 32.0
+                },
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 29.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            }
+          },
+          {
+            "schema_version": 1,
+            "model": "SmolLM2-360M-Instruct-Q4_0.gguf",
+            "arch": "llama",
+            "backend": "vulkan",
+            "isa": "vulkan",
+            "device_name": "Intel(R) UHD Graphics 770 (ADL-S GT1)",
+            "weights_mode": "uma-mapped",
+            "threads": 1,
+            "max_ctx": 1024,
+            "corpus_mode": false,
+            "active_decode_bytes": 227946240,
+            "load_ms": 194.02,
+            "ttft_ms": 1706.61,
+            "pp_tokens": 512,
+            "pp_ms": 1706.61,
+            "pp_tps": 300.01,
+            "tg_tokens": 64,
+            "tg_ms": 853.38,
+            "tg_tps": 75.0,
+            "ms_per_tok": 13.334,
+            "decode_eff_bw_gbs": 17.1,
+            "last_tok": 19975,
+            "greedy_tokens_fnv1a64": "6fc8ed5e636984b7",
+            "rss_bytes": 326942720,
+            "peak_rss_bytes": 326942720,
+            "private_dirty_bytes": 40222720,
+            "pss_anon_bytes": 40222720,
+            "telemetry_before": {
+              "max_temp_c": 35.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 4700.0,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 35.0
+                },
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 33.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            },
+            "telemetry_after": {
+              "max_temp_c": 33.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 878.3,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 33.0
+                },
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 29.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            }
+          },
+          {
+            "schema_version": 1,
+            "model": "SmolLM2-360M-Instruct-Q4_0.gguf",
+            "arch": "llama",
+            "backend": "vulkan",
+            "isa": "vulkan",
+            "device_name": "Intel(R) UHD Graphics 770 (ADL-S GT1)",
+            "weights_mode": "uma-mapped",
+            "threads": 1,
+            "max_ctx": 1024,
+            "corpus_mode": false,
+            "active_decode_bytes": 227946240,
+            "load_ms": 173.99,
+            "ttft_ms": 1705.69,
+            "pp_tokens": 512,
+            "pp_ms": 1705.69,
+            "pp_tps": 300.17,
+            "tg_tokens": 64,
+            "tg_ms": 852.69,
+            "tg_tps": 75.06,
+            "ms_per_tok": 13.323,
+            "decode_eff_bw_gbs": 17.11,
+            "last_tok": 19975,
+            "greedy_tokens_fnv1a64": "6fc8ed5e636984b7",
+            "rss_bytes": 326545408,
+            "peak_rss_bytes": 326545408,
+            "private_dirty_bytes": 40226816,
+            "pss_anon_bytes": 40226816,
+            "telemetry_before": {
+              "max_temp_c": 36.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 4715.5,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 36.0
+                },
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 34.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            },
+            "telemetry_after": {
+              "max_temp_c": 34.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 886.9,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 34.0
+                },
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 29.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            }
+          },
+          {
+            "schema_version": 1,
+            "model": "SmolLM2-360M-Instruct-Q4_0.gguf",
+            "arch": "llama",
+            "backend": "vulkan",
+            "isa": "vulkan",
+            "device_name": "Intel(R) UHD Graphics 770 (ADL-S GT1)",
+            "weights_mode": "uma-mapped",
+            "threads": 1,
+            "max_ctx": 1024,
+            "corpus_mode": false,
+            "active_decode_bytes": 227946240,
+            "load_ms": 176.19,
+            "ttft_ms": 1707.24,
+            "pp_tokens": 512,
+            "pp_ms": 1707.24,
+            "pp_tps": 299.9,
+            "tg_tokens": 64,
+            "tg_ms": 854.45,
+            "tg_tps": 74.9,
+            "ms_per_tok": 13.351,
+            "decode_eff_bw_gbs": 17.07,
+            "last_tok": 19975,
+            "greedy_tokens_fnv1a64": "6fc8ed5e636984b7",
+            "rss_bytes": 326610944,
+            "peak_rss_bytes": 326610944,
+            "private_dirty_bytes": 40222720,
+            "pss_anon_bytes": 40222720,
+            "telemetry_before": {
+              "max_temp_c": 36.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 4612.1,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 36.0
+                },
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 32.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            },
+            "telemetry_after": {
+              "max_temp_c": 32.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 900.1,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 32.0
+                },
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 29.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            }
+          },
+          {
+            "schema_version": 1,
+            "model": "SmolLM2-360M-Instruct-Q4_0.gguf",
+            "arch": "llama",
+            "backend": "vulkan",
+            "isa": "vulkan",
+            "device_name": "Intel(R) UHD Graphics 770 (ADL-S GT1)",
+            "weights_mode": "uma-mapped",
+            "threads": 1,
+            "max_ctx": 1024,
+            "corpus_mode": false,
+            "active_decode_bytes": 227946240,
+            "load_ms": 192.09,
+            "ttft_ms": 1707.03,
+            "pp_tokens": 512,
+            "pp_ms": 1707.03,
+            "pp_tps": 299.94,
+            "tg_tokens": 64,
+            "tg_ms": 852.44,
+            "tg_tps": 75.08,
+            "ms_per_tok": 13.319,
+            "decode_eff_bw_gbs": 17.11,
+            "last_tok": 19975,
+            "greedy_tokens_fnv1a64": "6fc8ed5e636984b7",
+            "rss_bytes": 326348800,
+            "peak_rss_bytes": 326348800,
+            "private_dirty_bytes": 40222720,
+            "pss_anon_bytes": 40222720,
+            "telemetry_before": {
+              "max_temp_c": 37.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 4510.1,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 37.0
+                },
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 32.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            },
+            "telemetry_after": {
+              "max_temp_c": 33.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 900.7,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 33.0
+                },
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 29.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "llamacpp_vulkan_uhd770": {
+        "pp512_tps_median": 800.33,
+        "tg64_tps_median": 50.01,
+        "rounds": [
+          {
+            "pp_tps": 800.69769,
+            "tg_tps": 49.979442
+          },
+          {
+            "pp_tps": 799.285927,
+            "tg_tps": 50.198767
+          },
+          {
+            "pp_tps": 800.471028,
+            "tg_tps": 50.007116
+          },
+          {
+            "pp_tps": 800.158431,
+            "tg_tps": 50.16605
+          },
+          {
+            "pp_tps": 800.334926,
+            "tg_tps": 49.966959
+          }
+        ]
+      },
+      "ratio_vs_llamacpp_vulkan_pct": {
+        "pp512_pct": 37.5,
+        "tg64_pct": 150.0
+      }
+    },
+    {
+      "model": "Qwen3.5-0.8B-Q4_0.gguf",
+      "weights_mode": "uma-mapped",
+      "tinymodel_vulkan_uhd770": {
+        "load_ms_median": 534.67,
+        "pp512_tps_median": 154.54,
+        "pp512_tps_max": 154.58,
+        "tg64_tps_median": 29.66,
+        "tg64_tps_max": 29.75,
+        "decode_eff_bw_gbs_median": 14.72,
+        "rss_mib_max": 581.6,
+        "private_dirty_mib_max": 43.7,
+        "deterministic": true,
+        "greedy_tokens_fnv1a64": "ae44422a335f1200",
+        "rounds": [
+          {
+            "schema_version": 1,
+            "model": "Qwen3.5-0.8B-Q4_0.gguf",
+            "arch": "qwen35",
+            "backend": "vulkan",
+            "isa": "vulkan",
+            "device_name": "Intel(R) UHD Graphics 770 (ADL-S GT1)",
+            "weights_mode": "uma-mapped",
+            "threads": 1,
+            "max_ctx": 1024,
+            "corpus_mode": false,
+            "active_decode_bytes": 496192768,
+            "load_ms": 535.31,
+            "ttft_ms": 3312.96,
+            "pp_tokens": 512,
+            "pp_ms": 3312.96,
+            "pp_tps": 154.54,
+            "tg_tokens": 64,
+            "tg_ms": 2151.36,
+            "tg_tps": 29.75,
+            "ms_per_tok": 33.615,
+            "decode_eff_bw_gbs": 14.76,
+            "last_tok": 2,
+            "greedy_tokens_fnv1a64": "ae44422a335f1200",
+            "rss_bytes": 609792000,
+            "peak_rss_bytes": 609792000,
+            "private_dirty_bytes": 45817856,
+            "pss_anon_bytes": 45817856,
+            "telemetry_before": {
+              "max_temp_c": 38.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 4685.8,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 38.0
+                },
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 34.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            },
+            "telemetry_after": {
+              "max_temp_c": 32.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 889.1,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 32.0
+                },
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 29.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            }
+          },
+          {
+            "schema_version": 1,
+            "model": "Qwen3.5-0.8B-Q4_0.gguf",
+            "arch": "qwen35",
+            "backend": "vulkan",
+            "isa": "vulkan",
+            "device_name": "Intel(R) UHD Graphics 770 (ADL-S GT1)",
+            "weights_mode": "uma-mapped",
+            "threads": 1,
+            "max_ctx": 1024,
+            "corpus_mode": false,
+            "active_decode_bytes": 496192768,
+            "load_ms": 523.35,
+            "ttft_ms": 3313.27,
+            "pp_tokens": 512,
+            "pp_ms": 3313.27,
+            "pp_tps": 154.53,
+            "tg_tokens": 64,
+            "tg_ms": 2157.89,
+            "tg_tps": 29.66,
+            "ms_per_tok": 33.717,
+            "decode_eff_bw_gbs": 14.72,
+            "last_tok": 2,
+            "greedy_tokens_fnv1a64": "ae44422a335f1200",
+            "rss_bytes": 609800192,
+            "peak_rss_bytes": 609800192,
+            "private_dirty_bytes": 45817856,
+            "pss_anon_bytes": 45817856,
+            "telemetry_before": {
+              "max_temp_c": 33.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 4714.3,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 33.0
+                },
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 32.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            },
+            "telemetry_after": {
+              "max_temp_c": 32.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 900.0,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 32.0
+                },
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 29.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            }
+          },
+          {
+            "schema_version": 1,
+            "model": "Qwen3.5-0.8B-Q4_0.gguf",
+            "arch": "qwen35",
+            "backend": "vulkan",
+            "isa": "vulkan",
+            "device_name": "Intel(R) UHD Graphics 770 (ADL-S GT1)",
+            "weights_mode": "uma-mapped",
+            "threads": 1,
+            "max_ctx": 1024,
+            "corpus_mode": false,
+            "active_decode_bytes": 496192768,
+            "load_ms": 527.53,
+            "ttft_ms": 3313.33,
+            "pp_tokens": 512,
+            "pp_ms": 3313.33,
+            "pp_tps": 154.53,
+            "tg_tokens": 64,
+            "tg_ms": 2156.86,
+            "tg_tps": 29.67,
+            "ms_per_tok": 33.701,
+            "decode_eff_bw_gbs": 14.72,
+            "last_tok": 2,
+            "greedy_tokens_fnv1a64": "ae44422a335f1200",
+            "rss_bytes": 609517568,
+            "peak_rss_bytes": 609517568,
+            "private_dirty_bytes": 45817856,
+            "pss_anon_bytes": 45817856,
+            "telemetry_before": {
+              "max_temp_c": 35.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 4500.0,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 35.0
+                },
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 32.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            },
+            "telemetry_after": {
+              "max_temp_c": 34.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 900.0,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 34.0
+                },
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 29.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            }
+          },
+          {
+            "schema_version": 1,
+            "model": "Qwen3.5-0.8B-Q4_0.gguf",
+            "arch": "qwen35",
+            "backend": "vulkan",
+            "isa": "vulkan",
+            "device_name": "Intel(R) UHD Graphics 770 (ADL-S GT1)",
+            "weights_mode": "uma-mapped",
+            "threads": 1,
+            "max_ctx": 1024,
+            "corpus_mode": false,
+            "active_decode_bytes": 496192768,
+            "load_ms": 534.67,
+            "ttft_ms": 3312.24,
+            "pp_tokens": 512,
+            "pp_ms": 3312.24,
+            "pp_tps": 154.58,
+            "tg_tokens": 64,
+            "tg_ms": 2158.2,
+            "tg_tps": 29.65,
+            "ms_per_tok": 33.722,
+            "decode_eff_bw_gbs": 14.71,
+            "last_tok": 2,
+            "greedy_tokens_fnv1a64": "ae44422a335f1200",
+            "rss_bytes": 609542144,
+            "peak_rss_bytes": 609542144,
+            "private_dirty_bytes": 45817856,
+            "pss_anon_bytes": 45817856,
+            "telemetry_before": {
+              "max_temp_c": 32.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 4699.4,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 32.0
+                },
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 31.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            },
+            "telemetry_after": {
+              "max_temp_c": 34.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 900.0,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 34.0
+                },
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 29.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            }
+          },
+          {
+            "schema_version": 1,
+            "model": "Qwen3.5-0.8B-Q4_0.gguf",
+            "arch": "qwen35",
+            "backend": "vulkan",
+            "isa": "vulkan",
+            "device_name": "Intel(R) UHD Graphics 770 (ADL-S GT1)",
+            "weights_mode": "uma-mapped",
+            "threads": 1,
+            "max_ctx": 1024,
+            "corpus_mode": false,
+            "active_decode_bytes": 496192768,
+            "load_ms": 538.66,
+            "ttft_ms": 3312.57,
+            "pp_tokens": 512,
+            "pp_ms": 3312.57,
+            "pp_tps": 154.56,
+            "tg_tokens": 64,
+            "tg_ms": 2157.58,
+            "tg_tps": 29.66,
+            "ms_per_tok": 33.712,
+            "decode_eff_bw_gbs": 14.72,
+            "last_tok": 2,
+            "greedy_tokens_fnv1a64": "ae44422a335f1200",
+            "rss_bytes": 609673216,
+            "peak_rss_bytes": 609673216,
+            "private_dirty_bytes": 45817856,
+            "pss_anon_bytes": 45817856,
+            "telemetry_before": {
+              "max_temp_c": 34.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 4584.6,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 34.0
+                },
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 31.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            },
+            "telemetry_after": {
+              "max_temp_c": 34.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 902.4,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 34.0
+                },
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 30.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "llamacpp_vulkan_uhd770": {
+        "pp512_tps_median": 306.23,
+        "tg64_tps_median": 24.51,
+        "rounds": [
+          {
+            "pp_tps": 306.716152,
+            "tg_tps": 24.508963
+          },
+          {
+            "pp_tps": 304.72337,
+            "tg_tps": 24.482715
+          },
+          {
+            "pp_tps": 305.783459,
+            "tg_tps": 24.490549
+          },
+          {
+            "pp_tps": 306.225948,
+            "tg_tps": 24.514294
+          },
+          {
+            "pp_tps": 306.38286,
+            "tg_tps": 24.570187
+          }
+        ]
+      },
+      "ratio_vs_llamacpp_vulkan_pct": {
+        "pp512_pct": 50.5,
+        "tg64_pct": 121.0
+      }
+    },
+    {
+      "model": "Llama-3.2-1B-Instruct-Q4_0.gguf",
+      "weights_mode": "uma-mapped",
+      "tinymodel_vulkan_uhd770": {
+        "load_ms_median": 460.02,
+        "pp512_tps_median": 114.07,
+        "pp512_tps_max": 114.09,
+        "tg64_tps_median": 24.45,
+        "tg64_tps_max": 24.49,
+        "decode_eff_bw_gbs_median": 18.71,
+        "rss_mib_max": 831.1,
+        "private_dirty_mib_max": 39.7,
+        "deterministic": true,
+        "greedy_tokens_fnv1a64": "2e7c790aed95ea9c",
+        "rounds": [
+          {
+            "schema_version": 1,
+            "model": "Llama-3.2-1B-Instruct-Q4_0.gguf",
+            "arch": "llama",
+            "backend": "vulkan",
+            "isa": "vulkan",
+            "device_name": "Intel(R) UHD Graphics 770 (ADL-S GT1)",
+            "weights_mode": "uma-mapped",
+            "threads": 1,
+            "max_ctx": 1024,
+            "corpus_mode": false,
+            "active_decode_bytes": 765194368,
+            "load_ms": 469.79,
+            "ttft_ms": 4487.81,
+            "pp_tokens": 512,
+            "pp_ms": 4487.81,
+            "pp_tps": 114.09,
+            "tg_tokens": 64,
+            "tg_ms": 2617.48,
+            "tg_tps": 24.45,
+            "ms_per_tok": 40.898,
+            "decode_eff_bw_gbs": 18.71,
+            "last_tok": 264,
+            "greedy_tokens_fnv1a64": "2e7c790aed95ea9c",
+            "rss_bytes": 871387136,
+            "peak_rss_bytes": 871387136,
+            "private_dirty_bytes": 41660416,
+            "pss_anon_bytes": 41660416,
+            "telemetry_before": {
+              "max_temp_c": 33.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 4700.0,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 33.0
+                },
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 32.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            },
+            "telemetry_after": {
+              "max_temp_c": 34.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 900.0,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 34.0
+                },
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 29.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            }
+          },
+          {
+            "schema_version": 1,
+            "model": "Llama-3.2-1B-Instruct-Q4_0.gguf",
+            "arch": "llama",
+            "backend": "vulkan",
+            "isa": "vulkan",
+            "device_name": "Intel(R) UHD Graphics 770 (ADL-S GT1)",
+            "weights_mode": "uma-mapped",
+            "threads": 1,
+            "max_ctx": 1024,
+            "corpus_mode": false,
+            "active_decode_bytes": 765194368,
+            "load_ms": 457.81,
+            "ttft_ms": 4488.55,
+            "pp_tokens": 512,
+            "pp_ms": 4488.55,
+            "pp_tps": 114.07,
+            "tg_tokens": 64,
+            "tg_ms": 2627.33,
+            "tg_tps": 24.36,
+            "ms_per_tok": 41.052,
+            "decode_eff_bw_gbs": 18.64,
+            "last_tok": 264,
+            "greedy_tokens_fnv1a64": "2e7c790aed95ea9c",
+            "rss_bytes": 870903808,
+            "peak_rss_bytes": 870903808,
+            "private_dirty_bytes": 41664512,
+            "pss_anon_bytes": 41664512,
+            "telemetry_before": {
+              "max_temp_c": 44.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 4709.3,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 44.0
+                },
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 32.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            },
+            "telemetry_after": {
+              "max_temp_c": 34.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 900.0,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 34.0
+                },
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 29.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            }
+          },
+          {
+            "schema_version": 1,
+            "model": "Llama-3.2-1B-Instruct-Q4_0.gguf",
+            "arch": "llama",
+            "backend": "vulkan",
+            "isa": "vulkan",
+            "device_name": "Intel(R) UHD Graphics 770 (ADL-S GT1)",
+            "weights_mode": "uma-mapped",
+            "threads": 1,
+            "max_ctx": 1024,
+            "corpus_mode": false,
+            "active_decode_bytes": 765194368,
+            "load_ms": 460.02,
+            "ttft_ms": 4489.06,
+            "pp_tokens": 512,
+            "pp_ms": 4489.06,
+            "pp_tps": 114.06,
+            "tg_tokens": 64,
+            "tg_ms": 2614.16,
+            "tg_tps": 24.48,
+            "ms_per_tok": 40.846,
+            "decode_eff_bw_gbs": 18.73,
+            "last_tok": 264,
+            "greedy_tokens_fnv1a64": "2e7c790aed95ea9c",
+            "rss_bytes": 871067648,
+            "peak_rss_bytes": 871067648,
+            "private_dirty_bytes": 41664512,
+            "pss_anon_bytes": 41664512,
+            "telemetry_before": {
+              "max_temp_c": 39.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 4620.5,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 39.0
+                },
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 34.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            },
+            "telemetry_after": {
+              "max_temp_c": 32.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 900.1,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 32.0
+                },
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 31.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            }
+          },
+          {
+            "schema_version": 1,
+            "model": "Llama-3.2-1B-Instruct-Q4_0.gguf",
+            "arch": "llama",
+            "backend": "vulkan",
+            "isa": "vulkan",
+            "device_name": "Intel(R) UHD Graphics 770 (ADL-S GT1)",
+            "weights_mode": "uma-mapped",
+            "threads": 1,
+            "max_ctx": 1024,
+            "corpus_mode": false,
+            "active_decode_bytes": 765194368,
+            "load_ms": 458.21,
+            "ttft_ms": 4488.19,
+            "pp_tokens": 512,
+            "pp_ms": 4488.19,
+            "pp_tps": 114.08,
+            "tg_tokens": 64,
+            "tg_ms": 2627.57,
+            "tg_tps": 24.36,
+            "ms_per_tok": 41.056,
+            "decode_eff_bw_gbs": 18.64,
+            "last_tok": 264,
+            "greedy_tokens_fnv1a64": "2e7c790aed95ea9c",
+            "rss_bytes": 871485440,
+            "peak_rss_bytes": 871485440,
+            "private_dirty_bytes": 41656320,
+            "pss_anon_bytes": 41656320,
+            "telemetry_before": {
+              "max_temp_c": 40.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 4658.4,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 40.0
+                },
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 32.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            },
+            "telemetry_after": {
+              "max_temp_c": 34.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 847.7,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 34.0
+                },
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 31.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            }
+          },
+          {
+            "schema_version": 1,
+            "model": "Llama-3.2-1B-Instruct-Q4_0.gguf",
+            "arch": "llama",
+            "backend": "vulkan",
+            "isa": "vulkan",
+            "device_name": "Intel(R) UHD Graphics 770 (ADL-S GT1)",
+            "weights_mode": "uma-mapped",
+            "threads": 1,
+            "max_ctx": 1024,
+            "corpus_mode": false,
+            "active_decode_bytes": 765194368,
+            "load_ms": 465.82,
+            "ttft_ms": 4488.76,
+            "pp_tokens": 512,
+            "pp_ms": 4488.76,
+            "pp_tps": 114.06,
+            "tg_tokens": 64,
+            "tg_ms": 2613.47,
+            "tg_tps": 24.49,
+            "ms_per_tok": 40.835,
+            "decode_eff_bw_gbs": 18.74,
+            "last_tok": 264,
+            "greedy_tokens_fnv1a64": "2e7c790aed95ea9c",
+            "rss_bytes": 871096320,
+            "peak_rss_bytes": 871096320,
+            "private_dirty_bytes": 41660416,
+            "pss_anon_bytes": 41660416,
+            "telemetry_before": {
+              "max_temp_c": 44.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 4593.1,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 44.0
+                },
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 35.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            },
+            "telemetry_after": {
+              "max_temp_c": 33.0,
+              "skin_temp_c": null,
+              "thermal_status": null,
+              "cur_freq_mhz_max": 885.7,
+              "governor": "powersave",
+              "battery_power_mw": null,
+              "battery_status": null,
+              "zones": [
+                {
+                  "zone": "iwlwifi_1",
+                  "temp_c": 33.0
+                },
+                {
+                  "zone": "x86_pkg_temp",
+                  "temp_c": 31.0
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 27.8
+                },
+                {
+                  "zone": "acpitz",
+                  "temp_c": 16.8
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "llamacpp_vulkan_uhd770": {
+        "pp512_tps_median": 414.91,
+        "tg64_tps_median": 20.69,
+        "rounds": [
+          {
+            "pp_tps": 415.097461,
+            "tg_tps": 20.688933
+          },
+          {
+            "pp_tps": 414.363952,
+            "tg_tps": 20.655226
+          },
+          {
+            "pp_tps": 414.907679,
+            "tg_tps": 20.698745
+          },
+          {
+            "pp_tps": 413.97955,
+            "tg_tps": 20.665281
+          },
+          {
+            "pp_tps": 415.120872,
+            "tg_tps": 20.733126
+          }
+        ]
+      },
+      "ratio_vs_llamacpp_vulkan_pct": {
+        "pp512_pct": 27.5,
+        "tg64_pct": 118.2
+      }
+    }
+  ]
+}

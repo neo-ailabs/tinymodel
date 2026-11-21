@@ -16,6 +16,7 @@ layout(local_size_x_id = 0) in;
 layout(std430, binding = 0) readonly buffer WA { uint16_t wa[]; };
 layout(std430, binding = 1) readonly buffer WB { uint16_t wb[]; };
 layout(std430, binding = 2) readonly buffer X  { float x[]; };
+layout(std430, binding = 2) readonly buffer X4 { vec4 x4[]; };
 layout(std430, binding = 3) writeonly buffer YA { float ya[]; };
 layout(std430, binding = 4) writeonly buffer YB { float yb[]; };
 
@@ -54,29 +55,20 @@ void main() {
 
     if (DTYPE == 0u) {
         const uint nb = pc.n_in / 32u;
-        for (uint ib = lane; ib < nb; ib += sg_size) {
-            const uint xb = ib * 32u;
-            float sumx = 0.0;
-            float xv[32];
-            for (uint k = 0u; k < 32u; ++k) {
-                xv[k] = x[xb + k];
-                sumx += xv[k];
-            }
-            const float corr = -8.0 * sumx;
+        const uint sub = lane & 3u;
+        const uint blk_step = sg_size >> 2u;
+        for (uint ib = (lane >> 2u); ib < nb; ib += blk_step) {
+            const vec4 xlo = x4[ib * 8u + sub];
+            const vec4 xhi = x4[ib * 8u + 4u + sub];
             for (uint r = 0u; r < NR; ++r) {
                 const uint b = row_b[r] + ib * 9u;
                 const float d = unpackHalf2x16(is_b ? uint(wb[b]) : uint(wa[b])).x;
-                float s = 0.0;
-                for (uint j = 0u; j < 8u; ++j) {
-                    const uint u = is_b ? uint(wb[b + 1u + j]) : uint(wa[b + 1u + j]);
-                    const uint b0 = u & 0xFFu;
-                    const uint b1 = u >> 8u;
-                    s = fma(float(b0 & 15u), xv[2u * j], s);
-                    s = fma(float(b0 >> 4u), xv[2u * j + 16u], s);
-                    s = fma(float(b1 & 15u), xv[2u * j + 1u], s);
-                    s = fma(float(b1 >> 4u), xv[2u * j + 17u], s);
-                }
-                acc[r] = fma(d, s + corr, acc[r]);
+                const uint u = is_b
+                    ? (uint(wb[b + 1u + 2u * sub]) | (uint(wb[b + 2u + 2u * sub]) << 16u))
+                    : (uint(wa[b + 1u + 2u * sub]) | (uint(wa[b + 2u + 2u * sub]) << 16u));
+                const float s = dot(vec4(u & 15u, (u >> 8u) & 15u, (u >> 16u) & 15u, (u >> 24u) & 15u) - 8.0, xlo)
+                              + dot(vec4((u >> 4u) & 15u, (u >> 12u) & 15u, (u >> 20u) & 15u, u >> 28u) - 8.0, xhi);
+                acc[r] = fma(d, s, acc[r]);
             }
         }
     } else {

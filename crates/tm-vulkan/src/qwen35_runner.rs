@@ -44,6 +44,8 @@ const SPV_GDN_GATES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gdn_gates
 const SPV_GDN_CONV_SILU_L2: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gdn_conv_silu_l2.spv"));
 const SPV_GDN_RECURRENCE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gdn_recurrence.spv"));
+const SPV_GDN_RECURRENCE_LDS: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gdn_recurrence_lds.spv"));
 const SPV_GDN_NORM_GATED_SILU: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gdn_norm_gated_silu.spv"));
 const SPV_GEMM_TILED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_tiled.spv"));
@@ -162,18 +164,26 @@ enum BatchAttnKind {
 }
 
 struct ArenaPlanner {
+    raw_align: u64,
     align: u64,
     slab_cap: u64,
     max_range: u64,
+    slab_base: usize,
+    imported_limit: Option<u64>,
+    imported_bytes: u64,
     slab_sizes: Vec<u64>,
 }
 
 impl ArenaPlanner {
-    fn new(align: u64, slab_cap: u64, max_range: u64) -> Self {
+    fn new(align: u64, slab_cap: u64, max_range: u64, imported_limit: Option<u64>) -> Self {
         Self {
+            raw_align: align.max(1),
             align: align.max(256),
             slab_cap,
             max_range,
+            slab_base: usize::from(imported_limit.is_some()),
+            imported_limit,
+            imported_bytes: 0,
             slab_sizes: Vec::new(),
         }
     }
@@ -193,12 +203,12 @@ impl ArenaPlanner {
             let offset = *last;
             *last += aligned;
             return Ok(VkSlice {
-                slab: self.slab_sizes.len() - 1,
+                slab: self.slab_base + self.slab_sizes.len() - 1,
                 offset,
                 len,
             });
         }
-        let slab = self.slab_sizes.len();
+        let slab = self.slab_base + self.slab_sizes.len();
         self.slab_sizes.push(aligned);
         Ok(VkSlice {
             slab,
@@ -207,8 +217,25 @@ impl ArenaPlanner {
         })
     }
 
+    fn try_import_slice(&mut self, file_offset: u64, byte_len: u64) -> Option<VkSlice> {
+        let limit = self.imported_limit?;
+        if byte_len == 0
+            || byte_len > self.max_range
+            || file_offset + byte_len > limit
+            || !file_offset.is_multiple_of(self.raw_align)
+        {
+            return None;
+        }
+        self.imported_bytes += byte_len;
+        Some(VkSlice {
+            slab: 0,
+            offset: file_offset,
+            len: byte_len,
+        })
+    }
+
     fn total_bytes(&self) -> u64 {
-        self.slab_sizes.iter().sum()
+        self.imported_bytes + self.slab_sizes.iter().sum::<u64>()
     }
 }
 
@@ -378,11 +405,16 @@ pub struct Qwen35VkRunner {
     cb_decode_greedy: vk::CommandBuffer,
     cb_batch: vk::CommandBuffer,
     fence: vk::Fence,
+    zero_copy_weights: bool,
+    used_lds_recurrence: bool,
+    // Kept AFTER `slabs` so the GGUF `mmap` outlives any imported `VK_EXT_external_memory_host` buffer.
+    _gguf: Arc<GgufFile>,
 }
 
 struct PendingMat<'a> {
     slice: VkSlice,
     bytes: &'a [u8],
+    imported: bool,
     mat: VkMat,
 }
 
@@ -417,10 +449,15 @@ fn plan_mat<'a>(
     let (info, bytes) = gguf.req_tensor(name, layer, &[cols, rows])?;
     let _ = dtype_code(info.dtype)?;
     let row_bytes = info.dtype.row_bytes(cols);
-    let slice = planner.reserve(bytes.len() as u64)?;
+    let file_off = gguf.tensor_file_offset(info) as u64;
+    let (slice, imported) = match planner.try_import_slice(file_off, bytes.len() as u64) {
+        Some(s) => (s, true),
+        None => (planner.reserve(bytes.len() as u64)?, false),
+    };
     Ok(PendingMat {
         slice,
         bytes,
+        imported,
         mat: VkMat {
             slice,
             dtype: info.dtype,
@@ -556,6 +593,7 @@ impl Qwen35VkRunner {
             }
         };
 
+        let umap_buf = ctx.try_import_host_readonly(gguf_ref.as_bytes(), gguf_ref.is_mmap());
         let slab_cap = TARGET_SLAB_BYTES
             .min(info.max_alloc_bytes / 2)
             .max(64 << 20);
@@ -563,6 +601,7 @@ impl Qwen35VkRunner {
             info.min_storage_buffer_offset_alignment,
             slab_cap,
             info.max_storage_buffer_range,
+            umap_buf.as_ref().map(VkBuffer::byte_len),
         );
 
         // 1. Plan every device allocation up front BEFORE mutating state (`AGENTS.md` MUST #4 & #6).
@@ -854,7 +893,15 @@ impl Qwen35VkRunner {
             + 2 * n_ff
             + max_i8_cols)
             * 4) as u64;
-        let mut max_batch = PREFERRED_MAX_BATCH.min(range_batch_cap);
+        // Cap single-submission batch to 64 on non-CoopMat UMA GPUs (Intel i915, Android Mali,
+        // RK3588 Panthor, Pi 5 V3D) so per-submit latency stays well below 500..2000 ms kernel
+        // GPU TDR watchdogs (`VK_ERROR_DEVICE_LOST`) while saving 8x activation scratch RAM.
+        let preferred_batch = if info.unified_memory && prefill_kind == ResolvedPrefill::Fallback {
+            64usize
+        } else {
+            PREFERRED_MAX_BATCH
+        };
+        let mut max_batch = preferred_batch.min(range_batch_cap);
         if max_batch > 128 && base_bytes + (max_batch as u64) * per_tok_scratch > budget {
             max_batch = 128.min(range_batch_cap);
         }
@@ -893,22 +940,28 @@ impl Qwen35VkRunner {
             });
         }
 
-        // 2. Allocate slabs, zero-initialize state, and upload weights via staging.
-        let mut slabs = Vec::with_capacity(planner.slab_sizes.len());
+        // 2. Allocate mutable slabs, zero-initialize state, and upload any non-imported weights.
+        let zero_copy_weights = umap_buf.is_some() && planner.imported_bytes > 0;
+        let mut slabs = Vec::with_capacity(planner.slab_base + planner.slab_sizes.len());
+        if let Some(ubuf) = umap_buf {
+            slabs.push(ubuf);
+        }
         for &sz in &planner.slab_sizes {
             slabs.push(ctx.create_device_slab(sz)?);
         }
-        ctx.run(|rec| {
-            for slab in &slabs {
-                // SAFETY: `slab` is a newly created transfer-dst buffer idle on the device.
-                unsafe {
-                    ctx.inner
-                        .device
-                        .cmd_fill_buffer(rec.cb, slab.buf, 0, vk::WHOLE_SIZE, 0);
+        if !planner.slab_sizes.is_empty() {
+            ctx.run(|rec| {
+                for slab in &slabs[planner.slab_base..] {
+                    // SAFETY: `slab` is a newly created mutable transfer-dst buffer idle on the device.
+                    unsafe {
+                        ctx.inner
+                            .device
+                            .cmd_fill_buffer(rec.cb, slab.buf, 0, vk::WHOLE_SIZE, 0);
+                    }
                 }
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })?;
+        }
 
         let write_f32 = |pf: &PendingF32| -> Result<(), VulkanError> {
             // SAFETY: `f32` slice viewed as plain bytes for staging copy.
@@ -918,6 +971,9 @@ impl Qwen35VkRunner {
             ctx.write_bytes(&slabs[pf.slice.slab], pf.slice.offset, bytes)
         };
         let write_mat = |pm: &PendingMat<'_>| -> Result<(), VulkanError> {
+            if pm.imported {
+                return Ok(());
+            }
             ctx.write_bytes(&slabs[pm.slice.slab], pm.slice.offset, pm.bytes)
         };
 
@@ -983,6 +1039,7 @@ impl Qwen35VkRunner {
         // 3. Build compute pipelines.
         let emb_dt = dtype_code(p_token_embd.mat.dtype)?;
         let attn_wg = 8 * sg;
+        let attn_n_vec = ((head_dim / 4).div_ceil(sg as usize)).max(1) as u32;
         let (attn_batch, attn_batch_kind) = if prefill_kind != ResolvedPrefill::Fallback
             && info.coopmat_f16_f32acc
             && sg == 32
@@ -995,18 +1052,25 @@ impl Qwen35VkRunner {
             )
         } else if head_dim.is_multiple_of(4) && head_dim <= 256 {
             (
-                ctx.pipeline("fa_gqa_tiled", attn_wg, SPV_FA_GQA_TILED, 4, 20, &[attn_wg])?,
+                ctx.pipeline(
+                    "fa_gqa_tiled",
+                    attn_wg | (attn_n_vec << 16),
+                    SPV_FA_GQA_TILED,
+                    4,
+                    20,
+                    &[attn_wg, attn_n_vec],
+                )?,
                 BatchAttnKind::Tiled8,
             )
         } else {
             (
                 ctx.pipeline(
                     "attn_batch",
-                    attn_wg | 0x1000,
+                    attn_wg | 0x1000 | (attn_n_vec << 16),
                     SPV_GQA_ATTN,
                     5,
                     16,
-                    &[attn_wg, 1],
+                    &[attn_wg, 1, attn_n_vec],
                 )?,
                 BatchAttnKind::Legacy1,
             )
@@ -1016,6 +1080,19 @@ impl Qwen35VkRunner {
             Some(ctx.pipeline("quantize_q8_1", 256, SPV_QUANTIZE_Q8_1, 3, 4, &[256])?)
         } else {
             None
+        };
+        let used_lds_recurrence = !info.subgroup_shuffle || ctx.force_lds_recurrence();
+        let gdn_recurrence_pipe = if used_lds_recurrence {
+            ctx.pipeline(
+                "gdn_recurrence_lds",
+                128,
+                SPV_GDN_RECURRENCE_LDS,
+                7,
+                16,
+                &[128],
+            )?
+        } else {
+            ctx.pipeline("gdn_recurrence", 128, SPV_GDN_RECURRENCE, 7, 16, &[128])?
         };
 
         let pipes = RunnerPipes {
@@ -1034,7 +1111,14 @@ impl Qwen35VkRunner {
             sigmoid_mul: ctx.pipeline("sigmoid_mul", 256, SPV_SIGMOID_MUL, 2, 4, &[256])?,
             rope_dec: ctx.pipeline("rope_dec", 0, SPV_ROPE_KV, 7, 32, &[64, 0])?,
             rope_batch: ctx.pipeline("rope_batch", 1, SPV_ROPE_KV, 7, 32, &[64, 1])?,
-            attn_dec: ctx.pipeline("attn_dec", attn_wg, SPV_GQA_ATTN, 5, 16, &[attn_wg, 0])?,
+            attn_dec: ctx.pipeline(
+                "attn_dec",
+                attn_wg | (attn_n_vec << 16),
+                SPV_GQA_ATTN,
+                5,
+                16,
+                &[attn_wg, 0, attn_n_vec],
+            )?,
             attn_batch,
             attn_batch_kind,
             gdn_gates: ctx.pipeline("gdn_gates", 64, SPV_GDN_GATES, 5, 8, &[64])?,
@@ -1062,14 +1146,7 @@ impl Qwen35VkRunner {
                 24,
                 &[128, 2],
             )?,
-            gdn_recurrence: ctx.pipeline(
-                "gdn_recurrence",
-                128,
-                SPV_GDN_RECURRENCE,
-                7,
-                16,
-                &[128],
-            )?,
+            gdn_recurrence: gdn_recurrence_pipe,
             gdn_norm_gated_silu: ctx.pipeline(
                 "gdn_norm_gated_silu",
                 64,
@@ -1897,6 +1974,9 @@ impl Qwen35VkRunner {
             cb_decode_greedy: cbs[2],
             cb_batch: cbs[3],
             fence,
+            zero_copy_weights,
+            used_lds_recurrence,
+            _gguf: gguf.clone(),
         };
         runner.prerecord_decode_command_buffers()?;
         Ok(runner)
@@ -1912,6 +1992,24 @@ impl Qwen35VkRunner {
 
     pub fn active_prefill_backend(&self) -> &'static str {
         self.prefill_kind.label()
+    }
+
+    pub fn is_zero_copy(&self) -> bool {
+        self.zero_copy_weights
+    }
+
+    pub fn uses_lds_recurrence(&self) -> bool {
+        self.used_lds_recurrence
+    }
+
+    pub fn weights_mode(&self) -> &'static str {
+        if self.zero_copy_weights {
+            "zero-copy-umap"
+        } else if self.ctx.info().unified_memory {
+            "uma-mapped"
+        } else {
+            "vram-slab"
+        }
     }
 
     /// Borrowed view of the most recently computed `[vocab_size]` FP32 logits.
@@ -2545,7 +2643,7 @@ impl Qwen35VkRunner {
         let sg = self.ctx.info().subgroup_size;
         let mat = entry.mat;
         let (gx, gy) = match entry.flavor {
-            GemmFlavor::Tiled32 => ((mat.rows as u32).div_ceil(32), n_tok.div_ceil(32)),
+            GemmFlavor::Tiled32 => ((mat.rows as u32).div_ceil(64), n_tok.div_ceil(32)),
             GemmFlavor::KQuantSubgroup => {
                 let rows_per_wg = (128 / sg).max(1);
                 ((mat.rows as u32).div_ceil(rows_per_wg), n_tok.div_ceil(8))

@@ -49,17 +49,19 @@
    python3 bench/device_harness.py list
    python3 bench/device_harness.py probe --target adb --build
    python3 bench/device_harness.py run --target adb -m models/Qwen3.5-0.8B-Q4_0.gguf --cluster-policy no-little --reps 5 --compare-local --build
+   python3 bench/device_harness.py run --target adb --vulkan -m models/Qwen3.5-0.8B-Q4_0.gguf --reps 5 --build
+   python3 bench/device_harness.py run --target ssh://root@rk3588.local --vulkan -m models/Qwen3.5-0.8B-Q4_0.gguf --reps 5 --build
    python3 bench/device_harness.py run --target ssh://pi@raspberrypi.local --profile micro -m models/SmolLM2-360M-Instruct-Q4_0.gguf --reps 5 --build
    ```
 
 ## 5. Vulkan 后端（`tm-vulkan`）
 
 - **对齐容差**：GPU 浮点累加顺序和标量参考实现不同，按 `|got − ref| / max(Σ|w·x|, 1) ≤ 1e-5` 判定（和 Metal 一致）；整数点积路径要求逐位一致。
-- **设备覆盖**：本机用户态已部署 **Mesa 25.2.8**（`~/.local/mesa-25.2.8/env.sh`，开启 RDNA4 `VK_KHR_cooperative_matrix`）。每次改 shader，都要在三种驱动/subgroup 宽度上跑 L1/L3（含 `parity_vk_q4_0`、`parity_vk_ops`、`parity_vk_coopmat` 及 `parity_vk_qwen35` FP64 GDN oracle）：`TM_VK_DEVICE=radv`（RADV wave32 + coopmat）、`TM_VK_DEVICE=UHD`（ANV，SIMD8–32）、`TM_VK_DEVICE=llvmpipe`（lavapipe，宽度 8，CI 用）。`TM_VK_DEVICE` 指定不存在的设备名时会直接报错失败，防止静默跳过。
+- **设备与 Subgroup 全覆盖**：本机用户态已部署 **Mesa 25.2.8**（`~/.local/mesa-25.2.8/env.sh`，开启 RDNA4 `VK_KHR_cooperative_matrix`）。每次改 shader，都要在三种驱动上跑完整测试套件（含 `parity_vk_q4_0`、`parity_vk_ops`、`parity_vk_coopmat`、`parity_vk_qwen35` FP64 GDN oracle 及 **`portability_vk_v5`**）：`TM_VK_DEVICE=radv`（RADV wave32 + 强制 wave64 + coopmat）、`TM_VK_DEVICE=UHD`（ANV SIMD8 / **SIMD16** / SIMD32 + `uma-mapped`）、`TM_VK_DEVICE=llvmpipe`（lavapipe wave8 + `zero-copy-umap`，CI 用），并校验 `gdn_recurrence_lds`（Pi 5 `V3DV` 无 Shuffle 退回）`0.0` 逐位一致及超限 Workgroup / 超预算显存前置报错。
   ```sh
   . ~/.local/mesa-25.2.8/env.sh
   for d in radv UHD llvmpipe; do TM_VK_DEVICE=$d cargo test -p tm-vulkan; done
   ```
-- **微基准**：`cargo run --release -p tm-vulkan --example bench_vk_gemv_q4_0 [wg nr]`（Decode GEMV）与 `cargo run --release -p tm-vulkan --example bench_vk_gemm`（V3 Prefill：对比 `gemm_tiled`、`gemm_coopmat_f16` 64×64/128×128、融合 `gemm_pair_silu_coopmat_f16`、`gemm_coopmat_i8` 及 `fa_gqa_tiled` / `fa_coopmat`）。可通过 `TM_VK_PREFILL=auto|f16|i8|fallback` 切换端到端 Prefill 路径。RX 9060 XT 有 32 MB Infinity Cache，**小于 32 MB 的形状测的是缓存带宽**；带宽利用率要看 ≥64 MB 的形状（例如 `65536x4096`、`151936x1024`）。
+- **微基准与可移植性消融**：`cargo run --release -p tm-vulkan --example bench_vk_gemv_q4_0 [wg nr]`（Decode GEMV）、`cargo run --release -p tm-vulkan --example bench_vk_gemm`（V3 Prefill）及 `cargo run --release -p tm-vulkan --example bench_vk_portability [model.gguf]`（V5 Subgroup `8/16/32/64` 与 `shuffle`/`lds` 消融）。可通过 `TM_VK_PREFILL=auto|f16|i8|fallback` 切换端到端 Prefill 路径。RX 9060 XT 有 32 MB Infinity Cache，**小于 32 MB 的形状测的是缓存带宽**；带宽利用率要看 ≥64 MB 的形状（例如 `65536x4096`、`151936x1024`）。
 - **基线**：`bench/run_amd_gpu_baseline.sh <out.json>`（llama.cpp Vulkan + HIP，`-p 512 -n 128 -r 5 -ngl 99 -fa 1`）。
 - **Shader 编译**：改了 `shaders/*.comp` 之后运行 `crates/tm-vulkan/gen_spv.sh`，把重新生成的 `spv/` 一起提交。

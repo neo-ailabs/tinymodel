@@ -964,9 +964,10 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
         let mut runner = tm_vulkan::Qwen35VkRunner::from_gguf(gguf, opts.max_ctx)?;
         let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
         eprintln!(
-            "[tinymodel] arch=qwen35 backend=vulkan ({} · {}) load={:.1}ms prompt_tokens={} vocab={} layers={} (gdn={}, full={})",
+            "[tinymodel] arch=qwen35 backend=vulkan ({} · {} · {}) load={:.1}ms prompt_tokens={} vocab={} layers={} (gdn={}, full={})",
             runner.device_name(),
             runner.driver_info(),
+            runner.weights_mode(),
             load_ms,
             prompt_ids.len(),
             runner.cfg.vocab_size,
@@ -1030,10 +1031,11 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
     let mut runner = tm_vulkan::LlamaVkRunner::from_gguf(gguf, opts.max_ctx)?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
     eprintln!(
-        "[tinymodel] arch={} backend=vulkan ({} · {}) load={:.1}ms prompt_tokens={} vocab={} layers={}",
+        "[tinymodel] arch={} backend=vulkan ({} · {} · {}) load={:.1}ms prompt_tokens={} vocab={} layers={}",
         runner.cfg.arch,
         runner.device_name(),
         runner.driver_info(),
+        runner.weights_mode(),
         load_ms,
         prompt_ids.len(),
         runner.cfg.vocab_size,
@@ -1148,7 +1150,7 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
         let tps = (n_gen as f64) / sec.max(1e-9);
         let tel_after = probe::collect_telemetry();
         let dev_name = runner.device_name().to_string();
-        let wmode = "vram-slab";
+        let wmode = runner.weights_mode();
         if opts.json {
             BenchMetrics {
                 model_name: &model_name,
@@ -1227,7 +1229,7 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
     let tps = (n_gen as f64) / sec.max(1e-9);
     let tel_after = probe::collect_telemetry();
     let dev_name = runner.device_name().to_string();
-    let wmode = "vram-slab";
+    let wmode = runner.weights_mode();
     if opts.json {
         BenchMetrics {
             model_name: &model_name,

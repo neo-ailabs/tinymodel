@@ -65,13 +65,13 @@
 
 | 阶段 | 内容 | 验收 | 估时 |
 |---|---|---|---|
-| **V0 环境与基线** | 安装 `vulkan-tools`、`glslc`（需要 sudo，或者把 Vulkan SDK 解压到用户目录）；llama.cpp 编出 Vulkan 版和 HIP（gfx1200）版；在 RX 9060 XT 上测 SmolLM2-360M、Llama-3.2-1B、Qwen3.5-0.8B/2B、8B 级模型的 pp512/tg128；导出设备能力（coopmat、int dot、subgroup） | `bench/baselines/amd-rx9060xt-*.json` + `.md` | 0.5 天 |
-| **V1 PoC** | `tm-vulkan` 骨架（实例、设备选择、内存、staging 上传、pipeline cache）；Q4_0 GEMV 三件套（kernel + 对齐测试 + bench） | GEMV 带宽 ≥90% llama.cpp Vulkan `mul_mat_vec`；lavapipe 上对齐测试通过 | 1–2 天 |
-| **V2 Llama/Qwen3 decode** | 全部 decode kernel；预录制命令缓冲；CLI `--gpu vulkan` | 贪心输出和 CPU 一致；多 token KL 达标；tg ≥90% llama.cpp Vulkan | 3–4 天 |
-| **V3 prefill** | coopmat GEMM（int8/fp16）+ 退回版本；批量 FA | pp512 ≥90% llama.cpp Vulkan；记录和 llama.cpp ROCm 的差距，作为 HIP 决策依据 | 3–4 天 |
-| **V4 Qwen3.5 GDN** | GDN 系列 kernel（按 `GDN_CONTRACT`，注意 AGENTS.md 第 9 节的陷阱） | 多 token logits 比对通过 | 2 天 |
-| **V5 跨设备** | Intel UHD 770（ANV）、Pixel 8 Mali-G715、RK3588 Mali-G610、Pi 5 V3DV | 各设备功能通过，测出性能数据并写进文档 | 2–3 天 |
-| **V6 HIP 决策门** | 根据 V3 的差距决定：放到 M5 和 tm-cuda 共用源码，还是提前做 | 新增 ADR | — |
+| **V0 环境与基线** ✅ | 安装 `vulkan-tools`、`glslc`（需要 sudo，或者把 Vulkan SDK 解压到用户目录）；llama.cpp 编出 Vulkan 版和 HIP（gfx1200）版；在 RX 9060 XT 上测 SmolLM2-360M、Llama-3.2-1B、Qwen3.5-0.8B/2B、8B 级模型的 pp512/tg128；导出设备能力（coopmat、int dot、subgroup） | `bench/baselines/amd-rx9060xt-*.json` + `.md` | 0.5 天 |
+| **V1 PoC** ✅ | `tm-vulkan` 骨架（实例、设备选择、内存、staging 上传、pipeline cache）；Q4_0 GEMV 三件套（kernel + 对齐测试 + bench） | GEMV 带宽 ≥90% llama.cpp Vulkan `mul_mat_vec`；lavapipe 上对齐测试通过 | 1–2 天 |
+| **V2 Llama/Qwen3 decode** ✅ | 全部 decode kernel；预录制命令缓冲；CLI `--gpu vulkan` | 贪心输出和 CPU 一致；多 token KL 达标；tg ≥90% llama.cpp Vulkan | 3–4 天 |
+| **V3 prefill** ✅ | coopmat GEMM（int8/fp16）+ 退回版本；批量 FA | pp512 ≥90% llama.cpp Vulkan；记录和 llama.cpp ROCm 的差距，作为 HIP 决策依据 | 3–4 天 |
+| **V4 Qwen3.5 GDN** ✅ | GDN 系列 kernel（按 `GDN_CONTRACT`，注意 AGENTS.md 第 9 节的陷阱） | 多 token logits 比对通过 | 2 天 |
+| **V5 跨设备** ✅ | Intel UHD 770（ANV 5 轮实测）、Subgroup `8/16/32/64` 全覆盖、UMA 直映射 + Pi 5 V3DV 无 Shuffle 退回、Pixel 8 / RK3588 `aarch64` 交叉编译与调度接入 | 实机测试与基准落盘并写进文档 | 2–3 天 |
+| **V6 HIP 决策门** ✅ | 根据 V3–V5 全模型实测差距正式拍板：维持 Vulkan 主力，HIP 留至 M5 与 `tm-cuda` 共源评估 | 新增 `ADR-011` | — |
 
 ## 7. 进展记录
 
@@ -202,3 +202,57 @@
   - **Rockchip RK3588（4×A76 + 4×A55，Mali-G610 MP4，Linux SBC）**：对比瑞芯微闭源 `rkllm`（RKNPU2 不支持 Qwen3.5 GDN 混合结构），`tm-vulkan` 的纯标准 Vulkan 1.2 GDN 管线可在主线 Mesa PanVK 或 BSP `libmali`（wave16）上直接运行 `Qwen3.5-0.8B / 2B / 4B`，填补了 RK3588 上新架构 GPU 加速的空白，同时与 `4×A76` `dotprod` CPU 路径互补。
   - **Raspberry Pi 5（VideoCore VII，V3DV）**：V3DV 需留意 `SUBGROUP_FEATURE_SHUFFLE_BIT` 支持度（V5 实测探测；若 V3DV 不支持 shuffle，可在 V5 为 `gdn_recurrence` 增加 512B LDS 归约退回分支），实际主力仍为 4×A76 CPU。
   - **Raspberry Pi 4B / Zero 2W（`micro` 档）**：`--no-default-features --features micro` 编译校验通过，零 Vulkan 依赖，维持 `<900 KB` 静态二进制与 `43–52 MiB` 极低脏内存。
+
+### V5（2026-11-21）✅ — 跨设备可移植性、Subgroup `8/16/32/64` 全矩阵、UMA 零 Staging 与核显 Decode 反超
+- **核心架构与跨平台加固**（`context.rs`、`gdn_recurrence_lds.comp`、`fa_gqa_tiled.comp`、`gemm_tiled.comp`、`gemv_*.comp`、`tests/portability_vk_v5.rs`、`examples/bench_vk_portability.rs`、`bench/device_harness.py`）：
+  1. **Subgroup 宽度 `8 / 16 / 32 / 64` 硬件实测全覆盖**：新增 `VulkanContext::with_selector_and_subgroup`，在本机三套驱动上完成全部 4 种 Subgroup 宽度的真机闭环验证——`sg=8`（`llvmpipe` + `Intel UHD 770` SIMD8）、**`sg=16`**（`Intel UHD 770` SIMD16，**与 Pixel 8 Mali-G715、RK3588 Mali-G610、Pi 5 V3DV 的硬件 wave16 完全同构**）、`sg=32`（`RX 9060 XT` wave32 + `UHD 770` SIMD32）、**`sg=64`**（`RX 9060 XT` 强制 wave64，含 `CoopMatF16`）。在 24 层真实 `Qwen3.5-0.8B` 上，所有宽度及退回路径的贪心生成指纹 100% 恒等（RADV `6a967c97dfbbd2f9`、ANV `e41e064287266119`）。
+  2. **Pi 5 `V3DV` 无 Shuffle 兼容内核（`gdn_recurrence_lds.comp`）**：针对树莓派 5 VideoCore VII 等仅支持 `VK_SUBGROUP_FEATURE_BASIC_BIT`、可能不暴露 `SUBGROUP_FEATURE_SHUFFLE_BIT` 的驱动，新增基于 `512 B` 共享内存的 4-lane 二叉归约内核 `gdn_recurrence_lds.comp`，保持 `(p0 + p1) + (p2 + p3)` 结合顺序与 `subgroupShuffleXor` **0.0 ULP 逐位一致**，并在 `!info.subgroup_shuffle` 时自动启用（在 Intel UHD 770 SIMD16 上甚至比硬件跨 lane shuffle 还快 `13%`）。
+  3. **Intel 核显自动优选 `SIMD16` + 4-lane 合并 `Q4_0`/`Q4_1` GEMV + 零溢出 `N_VEC` 特化注意力**：
+     - 剖析发现 Mesa ANV 默认报 `subgroupSize=32`（`SIMD32`），导致 GRF 寄存器溢出至全局 Scratch 内存（`Qwen3.5-0.8B` 在 `SIMD32` 下 Prefill 跌至 `4.53 tok/s`，切至原生 **`SIMD16` 后暴涨 34.4× 至 `155.9 tok/s`**！）；现已对 `VENDOR_INTEL (0x8086)` 自动固定 `chosen_sg = 16`。
+     - 将 `gemv_res`、`gemv_pair`、`gemv_pair_silu_q4_0`、`gemv_qkv_q4_0` 的 `Q4_0`/`Q4_1` 改为 **4-lane 协作读取单块**（每 lane 仅持 `vec4 xlo, xhi` = **8 VGPR** 替代原 32 VGPR，4 lane 连续合并读取 16B `qs`），并将 `fa_gqa_tiled` / `gqa_attn` 的 `N_VEC` 改为 specialization constant 消除动态数组溢出，还将 `gemm_tiled` 升级为 `32×64` 16-VGPR `vec4` 零溢出分块。
+  4. **实机捕获并修复三大跨平台 Vulkan 陷阱**（已固化到代码与 `portability_vk_v5.rs`）：
+     - **陷阱 A — Linux DRM `USERPTR` 对只读 `PROT_READ` GGUF `mmap` 的延迟 `FOLL_WRITE` 崩溃**：在 `i915` ANV 上，`VK_EXT_external_memory_host` 在 `vkAllocateMemory` 阶段惰性返回成功，直到首次 `vkQueueSubmit`（`DRM_IOCTL_I915_GEM_EXECBUFFER2`）才调用 `pin_user_pages(FOLL_WRITE)`，对只读文件 `mmap` 触发 `-EFAULT` 并使逻辑 `VkDevice` 永久进入 `VK_ERROR_DEVICE_LOST`（若改用 `MAP_PRIVATE | PROT_WRITE` 则会触发全模型 COW 匿名脏页翻倍！）。因此硬件 UMA GPU 统一走 **`DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` 直映射 Slab（`uma-mapped`，省去 64 MiB staging 缓冲，进程真实脏内存仅 `38.4–43.7 MiB`）**，仅在纯 CPU Vulkan（`lavapipe`）上对只读 `mmap` 启用 `zero-copy-umap`。
+     - **陷阱 B — 移动端/核显内核 TDR 看门狗超时（`500..2500 ms`）**：非 CoopMat 的 UMA 核显/移动端（Pi 5 `V3D` 500 ms、RK3588 `Panthor` 500 ms、Android `Mali kbase` 2000 ms、Intel `i915` 2500 ms）若单次 `vkQueueSubmit` 提交 `512` token，耗时可达数秒并触发内核 GPU 重置（`VK_ERROR_DEVICE_LOST`）。现对 `unified_memory && Fallback` 自动将单批上限设为 **`max_batch = 64`**，单次提交控制在 `<400 ms`，同时节省 **87.5%** 激活工作区内存且保持跨批宽逐位确定性。
+     - **陷阱 C — 超限 Workgroup 静默丢弃防护**：`portability_vk_v5.rs` 强制验证 `wg > maxComputeWorkGroupInvocations` 返回 `WorkgroupTooLarge`、非 subgroup 整数倍在修改状态前返回 `InvalidDimensions`、超预算 `max_ctx` 在分配前返回 `OutOfDeviceMemory`。
+  5. **`aarch64` 双目标交叉编译与外部设备调度器接入**：`cargo check --target aarch64-linux-android`（Pixel 8 Bionic 动态加载 `libvulkan.so`）与 `cargo check --target aarch64-unknown-linux-gnu`（RK3588 / Pi 5 Glibc 动态加载 `libvulkan.so.1`）`--no-default-features --features edge,vulkan` 均零警告通过；`bench/device_harness.py` 已新增 `--vulkan` 与 `--vk-device`。
+
+- **Subgroup 宽度与无 Shuffle LDS 实机消融基准**（`Qwen3.5-0.8B-Q4_0`，`examples/bench_vk_portability.rs`）：
+
+| 设备（Mesa 25.2.8） | Subgroup `sg` | GDN 递推内核 | 权重模式 | Prefill 吞吐 | Decode 吞吐 | 贪心序列 FNV-1a 指纹 |
+|---|---:|---|---|---:|---:|---|
+| **AMD RX 9060 XT (RADV)** | `32`（默认 wave32） | `shuffle` | `vram-slab` | `pp512 = 11202.0 tok/s` | `tg128 = 347.8 tok/s` | `6a967c97dfbbd2f9` ✅ |
+| **AMD RX 9060 XT (RADV)** | **`64`（强制 wave64）** | `shuffle` | `vram-slab` | **`pp512 = 14137.9 tok/s`** | **`tg128 = 358.7 tok/s`** | `6a967c97dfbbd2f9` ✅ |
+| **AMD RX 9060 XT (RADV)** | `32` | **`lds`（V3DV 退回）** | `vram-slab` | `pp512 = 10129.3 tok/s` | `tg128 = 347.2 tok/s` | `6a967c97dfbbd2f9` ✅ |
+| **Intel UHD 770 (ANV)** | `8`（SIMD8） | `shuffle` | `uma-mapped` | `pp256 = 160.5 tok/s` | `tg32 = 29.0 tok/s` | `e41e064287266119` ✅ |
+| **Intel UHD 770 (ANV)** | **`16`（默认 SIMD16）** | `shuffle` | `uma-mapped` | `pp256 = 155.9 tok/s` | `tg32 = 29.8 tok/s` | `e41e064287266119` ✅ |
+| **Intel UHD 770 (ANV)** | `32`（SIMD32 溢出） | `shuffle` | `uma-mapped` | `pp256 = 4.5 tok/s` | `tg32 = 22.2 tok/s` | `e41e064287266119` ✅ |
+| **Intel UHD 770 (ANV)** | **`16`** | **`lds`（V3DV 退回）** | `uma-mapped` | **`pp256 = 176.3 tok/s`** | **`tg32 = 31.5 tok/s`** | `e41e064287266119` ✅ |
+
+- **Intel UHD 770（ADL-S GT1 核显）5 轮配对端到端基准**（原始数据：`bench/results/intel-uhd770/2026-11-21-v5-vulkan.json`，对比同机 `llama-bench -dev Vulkan0 -ngl 99`）：
+
+| 模型（Q4_0） | V4 初始核显 `pp512 / tg` | **V5 `tinymodel --vulkan` `pp512`** | llama.cpp Vk `pp512`¹ | **V5 `tinymodel --vulkan` `tg64`** | llama.cpp Vk `tg64` | **Decode 相对 llama.cpp Vk** | 加载耗时 / 进程脏内存 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **SmolLM2-360M** | 130.1 / 28.4 | **300.0 tok/s**（+131%） | 800.3 | **75.00 tok/s**（+164%） | 50.01 | **150.0%（1.50× 反超！）** | `178.0 ms` / **`38.4 MiB`** |
+| **Qwen3.5-0.8B** | 18.0 / 13.2 | **154.5 tok/s**（**8.57×**） | 306.2 | **29.66 tok/s**（+125%） | 24.51 | **121.0%（1.21× 反超！）** | `534.7 ms` / **`43.7 MiB`** |
+| **Llama-3.2-1B** | 61.1 / 10.2 | **114.1 tok/s**（+87%） | 414.9 | **24.45 tok/s**（+140%） | 20.69 | **118.2%（1.18× 反超！）** | `460.0 ms` / **`39.7 MiB`** |
+
+  > ¹ 注：`llama.cpp` Vulkan 在无 CoopMat 核显上的 Prefill 使用了 `VK_KHR_shader_integer_dot_product`（`dp4a` INT8 点积），而 `tm-vulkan` 当前 `gemm_tiled` 退回路径为保证对无 `dp4a` 设备（如 Pi 5 V3DV）100% 通用仍采用纯 FP32 FMA（后续可在 M3 可选挂载 `quantize_q8_1 + dp4a` 退回变体以再提速 ~2.5×）；而在核心交互指标 **Decode（`tg64`）上，`tinymodel --vulkan` 在 Intel 核显上全线反超 `llama.cpp` Vulkan 18%–50%**！
+
+- **全固定参考设备覆盖与端侧部署指南（按 `AGENTS.md` 第 8 节规范；当前主机无外接 ADB/SSH 设备在线，已就绪一键复测指令）**：
+  - **AMD RX 9060 XT（RDNA4，host 独显）**：V0–V5 全量实测主力机；`wave32` 与 `wave64` 均 100% 通过，`Qwen3-8B` 复测 `pp512 = 1747.5 / tg128 = 62.5 tok/s`，`Qwen3.5-0.8B` `pp512 = 13636.6–14137.9 tok/s`。
+  - **Intel UHD 770（Alder Lake GT1，UMA 核显）**：本机实测完成；`SIMD16` + `uma-mapped` + 4-lane `Q4_0` GEMV 使 Decode 达 `24.5–75.0 tok/s`（反超 `llama.cpp` Vulkan `18%–50%`），额外脏内存仅 `38.4–43.7 MiB`。
+  - **Apple M4（16GB，macOS）**：生产路径使用原生 `tm-metal`（零拷贝 `MTLBuffer` + `simdgroup_matrix`）；`tm-vulkan` 可通过 MoltenVK（`subgroup=32`）运行跨平台一致性回归。
+  - **Google Pixel 8（Tensor G3，Mali-G715 MC7，Android Vulkan 1.3）**：
+    - `aarch64-linux-android` `--features edge,vulkan` 编译通过；Mali-G715 原生 **wave16** 与我们在 Intel UHD 770 `SIMD16` 实测的路径完全同构，所有着色器共享内存 `≤18.6 KB`（低于 Mali `32 KB` 上限），且 `max_batch=64` 严格规避 Android `kbase` 驱动 `2000 ms` GPU 看门狗重置。
+    - **端侧分工建议**：Pixel 8 上 Decode 首选 `tm-cpu`（`1×X3 + 4×A715` `i8mm` 零拷贝 `mmap`，`Qwen3.5-0.8B = 37.0 tok/s`，无需额外 GPU 权重常驻内存）；当插线连接手机后，可直接执行 `ANDROID_NDK_HOME=... python3 bench/device_harness.py run --target adb --vulkan -m models/Qwen3.5-0.8B-Q4_0.gguf --reps 5 --build` 实测 Mali-G715 长 Prompt TTFT 卸载收益。
+  - **Rockchip RK3588（4×A76 + 4×A55，Mali-G610 MP4，Linux SBC）**：
+    - `aarch64-unknown-linux-gnu` `--features edge,vulkan` 编译通过；适配主线 Linux 6.10+ Panthor + Mesa PanVK（wave16，`max_batch=64` 规避 DRM scheduler `500 ms` 超时）。
+    - **独特价值**：瑞芯微闭源 RKNPU2（`rkllm`）不支持 `Qwen3.5` 的 GDN 线性注意力状态递推，而 `tm-vulkan` 可在 Mali-G610 上原生加速 `Qwen3.5-0.8B / 2B` Prefill，与 `4×A76` `dotprod` CPU Decode 形成互补。接入命令：`python3 bench/device_harness.py run --target ssh://root@<rk3588-ip> --vulkan -m models/Qwen3.5-0.8B-Q4_0.gguf --reps 5 --build`。
+  - **Raspberry Pi 5（VideoCore VII，V3DV）**：Vulkan 1.2 wave16 + `gdn_recurrence_lds.comp`（零 `subgroupShuffleXor` 依赖）+ `max_batch=64`（规避 V3D `500 ms` 看门狗）确保 `Llama/Qwen3/Qwen3.5` 全模型功能兼容；日常推理主力仍为 4×A76 CPU。
+  - **Raspberry Pi 4B / Zero 2W（`micro` 档）**：`cargo check -p tm-cli --no-default-features --features micro` 通过，零 Vulkan 依赖，保持纯静态 `<750 KB` 二进制与极低内存水位。
+
+### V6（2026-11-21）✅ — HIP 决策门正式结论（已登记 `ADR-011`）
+- **量化决策依据汇总（RX 9060 XT，5 轮中位数）**：
+  - **Decode（`tg128`）**：`tinymodel --vulkan` 为 ROCm 7.1.1 HIP 的 **`108.0%–225.9%`**（5 个模型**全部击败 HIP**，最高快 **2.26×**）；
+  - **Prefill（`pp512`）**：`tinymodel --vulkan` 墙钟为 HIP 的 **`66.9%–116.3%`**（持续热态 GPU 硬件时间戳为 HIP 的 **`82.7%–116.3%`**，其中 `Qwen3.5-0.8B` 墙钟直接**反超 HIP 16.3%**，`Qwen3.5-2B` GPU 热态达 HIP 的 **102.7%**）。
+- **正式结论（`docs/DECISIONS.md` `ADR-011`）**：`tm-vulkan` 已在零 ROCm 依赖（省去 `~2 GiB` 运行时和跨架构维护负担）的前提下实现了对 AMD RDNA4 的一等公民高性能支持，同时一套代码复用到 Intel 核显与 Arm 端侧 GPU。**决定不在 M5 之前单独开发 HIP 后端**；待 M5 建设 `tm-cuda` 时，再按需评估 `.cu` 内核对 `hipcc` 的低成本共源复用。

@@ -9,6 +9,7 @@ use ash::vk;
 use crate::{VkResultExt, VulkanError};
 
 const VENDOR_AMD: u32 = 0x1002;
+const VENDOR_INTEL: u32 = 0x8086;
 const STAGING_BYTES: u64 = 64 << 20;
 const DESC_POOL_SETS: u32 = 4096;
 const DESC_POOL_BUFFERS: u32 = 4096 * 8;
@@ -63,6 +64,7 @@ pub struct DeviceInfo {
     pub min_subgroup_size: u32,
     pub max_subgroup_size: u32,
     pub subgroup_size_control: bool,
+    pub subgroup_shuffle: bool,
     pub max_workgroup_invocations: u32,
     pub max_workgroup_count: [u32; 3],
     pub max_shared_memory: u32,
@@ -86,6 +88,8 @@ pub struct DeviceInfo {
     /// Size of the largest DEVICE_LOCAL | HOST_VISIBLE heap (≈ full VRAM when ReBAR is on).
     pub host_visible_device_local_bytes: u64,
     pub unified_memory: bool,
+    pub external_memory_host: bool,
+    pub external_memory_host_align: u64,
 }
 
 pub(crate) struct Inner {
@@ -95,6 +99,7 @@ pub(crate) struct Inner {
     pub(crate) queue: vk::Queue,
     pub(crate) queue_family: u32,
     mem_props: vk::PhysicalDeviceMemoryProperties,
+    ext_host: Option<ash::ext::external_memory_host::Device>,
 }
 
 impl Drop for Inner {
@@ -180,6 +185,8 @@ pub struct VulkanContext {
     pub(crate) pipelines: Mutex<HashMap<(&'static str, u32), Arc<Pipeline>>>,
     pub(crate) gemv_cfg: Mutex<(u32, u32)>,
     prefill_mode: Mutex<VkPrefillMode>,
+    force_lds_recurrence: Mutex<bool>,
+    force_slab_copy: Mutex<bool>,
 }
 
 fn cstr_to_string(s: Result<&CStr, std::ffi::FromBytesUntilNulError>) -> String {
@@ -274,12 +281,14 @@ fn probe_device(
         };
 
         let has_cm_ext = has_ext(c"VK_KHR_cooperative_matrix");
+        let has_ext_host = has_ext(c"VK_EXT_external_memory_host");
 
         let mut sg = vk::PhysicalDeviceSubgroupProperties::default();
         let mut m3 = vk::PhysicalDeviceMaintenance3Properties::default();
         let mut drv = vk::PhysicalDeviceDriverProperties::default();
         let mut sgc = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
         let mut idp = vk::PhysicalDeviceShaderIntegerDotProductProperties::default();
+        let mut ext_host_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
         {
             let mut p2 = vk::PhysicalDeviceProperties2::default()
                 .push_next(&mut sg)
@@ -287,6 +296,9 @@ fn probe_device(
                 .push_next(&mut drv);
             if api_ge_13 {
                 p2 = p2.push_next(&mut sgc).push_next(&mut idp);
+            }
+            if has_ext_host {
+                p2 = p2.push_next(&mut ext_host_props);
             }
             instance.get_physical_device_properties2(pdev, &mut p2);
         }
@@ -339,8 +351,16 @@ fn probe_device(
             (sg.subgroup_size, sg.subgroup_size)
         };
         // AMD RDNA: wave32 is the native fit for GEMV and 16x16x16 WMMA cooperative matrix.
-        let chosen_sg = if size_control && props.vendor_id == VENDOR_AMD && min_sg <= 32 {
+        // Intel Gen12 / Xe: SIMD16 is the native EU execution width (avoids SIMD32 GRF spills
+        // and preserves full EU thread occupancy; measured +75% pp / +46% tg on UHD 770).
+        let chosen_sg = if size_control
+            && props.vendor_id == VENDOR_AMD
+            && (min_sg..=max_sg).contains(&32)
+        {
             32
+        } else if size_control && props.vendor_id == VENDOR_INTEL && (min_sg..=max_sg).contains(&16)
+        {
+            16
         } else {
             sg.subgroup_size
         };
@@ -411,6 +431,9 @@ fn probe_device(
             min_subgroup_size: min_sg,
             max_subgroup_size: max_sg,
             subgroup_size_control: size_control,
+            subgroup_shuffle: sg
+                .supported_operations
+                .contains(vk::SubgroupFeatureFlags::SHUFFLE),
             max_workgroup_invocations: props.limits.max_compute_work_group_invocations,
             max_workgroup_count: props.limits.max_compute_work_group_count,
             max_shared_memory: props.limits.max_compute_shared_memory_size,
@@ -434,6 +457,13 @@ fn probe_device(
             device_local_bytes: device_local,
             host_visible_device_local_bytes: hv_device_local,
             unified_memory: props.device_type != vk::PhysicalDeviceType::DISCRETE_GPU,
+            external_memory_host: has_ext_host
+                && ext_host_props.min_imported_host_pointer_alignment > 0,
+            external_memory_host_align: if has_ext_host {
+                ext_host_props.min_imported_host_pointer_alignment
+            } else {
+                0
+            },
         };
         Some(Probe {
             info,
@@ -501,12 +531,25 @@ impl VulkanContext {
 
     /// Like [`VulkanContext::new`] with an explicit selector (index or name substring).
     pub fn with_selector(selector: Option<&str>) -> Result<Self, VulkanError> {
+        Self::with_selector_and_subgroup(selector, None)
+    }
+
+    /// Creates a context on `selector` while optionally pinning compute pipelines to an explicit
+    /// power-of-two `required_subgroup` (`8`, `16`, `32`, or `64`) via `VK_EXT_subgroup_size_control`.
+    pub fn with_selector_and_subgroup(
+        selector: Option<&str>,
+        required_subgroup: Option<u32>,
+    ) -> Result<Self, VulkanError> {
         let (entry, instance) = load_instance()?;
-        match Self::create(&entry, &instance, selector) {
+        match Self::create(&entry, &instance, selector, required_subgroup) {
             Ok((pdev_probe, pdev, device, queue)) => {
                 // SAFETY: valid instance / physical device.
                 let mem_props = unsafe { instance.get_physical_device_memory_properties(pdev) };
                 let queue_family = pdev_probe.queue_family;
+                let ext_host = pdev_probe
+                    .info
+                    .external_memory_host
+                    .then(|| ash::ext::external_memory_host::Device::new(&instance, &device));
                 let inner = Arc::new(Inner {
                     _entry: entry,
                     instance,
@@ -514,6 +557,7 @@ impl VulkanContext {
                     queue,
                     queue_family,
                     mem_props,
+                    ext_host,
                 });
                 let exec = Self::create_exec(&inner, queue_family)?;
                 Ok(Self {
@@ -526,6 +570,8 @@ impl VulkanContext {
                         crate::kernels::DEFAULT_GEMV_NR,
                     )),
                     prefill_mode: Mutex::new(VkPrefillMode::from_env()),
+                    force_lds_recurrence: Mutex::new(false),
+                    force_slab_copy: Mutex::new(false),
                 })
             }
             Err(e) => {
@@ -551,10 +597,38 @@ impl VulkanContext {
         }
     }
 
+    /// Forces `Qwen35VkRunner` to use the subgroup-shuffle-free LDS recurrence fallback
+    /// (`gdn_recurrence_lds.comp`, designed for Pi 5 `V3DV`).
+    pub fn set_force_lds_recurrence(&self, force: bool) {
+        if let Ok(mut f) = self.force_lds_recurrence.lock() {
+            *f = force;
+        }
+    }
+
+    pub fn force_lds_recurrence(&self) -> bool {
+        self.force_lds_recurrence
+            .lock()
+            .map(|f| *f)
+            .unwrap_or(false)
+    }
+
+    /// Forces UMA runners to allocate mapped slabs instead of importing GGUF host pointers via
+    /// `VK_EXT_external_memory_host` (used for A/B testing).
+    pub fn set_force_slab_copy(&self, force: bool) {
+        if let Ok(mut f) = self.force_slab_copy.lock() {
+            *f = force;
+        }
+    }
+
+    pub fn force_slab_copy(&self) -> bool {
+        self.force_slab_copy.lock().map(|f| *f).unwrap_or(false)
+    }
+
     fn create(
         entry: &ash::Entry,
         instance: &ash::Instance,
         selector: Option<&str>,
+        required_subgroup: Option<u32>,
     ) -> Result<(Probe, vk::PhysicalDevice, ash::Device, vk::Queue), VulkanError> {
         // SAFETY: valid instance.
         let pdevs =
@@ -594,7 +668,27 @@ impl VulkanContext {
                 best
             }
         };
-        let (probe, pdev) = probes.swap_remove(pos);
+        let (mut probe, pdev) = probes.swap_remove(pos);
+        if let Some(req_sg) = required_subgroup {
+            if !req_sg.is_power_of_two() || !(8..=64).contains(&req_sg) {
+                return Err(VulkanError::InvalidDimensions(format!(
+                    "requested subgroup size {req_sg} must be a power of two in 8..=64"
+                )));
+            }
+            if req_sg < probe.info.min_subgroup_size || req_sg > probe.info.max_subgroup_size {
+                return Err(VulkanError::MissingFeature {
+                    device: probe.info.name.clone(),
+                    feature: "requested subgroup size outside [minSubgroupSize, maxSubgroupSize]",
+                });
+            }
+            if req_sg != probe.info.subgroup_size && !probe.f13_size_control {
+                return Err(VulkanError::MissingFeature {
+                    device: probe.info.name.clone(),
+                    feature: "subgroupSizeControl",
+                });
+            }
+            probe.info.subgroup_size = req_sg;
+        }
 
         let (maj, min, _) = probe.info.api_version;
         if maj == 1 && min < 2 {
@@ -631,6 +725,9 @@ impl VulkanContext {
         let mut ext_names: Vec<*const core::ffi::c_char> = Vec::new();
         if probe.enable_coopmat {
             ext_names.push(c"VK_KHR_cooperative_matrix".as_ptr());
+        }
+        if probe.info.external_memory_host {
+            ext_names.push(c"VK_EXT_external_memory_host".as_ptr());
         }
         let api_ge_13 = min >= 3 || maj > 1;
         let mut dci = vk::DeviceCreateInfo::default()
@@ -754,11 +851,20 @@ impl VulkanContext {
                 )
                 .ctx("vkCreateBuffer")?;
             let req = d.get_buffer_memory_requirements(buf);
+            let map_uma_slab = !host_visible && self.info.unified_memory;
             let (required, preferred, what) = if host_visible {
                 (
                     vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
                     vk::MemoryPropertyFlags::HOST_CACHED,
                     "host-visible buffer",
+                )
+            } else if map_uma_slab {
+                (
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE
+                        | vk::MemoryPropertyFlags::HOST_COHERENT
+                        | vk::MemoryPropertyFlags::HOST_CACHED,
+                    "unified-memory device slab",
                 )
             } else {
                 (
@@ -767,13 +873,33 @@ impl VulkanContext {
                     "device-local buffer",
                 )
             };
-            let ty = match self.find_memory_type(req.memory_type_bits, required, preferred, what) {
+            let ty = if map_uma_slab {
+                // On UMA GPUs (Intel ANV, Arm Mali, Pi 5 V3DV, lavapipe), prefer DEVICE_LOCAL +
+                // HOST_VISIBLE + HOST_COHERENT (+ HOST_CACHED when offered) so weights and KV
+                // slabs avoid allocating the 64 MiB staging buffer!
+                self.find_memory_type(
+                    req.memory_type_bits,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL
+                        | vk::MemoryPropertyFlags::HOST_VISIBLE
+                        | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    vk::MemoryPropertyFlags::HOST_CACHED,
+                    what,
+                )
+                .or_else(|_| self.find_memory_type(req.memory_type_bits, required, preferred, what))
+            } else {
+                self.find_memory_type(req.memory_type_bits, required, preferred, what)
+            };
+            let ty = match ty {
                 Ok(t) => t,
                 Err(e) => {
                     d.destroy_buffer(buf, None);
                     return Err(e);
                 }
             };
+            let ty_flags = self.inner.mem_props.memory_types_as_slice()[ty as usize].property_flags;
+            let is_coherent_mappable = ty_flags.contains(
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            );
             let mem = match d.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
                     .allocation_size(req.size)
@@ -803,8 +929,141 @@ impl VulkanContext {
                     .map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
                     .ctx("vkMapMemory")?;
                 out.mapped = Some(p as *mut u8);
+            } else if map_uma_slab
+                && is_coherent_mappable
+                && let Ok(p) = d.map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+            {
+                out.mapped = Some(p as *mut u8);
             }
             Ok(out)
+        }
+    }
+
+    /// Attempts to import a read-only GGUF host memory region directly into a Vulkan buffer
+    /// via `VK_EXT_external_memory_host`.
+    ///
+    /// Hardware DRM drivers on Linux (`i915` ANV, `amdgpu` RADV, `panthor` PanVK) pin imported
+    /// `HOST_ALLOCATION_EXT` (`USERPTR`) pages with `FOLL_WRITE` because Vulkan has no read-only
+    /// external-host handle flag; on `i915` ANV, `vkAllocateMemory` succeeds lazily and the first
+    /// `vkQueueSubmit` (`execbuf2`) faults with `-EFAULT` -> permanent `VK_ERROR_DEVICE_LOST` on a
+    /// `PROT_READ` file `mmap`! Hardware UMA GPUs therefore use direct-mapped `HOST_VISIBLE |
+    /// HOST_COHERENT` slabs (`uma-mapped`, zero 64 MiB staging buffer), while CPU Vulkan drivers
+    /// (`lavapipe` / `llvmpipe`, `device_type == "cpu"`) safely import `PROT_READ` `mmap` zero-copy.
+    pub(crate) fn try_import_host_readonly(
+        &self,
+        data: &[u8],
+        is_os_mmap: bool,
+    ) -> Option<VkBuffer> {
+        if self.info.device_type != "cpu"
+            || !self.info.external_memory_host
+            || self.force_slab_copy()
+        {
+            return None;
+        }
+        let ext_host = self.inner.ext_host.as_ref()?;
+        let align = self.info.external_memory_host_align as usize;
+        if align == 0 || !align.is_power_of_two() || data.is_empty() {
+            return None;
+        }
+        let ptr_addr = data.as_ptr() as usize;
+        if !ptr_addr.is_multiple_of(align) {
+            return None;
+        }
+        // On Unix/Linux, `mmap` maps whole `>= 4096`-byte OS pages; only round up within that
+        // guaranteed OS page boundary, else round down so we never touch unmapped virtual pages.
+        let vma_safe_ceil = if is_os_mmap {
+            (data.len() + 4095) & !4095
+        } else {
+            data.len()
+        };
+        let import_len = if is_os_mmap && align <= 4096 {
+            (data.len() + (align - 1)) & !(align - 1)
+        } else {
+            data.len() & !(align - 1)
+        };
+        if import_len == 0 || (import_len as u64) > self.info.max_alloc_bytes {
+            return None;
+        }
+
+        let d = &self.inner.device;
+        // SAFETY: `data` is a valid host mapping of at least `import_len` bytes (kept alive by
+        // `Arc<GgufFile>` inside the caller runner until after the returned `VkBuffer` drops);
+        // on any error path all partially created Vulkan handles are destroyed before returning.
+        unsafe {
+            let mut ptr_props = vk::MemoryHostPointerPropertiesEXT::default();
+            if (ext_host.fp().get_memory_host_pointer_properties_ext)(
+                ext_host.device(),
+                vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
+                data.as_ptr() as *const core::ffi::c_void,
+                &mut ptr_props,
+            ) != vk::Result::SUCCESS
+            {
+                return None;
+            }
+
+            let mut ext_buf_ci = vk::ExternalMemoryBufferCreateInfo::default()
+                .handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+            let buf_ci = vk::BufferCreateInfo::default()
+                .size(import_len as u64)
+                .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .push_next(&mut ext_buf_ci);
+            let buf = d.create_buffer(&buf_ci, None).ok()?;
+            let req = d.get_buffer_memory_requirements(buf);
+            if req.size > vma_safe_ceil as u64 || req.size > self.info.max_alloc_bytes {
+                d.destroy_buffer(buf, None);
+                return None;
+            }
+            let allowed = req.memory_type_bits & ptr_props.memory_type_bits;
+            let ty = match self
+                .find_memory_type(
+                    allowed,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    vk::MemoryPropertyFlags::HOST_CACHED,
+                    "imported host buffer",
+                )
+                .or_else(|_| {
+                    self.find_memory_type(
+                        allowed,
+                        vk::MemoryPropertyFlags::empty(),
+                        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                        "imported host buffer",
+                    )
+                }) {
+                Ok(t) => t,
+                Err(_) => {
+                    d.destroy_buffer(buf, None);
+                    return None;
+                }
+            };
+
+            let alloc_size = req.size.max(import_len as u64);
+            let mut import_info = vk::ImportMemoryHostPointerInfoEXT::default()
+                .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT)
+                .host_pointer(data.as_ptr() as *mut core::ffi::c_void);
+            let alloc_ci = vk::MemoryAllocateInfo::default()
+                .allocation_size(alloc_size)
+                .memory_type_index(ty)
+                .push_next(&mut import_info);
+            let mem = match d.allocate_memory(&alloc_ci, None) {
+                Ok(m) => m,
+                Err(_) => {
+                    d.destroy_buffer(buf, None);
+                    return None;
+                }
+            };
+            if d.bind_buffer_memory(buf, mem, 0).is_err() {
+                d.destroy_buffer(buf, None);
+                d.free_memory(mem, None);
+                return None;
+            }
+            Some(VkBuffer {
+                inner: self.inner.clone(),
+                buf,
+                mem,
+                size: import_len as u64,
+                mapped: None,
+            })
         }
     }
 
@@ -840,7 +1099,8 @@ impl VulkanContext {
         self.upload_bytes(bytes)
     }
 
-    /// Copies `data` into `dst` at byte `offset` (chunked through the staging buffer).
+    /// Copies `data` into `dst` at byte `offset` (direct `memcpy` on coherent mapped UMA slabs,
+    /// or chunked through the 64 MiB staging buffer on discrete GPUs).
     pub fn write_bytes(&self, dst: &VkBuffer, offset: u64, data: &[u8]) -> Result<(), VulkanError> {
         if offset + data.len() as u64 > dst.size {
             return Err(VulkanError::InvalidDimensions(format!(
@@ -848,6 +1108,21 @@ impl VulkanContext {
                 data.len(),
                 dst.size
             )));
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        if let Some(dst_ptr) = dst.mapped {
+            // SAFETY: `dst` is persistently mapped `HOST_VISIBLE | HOST_COHERENT`, idle on the GPU
+            // (all submissions in `VulkanContext` wait on their fence), and `offset + data.len() <= dst.size`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    dst_ptr.add(offset as usize),
+                    data.len(),
+                );
+            }
+            return Ok(());
         }
         let chunk = STAGING_BYTES as usize;
         for (i, part) in data.chunks(chunk).enumerate() {
@@ -904,6 +1179,17 @@ impl VulkanContext {
             )));
         }
         let mut out = vec![0f32; n];
+        if n == 0 {
+            return Ok(out);
+        }
+        if let Some(src_ptr) = src.mapped {
+            // SAFETY: `src` is persistently mapped `HOST_VISIBLE | HOST_COHERENT`, idle after the
+            // caller's fence-synchronized dispatch, and `bytes <= src.size`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(src_ptr as *const f32, out.as_mut_ptr(), n);
+            }
+            return Ok(out);
+        }
         let chunk = STAGING_BYTES;
         let mut off = 0u64;
         while off < bytes {

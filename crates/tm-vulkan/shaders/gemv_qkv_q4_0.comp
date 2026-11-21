@@ -45,54 +45,34 @@ void main() {
     }
 
     const uint nb = pc.n_in / 32u;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sub = lane & 3u;
+    const uint blk_step = gl_SubgroupSize >> 2u;
     float acc[NR];
     for (uint r = 0u; r < NR; ++r) acc[r] = 0.0;
 
-    for (uint ib = gl_SubgroupInvocationID; ib < nb; ib += gl_SubgroupSize) {
-        const uint xb = ib * 8u;
-        vec4 xv0 = x4[xb + 0u];
-        vec4 xv1 = x4[xb + 1u];
-        vec4 xv2 = x4[xb + 2u];
-        vec4 xv3 = x4[xb + 3u];
-        vec4 xv4 = x4[xb + 4u];
-        vec4 xv5 = x4[xb + 5u];
-        vec4 xv6 = x4[xb + 6u];
-        vec4 xv7 = x4[xb + 7u];
+    for (uint ib = (lane >> 2u); ib < nb; ib += blk_step) {
+        const vec4 xlo = x4[ib * 8u + sub];
+        const vec4 xhi = x4[ib * 8u + 4u + sub];
 
         for (uint r = 0u; r < NR; ++r) {
             const uint row = min(local_row0 + r, mat_rows - 1u);
             const uint base = (row * nb + ib) * 9u;
             float d;
-            uint u0, u1, u2, u3;
+            uint u;
             if (which == 0u) {
-                d  = unpackHalf2x16(uint(wq[base])).x;
-                u0 = uint(wq[base + 1u]) | (uint(wq[base + 2u]) << 16u);
-                u1 = uint(wq[base + 3u]) | (uint(wq[base + 4u]) << 16u);
-                u2 = uint(wq[base + 5u]) | (uint(wq[base + 6u]) << 16u);
-                u3 = uint(wq[base + 7u]) | (uint(wq[base + 8u]) << 16u);
+                d = unpackHalf2x16(uint(wq[base])).x;
+                u = uint(wq[base + 1u + 2u * sub]) | (uint(wq[base + 2u + 2u * sub]) << 16u);
             } else if (which == 1u) {
-                d  = unpackHalf2x16(uint(wk[base])).x;
-                u0 = uint(wk[base + 1u]) | (uint(wk[base + 2u]) << 16u);
-                u1 = uint(wk[base + 3u]) | (uint(wk[base + 4u]) << 16u);
-                u2 = uint(wk[base + 5u]) | (uint(wk[base + 6u]) << 16u);
-                u3 = uint(wk[base + 7u]) | (uint(wk[base + 8u]) << 16u);
+                d = unpackHalf2x16(uint(wk[base])).x;
+                u = uint(wk[base + 1u + 2u * sub]) | (uint(wk[base + 2u + 2u * sub]) << 16u);
             } else {
-                d  = unpackHalf2x16(uint(wv[base])).x;
-                u0 = uint(wv[base + 1u]) | (uint(wv[base + 2u]) << 16u);
-                u1 = uint(wv[base + 3u]) | (uint(wv[base + 4u]) << 16u);
-                u2 = uint(wv[base + 5u]) | (uint(wv[base + 6u]) << 16u);
-                u3 = uint(wv[base + 7u]) | (uint(wv[base + 8u]) << 16u);
+                d = unpackHalf2x16(uint(wv[base])).x;
+                u = uint(wv[base + 1u + 2u * sub]) | (uint(wv[base + 2u + 2u * sub]) << 16u);
             }
 
-            float s = 0.0;
-            s += dot(vec4(u0 & 15u, (u0 >> 8u) & 15u, (u0 >> 16u) & 15u, (u0 >> 24u) & 15u) - 8.0, xv0);
-            s += dot(vec4((u0 >> 4u) & 15u, (u0 >> 12u) & 15u, (u0 >> 20u) & 15u, u0 >> 28u) - 8.0, xv4);
-            s += dot(vec4(u1 & 15u, (u1 >> 8u) & 15u, (u1 >> 16u) & 15u, (u1 >> 24u) & 15u) - 8.0, xv1);
-            s += dot(vec4((u1 >> 4u) & 15u, (u1 >> 12u) & 15u, (u1 >> 20u) & 15u, u1 >> 28u) - 8.0, xv5);
-            s += dot(vec4(u2 & 15u, (u2 >> 8u) & 15u, (u2 >> 16u) & 15u, (u2 >> 24u) & 15u) - 8.0, xv2);
-            s += dot(vec4((u2 >> 4u) & 15u, (u2 >> 12u) & 15u, (u2 >> 20u) & 15u, u2 >> 28u) - 8.0, xv6);
-            s += dot(vec4(u3 & 15u, (u3 >> 8u) & 15u, (u3 >> 16u) & 15u, (u3 >> 24u) & 15u) - 8.0, xv3);
-            s += dot(vec4((u3 >> 4u) & 15u, (u3 >> 12u) & 15u, (u3 >> 20u) & 15u, u3 >> 28u) - 8.0, xv7);
+            const float s = dot(vec4(u & 15u, (u >> 8u) & 15u, (u >> 16u) & 15u, (u >> 24u) & 15u) - 8.0, xlo)
+                          + dot(vec4((u >> 4u) & 15u, (u >> 12u) & 15u, (u >> 20u) & 15u, u >> 28u) - 8.0, xhi);
             acc[r] = fma(d, s, acc[r]);
         }
     }

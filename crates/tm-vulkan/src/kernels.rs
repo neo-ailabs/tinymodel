@@ -201,7 +201,7 @@ impl VulkanContext {
         let (pipe, gx, gy) = match dtype {
             DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::F32 => (
                 self.pipeline("gemm_tiled", dt, SPV_GEMM_TILED, 3, 20, &[128, dt])?,
-                (rows as u32).div_ceil(32),
+                (rows as u32).div_ceil(64),
                 (n_tok as u32).div_ceil(32),
             ),
             DType::Q5K | DType::Q6K => {
@@ -435,8 +435,16 @@ impl VulkanContext {
             )
         } else {
             let wg = 8 * sg;
+            let n_vec = ((head_dim / 4).div_ceil(sg as usize)).max(1) as u32;
             (
-                self.pipeline("fa_gqa_tiled", wg, SPV_FA_GQA_TILED, 4, 20, &[wg])?,
+                self.pipeline(
+                    "fa_gqa_tiled",
+                    wg | (n_vec << 16),
+                    SPV_FA_GQA_TILED,
+                    4,
+                    20,
+                    &[wg, n_vec],
+                )?,
                 n_head as u32,
                 (n_tok as u32).div_ceil(8),
             )

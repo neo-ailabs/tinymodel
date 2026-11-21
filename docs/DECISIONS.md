@@ -60,3 +60,12 @@
 - **背景**：开发主机有 AMD Radeon RX 9060 XT（RDNA4/gfx1200，8 GiB），可选 Vulkan（RADV）或 HIP/ROCm 7.1.1。分析见 `research/11-amdgpu.md`。
 - **决策**：AMD 显卡通过 `tm-vulkan`（ash + GLSL→SPIR-V）支持，本机作为 Vulkan 主力开发机；HIP 不单独立项，等 V3 拿到 prefill 差距数据后，再评估是否在 M5 和 `tm-cuda` 共用 kernel 源码。
 - **后果**：Vulkan 后端从 M3 提前开始；kernel 需要兼容 subgroup 宽度 16/32/64；CI 用 lavapipe 跑对齐测试；普通构建不能强制依赖 `glslc`（需要提交预编译的 SPIR-V）。
+
+### ADR-011 V6 决策门结论：维持 `tm-vulkan` 为 AMD 与跨平台主力后端，HIP 留至 M5 与 `tm-cuda` 共源评估
+- **状态**：Accepted（2026-11-21）
+- **背景**：完成 V0–V5（见 `research/11-amdgpu.md`）后，我们在 AMD Radeon RX 9060 XT（RDNA4，Mesa 25.2.8 vs ROCm 7.1.1）和 Intel UHD 770（ANV）上拿到了全基准模型集的 5 轮实测数据：
+  1. **Decode（`tg128`）全面超越 HIP**：在全部 5 个基准模型上，`tinymodel --vulkan` 均同时超越 `llama.cpp` Vulkan（`104%–183%`）和 **ROCm 7.1.1 HIP（`108%–226%`）**（其中 `SmolLM2-360M` 达 `608.8 tok/s = 225.9%` HIP、`Qwen3.5-0.8B` 达 `366.5 tok/s = 217.8%` HIP、`Qwen3.5-2B` 达 `184.5 tok/s = 137.4%` HIP、`Qwen3-8B` 达 `64.0 tok/s = 108.0%` HIP）。
+  2. **Prefill（`pp512`）追平乃至反超 HIP**：引入 `16×16×16` FP16 Cooperative Matrix、零溢出 `4×2` warp 分块、融合 `Gate+Up+SwiGLU`（`31.1 TFLOP/s`）、`fa_coopmat`（`16.5 KB` LDS）与 LDS 预取 GDN 递推后，`pp512` 达 `llama.cpp` Vulkan 的 **`96.5%–474.9%`**、ROCm HIP 的 **`66.9%–116.3%`**（GPU 硬件时间戳热态达 HIP 的 **`82.7%–116.3%`**，其中 `Qwen3.5-0.8B` 以 `13566.6 tok/s` 直接反超 HIP `16.3%`）。
+  3. **单后端跨厂商复用收益显著**：同一套 `tm-vulkan` 已在 subgroup 宽度 `8 / 16 / 32 / 64` 上实机验证通过，在 **Intel UHD 770** 上 Decode 超越 `llama.cpp` Vulkan **`18.2%–50.0%`**，并无修改通过 `aarch64-linux-android`（Pixel 8）和 `aarch64-unknown-linux-gnu`（RK3588 / Pi 5）交叉编译。
+- **决策**：**不单独提前开辟 HIP 后端**，`tm-vulkan` 作为 AMD 独显/APU、Intel 核显/独显及 Arm 端侧 GPU 的正式主力后端。到 M5 实现 `tm-cuda` 时，仅针对需要极致稠密 Prefill 吞吐的主机/服务端场景，再按需通过条件宏让 `.cu` 内核同时支持 `nvcc` 与 `hipcc`。
+- **后果**：省去在 M3/M4 维护第三套 GPU 后端的工程负担与 `~2 GiB` ROCm 运行时依赖；集中精力推进 M3 投机解码、KV 量化与 M4 低比特内核。

@@ -4,11 +4,13 @@
 // (subgroup_size in {8, 16, 32, 64}; max 10 KB shared memory, fits lavapipe 32 KB & RADV 64 KB).
 // Uses 64-bit `uvec2` (4x fp16) coalesced loads for 8x fewer memory instructions on RDNA4.
 
+#extension GL_EXT_control_flow_attributes : enable
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
 layout(constant_id = 0) const uint WG = 256;
 layout(constant_id = 1) const uint BATCH = 0;
+layout(constant_id = 2) const uint N_VEC = 8;
 layout(local_size_x_id = 0) in;
 
 layout(std430, binding = 0) readonly buffer QBuf { vec4 q4[]; };
@@ -62,16 +64,15 @@ void main() {
     float m_local = -1.0e30;
     float l_local = 0.0;
     // With min subgroup_size == 8 and MAX_HD4 == 64, each lane holds at most 8 vec4s.
-    vec4 o_local[8];
-    const uint n_vec = (hd4 + sg_size - 1u) / sg_size;
-    for (uint k = 0u; k < n_vec; ++k) {
+    vec4 o_local[N_VEC];
+    [[unroll]] for (uint k = 0u; k < N_VEC; ++k) {
         o_local[k] = vec4(0.0);
     }
 
     for (uint t = sg; t < seq_len; t += SG) {
         const uint kv_off4 = t * kv_dim4 + kv_h * hd4;
         float dot_val = 0.0;
-        for (uint k = 0u; k < n_vec; ++k) {
+        [[unroll]] for (uint k = 0u; k < N_VEC; ++k) {
             const uint d4 = k * sg_size + lane;
             if (d4 < hd4) {
                 dot_val += dot(q_shared[d4], unpack_f16x4(k_cache4[kv_off4 + d4]));
@@ -85,7 +86,7 @@ void main() {
         l_local = l_local * alpha + p;
         m_local = m_new;
 
-        for (uint k = 0u; k < n_vec; ++k) {
+        [[unroll]] for (uint k = 0u; k < N_VEC; ++k) {
             const uint d4 = k * sg_size + lane;
             if (d4 < hd4) {
                 o_local[k] = o_local[k] * alpha + p * unpack_f16x4(v_cache4[kv_off4 + d4]);
@@ -97,7 +98,7 @@ void main() {
         tg_m[sg] = m_local;
         tg_l[sg] = l_local;
     }
-    for (uint k = 0u; k < n_vec; ++k) {
+    [[unroll]] for (uint k = 0u; k < N_VEC; ++k) {
         const uint d4 = k * sg_size + lane;
         if (d4 < hd4) {
             tg_o[sg * MAX_HD4 + d4] = o_local[k];

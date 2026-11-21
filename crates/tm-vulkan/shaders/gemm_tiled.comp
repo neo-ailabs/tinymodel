@@ -1,20 +1,22 @@
 #version 450
-// LDS-tiled 32x32x32 register-blocked (2x4/thread, WG=128) batched GEMM for Q4_0 / Q4_1 / Q8_0 / F32.
-// Subgroup-size independent (works identically for subgroup_size in {8, 16, 32, 64}).
-// Supports fused `add_residual` (`y[t * n_out + r] += dot(W[r], x[t])`).
+// LDS-tiled 32x64x32 zero-spill register-blocked (`4x4 = 16` FMAs/thread in 4 `vec4` SSA registers, `WG=128`)
+// batched GEMM fallback for non-CoopMat GPUs (Intel UHD/Xe, Arm Mali-G715/G610, Pi 5 V3DV, lavapipe).
+// Subgroup-size independent (`subgroup_size` in {8, 16, 32, 64}); uses `12.25 KB` shared memory (`<= 32 KB`),
+// 128-bit `vec4` activation loads, 32-bit `dword` quantized weight loads, and Group-8 L2 tile swizzling.
 //
 // DTYPE (constant_id = 1):
 //   0 = Q4_0, 1 = Q4_1, 2 = Q8_0, 5 = F32
 
+#extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
 
 layout(constant_id = 0) const uint WG = 128;
 layout(constant_id = 1) const uint DTYPE = 0;
 layout(local_size_x_id = 0) in;
 
-layout(std430, binding = 0) readonly buffer W { uint16_t w16[]; };
-layout(std430, binding = 1) readonly buffer X { float x[]; };
-layout(std430, binding = 2) buffer Y { float y[]; };
+layout(std430, binding = 0) readonly buffer W  { uint16_t w16[]; };
+layout(std430, binding = 1) readonly buffer X4 { vec4 x4[]; };
+layout(std430, binding = 2) buffer Y           { float y[]; };
 
 layout(push_constant) uniform PC {
     uint n_in;
@@ -24,94 +26,131 @@ layout(push_constant) uniform PC {
     uint row_u16s;
 } pc;
 
-// +1 padding eliminates 32-way shared-memory bank conflicts on RDNA / NVIDIA / Intel.
+// +1 padding eliminates shared-memory bank conflicts (`4.125 KB + 8.125 KB = 12.25 KB`).
 shared float X_sh[32][33];
-shared float W_sh[32][33];
+shared float W_sh[32][65];
 
 int sbyte_lo(uint u16) { return bitfieldExtract(int(u16), 0, 8); }
 int sbyte_hi(uint u16) { return bitfieldExtract(int(u16), 8, 8); }
 
+void store_row4(uint gm, uint gn0, vec4 c) {
+    if (gm >= pc.n_tok) return;
+    const uint yb = gm * pc.n_out + gn0;
+    if (pc.add_residual != 0u) {
+        if (gn0 + 0u < pc.n_out) y[yb + 0u] += c.x;
+        if (gn0 + 1u < pc.n_out) y[yb + 1u] += c.y;
+        if (gn0 + 2u < pc.n_out) y[yb + 2u] += c.z;
+        if (gn0 + 3u < pc.n_out) y[yb + 3u] += c.w;
+    } else {
+        if (gn0 + 0u < pc.n_out) y[yb + 0u] = c.x;
+        if (gn0 + 1u < pc.n_out) y[yb + 1u] = c.y;
+        if (gn0 + 2u < pc.n_out) y[yb + 2u] = c.z;
+        if (gn0 + 3u < pc.n_out) y[yb + 3u] = c.w;
+    }
+}
+
 void main() {
-    const uint r0 = gl_WorkGroupID.x * 32u;
-    const uint t0 = gl_WorkGroupID.y * 32u;
+    // Group-8 L2 cache tile swizzle so weight strips stay hot across M tiles.
+    const uint num_n = gl_NumWorkGroups.x;
+    const uint num_m = gl_NumWorkGroups.y;
+    const uint wg_linear = gl_WorkGroupID.y * num_n + gl_WorkGroupID.x;
+    const uint group_sz = num_m * 8u;
+    const uint group_id = wg_linear / group_sz;
+    const uint first_n = group_id * 8u;
+    const uint group_n = min(num_n - first_n, 8u);
+    const uint in_group = wg_linear % group_sz;
+    const uint pid_n = first_n + (in_group % group_n);
+    const uint pid_m = in_group / group_n;
+
+    const uint r0 = pid_n * 64u;
+    const uint t0 = pid_m * 32u;
     if (r0 >= pc.n_out || t0 >= pc.n_tok) return;
 
     const uint tid = gl_LocalInvocationID.x;
-    const uint load_row = tid >> 2u;       // 0..31
-    const uint sub = tid & 3u;             // 0..3
-    const uint load_col = sub * 8u;        // 0, 8, 16, 24
+    // X loader coordinates: 128 threads -> 32 rows x 4 sub-lanes (2 vec4s = 8 floats per sub-lane)
+    const uint x_row = tid >> 2u;             // 0..31
+    const uint sub = tid & 3u;                // 0..3
+    const uint load_col = sub * 8u;
+    const bool valid_x = (t0 + x_row) < pc.n_tok;
+    const uint x4_row_base = (t0 + x_row) * (pc.n_in >> 2u);
 
-    const uint tm = (tid >> 3u) * 2u;      // 0..30 (token sub-tile)
-    const uint rn = (tid & 7u) * 4u;       // 0..28 (row sub-tile)
+    // 8 x 16 compute tile decomposition -> each thread computes 4 tokens x 4 cols = 16 outputs (16 VGPRs!)
+    const uint tm = (tid >> 4u) * 4u;         // 0..28
+    const uint rn = (tid & 15u) * 4u;         // 0..60
 
-    float acc00 = 0.0, acc01 = 0.0, acc02 = 0.0, acc03 = 0.0;
-    float acc10 = 0.0, acc11 = 0.0, acc12 = 0.0, acc13 = 0.0;
+    vec4 c0 = vec4(0.0);
+    vec4 c1 = vec4(0.0);
+    vec4 c2 = vec4(0.0);
+    vec4 c3 = vec4(0.0);
 
-    const uint nb = pc.n_in / 32u;
-    const bool valid_t = (t0 + load_row) < pc.n_tok;
-    const bool valid_r = (r0 + load_row) < pc.n_out;
-    const uint x_row_base = (t0 + load_row) * pc.n_in;
-    const uint w_row_base = (r0 + load_row) * pc.row_u16s;
+    const uint nb = pc.n_in >> 5u;
 
     for (uint ib = 0u; ib < nb; ++ib) {
-        if (valid_t) {
-            const uint xo = x_row_base + ib * 32u + load_col;
-            for (uint j = 0u; j < 8u; ++j) {
-                X_sh[load_row][load_col + j] = x[xo + j];
-            }
+        if (valid_x) {
+            const uint x4_off = x4_row_base + ib * 8u + sub * 2u;
+            const vec4 v0 = x4[x4_off + 0u];
+            const vec4 v1 = x4[x4_off + 1u];
+            X_sh[x_row][load_col + 0u] = v0.x; X_sh[x_row][load_col + 1u] = v0.y;
+            X_sh[x_row][load_col + 2u] = v0.z; X_sh[x_row][load_col + 3u] = v0.w;
+            X_sh[x_row][load_col + 4u] = v1.x; X_sh[x_row][load_col + 5u] = v1.y;
+            X_sh[x_row][load_col + 6u] = v1.z; X_sh[x_row][load_col + 7u] = v1.w;
         } else {
-            for (uint j = 0u; j < 8u; ++j) {
-                X_sh[load_row][load_col + j] = 0.0;
+            [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+                X_sh[x_row][load_col + j] = 0.0;
             }
         }
 
-        if (valid_r) {
-            if (DTYPE == 0u) {
-                const uint b = w_row_base + ib * 9u;
-                const float d = unpackHalf2x16(uint(w16[b])).x;
-                for (uint i = 0u; i < 2u; ++i) {
-                    const uint j = sub * 2u + i;
-                    const uint u = uint(w16[b + 1u + j]);
-                    const uint b0 = u & 0xFFu;
-                    const uint b1 = u >> 8u;
-                    W_sh[2u * j][load_row]       = (float(b0 & 15u) - 8.0) * d;
-                    W_sh[2u * j + 1u][load_row]  = (float(b1 & 15u) - 8.0) * d;
-                    W_sh[2u * j + 16u][load_row] = (float(b0 >> 4u) - 8.0) * d;
-                    W_sh[2u * j + 17u][load_row] = (float(b1 >> 4u) - 8.0) * d;
-                }
-            } else if (DTYPE == 1u) {
-                const uint b = w_row_base + ib * 10u;
-                const float d = unpackHalf2x16(uint(w16[b])).x;
-                const float m = unpackHalf2x16(uint(w16[b + 1u])).x;
-                for (uint i = 0u; i < 2u; ++i) {
-                    const uint j = sub * 2u + i;
-                    const uint u = uint(w16[b + 2u + j]);
-                    const uint b0 = u & 0xFFu;
-                    const uint b1 = u >> 8u;
-                    W_sh[2u * j][load_row]       = fma(float(b0 & 15u), d, m);
-                    W_sh[2u * j + 1u][load_row]  = fma(float(b1 & 15u), d, m);
-                    W_sh[2u * j + 16u][load_row] = fma(float(b0 >> 4u), d, m);
-                    W_sh[2u * j + 17u][load_row] = fma(float(b1 >> 4u), d, m);
-                }
-            } else if (DTYPE == 2u) {
-                const uint b = w_row_base + ib * 17u;
-                const float d = unpackHalf2x16(uint(w16[b])).x;
-                for (uint i = 0u; i < 4u; ++i) {
-                    const uint j = sub * 4u + i;
-                    const uint u = uint(w16[b + 1u + j]);
-                    W_sh[2u * j][load_row]      = float(sbyte_lo(u)) * d;
-                    W_sh[2u * j + 1u][load_row] = float(sbyte_hi(u)) * d;
+        [[unroll]] for (uint rp = 0u; rp < 2u; ++rp) {
+            const uint lr = rp * 32u + x_row;
+            if (r0 + lr < pc.n_out) {
+                const uint w_row_base = (r0 + lr) * pc.row_u16s;
+                if (DTYPE == 0u) {
+                    const uint b = w_row_base + ib * 9u;
+                    const float d = unpackHalf2x16(uint(w16[b])).x;
+                    const uint u = uint(w16[b + 1u + sub * 2u]) | (uint(w16[b + 2u + sub * 2u]) << 16u);
+                    const uint k_lo = sub * 4u;
+                    W_sh[k_lo + 0u][lr]  = (float(u & 15u) - 8.0) * d;
+                    W_sh[k_lo + 1u][lr]  = (float((u >> 8u) & 15u) - 8.0) * d;
+                    W_sh[k_lo + 2u][lr]  = (float((u >> 16u) & 15u) - 8.0) * d;
+                    W_sh[k_lo + 3u][lr]  = (float((u >> 24u) & 15u) - 8.0) * d;
+                    W_sh[k_lo + 16u][lr] = (float((u >> 4u) & 15u) - 8.0) * d;
+                    W_sh[k_lo + 17u][lr] = (float((u >> 12u) & 15u) - 8.0) * d;
+                    W_sh[k_lo + 18u][lr] = (float((u >> 20u) & 15u) - 8.0) * d;
+                    W_sh[k_lo + 19u][lr] = (float(u >> 28u) - 8.0) * d;
+                } else if (DTYPE == 1u) {
+                    const uint b = w_row_base + ib * 10u;
+                    const float d = unpackHalf2x16(uint(w16[b])).x;
+                    const float m = unpackHalf2x16(uint(w16[b + 1u])).x;
+                    const uint u = uint(w16[b + 2u + sub * 2u]) | (uint(w16[b + 3u + sub * 2u]) << 16u);
+                    const uint k_lo = sub * 4u;
+                    W_sh[k_lo + 0u][lr]  = fma(float(u & 15u), d, m);
+                    W_sh[k_lo + 1u][lr]  = fma(float((u >> 8u) & 15u), d, m);
+                    W_sh[k_lo + 2u][lr]  = fma(float((u >> 16u) & 15u), d, m);
+                    W_sh[k_lo + 3u][lr]  = fma(float((u >> 24u) & 15u), d, m);
+                    W_sh[k_lo + 16u][lr] = fma(float((u >> 4u) & 15u), d, m);
+                    W_sh[k_lo + 17u][lr] = fma(float((u >> 12u) & 15u), d, m);
+                    W_sh[k_lo + 18u][lr] = fma(float((u >> 20u) & 15u), d, m);
+                    W_sh[k_lo + 19u][lr] = fma(float(u >> 28u), d, m);
+                } else if (DTYPE == 2u) {
+                    const uint b = w_row_base + ib * 17u;
+                    const float d = unpackHalf2x16(uint(w16[b])).x;
+                    [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+                        const uint j = sub * 4u + i;
+                        const uint u = uint(w16[b + 1u + j]);
+                        W_sh[2u * j][lr]      = float(sbyte_lo(u)) * d;
+                        W_sh[2u * j + 1u][lr] = float(sbyte_hi(u)) * d;
+                    }
+                } else {
+                    const uint b = w_row_base + (ib * 32u + load_col) * 2u;
+                    [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+                        const uint bits = uint(w16[b + 2u * j]) | (uint(w16[b + 2u * j + 1u]) << 16u);
+                        W_sh[load_col + j][lr] = uintBitsToFloat(bits);
+                    }
                 }
             } else {
-                const uint b = w_row_base + (ib * 32u + load_col) * 2u;
-                for (uint j = 0u; j < 8u; ++j) {
-                    const uint bits = uint(w16[b + 2u * j]) | (uint(w16[b + 2u * j + 1u]) << 16u);
-                    W_sh[load_col + j][load_row] = uintBitsToFloat(bits);
+                [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+                    W_sh[load_col + j][lr] = 0.0;
                 }
-            }
-        } else {
-            for (uint j = 0u; j < 8u; ++j) {
-                W_sh[load_col + j][load_row] = 0.0;
             }
         }
 
@@ -120,40 +159,20 @@ void main() {
         for (uint k = 0u; k < 32u; ++k) {
             const float x0 = X_sh[tm + 0u][k];
             const float x1 = X_sh[tm + 1u][k];
-            const float w0 = W_sh[k][rn + 0u];
-            const float w1 = W_sh[k][rn + 1u];
-            const float w2 = W_sh[k][rn + 2u];
-            const float w3 = W_sh[k][rn + 3u];
-            acc00 = fma(x0, w0, acc00);
-            acc01 = fma(x0, w1, acc01);
-            acc02 = fma(x0, w2, acc02);
-            acc03 = fma(x0, w3, acc03);
-            acc10 = fma(x1, w0, acc10);
-            acc11 = fma(x1, w1, acc11);
-            acc12 = fma(x1, w2, acc12);
-            acc13 = fma(x1, w3, acc13);
+            const float x2 = X_sh[tm + 2u][k];
+            const float x3 = X_sh[tm + 3u][k];
+            const vec4 w = vec4(W_sh[k][rn + 0u], W_sh[k][rn + 1u], W_sh[k][rn + 2u], W_sh[k][rn + 3u]);
+            c0 = fma(vec4(x0), w, c0);
+            c1 = fma(vec4(x1), w, c1);
+            c2 = fma(vec4(x2), w, c2);
+            c3 = fma(vec4(x3), w, c3);
         }
 
         barrier();
     }
 
-    const float outs0[4] = float[4](acc00, acc01, acc02, acc03);
-    const float outs1[4] = float[4](acc10, acc11, acc12, acc13);
-
-    if (t0 + tm < pc.n_tok) {
-        const uint yb = (t0 + tm) * pc.n_out + r0 + rn;
-        for (uint j = 0u; j < 4u; ++j) {
-            if (r0 + rn + j < pc.n_out) {
-                y[yb + j] = (pc.add_residual != 0u) ? (y[yb + j] + outs0[j]) : outs0[j];
-            }
-        }
-    }
-    if (t0 + tm + 1u < pc.n_tok) {
-        const uint yb = (t0 + tm + 1u) * pc.n_out + r0 + rn;
-        for (uint j = 0u; j < 4u; ++j) {
-            if (r0 + rn + j < pc.n_out) {
-                y[yb + j] = (pc.add_residual != 0u) ? (y[yb + j] + outs1[j]) : outs1[j];
-            }
-        }
-    }
+    store_row4(t0 + tm + 0u, r0 + rn, c0);
+    store_row4(t0 + tm + 1u, r0 + rn, c1);
+    store_row4(t0 + tm + 2u, r0 + rn, c2);
+    store_row4(t0 + tm + 3u, r0 + rn, c3);
 }

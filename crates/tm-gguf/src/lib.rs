@@ -486,6 +486,18 @@ impl GgufFile {
         self.backing.as_slice()
     }
 
+    /// Returns `true` when backed by an OS page-aligned read-only `mmap` (vs in-memory test buffer).
+    pub fn is_mmap(&self) -> bool {
+        #[cfg(test)]
+        {
+            matches!(self.backing, Backing::Mmap(_))
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    }
+
     /// Absolute byte offset of a tensor from the start of the GGUF file.
     pub fn tensor_file_offset(&self, info: &TensorInfo) -> usize {
         self.data_offset + info.offset

@@ -69,56 +69,36 @@ void main() {
 
     if (DTYPE == 0u) {
         const uint nb = pc.n_in / 32u;
-        for (uint ib = lane; ib < nb; ib += sg_size) {
-            const uint xb = ib * 32u;
-            float sumx = 0.0;
-            float xv[32];
-            for (uint k = 0u; k < 32u; ++k) {
-                xv[k] = x[xb + k];
-                sumx += xv[k];
-            }
-            const float corr = -8.0 * sumx;
+        const uint sub = lane & 3u;
+        const uint blk_step = sg_size >> 2u;
+        for (uint ib = (lane >> 2u); ib < nb; ib += blk_step) {
+            const vec4 xlo = x4[ib * 8u + sub];
+            const vec4 xhi = x4[ib * 8u + 4u + sub];
             for (uint r = 0u; r < NR; ++r) {
                 const uint b = row_b[r] + ib * 9u;
                 const float d = unpackHalf2x16(uint(w16[b])).x;
-                float s = 0.0;
-                for (uint j = 0u; j < 8u; ++j) {
-                    const uint u = uint(w16[b + 1u + j]);
-                    const uint b0 = u & 0xFFu;
-                    const uint b1 = u >> 8u;
-                    s = fma(float(b0 & 15u), xv[2u * j], s);
-                    s = fma(float(b0 >> 4u), xv[2u * j + 16u], s);
-                    s = fma(float(b1 & 15u), xv[2u * j + 1u], s);
-                    s = fma(float(b1 >> 4u), xv[2u * j + 17u], s);
-                }
-                acc[r] = fma(d, s + corr, acc[r]);
+                const uint u = uint(w16[b + 1u + 2u * sub]) | (uint(w16[b + 2u + 2u * sub]) << 16u);
+                const float s = dot(vec4(u & 15u, (u >> 8u) & 15u, (u >> 16u) & 15u, (u >> 24u) & 15u) - 8.0, xlo)
+                              + dot(vec4((u >> 4u) & 15u, (u >> 12u) & 15u, (u >> 20u) & 15u, u >> 28u) - 8.0, xhi);
+                acc[r] = fma(d, s, acc[r]);
             }
         }
     } else if (DTYPE == 1u) {
         const uint nb = pc.n_in / 32u;
-        for (uint ib = lane; ib < nb; ib += sg_size) {
-            const uint xb = ib * 32u;
-            float sumx = 0.0;
-            float xv[32];
-            for (uint k = 0u; k < 32u; ++k) {
-                xv[k] = x[xb + k];
-                sumx += xv[k];
-            }
+        const uint sub = lane & 3u;
+        const uint blk_step = sg_size >> 2u;
+        for (uint ib = (lane >> 2u); ib < nb; ib += blk_step) {
+            const vec4 xlo = x4[ib * 8u + sub];
+            const vec4 xhi = x4[ib * 8u + 4u + sub];
+            const float sumx8 = (xlo.x + xlo.y + xlo.z + xlo.w) + (xhi.x + xhi.y + xhi.z + xhi.w);
             for (uint r = 0u; r < NR; ++r) {
                 const uint b = row_b[r] + ib * 10u;
                 const float d = unpackHalf2x16(uint(w16[b])).x;
                 const float m = unpackHalf2x16(uint(w16[b + 1u])).x;
-                float s = 0.0;
-                for (uint j = 0u; j < 8u; ++j) {
-                    const uint u = uint(w16[b + 2u + j]);
-                    const uint b0 = u & 0xFFu;
-                    const uint b1 = u >> 8u;
-                    s = fma(float(b0 & 15u), xv[2u * j], s);
-                    s = fma(float(b0 >> 4u), xv[2u * j + 16u], s);
-                    s = fma(float(b1 & 15u), xv[2u * j + 1u], s);
-                    s = fma(float(b1 >> 4u), xv[2u * j + 17u], s);
-                }
-                acc[r] = fma(d, s, fma(m, sumx, acc[r]));
+                const uint u = uint(w16[b + 2u + 2u * sub]) | (uint(w16[b + 3u + 2u * sub]) << 16u);
+                const float s = dot(vec4(u & 15u, (u >> 8u) & 15u, (u >> 16u) & 15u, (u >> 24u) & 15u), xlo)
+                              + dot(vec4((u >> 4u) & 15u, (u >> 12u) & 15u, (u >> 20u) & 15u, u >> 28u), xhi);
+                acc[r] = fma(d, s, fma(m, sumx8, acc[r]));
             }
         }
     } else if (DTYPE == 2u) {

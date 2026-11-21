@@ -200,7 +200,7 @@ class DeviceTransport(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def prepare_binary(self, profile: str, auto_build: bool) -> str:
+    def prepare_binary(self, profile: str, auto_build: bool, vulkan: bool = False) -> str:
         """Ensures the `tinymodel` binary is built and staged on the target; returns target path."""
         raise NotImplementedError
 
@@ -231,11 +231,11 @@ class LocalTransport(DeviceTransport):
     def describe(self) -> str:
         return f"local ({platform.system()}/{platform.machine()})"
 
-    def prepare_binary(self, profile: str, auto_build: bool) -> str:
+    def prepare_binary(self, profile: str, auto_build: bool, vulkan: bool = False) -> str:
         exe = REPO_ROOT / "target" / "release" / "tinymodel"
         if auto_build or not exe.exists():
-            cmd = ["cargo", "build", "--release", "-p", "tm-cli"]
-            if profile == "micro":
+            cmd = ["cargo", "build", "--release", "-p", "tm-cli", "--bins"]
+            if profile == "micro" and not vulkan:
                 cmd.extend(["--no-default-features", "--features", "micro"])
             subprocess.run(cmd, cwd=REPO_ROOT, check=True)
         if not exe.exists():
@@ -288,19 +288,22 @@ class LocalTransport(DeviceTransport):
         return proc, None
 
 
-def build_musl_binary(profile: str) -> Path:
-    exe = REPO_ROOT / "target" / "aarch64-unknown-linux-musl" / "release" / "tinymodel"
+def build_cross_binary(profile: str, target_triple: str = "aarch64-unknown-linux-musl", vulkan: bool = False) -> Path:
+    exe = REPO_ROOT / "target" / target_triple / "release" / "tinymodel"
+    use_zigbuild = target_triple != "aarch64-linux-android" or shutil.which("cargo-zigbuild") is not None
     cmd = [
         "cargo",
-        "zigbuild",
+        "zigbuild" if use_zigbuild and target_triple != "aarch64-linux-android" else "build",
         "--release",
         "-p",
         "tm-cli",
         "--target",
-        "aarch64-unknown-linux-musl",
+        target_triple,
     ]
     if profile == "micro":
         cmd.extend(["--no-default-features", "--features", "micro"])
+    elif vulkan:
+        cmd.extend(["--no-default-features", "--features", "edge,vulkan"])
     else:
         cmd.extend(["--no-default-features", "--features", "edge"])
     env = os.environ.copy()
@@ -310,6 +313,10 @@ def build_musl_binary(profile: str) -> Path:
     if not exe.exists():
         raise RuntimeError(f"Cross-compiled binary missing after build: {exe}")
     return exe
+
+
+def build_musl_binary(profile: str) -> Path:
+    return build_cross_binary(profile, "aarch64-unknown-linux-musl", vulkan=False)
 
 
 class AdbTransport(DeviceTransport):
@@ -358,12 +365,14 @@ class AdbTransport(DeviceTransport):
         s = r.stdout.strip()
         return int(s) if r.returncode == 0 and s.isdigit() else None
 
-    def prepare_binary(self, profile: str, auto_build: bool) -> str:
-        local_exe = REPO_ROOT / "target" / "aarch64-unknown-linux-musl" / "release" / "tinymodel"
+    def prepare_binary(self, profile: str, auto_build: bool, vulkan: bool = False) -> str:
+        # Vulkan uses `dlopen("libvulkan.so")`, requiring bionic dynamic linking (`aarch64-linux-android`);
+        # pure CPU uses compact static `aarch64-unknown-linux-musl`.
+        triple = "aarch64-linux-android" if vulkan else "aarch64-unknown-linux-musl"
+        local_exe = REPO_ROOT / "target" / triple / "release" / "tinymodel"
         if auto_build or not local_exe.exists():
-            local_exe = build_musl_binary(profile)
-        rbin = f"{self.remote_dir}/tinymodel"
-        # Always push the compact (~750 KB) binary so code changes take effect immediately
+            local_exe = build_cross_binary(profile, triple, vulkan=vulkan)
+        rbin = f"{self.remote_dir}/tinymodel-vk" if vulkan else f"{self.remote_dir}/tinymodel"
         self._adb(["push", str(local_exe), rbin], check=True)
         self._adb(["shell", f"chmod 755 {shlex.quote(rbin)}"], check=True)
         return rbin
@@ -460,11 +469,13 @@ class SshTransport(DeviceTransport):
         s = r.stdout.strip()
         return int(s) if r.returncode == 0 and s.isdigit() else None
 
-    def prepare_binary(self, profile: str, auto_build: bool) -> str:
-        local_exe = REPO_ROOT / "target" / "aarch64-unknown-linux-musl" / "release" / "tinymodel"
+    def prepare_binary(self, profile: str, auto_build: bool, vulkan: bool = False) -> str:
+        # Vulkan uses `dlopen("libvulkan.so.1")`, requiring glibc (`aarch64-unknown-linux-gnu`) on RK3588 / Pi 5.
+        triple = "aarch64-unknown-linux-gnu" if vulkan else "aarch64-unknown-linux-musl"
+        local_exe = REPO_ROOT / "target" / triple / "release" / "tinymodel"
         if auto_build or not local_exe.exists():
-            local_exe = build_musl_binary(profile)
-        rbin = f"{self.remote_dir}/tinymodel"
+            local_exe = build_cross_binary(profile, triple, vulkan=vulkan)
+        rbin = f"{self.remote_dir}/tinymodel-vk" if vulkan else f"{self.remote_dir}/tinymodel"
         self._scp(local_exe, rbin)
         self._ssh(f"chmod 755 {shlex.quote(rbin)}", check=True)
         return rbin
@@ -634,14 +645,19 @@ def cmd_probe(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     manifest = verify_prompt_manifest()
     transport = make_transport(args.target, args.remote_dir)
-    rbin = transport.prepare_binary(args.profile, args.build)
-    env = {"TM_FORCE_ISA": args.force_isa} if args.force_isa else None
+    rbin = transport.prepare_binary(args.profile, args.build, vulkan=args.vulkan)
+    env: Dict[str, str] = {}
+    if args.force_isa:
+        env["TM_FORCE_ISA"] = args.force_isa
+    if args.vk_device:
+        env["TM_VK_DEVICE"] = args.vk_device
+    run_env = env or None
 
     # 1. Probe target device capabilities, clusters & STREAM bandwidth
     probe_args = ["probe", "--json"]
     if args.stream_mib:
         probe_args.extend(["--stream-mib", str(args.stream_mib)])
-    probe_proc, _ = transport.run_tinymodel(rbin, probe_args, env=env, cpu_mask=args.cpu_mask)
+    probe_proc, _ = transport.run_tinymodel(rbin, probe_args, env=run_env, cpu_mask=args.cpu_mask)
     if probe_proc.returncode != 0:
         sys.stderr.write(probe_proc.stderr or probe_proc.stdout)
         raise RuntimeError(f"Target probe failed (code {probe_proc.returncode})")
@@ -661,7 +677,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         sp_args = ["probe", "--json", "-t", str(eff_threads)]
         if args.stream_mib:
             sp_args.extend(["--stream-mib", str(args.stream_mib)])
-        sp_proc, _ = transport.run_tinymodel(rbin, sp_args, env=env, cpu_mask=cpu_mask)
+        sp_proc, _ = transport.run_tinymodel(rbin, sp_args, env=run_env, cpu_mask=cpu_mask)
         if sp_proc.returncode == 0:
             probe_info = parse_last_json_line(sp_proc.stdout)
 
@@ -700,11 +716,13 @@ def cmd_run(args: argparse.Namespace) -> int:
                 ]
                 if args.metal:
                     b_args.append("--metal")
+                if args.vulkan:
+                    b_args.append("--vulkan")
                 if corpus_flag:
                     b_args.extend(["-f", remote_prompt])
 
                 proc, host_rss = transport.run_tinymodel(
-                    rbin, b_args, env=env, cpu_mask=cpu_mask
+                    rbin, b_args, env=run_env, cpu_mask=cpu_mask
                 )
                 if proc.returncode != 0:
                     sys.stderr.write(proc.stderr or proc.stdout)
@@ -1179,6 +1197,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_run.add_argument("-t", "--threads", type=int, default=None, help="Override thread count")
     p_run.add_argument("-c", "--max-ctx", type=int, default=1024, help="Context window size")
     p_run.add_argument("--metal", action="store_true", help="Use Metal GPU backend (macOS local target)")
+    p_run.add_argument("--vulkan", action="store_true", help="Use Vulkan GPU backend (local, Android ADB, or Linux SSH)")
+    p_run.add_argument("--vk-device", default=None, help="Set TM_VK_DEVICE selector (e.g. UHD, radv, Mali, V3D)")
     p_run.add_argument(
         "--cluster-policy",
         choices=["all", "no-little", "mid-only"],

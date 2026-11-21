@@ -24,36 +24,26 @@ void main() {
     if (row >= pc.n_out) return;
 
     const uint nb = pc.n_in / 32u;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sub = lane & 3u;
+    const uint blk_step = gl_SubgroupSize >> 2u;
     float acc_g = 0.0;
     float acc_u = 0.0;
 
-    for (uint ib = gl_SubgroupInvocationID; ib < nb; ib += gl_SubgroupSize) {
-        const uint xb = ib * 8u;
-        const vec4 xv0 = x4[xb + 0u];
-        const vec4 xv1 = x4[xb + 1u];
-        const vec4 xv2 = x4[xb + 2u];
-        const vec4 xv3 = x4[xb + 3u];
-        const vec4 xv4 = x4[xb + 4u];
-        const vec4 xv5 = x4[xb + 5u];
-        const vec4 xv6 = x4[xb + 6u];
-        const vec4 xv7 = x4[xb + 7u];
+    for (uint ib = (lane >> 2u); ib < nb; ib += blk_step) {
+        const vec4 xlo = x4[ib * 8u + sub];
+        const vec4 xhi = x4[ib * 8u + 4u + sub];
 
         const uint base = (row * nb + ib) * 9u;
         const float dg = unpackHalf2x16(uint(wg[base])).x;
         const float du = unpackHalf2x16(uint(wu[base])).x;
+        const uint ug = uint(wg[base + 1u + 2u * sub]) | (uint(wg[base + 2u + 2u * sub]) << 16u);
+        const uint uu = uint(wu[base + 1u + 2u * sub]) | (uint(wu[base + 2u + 2u * sub]) << 16u);
 
-        float sg_dot = 0.0;
-        float su_dot = 0.0;
-        for (uint c = 0u; c < 4u; ++c) {
-            const uint ug = uint(wg[base + 1u + 2u * c]) | (uint(wg[base + 2u + 2u * c]) << 16u);
-            const uint uu = uint(wu[base + 1u + 2u * c]) | (uint(wu[base + 2u + 2u * c]) << 16u);
-            const vec4 xlo = (c == 0u) ? xv0 : ((c == 1u) ? xv1 : ((c == 2u) ? xv2 : xv3));
-            const vec4 xhi = (c == 0u) ? xv4 : ((c == 1u) ? xv5 : ((c == 2u) ? xv6 : xv7));
-            sg_dot += dot(vec4(ug & 15u, (ug >> 8u) & 15u, (ug >> 16u) & 15u, (ug >> 24u) & 15u) - 8.0, xlo)
-                    + dot(vec4((ug >> 4u) & 15u, (ug >> 12u) & 15u, (ug >> 20u) & 15u, ug >> 28u) - 8.0, xhi);
-            su_dot += dot(vec4(uu & 15u, (uu >> 8u) & 15u, (uu >> 16u) & 15u, (uu >> 24u) & 15u) - 8.0, xlo)
-                    + dot(vec4((uu >> 4u) & 15u, (uu >> 12u) & 15u, (uu >> 20u) & 15u, uu >> 28u) - 8.0, xhi);
-        }
+        const float sg_dot = dot(vec4(ug & 15u, (ug >> 8u) & 15u, (ug >> 16u) & 15u, (ug >> 24u) & 15u) - 8.0, xlo)
+                           + dot(vec4((ug >> 4u) & 15u, (ug >> 12u) & 15u, (ug >> 20u) & 15u, ug >> 28u) - 8.0, xhi);
+        const float su_dot = dot(vec4(uu & 15u, (uu >> 8u) & 15u, (uu >> 16u) & 15u, (uu >> 24u) & 15u) - 8.0, xlo)
+                           + dot(vec4((uu >> 4u) & 15u, (uu >> 12u) & 15u, (uu >> 20u) & 15u, uu >> 28u) - 8.0, xhi);
         acc_g = fma(dg, sg_dot, acc_g);
         acc_u = fma(du, su_dot, acc_u);
     }

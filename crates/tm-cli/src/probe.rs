@@ -803,13 +803,18 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
                     .iter()
                     .map(|d| {
                         format!(
-                            "{{\"index\":{},\"name\":\"{}\",\"type\":\"{}\",\"driver\":\"{}\",\"subgroup\":{},\"coopmat\":{},\"vram_bytes\":{}}}",
+                            "{{\"index\":{},\"name\":\"{}\",\"type\":\"{}\",\"driver\":\"{}\",\"subgroup\":{},\"min_subgroup\":{},\"max_subgroup\":{},\"subgroup_shuffle\":{},\"coopmat\":{},\"uma\":{},\"ext_mem_host\":{},\"vram_bytes\":{}}}",
                             d.index,
                             json_escape(&d.name),
                             d.device_type,
                             json_escape(&d.driver_info),
                             d.subgroup_size,
+                            d.min_subgroup_size,
+                            d.max_subgroup_size,
+                            d.subgroup_shuffle,
                             d.cooperative_matrix,
+                            d.unified_memory,
+                            d.external_memory_host,
                             d.device_local_bytes
                         )
                     })
@@ -900,13 +905,17 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
             println!("Vulkan GPUs:");
             for d in &devs {
                 println!(
-                    "  [{}] {} ({}, {}, subgroup={}, coopmat={}, VRAM={:.1} MiB)",
+                    "  [{}] {} ({}, {}, subgroup={} [{}..{}], shuffle={}, coopmat={}, ext_host={}, VRAM={:.1} MiB)",
                     d.index,
                     d.name,
                     d.device_type,
                     d.driver_info,
                     d.subgroup_size,
+                    d.min_subgroup_size,
+                    d.max_subgroup_size,
+                    d.subgroup_shuffle,
                     d.cooperative_matrix,
+                    d.external_memory_host,
                     d.device_local_bytes as f64 / 1048576.0
                 );
             }
