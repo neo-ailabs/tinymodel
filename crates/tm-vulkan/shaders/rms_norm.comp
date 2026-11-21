@@ -1,0 +1,53 @@
+#version 450
+// Subgroup-portable RMSNorm (1 workgroup of 256 threads per token).
+// Works identically for gl_SubgroupSize in {8, 16, 32, 64}.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(constant_id = 0) const uint WG = 256;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer InX { float x[]; };
+layout(std430, binding = 1) readonly buffer Weight { float w[]; };
+layout(std430, binding = 2) writeonly buffer OutY { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint x_offset; // element offset into `x` (0 normally; (b-1)*n for final prefill token)
+    float eps;
+} pc;
+
+shared float sg_sums[32];
+
+void main() {
+    const uint t = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint xb = pc.x_offset + t * pc.n;
+    const uint yb = t * pc.n;
+
+    float ss = 0.0;
+    for (uint i = tid; i < pc.n; i += WG) {
+        const float v = x[xb + i];
+        ss = fma(v, v, ss);
+    }
+    ss = subgroupAdd(ss);
+    if (subgroupElect()) {
+        sg_sums[gl_SubgroupID] = ss;
+    }
+    barrier();
+
+    if (tid == 0u) {
+        float total = 0.0;
+        for (uint s = 0u; s < gl_NumSubgroups; ++s) {
+            total += sg_sums[s];
+        }
+        sg_sums[0] = inversesqrt(total / float(pc.n) + pc.eps);
+    }
+    barrier();
+
+    const float scale = sg_sums[0];
+    for (uint i = tid; i < pc.n; i += WG) {
+        y[yb + i] = x[xb + i] * scale * w[i];
+    }
+}

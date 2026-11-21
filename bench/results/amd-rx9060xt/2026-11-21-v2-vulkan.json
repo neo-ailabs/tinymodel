@@ -1,0 +1,1282 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-21",
+  "milestone": "V2",
+  "device": "AMD Radeon RX 9060 XT (RADV GFX1200, 8 GiB, Mesa 25.2.8)",
+  "summary": {
+    "Llama-3.2-1B-Instruct-Q4_0.gguf": {
+      "rounds": 5,
+      "load_ms_median": 199.42,
+      "pp512_tps_median": 1181.94,
+      "tg128_tps_median": 302.16,
+      "tg128_tps_max": 309.22,
+      "active_decode_eff_bw_gbs_median": 231.21,
+      "greedy_tokens_fnv1a64": "e1f7b4090804eacb"
+    },
+    "Qwen_Qwen3-8B-Q4_0.gguf": {
+      "rounds": 5,
+      "load_ms_median": 899.01,
+      "pp512_tps_median": 252.46,
+      "tg128_tps_median": 63.84,
+      "tg128_tps_max": 64.0,
+      "active_decode_eff_bw_gbs_median": 282.91,
+      "greedy_tokens_fnv1a64": "dbad50c59a5d18d8"
+    },
+    "SmolLM2-360M-Instruct-Q4_0.gguf": {
+      "rounds": 5,
+      "load_ms_median": 87.94,
+      "pp512_tps_median": 2798.61,
+      "tg128_tps_median": 531.92,
+      "tg128_tps_max": 548.32,
+      "active_decode_eff_bw_gbs_median": 121.25,
+      "greedy_tokens_fnv1a64": "7851cc1ae736ea12"
+    }
+  },
+  "runs": [
+    {
+      "schema_version": 1,
+      "model": "SmolLM2-360M-Instruct-Q4_0.gguf",
+      "arch": "llama",
+      "backend": "vulkan",
+      "isa": "vulkan",
+      "device_name": "AMD Radeon Graphics (RADV GFX1200)",
+      "weights_mode": "vram-slab",
+      "threads": 1,
+      "max_ctx": 2048,
+      "corpus_mode": false,
+      "active_decode_bytes": 227946240,
+      "load_ms": 100.96,
+      "ttft_ms": 171.89,
+      "pp_tokens": 512,
+      "pp_ms": 171.89,
+      "pp_tps": 2978.59,
+      "tg_tokens": 128,
+      "tg_ms": 233.44,
+      "tg_tps": 548.32,
+      "ms_per_tok": 1.824,
+      "decode_eff_bw_gbs": 124.99,
+      "last_tok": 1120,
+      "greedy_tokens_fnv1a64": "7851cc1ae736ea12",
+      "rss_bytes": 68284416,
+      "peak_rss_bytes": 298991616,
+      "private_dirty_bytes": 13189120,
+      "pss_anon_bytes": 11988992,
+      "telemetry_before": {
+        "max_temp_c": 34.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 900.4,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 34.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 28.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      },
+      "telemetry_after": {
+        "max_temp_c": 34.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 891.0,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 34.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 29.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": 1,
+      "model": "SmolLM2-360M-Instruct-Q4_0.gguf",
+      "arch": "llama",
+      "backend": "vulkan",
+      "isa": "vulkan",
+      "device_name": "AMD Radeon Graphics (RADV GFX1200)",
+      "weights_mode": "vram-slab",
+      "threads": 1,
+      "max_ctx": 2048,
+      "corpus_mode": false,
+      "active_decode_bytes": 227946240,
+      "load_ms": 90.24,
+      "ttft_ms": 179.96,
+      "pp_tokens": 512,
+      "pp_ms": 179.96,
+      "pp_tps": 2845.12,
+      "tg_tokens": 128,
+      "tg_ms": 242.72,
+      "tg_tps": 527.35,
+      "ms_per_tok": 1.896,
+      "decode_eff_bw_gbs": 120.21,
+      "last_tok": 1120,
+      "greedy_tokens_fnv1a64": "7851cc1ae736ea12",
+      "rss_bytes": 68362240,
+      "peak_rss_bytes": 298999808,
+      "private_dirty_bytes": 13189120,
+      "pss_anon_bytes": 11993088,
+      "telemetry_before": {
+        "max_temp_c": 35.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 878.8,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 35.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 29.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      },
+      "telemetry_after": {
+        "max_temp_c": 32.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 900.0,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 32.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 28.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": 1,
+      "model": "SmolLM2-360M-Instruct-Q4_0.gguf",
+      "arch": "llama",
+      "backend": "vulkan",
+      "isa": "vulkan",
+      "device_name": "AMD Radeon Graphics (RADV GFX1200)",
+      "weights_mode": "vram-slab",
+      "threads": 1,
+      "max_ctx": 2048,
+      "corpus_mode": false,
+      "active_decode_bytes": 227946240,
+      "load_ms": 86.6,
+      "ttft_ms": 183.54,
+      "pp_tokens": 512,
+      "pp_ms": 183.54,
+      "pp_tps": 2789.52,
+      "tg_tokens": 128,
+      "tg_ms": 238.01,
+      "tg_tps": 537.78,
+      "ms_per_tok": 1.859,
+      "decode_eff_bw_gbs": 122.59,
+      "last_tok": 1120,
+      "greedy_tokens_fnv1a64": "7851cc1ae736ea12",
+      "rss_bytes": 68456448,
+      "peak_rss_bytes": 299053056,
+      "private_dirty_bytes": 13189120,
+      "pss_anon_bytes": 11988992,
+      "telemetry_before": {
+        "max_temp_c": 32.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 994.3,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 32.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 28.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      },
+      "telemetry_after": {
+        "max_temp_c": 35.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 4525.9,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 35.0
+          },
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 33.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": 1,
+      "model": "SmolLM2-360M-Instruct-Q4_0.gguf",
+      "arch": "llama",
+      "backend": "vulkan",
+      "isa": "vulkan",
+      "device_name": "AMD Radeon Graphics (RADV GFX1200)",
+      "weights_mode": "vram-slab",
+      "threads": 1,
+      "max_ctx": 2048,
+      "corpus_mode": false,
+      "active_decode_bytes": 227946240,
+      "load_ms": 87.73,
+      "ttft_ms": 182.95,
+      "pp_tokens": 512,
+      "pp_ms": 182.95,
+      "pp_tps": 2798.61,
+      "tg_tokens": 128,
+      "tg_ms": 243.02,
+      "tg_tps": 526.7,
+      "ms_per_tok": 1.899,
+      "decode_eff_bw_gbs": 120.06,
+      "last_tok": 1120,
+      "greedy_tokens_fnv1a64": "7851cc1ae736ea12",
+      "rss_bytes": 68403200,
+      "peak_rss_bytes": 298954752,
+      "private_dirty_bytes": 13205504,
+      "pss_anon_bytes": 11988992,
+      "telemetry_before": {
+        "max_temp_c": 38.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 4520.6,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 38.0
+          },
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 32.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      },
+      "telemetry_after": {
+        "max_temp_c": 34.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 900.0,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 34.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 29.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": 1,
+      "model": "SmolLM2-360M-Instruct-Q4_0.gguf",
+      "arch": "llama",
+      "backend": "vulkan",
+      "isa": "vulkan",
+      "device_name": "AMD Radeon Graphics (RADV GFX1200)",
+      "weights_mode": "vram-slab",
+      "threads": 1,
+      "max_ctx": 2048,
+      "corpus_mode": false,
+      "active_decode_bytes": 227946240,
+      "load_ms": 87.94,
+      "ttft_ms": 183.99,
+      "pp_tokens": 512,
+      "pp_ms": 183.99,
+      "pp_tps": 2782.8,
+      "tg_tokens": 128,
+      "tg_ms": 240.64,
+      "tg_tps": 531.92,
+      "ms_per_tok": 1.88,
+      "decode_eff_bw_gbs": 121.25,
+      "last_tok": 1120,
+      "greedy_tokens_fnv1a64": "7851cc1ae736ea12",
+      "rss_bytes": 68485120,
+      "peak_rss_bytes": 299057152,
+      "private_dirty_bytes": 13217792,
+      "pss_anon_bytes": 11993088,
+      "telemetry_before": {
+        "max_temp_c": 34.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 1630.4,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 34.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 29.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      },
+      "telemetry_after": {
+        "max_temp_c": 32.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 878.6,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 32.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 28.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": 1,
+      "model": "Llama-3.2-1B-Instruct-Q4_0.gguf",
+      "arch": "llama",
+      "backend": "vulkan",
+      "isa": "vulkan",
+      "device_name": "AMD Radeon Graphics (RADV GFX1200)",
+      "weights_mode": "vram-slab",
+      "threads": 1,
+      "max_ctx": 2048,
+      "corpus_mode": false,
+      "active_decode_bytes": 765194368,
+      "load_ms": 199.42,
+      "ttft_ms": 441.15,
+      "pp_tokens": 512,
+      "pp_ms": 441.15,
+      "pp_tps": 1160.61,
+      "tg_tokens": 128,
+      "tg_ms": 428.71,
+      "tg_tps": 298.57,
+      "ms_per_tok": 3.349,
+      "decode_eff_bw_gbs": 228.47,
+      "last_tok": 389,
+      "greedy_tokens_fnv1a64": "e1f7b4090804eacb",
+      "rss_bytes": 68497408,
+      "peak_rss_bytes": 845238272,
+      "private_dirty_bytes": 13135872,
+      "pss_anon_bytes": 11931648,
+      "telemetry_before": {
+        "max_temp_c": 33.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 901.0,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 33.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 28.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      },
+      "telemetry_after": {
+        "max_temp_c": 36.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 900.0,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 36.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 28.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": 1,
+      "model": "Llama-3.2-1B-Instruct-Q4_0.gguf",
+      "arch": "llama",
+      "backend": "vulkan",
+      "isa": "vulkan",
+      "device_name": "AMD Radeon Graphics (RADV GFX1200)",
+      "weights_mode": "vram-slab",
+      "threads": 1,
+      "max_ctx": 2048,
+      "corpus_mode": false,
+      "active_decode_bytes": 765194368,
+      "load_ms": 203.58,
+      "ttft_ms": 435.28,
+      "pp_tokens": 512,
+      "pp_ms": 435.28,
+      "pp_tps": 1176.24,
+      "tg_tokens": 128,
+      "tg_ms": 420.61,
+      "tg_tps": 304.32,
+      "ms_per_tok": 3.286,
+      "decode_eff_bw_gbs": 232.86,
+      "last_tok": 389,
+      "greedy_tokens_fnv1a64": "e1f7b4090804eacb",
+      "rss_bytes": 68280320,
+      "peak_rss_bytes": 844791808,
+      "private_dirty_bytes": 13160448,
+      "pss_anon_bytes": 11931648,
+      "telemetry_before": {
+        "max_temp_c": 35.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 3318.0,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 35.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 28.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      },
+      "telemetry_after": {
+        "max_temp_c": 35.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 892.4,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 35.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 28.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": 1,
+      "model": "Llama-3.2-1B-Instruct-Q4_0.gguf",
+      "arch": "llama",
+      "backend": "vulkan",
+      "isa": "vulkan",
+      "device_name": "AMD Radeon Graphics (RADV GFX1200)",
+      "weights_mode": "vram-slab",
+      "threads": 1,
+      "max_ctx": 2048,
+      "corpus_mode": false,
+      "active_decode_bytes": 765194368,
+      "load_ms": 191.62,
+      "ttft_ms": 428.21,
+      "pp_tokens": 512,
+      "pp_ms": 428.21,
+      "pp_tps": 1195.68,
+      "tg_tokens": 128,
+      "tg_ms": 413.95,
+      "tg_tps": 309.22,
+      "ms_per_tok": 3.234,
+      "decode_eff_bw_gbs": 236.61,
+      "last_tok": 389,
+      "greedy_tokens_fnv1a64": "e1f7b4090804eacb",
+      "rss_bytes": 68354048,
+      "peak_rss_bytes": 845049856,
+      "private_dirty_bytes": 13094912,
+      "pss_anon_bytes": 11927552,
+      "telemetry_before": {
+        "max_temp_c": 34.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 4657.2,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 34.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 29.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      },
+      "telemetry_after": {
+        "max_temp_c": 34.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 835.0,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 34.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 28.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": 1,
+      "model": "Llama-3.2-1B-Instruct-Q4_0.gguf",
+      "arch": "llama",
+      "backend": "vulkan",
+      "isa": "vulkan",
+      "device_name": "AMD Radeon Graphics (RADV GFX1200)",
+      "weights_mode": "vram-slab",
+      "threads": 1,
+      "max_ctx": 2048,
+      "corpus_mode": false,
+      "active_decode_bytes": 765194368,
+      "load_ms": 205.91,
+      "ttft_ms": 433.19,
+      "pp_tokens": 512,
+      "pp_ms": 433.19,
+      "pp_tps": 1181.94,
+      "tg_tokens": 128,
+      "tg_ms": 423.61,
+      "tg_tps": 302.16,
+      "ms_per_tok": 3.309,
+      "decode_eff_bw_gbs": 231.21,
+      "last_tok": 389,
+      "greedy_tokens_fnv1a64": "e1f7b4090804eacb",
+      "rss_bytes": 68345856,
+      "peak_rss_bytes": 844918784,
+      "private_dirty_bytes": 13094912,
+      "pss_anon_bytes": 11927552,
+      "telemetry_before": {
+        "max_temp_c": 34.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 1978.0,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 34.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 28.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      },
+      "telemetry_after": {
+        "max_temp_c": 34.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 902.3,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 34.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 28.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": 1,
+      "model": "Llama-3.2-1B-Instruct-Q4_0.gguf",
+      "arch": "llama",
+      "backend": "vulkan",
+      "isa": "vulkan",
+      "device_name": "AMD Radeon Graphics (RADV GFX1200)",
+      "weights_mode": "vram-slab",
+      "threads": 1,
+      "max_ctx": 2048,
+      "corpus_mode": false,
+      "active_decode_bytes": 765194368,
+      "load_ms": 192.43,
+      "ttft_ms": 428.17,
+      "pp_tokens": 512,
+      "pp_ms": 428.17,
+      "pp_tps": 1195.78,
+      "tg_tokens": 128,
+      "tg_ms": 425.62,
+      "tg_tps": 300.74,
+      "ms_per_tok": 3.325,
+      "decode_eff_bw_gbs": 230.12,
+      "last_tok": 389,
+      "greedy_tokens_fnv1a64": "e1f7b4090804eacb",
+      "rss_bytes": 68677632,
+      "peak_rss_bytes": 845410304,
+      "private_dirty_bytes": 13127680,
+      "pss_anon_bytes": 11931648,
+      "telemetry_before": {
+        "max_temp_c": 34.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 1243.3,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 34.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 29.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      },
+      "telemetry_after": {
+        "max_temp_c": 34.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 900.0,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 34.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 28.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": 1,
+      "model": "Qwen_Qwen3-8B-Q4_0.gguf",
+      "arch": "qwen3",
+      "backend": "vulkan",
+      "isa": "vulkan",
+      "device_name": "AMD Radeon Graphics (RADV GFX1200)",
+      "weights_mode": "vram-slab",
+      "threads": 1,
+      "max_ctx": 2048,
+      "corpus_mode": false,
+      "active_decode_bytes": 4431314944,
+      "load_ms": 899.01,
+      "ttft_ms": 2027.52,
+      "pp_tokens": 512,
+      "pp_ms": 2027.52,
+      "pp_tps": 252.52,
+      "tg_tokens": 128,
+      "tg_ms": 1999.9,
+      "tg_tps": 64.0,
+      "ms_per_tok": 15.624,
+      "decode_eff_bw_gbs": 283.62,
+      "last_tok": 315,
+      "greedy_tokens_fnv1a64": "dbad50c59a5d18d8",
+      "rss_bytes": 69308416,
+      "peak_rss_bytes": 4859478016,
+      "private_dirty_bytes": 14200832,
+      "pss_anon_bytes": 13033472,
+      "telemetry_before": {
+        "max_temp_c": 32.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 900.1,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 32.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 28.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      },
+      "telemetry_after": {
+        "max_temp_c": 35.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 1756.4,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 35.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 28.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": 1,
+      "model": "Qwen_Qwen3-8B-Q4_0.gguf",
+      "arch": "qwen3",
+      "backend": "vulkan",
+      "isa": "vulkan",
+      "device_name": "AMD Radeon Graphics (RADV GFX1200)",
+      "weights_mode": "vram-slab",
+      "threads": 1,
+      "max_ctx": 2048,
+      "corpus_mode": false,
+      "active_decode_bytes": 4431314944,
+      "load_ms": 899.7,
+      "ttft_ms": 2029.32,
+      "pp_tokens": 512,
+      "pp_ms": 2029.32,
+      "pp_tps": 252.3,
+      "tg_tokens": 128,
+      "tg_ms": 2011.41,
+      "tg_tps": 63.64,
+      "ms_per_tok": 15.714,
+      "decode_eff_bw_gbs": 282.0,
+      "last_tok": 315,
+      "greedy_tokens_fnv1a64": "dbad50c59a5d18d8",
+      "rss_bytes": 69234688,
+      "peak_rss_bytes": 4859408384,
+      "private_dirty_bytes": 14249984,
+      "pss_anon_bytes": 13037568,
+      "telemetry_before": {
+        "max_temp_c": 35.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 1345.5,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 35.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 28.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      },
+      "telemetry_after": {
+        "max_temp_c": 33.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 873.7,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 33.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 28.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": 1,
+      "model": "Qwen_Qwen3-8B-Q4_0.gguf",
+      "arch": "qwen3",
+      "backend": "vulkan",
+      "isa": "vulkan",
+      "device_name": "AMD Radeon Graphics (RADV GFX1200)",
+      "weights_mode": "vram-slab",
+      "threads": 1,
+      "max_ctx": 2048,
+      "corpus_mode": false,
+      "active_decode_bytes": 4431314944,
+      "load_ms": 894.89,
+      "ttft_ms": 2027.9,
+      "pp_tokens": 512,
+      "pp_ms": 2027.9,
+      "pp_tps": 252.48,
+      "tg_tokens": 128,
+      "tg_ms": 2003.26,
+      "tg_tps": 63.9,
+      "ms_per_tok": 15.65,
+      "decode_eff_bw_gbs": 283.14,
+      "last_tok": 315,
+      "greedy_tokens_fnv1a64": "dbad50c59a5d18d8",
+      "rss_bytes": 69324800,
+      "peak_rss_bytes": 4859506688,
+      "private_dirty_bytes": 14237696,
+      "pss_anon_bytes": 13033472,
+      "telemetry_before": {
+        "max_temp_c": 32.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 1483.6,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 32.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 28.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      },
+      "telemetry_after": {
+        "max_temp_c": 33.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 894.5,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 33.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 28.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": 1,
+      "model": "Qwen_Qwen3-8B-Q4_0.gguf",
+      "arch": "qwen3",
+      "backend": "vulkan",
+      "isa": "vulkan",
+      "device_name": "AMD Radeon Graphics (RADV GFX1200)",
+      "weights_mode": "vram-slab",
+      "threads": 1,
+      "max_ctx": 2048,
+      "corpus_mode": false,
+      "active_decode_bytes": 4431314944,
+      "load_ms": 900.25,
+      "ttft_ms": 2031.95,
+      "pp_tokens": 512,
+      "pp_ms": 2031.95,
+      "pp_tps": 251.97,
+      "tg_tokens": 128,
+      "tg_ms": 2006.87,
+      "tg_tps": 63.78,
+      "ms_per_tok": 15.679,
+      "decode_eff_bw_gbs": 282.63,
+      "last_tok": 315,
+      "greedy_tokens_fnv1a64": "dbad50c59a5d18d8",
+      "rss_bytes": 69795840,
+      "peak_rss_bytes": 4859904000,
+      "private_dirty_bytes": 13033472,
+      "pss_anon_bytes": 13033472,
+      "telemetry_before": {
+        "max_temp_c": 33.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 934.8,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 33.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 28.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      },
+      "telemetry_after": {
+        "max_temp_c": 33.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 884.3,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 33.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 28.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": 1,
+      "model": "Qwen_Qwen3-8B-Q4_0.gguf",
+      "arch": "qwen3",
+      "backend": "vulkan",
+      "isa": "vulkan",
+      "device_name": "AMD Radeon Graphics (RADV GFX1200)",
+      "weights_mode": "vram-slab",
+      "threads": 1,
+      "max_ctx": 2048,
+      "corpus_mode": false,
+      "active_decode_bytes": 4431314944,
+      "load_ms": 894.87,
+      "ttft_ms": 2028.07,
+      "pp_tokens": 512,
+      "pp_ms": 2028.07,
+      "pp_tps": 252.46,
+      "tg_tokens": 128,
+      "tg_ms": 2004.88,
+      "tg_tps": 63.84,
+      "ms_per_tok": 15.663,
+      "decode_eff_bw_gbs": 282.91,
+      "last_tok": 315,
+      "greedy_tokens_fnv1a64": "dbad50c59a5d18d8",
+      "rss_bytes": 69492736,
+      "peak_rss_bytes": 4859674624,
+      "private_dirty_bytes": 13033472,
+      "pss_anon_bytes": 13033472,
+      "telemetry_before": {
+        "max_temp_c": 33.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 4366.1,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 33.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 28.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      },
+      "telemetry_after": {
+        "max_temp_c": 34.0,
+        "skin_temp_c": null,
+        "thermal_status": null,
+        "cur_freq_mhz_max": 895.4,
+        "governor": "powersave",
+        "battery_power_mw": null,
+        "battery_status": null,
+        "zones": [
+          {
+            "zone": "iwlwifi_1",
+            "temp_c": 34.0
+          },
+          {
+            "zone": "x86_pkg_temp",
+            "temp_c": 29.0
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 27.8
+          },
+          {
+            "zone": "acpitz",
+            "temp_c": 16.8
+          }
+        ]
+      }
+    }
+  ]
+}

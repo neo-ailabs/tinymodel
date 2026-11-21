@@ -1,0 +1,50 @@
+#version 450
+// Deterministic GPU-side greedy argmax over `n` logits (1 workgroup of 256 threads).
+// Ties break toward the smaller index, matching `tm_models::argmax`.
+
+layout(constant_id = 0) const uint WG = 256;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer Logits { float logits[]; };
+layout(std430, binding = 1) writeonly buffer OutId { uint out_id[]; };
+
+layout(push_constant) uniform PC {
+    uint n;
+} pc;
+
+shared float sh_v[256];
+shared uint sh_i[256];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    float best_v = -1.0 / 0.0;
+    uint best_i = 0u;
+    for (uint i = tid; i < pc.n; i += WG) {
+        const float v = logits[i];
+        if (v > best_v || (v == best_v && i < best_i)) {
+            best_v = v;
+            best_i = i;
+        }
+    }
+    sh_v[tid] = best_v;
+    sh_i[tid] = best_i;
+    barrier();
+
+    for (uint stride = WG / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            const float rv = sh_v[tid + stride];
+            const uint ri = sh_i[tid + stride];
+            const float lv = sh_v[tid];
+            const uint li = sh_i[tid];
+            if (rv > lv || (rv == lv && ri < li)) {
+                sh_v[tid] = rv;
+                sh_i[tid] = ri;
+            }
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        out_id[0] = sh_i[0];
+    }
+}

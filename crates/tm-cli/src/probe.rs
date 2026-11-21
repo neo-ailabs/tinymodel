@@ -796,6 +796,31 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
             None => "null".to_string(),
         };
 
+        #[cfg(feature = "vulkan")]
+        let vk_json = match tm_vulkan::VulkanContext::list_devices() {
+            Ok(devs) => {
+                let items: Vec<String> = devs
+                    .iter()
+                    .map(|d| {
+                        format!(
+                            "{{\"index\":{},\"name\":\"{}\",\"type\":\"{}\",\"driver\":\"{}\",\"subgroup\":{},\"coopmat\":{},\"vram_bytes\":{}}}",
+                            d.index,
+                            json_escape(&d.name),
+                            d.device_type,
+                            json_escape(&d.driver_info),
+                            d.subgroup_size,
+                            d.cooperative_matrix,
+                            d.device_local_bytes
+                        )
+                    })
+                    .collect();
+                format!("[{}]", items.join(","))
+            }
+            Err(_) => "[]".to_string(),
+        };
+        #[cfg(not(feature = "vulkan"))]
+        let vk_json = "[]".to_string();
+
         println!(
             "{{\"schema_version\":1,\"device_model\":\"{}\",\"os\":\"{}\",\"arch\":\"{}\",\
             \"logical_cpus\":{},\"active_isa\":\"{}\",\
@@ -804,6 +829,7 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
             \"process_rss_bytes\":{},\"process_peak_rss_bytes\":{},\
             \"process_private_dirty_bytes\":{},\"process_pss_anon_bytes\":{},\
             \"kernel_self_check\":{{\"passed\":{},\"error\":{}}},\
+            \"vulkan_devices\":{},\
             \"stream_bw\":{},\"telemetry\":{}}}",
             json_escape(&model_name),
             std::env::consts::OS,
@@ -824,6 +850,7 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
             opt_u64_json(mem_stats.pss_anon_bytes),
             self_ok,
             err_json,
+            vk_json,
             stream_json,
             telemetry.to_json()
         );
@@ -866,6 +893,24 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
             "Kernel L1 Self-Check: {}",
             if self_ok { "PASSED" } else { "FAILED" }
         );
+        #[cfg(feature = "vulkan")]
+        if let Ok(devs) = tm_vulkan::VulkanContext::list_devices()
+            && !devs.is_empty()
+        {
+            println!("Vulkan GPUs:");
+            for d in &devs {
+                println!(
+                    "  [{}] {} ({}, {}, subgroup={}, coopmat={}, VRAM={:.1} MiB)",
+                    d.index,
+                    d.name,
+                    d.device_type,
+                    d.driver_info,
+                    d.subgroup_size,
+                    d.cooperative_matrix,
+                    d.device_local_bytes as f64 / 1048576.0
+                );
+            }
+        }
         if let Some((mib, rgbs, cgbs)) = stream {
             println!(
                 "STREAM Bandwidth ({} threads, {} MiB): Read={:.2} GB/s | Copy={:.2} GB/s",

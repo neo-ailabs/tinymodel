@@ -1,0 +1,69 @@
+#version 450
+// Q4_0 x F32 GEMV / multi-token shared-weight GEMV on the raw ggml BlockQ4_0 layout
+// (18 bytes = fp16 d + 16 packed nibble bytes; ggml, MIT, Copyright (c) 2023-2026 The ggml
+// authors). Used where weights are imported zero-copy (integrated GPUs) and as a baseline
+// against the repacked SoA variant. Geometry identical to gemv_q4_0_soa.comp.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(constant_id = 0) const uint WG = 128;
+layout(constant_id = 1) const uint NR = 2;
+layout(constant_id = 2) const uint NTOK = 1;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer W { uint16_t w16[]; };
+layout(std430, binding = 1) readonly buffer X { vec4 x4[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint n_in;
+    uint n_out;
+} pc;
+
+void main() {
+    const uint nb = pc.n_in / 32u;
+    const uint xs = pc.n_in / 4u;
+    const uint row0 = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * NR;
+    if (row0 >= pc.n_out) {
+        return;
+    }
+
+    float acc[NR * NTOK];
+    for (uint i = 0u; i < NR * NTOK; ++i) {
+        acc[i] = 0.0;
+    }
+
+    for (uint ib = gl_SubgroupInvocationID; ib < nb; ib += gl_SubgroupSize) {
+        for (uint r = 0u; r < NR; ++r) {
+            const uint row = min(row0 + r, pc.n_out - 1u);
+            const uint base = (row * nb + ib) * 9u;
+            const float d = unpackHalf2x16(uint(w16[base])).x;
+            vec4 lo[4];
+            vec4 hi[4];
+            for (uint c = 0u; c < 4u; ++c) {
+                const uint u = uint(w16[base + 1u + 2u * c]) | (uint(w16[base + 2u + 2u * c]) << 16);
+                lo[c] = vec4(u & 15u, (u >> 8) & 15u, (u >> 16) & 15u, (u >> 24) & 15u) - 8.0;
+                hi[c] = vec4((u >> 4) & 15u, (u >> 12) & 15u, (u >> 20) & 15u, u >> 28) - 8.0;
+            }
+            for (uint t = 0u; t < NTOK; ++t) {
+                const uint xb = t * xs + ib * 8u;
+                float s = 0.0;
+                for (uint c = 0u; c < 4u; ++c) {
+                    s += dot(lo[c], x4[xb + c]) + dot(hi[c], x4[xb + 4u + c]);
+                }
+                acc[r * NTOK + t] = fma(d, s, acc[r * NTOK + t]);
+            }
+        }
+    }
+
+    for (uint r = 0u; r < NR; ++r) {
+        for (uint t = 0u; t < NTOK; ++t) {
+            const float v = subgroupAdd(acc[r * NTOK + t]);
+            if (subgroupElect() && row0 + r < pc.n_out) {
+                y[t * pc.n_out + row0 + r] = v;
+            }
+        }
+    }
+}

@@ -1,0 +1,50 @@
+#version 450
+// Subgroup-portable per-head QK-Norm (in-place over `vec[(tok * n_heads + head) * head_dim]`).
+// Works for gl_SubgroupSize in {8, 16, 32, 64} with WG = 64.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(constant_id = 0) const uint WG = 64;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) buffer Vec { float data[]; };
+layout(std430, binding = 1) readonly buffer Weight { float w[]; };
+
+layout(push_constant) uniform PC {
+    uint head_dim;
+    float eps;
+} pc;
+
+shared float sg_sums[8];
+
+void main() {
+    const uint head_idx = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    const uint base = head_idx * pc.head_dim;
+    const uint tid = gl_LocalInvocationID.x;
+
+    float ss = 0.0;
+    for (uint i = tid; i < pc.head_dim; i += WG) {
+        const float v = data[base + i];
+        ss = fma(v, v, ss);
+    }
+    ss = subgroupAdd(ss);
+    if (subgroupElect()) {
+        sg_sums[gl_SubgroupID] = ss;
+    }
+    barrier();
+
+    if (tid == 0u) {
+        float total = 0.0;
+        for (uint s = 0u; s < gl_NumSubgroups; ++s) {
+            total += sg_sums[s];
+        }
+        sg_sums[0] = inversesqrt(total / float(pc.head_dim) + pc.eps);
+    }
+    barrier();
+
+    const float scale = sg_sums[0];
+    for (uint i = tid; i < pc.head_dim; i += WG) {
+        data[base + i] = data[base + i] * scale * w[i];
+    }
+}

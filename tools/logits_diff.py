@@ -147,9 +147,14 @@ def read_tmlg(path: Path):
 
 
 def ensure_llama_oracle(repo_root: Path) -> Path:
-    bin_dir = repo_root / "third_party" / "llama.cpp" / "build" / "bin"
-    inc_llama = repo_root / "third_party" / "llama.cpp" / "include"
-    inc_ggml = repo_root / "third_party" / "llama.cpp" / "ggml" / "include"
+    llama_root = Path(os.environ.get("LLAMA_DIR", repo_root / "third_party" / "llama.cpp"))
+    if not llama_root.exists():
+        llama_root = Path.home() / "llama.cpp"
+    bin_dir = llama_root / "build-vulkan" / "bin"
+    if not (bin_dir / "libllama.so").exists() and not (bin_dir / "libllama.dylib").exists():
+        bin_dir = llama_root / "build" / "bin"
+    inc_llama = llama_root / "include"
+    inc_ggml = llama_root / "ggml" / "include"
     out_bin = repo_root / "target" / "llama_cpp_logits_oracle"
     src_file = repo_root / "target" / "llama_cpp_logits_oracle.c"
     out_bin.parent.mkdir(parents=True, exist_ok=True)
@@ -295,7 +300,8 @@ def main() -> int:
     )
     ap.add_argument("--tokens", help="Explicit comma-separated token IDs")
     ap.add_argument("--metal", action="store_true", help="Test tinymodel Metal backend")
-    ap.add_argument("--both", action="store_true", help="Test BOTH tinymodel CPU and Metal against llama.cpp")
+    ap.add_argument("--vulkan", action="store_true", help="Test tinymodel Vulkan backend")
+    ap.add_argument("--both", action="store_true", help="Test BOTH tinymodel CPU and GPU against llama.cpp")
     ap.add_argument("--ngl", type=int, default=99, help="n_gpu_layers for llama.cpp reference (default: 99)")
     ap.add_argument("--max-kl", type=float, default=1e-3, help="Max allowed mean KL divergence")
     ap.add_argument("--min-top1", type=float, default=0.95, help="Min allowed Top-1 agreement rate")
@@ -321,7 +327,8 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="tm_logits_") as tmpdir:
         tmp = Path(tmpdir)
-        backends = ["cpu", "metal"] if args.both else (["metal"] if args.metal else ["cpu"])
+        gpu_bk = "vulkan" if args.vulkan else "metal"
+        backends = ["cpu", gpu_bk] if args.both else (["vulkan"] if args.vulkan else (["metal"] if args.metal else ["cpu"]))
         cand_files = {}
         toks_ref = None
 
@@ -334,6 +341,8 @@ def main() -> int:
                 cmd += ["-p", args.prompt]
             if bk == "metal":
                 cmd.append("--metal")
+            elif bk == "vulkan":
+                cmd.append("--vulkan")
             subprocess.run(cmd, check=True)
             toks, _, mat = read_tmlg(out_f)
             toks_ref = toks

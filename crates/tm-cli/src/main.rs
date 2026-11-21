@@ -25,10 +25,10 @@ fn print_usage() {
         "Usage:
   tinymodel probe [-t <threads>] [--stream-mib <mib>] [--no-stream] [--json]
   tinymodel inspect <model.gguf>
-  tinymodel run -m <model.gguf> [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--metal]
-  tinymodel bench -m <model.gguf> [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--metal] [--json]
-  tinymodel profile -m <model.gguf> [-n <tokens>] [-t <threads>] [-c <ctx>] [--metal]
-  tinymodel logits -m <model.gguf> -o <out.bin> [-p <prompt> | --tokens 1,2,3] [-t <threads>] [-c <ctx>] [--metal]"
+  tinymodel run -m <model.gguf> [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]
+  tinymodel bench -m <model.gguf> [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--vulkan | --metal | --gpu <vulkan|metal|cpu>] [--json]
+  tinymodel profile -m <model.gguf> [-n <tokens>] [-t <threads>] [-c <ctx>] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]
+  tinymodel logits -m <model.gguf> -o <out.bin> [-p <prompt> | --tokens 1,2,3] [-t <threads>] [-c <ctx>] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]"
     );
 }
 
@@ -68,6 +68,7 @@ struct RunOpts {
     threads: usize,
     max_ctx: usize,
     use_metal: bool,
+    use_vulkan: bool,
     json: bool,
     sampler: SamplerConfig,
 }
@@ -82,6 +83,7 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
     let mut threads = tm_cpu::recommended_threads();
     let mut max_ctx = 2048usize;
     let mut use_metal = false;
+    let mut use_vulkan = false;
     let mut json = false;
     let mut sampler = SamplerConfig::default();
 
@@ -196,6 +198,30 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
             }
             "--metal" => {
                 use_metal = true;
+                use_vulkan = false;
+            }
+            "--vulkan" => {
+                use_vulkan = true;
+                use_metal = false;
+            }
+            "--gpu" => {
+                i += 1;
+                let bk = args.get(i).context("missing value for --gpu")?;
+                match bk.as_str() {
+                    "vulkan" | "vk" => {
+                        use_vulkan = true;
+                        use_metal = false;
+                    }
+                    "metal" | "mtl" => {
+                        use_metal = true;
+                        use_vulkan = false;
+                    }
+                    "cpu" | "none" => {
+                        use_vulkan = false;
+                        use_metal = false;
+                    }
+                    other => bail!("unknown --gpu backend '{other}' (expected vulkan, metal, cpu)"),
+                }
             }
             "--json" => {
                 json = true;
@@ -216,6 +242,7 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
         threads,
         max_ctx,
         use_metal,
+        use_vulkan,
         json,
         sampler,
     })
@@ -826,7 +853,258 @@ fn estimate_qwen35_dirty_bytes(model: &Qwen35Model, max_ctx: usize) -> u64 {
     kv_bytes + gdn_bytes + scratch_bytes
 }
 
+#[cfg(feature = "vulkan")]
+fn print_vulkan_profile_report(
+    model_name: &str,
+    dev_name: &str,
+    drv_info: &str,
+    rep: &tm_vulkan::VkProfileReport,
+) {
+    let dec_tps = 1e6 / rep.decode_single_cb_wall_us.max(1e-3);
+    let host_ovh_us = (rep.decode_single_cb_wall_us - rep.decode_single_cb_gpu_us).max(0.0);
+    let sum_dec_gpu_us: f64 = rep.decode_stages.iter().map(|s| s.gpu_us).sum();
+    let total_dec_bytes: u64 = rep.decode_stages.iter().map(|s| s.bytes).sum();
+    let e2e_bw_gbs = (total_dec_bytes as f64 / 1e9) / (rep.decode_single_cb_wall_us * 1e-6);
+
+    println!("=== Vulkan Profile: {model_name} ({dev_name} · {drv_info}) ===");
+    println!(
+        "Decode 1-CB E2E: wall={:.1} us/tok ({:.2} tok/s) | gpu={:.1} us/tok | host+sync={:.1} us/tok ({:.1}%) | eff_bw={:.2} GB/s",
+        rep.decode_single_cb_wall_us,
+        dec_tps,
+        rep.decode_single_cb_gpu_us,
+        host_ovh_us,
+        100.0 * host_ovh_us / rep.decode_single_cb_wall_us.max(1e-3),
+        e2e_bw_gbs,
+    );
+    println!();
+    println!(
+        "{:<28} {:>10} {:>8} {:>10} {:>12} {:>14}",
+        "Decode Stage", "GPU us", "Share%", "MiB/tok", "Eff GB/s", "Eff GFLOP/s"
+    );
+    println!("{}", "-".repeat(86));
+    for st in &rep.decode_stages {
+        let pct = 100.0 * st.gpu_us / sum_dec_gpu_us.max(1e-3);
+        let mib = st.bytes as f64 / (1024.0 * 1024.0);
+        let gbs = if st.bytes > 0 && st.gpu_us > 0.0 {
+            (st.bytes as f64 / 1e9) / (st.gpu_us * 1e-6)
+        } else {
+            0.0
+        };
+        let gflops = if st.flops > 0 && st.gpu_us > 0.0 {
+            (st.flops as f64 / 1e9) / (st.gpu_us * 1e-6)
+        } else {
+            0.0
+        };
+        println!(
+            "{:<28} {:>10.1} {:>7.1}% {:>10.2} {:>12.2} {:>14.1}",
+            st.name, st.gpu_us, pct, mib, gbs, gflops
+        );
+    }
+    println!(
+        "{:<28} {:>10.1} {:>7.1}% {:>10.2}",
+        "Sum (timestamped)",
+        sum_dec_gpu_us,
+        100.0,
+        total_dec_bytes as f64 / (1024.0 * 1024.0)
+    );
+    let pp_tps = (rep.prefill_tokens as f64) / (rep.prefill_wall_ms * 1e-3).max(1e-9);
+    println!();
+    println!(
+        "Prefill pp{}: wall={:.2} ms ({:.1} tok/s)",
+        rep.prefill_tokens, rep.prefill_wall_ms, pp_tps
+    );
+}
+
+#[cfg(feature = "vulkan")]
+fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
+    let t_load = Instant::now();
+    let gguf = std::sync::Arc::new(GgufFile::open(&opts.model)?);
+    let tok = Tokenizer::from_gguf(&gguf)?;
+    let prompt_ids = resolve_prompt_ids(&opts, &tok)?;
+    let is_pure_greedy =
+        opts.sampler.temperature <= 0.0 && (opts.sampler.repeat_penalty - 1.0).abs() < 1e-6;
+
+    let mut runner = tm_vulkan::LlamaVkRunner::from_gguf(gguf, opts.max_ctx)?;
+    let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
+    eprintln!(
+        "[tinymodel] arch={} backend=vulkan ({} · {}) load={:.1}ms prompt_tokens={} vocab={} layers={}",
+        runner.cfg.arch,
+        runner.device_name(),
+        runner.driver_info(),
+        load_ms,
+        prompt_ids.len(),
+        runner.cfg.vocab_size,
+        runner.cfg.n_layers
+    );
+
+    let mut sampler = Sampler::new(opts.sampler, runner.cfg.vocab_size);
+    let mut history = prompt_ids.clone();
+
+    let t_pp = Instant::now();
+    let logits = runner.forward_batch(&prompt_ids, 0, true)?;
+    let mut next_id = sampler.sample(logits, &history);
+    let pp_sec = t_pp.elapsed().as_secs_f64();
+
+    let mut stdout = io::stdout().lock();
+    let mut pos = prompt_ids.len();
+    let mut generated = 0usize;
+
+    let t_gen = Instant::now();
+    while generated < opts.n_predict {
+        if tok.eos_id == Some(next_id) {
+            break;
+        }
+        stdout.write_all(&tok.decode_token_bytes(next_id))?;
+        stdout.flush()?;
+        history.push(next_id);
+        generated += 1;
+        if generated >= opts.n_predict {
+            break;
+        }
+        if is_pure_greedy {
+            next_id = runner.forward_token_greedy(next_id, pos)?;
+        } else {
+            let logits = runner.forward_token(next_id, pos, true)?;
+            next_id = sampler.sample(logits, &history);
+        }
+        pos += 1;
+    }
+    let gen_sec = t_gen.elapsed().as_secs_f64();
+
+    writeln!(stdout)?;
+    let pp_tps = (prompt_ids.len() as f64) / pp_sec.max(1e-9);
+    let tg_runs = generated.saturating_sub(1);
+    let tg_tps = if tg_runs > 0 {
+        (tg_runs as f64) / gen_sec.max(1e-9)
+    } else {
+        0.0
+    };
+    eprintln!(
+        "[tinymodel] prompt: {:.2} ms / {} tok ({:.2} tok/s) | eval: {:.2} ms / {} runs ({:.2} tok/s)",
+        pp_sec * 1e3,
+        prompt_ids.len(),
+        pp_tps,
+        gen_sec * 1e3,
+        tg_runs,
+        tg_tps
+    );
+    Ok(())
+}
+
+#[cfg(feature = "vulkan")]
+fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
+    let tel_before = probe::collect_telemetry();
+    let t_load = Instant::now();
+    let gguf = std::sync::Arc::new(GgufFile::open(&opts.model)?);
+    let arch = gguf.req_str("general.architecture")?.to_string();
+    let active_decode_bytes = compute_active_decode_bytes(&gguf);
+    let (pp_ids, corpus_mode) = resolve_bench_pp_ids(&opts, &gguf)?;
+    let n_pp = pp_ids.len();
+    let model_name = opts
+        .model
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("?")
+        .to_string();
+
+    let mut runner = tm_vulkan::LlamaVkRunner::from_gguf(gguf, opts.max_ctx)?;
+    let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
+
+    let _ = runner.forward_token_greedy(1, 0)?;
+    let warmup_ids = [1u32; 8];
+    let _ = runner.forward_batch(&warmup_ids, 0, false)?;
+
+    let t_pp = Instant::now();
+    let pp_logits = runner.forward_batch(&pp_ids, 0, corpus_mode)?;
+    let first_tok = if corpus_mode { argmax(pp_logits) } else { 0 };
+    let pp_sec = t_pp.elapsed().as_secs_f64();
+    let pp_tps = (n_pp as f64) / pp_sec.max(1e-9);
+
+    let n_gen = opts.n_predict;
+    let mut gen_tokens = Vec::with_capacity(n_gen + 1);
+    let (mut tok, base_pos) = if corpus_mode {
+        (first_tok, n_pp)
+    } else {
+        (runner.forward_token_greedy(1, 0)?, 1)
+    };
+    gen_tokens.push(tok);
+    let t0 = Instant::now();
+    for step in 0..n_gen {
+        tok = runner.forward_token_greedy(tok, base_pos + step)?;
+        gen_tokens.push(tok);
+    }
+    let sec = t0.elapsed().as_secs_f64();
+    let tps = (n_gen as f64) / sec.max(1e-9);
+    let tel_after = probe::collect_telemetry();
+    let dev_name = runner.device_name().to_string();
+    let wmode = "vram-slab";
+    if opts.json {
+        BenchMetrics {
+            model_name: &model_name,
+            arch: &arch,
+            backend: "vulkan",
+            isa: "vulkan",
+            device_name: &dev_name,
+            weights_mode: wmode,
+            threads: 1,
+            max_ctx: opts.max_ctx,
+            corpus_mode,
+            active_decode_bytes,
+            load_ms,
+            ttft_ms: pp_sec * 1e3,
+            n_pp,
+            pp_ms: pp_sec * 1e3,
+            n_gen,
+            tg_ms: sec * 1e3,
+            last_tok: tok,
+            greedy_hash: probe::hash_token_sequence(&gen_tokens),
+            tel_before,
+            tel_after,
+        }
+        .print_json();
+    } else {
+        println!(
+            "bench: model={} backend=vulkan ({}) weights={} load={:.1}ms pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
+            model_name,
+            dev_name,
+            wmode,
+            load_ms,
+            n_pp,
+            pp_tps,
+            n_gen,
+            tps,
+            (sec * 1e3) / (n_gen as f64),
+            tok
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "vulkan")]
+fn cmd_profile_vulkan(opts: RunOpts) -> Result<()> {
+    let model_name = opts
+        .model
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("?")
+        .to_string();
+    let gguf = std::sync::Arc::new(GgufFile::open(&opts.model)?);
+    let n_runs = opts.n_predict.max(16);
+    let mut runner = tm_vulkan::LlamaVkRunner::from_gguf(gguf, opts.max_ctx)?;
+    let dev = runner.device_name().to_string();
+    let drv = runner.driver_info().to_string();
+    let rep = runner.profile(n_runs, 512)?;
+    print_vulkan_profile_report(&model_name, &dev, &drv, &rep);
+    Ok(())
+}
+
 fn cmd_run(opts: RunOpts) -> Result<()> {
+    if opts.use_vulkan {
+        #[cfg(feature = "vulkan")]
+        return cmd_run_vulkan(opts);
+        #[cfg(not(feature = "vulkan"))]
+        bail!("--vulkan requires compiling with feature 'vulkan'");
+    }
     if opts.use_metal {
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         return cmd_run_metal(opts);
@@ -980,6 +1258,12 @@ fn cmd_run(opts: RunOpts) -> Result<()> {
 }
 
 fn cmd_bench(opts: RunOpts) -> Result<()> {
+    if opts.use_vulkan {
+        #[cfg(feature = "vulkan")]
+        return cmd_bench_vulkan(opts);
+        #[cfg(not(feature = "vulkan"))]
+        bail!("--vulkan requires compiling with feature 'vulkan'");
+    }
     if opts.use_metal {
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         return cmd_bench_metal(opts);
@@ -1197,6 +1481,12 @@ fn cmd_profile_metal(opts: RunOpts) -> Result<()> {
 }
 
 fn cmd_profile(opts: RunOpts) -> Result<()> {
+    if opts.use_vulkan {
+        #[cfg(feature = "vulkan")]
+        return cmd_profile_vulkan(opts);
+        #[cfg(not(feature = "vulkan"))]
+        bail!("--vulkan requires compiling with feature 'vulkan'");
+    }
     if opts.use_metal {
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         return cmd_profile_metal(opts);
@@ -1441,6 +1731,36 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
     let file = File::create(&out_path)
         .with_context(|| format!("failed to create '{}'", out_path.display()))?;
     let mut writer = BufWriter::new(file);
+
+    if opts.use_vulkan {
+        #[cfg(feature = "vulkan")]
+        {
+            let mut runner = tm_vulkan::LlamaVkRunner::from_gguf(gguf, opts.max_ctx)?;
+            let vocab = runner.cfg.vocab_size as u32;
+            writer.write_all(b"TMLG")?;
+            writer.write_all(&1u32.to_le_bytes())?;
+            writer.write_all(&(n_steps as u32).to_le_bytes())?;
+            writer.write_all(&vocab.to_le_bytes())?;
+            for &id in &input_ids {
+                writer.write_all(&id.to_le_bytes())?;
+            }
+            for (pos, &id) in input_ids.iter().enumerate() {
+                let logits = runner.forward_token(id, pos, true)?;
+                write_f32_le(&mut writer, logits)?;
+            }
+            writer.flush()?;
+            eprintln!(
+                "[tinymodel logits] wrote {} steps x {} vocab (vulkan {}) -> {}",
+                n_steps,
+                vocab,
+                arch,
+                out_path.display()
+            );
+            return Ok(());
+        }
+        #[cfg(not(feature = "vulkan"))]
+        bail!("--vulkan requires compiling with feature 'vulkan'");
+    }
 
     if opts.use_metal {
         #[cfg(all(feature = "metal", target_vendor = "apple"))]

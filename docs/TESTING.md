@@ -36,6 +36,7 @@
 | Raspberry Pi 5 | edge 档 SBC 基准（4×A76、dotprod） | `--target ssh://pi@<host>` | 手动或自托管 runner |
 | Raspberry Pi 4B | micro ISA 大内存基准（4×A72、纯 ARMv8.0 NEON） | `--target ssh://pi@<host> --profile micro` | 手动 |
 | Raspberry Pi Zero 2W | micro 档极限内存基准（4×A53、512MB） | `--target ssh://pi@<host> --profile micro` | 手动 |
+| **x86 + AMD RX 9060 XT**（RDNA4，8 GiB） | Vulkan 后端主力开发机（RADV）；同机还有 Intel UHD 770（ANV）和 lavapipe | `--target local` | 本地 |
 | x86 + NVIDIA | AVX2 / AVX-512、CUDA | `--target ssh://...` | 远期 |
 | CI（GitHub Actions） | x86_64 和 aarch64 Linux 的 L0/L1/L5 测试、交叉编译检查、GPU 后端只做编译检查 | — | 每次提交 |
 
@@ -50,3 +51,15 @@
    python3 bench/device_harness.py run --target adb -m models/Qwen3.5-0.8B-Q4_0.gguf --cluster-policy no-little --reps 5 --compare-local --build
    python3 bench/device_harness.py run --target ssh://pi@raspberrypi.local --profile micro -m models/SmolLM2-360M-Instruct-Q4_0.gguf --reps 5 --build
    ```
+
+## 5. Vulkan 后端（`tm-vulkan`）
+
+- **对齐容差**：GPU 浮点累加顺序和标量参考实现不同，按 `|got − ref| / max(Σ|w·x|, 1) ≤ 1e-5` 判定（和 Metal 一致）；整数点积路径要求逐位一致。
+- **设备覆盖**：本机用户态已部署 **Mesa 25.2.8**（`~/.local/mesa-25.2.8/env.sh`，开启 RDNA4 `VK_KHR_cooperative_matrix`）。每次改 shader，都要在三种驱动/subgroup 宽度上跑 L1：`TM_VK_DEVICE=radv`（RADV wave32 + coopmat）、`TM_VK_DEVICE=UHD`（ANV，SIMD8–32）、`TM_VK_DEVICE=llvmpipe`（lavapipe，宽度 8，CI 用）。`TM_VK_DEVICE` 指定不存在的设备名时会直接报错失败，防止静默跳过。
+  ```sh
+  . ~/.local/mesa-25.2.8/env.sh
+  for d in radv UHD llvmpipe; do TM_VK_DEVICE=$d cargo test -p tm-vulkan; done
+  ```
+- **微基准**：`cargo run --release -p tm-vulkan --example bench_vk_gemv_q4_0 [wg nr]`。RX 9060 XT 有 32 MB Infinity Cache，**小于 32 MB 的形状测的是缓存带宽**；带宽利用率要看 ≥64 MB 的形状（例如 `65536x4096`、`151936x1024`）。
+- **基线**：`bench/run_amd_gpu_baseline.sh <out.json>`（llama.cpp Vulkan + HIP，`-p 512 -n 128 -r 5 -ngl 99 -fa 1`）。
+- **Shader 编译**：改了 `shaders/*.comp` 之后运行 `crates/tm-vulkan/gen_spv.sh`，把重新生成的 `spv/` 一起提交。

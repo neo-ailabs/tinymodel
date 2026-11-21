@@ -1,0 +1,93 @@
+#version 450
+// Fused RoPE (Norm interleaved or NeoX split-half, optional freq_factors) + F16 KV cache store.
+// BATCH = 0: reads base `pos` from StepParams buffer (`step[1]`), enabling pre-recorded decode CBs!
+// BATCH = 1: reads base `pos` from push constant `pc.base_pos`, plus `gl_WorkGroupID.y`.
+
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(constant_id = 0) const uint WG = 64;
+layout(constant_id = 1) const uint BATCH = 0;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) buffer QBuf { float q[]; };
+layout(std430, binding = 1) buffer KBuf { float k[]; };
+layout(std430, binding = 2) readonly buffer VBuf { float v[]; };
+layout(std430, binding = 3) writeonly buffer KCache { uint16_t k_cache[]; };
+layout(std430, binding = 4) writeonly buffer VCache { uint16_t v_cache[]; };
+layout(std430, binding = 5) readonly buffer Freqs { float freq_factors[]; };
+layout(std430, binding = 6) readonly buffer Step { uint step[]; };
+
+layout(push_constant) uniform PC {
+    uint n_head;
+    uint n_head_kv;
+    uint head_dim;
+    uint rope_dim;
+    uint base_pos;
+    uint rope_type;        // 0 = Norm (interleaved), 1 = NeoX (split-half)
+    uint has_freq_factors; // 0 or 1
+    float freq_base;
+} pc;
+
+uint to_f16(float val) {
+    return packHalf2x16(vec2(val, 0.0)) & 0xFFFFu;
+}
+
+void main() {
+    const uint tid = gl_GlobalInvocationID.x;
+    const uint t = (BATCH == 0u) ? 0u : gl_WorkGroupID.y;
+    const uint pos = ((BATCH == 0u) ? step[1] : pc.base_pos) + t;
+
+    const uint half_rope = pc.rope_dim / 2u;
+    const uint q_dim = pc.n_head * pc.head_dim;
+    const uint kv_dim = pc.n_head_kv * pc.head_dim;
+    const uint q_pairs = pc.n_head * half_rope;
+    const uint k_pairs = pc.n_head_kv * half_rope;
+
+    const uint qt_off = t * q_dim;
+    const uint kt_off = t * kv_dim;
+
+    if (tid < q_pairs + k_pairs) {
+        const bool is_k = (tid >= q_pairs);
+        const uint idx = is_k ? (tid - q_pairs) : tid;
+        const uint h = idx / half_rope;
+        const uint i = idx % half_rope;
+
+        float freq = pow(pc.freq_base, -2.0 * float(i) / float(pc.rope_dim));
+        if (pc.has_freq_factors != 0u) {
+            freq /= freq_factors[i];
+        }
+        const float theta = float(pos) * freq;
+        const float c = cos(theta);
+        const float s = sin(theta);
+
+        const uint i0 = (pc.rope_type == 0u) ? (2u * i) : i;
+        const uint i1 = (pc.rope_type == 0u) ? (2u * i + 1u) : (i + half_rope);
+
+        if (is_k) {
+            const uint hb = kt_off + h * pc.head_dim;
+            const float x0 = k[hb + i0];
+            const float x1 = k[hb + i1];
+            const float r0 = x0 * c - x1 * s;
+            const float r1 = x0 * s + x1 * c;
+            k[hb + i0] = r0;
+            k[hb + i1] = r1;
+            const uint kv_off = pos * kv_dim + h * pc.head_dim;
+            k_cache[kv_off + i0] = uint16_t(to_f16(r0));
+            k_cache[kv_off + i1] = uint16_t(to_f16(r1));
+        } else {
+            const uint hb = qt_off + h * pc.head_dim;
+            const float x0 = q[hb + i0];
+            const float x1 = q[hb + i1];
+            q[hb + i0] = x0 * c - x1 * s;
+            q[hb + i1] = x0 * s + x1 * c;
+        }
+    }
+
+    if (tid < kv_dim) {
+        const uint kv_off = pos * kv_dim;
+        v_cache[kv_off + tid] = uint16_t(to_f16(v[kt_off + tid]));
+        if (pc.rope_dim < pc.head_dim && (tid % pc.head_dim) >= pc.rope_dim) {
+            k_cache[kv_off + tid] = uint16_t(to_f16(k[kt_off + tid]));
+        }
+    }
+}

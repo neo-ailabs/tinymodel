@@ -1,0 +1,159 @@
+#version 450
+// LDS-tiled 32x32x32 register-blocked (2x4/thread, WG=128) batched GEMM for Q4_0 / Q4_1 / Q8_0 / F32.
+// Subgroup-size independent (works identically for subgroup_size in {8, 16, 32, 64}).
+// Supports fused `add_residual` (`y[t * n_out + r] += dot(W[r], x[t])`).
+//
+// DTYPE (constant_id = 1):
+//   0 = Q4_0, 1 = Q4_1, 2 = Q8_0, 5 = F32
+
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(constant_id = 0) const uint WG = 128;
+layout(constant_id = 1) const uint DTYPE = 0;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer W { uint16_t w16[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) buffer Y { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint n_in;
+    uint n_out;
+    uint n_tok;
+    uint add_residual;
+    uint row_u16s;
+} pc;
+
+// +1 padding eliminates 32-way shared-memory bank conflicts on RDNA / NVIDIA / Intel.
+shared float X_sh[32][33];
+shared float W_sh[32][33];
+
+int sbyte_lo(uint u16) { return bitfieldExtract(int(u16), 0, 8); }
+int sbyte_hi(uint u16) { return bitfieldExtract(int(u16), 8, 8); }
+
+void main() {
+    const uint r0 = gl_WorkGroupID.x * 32u;
+    const uint t0 = gl_WorkGroupID.y * 32u;
+    if (r0 >= pc.n_out || t0 >= pc.n_tok) return;
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint load_row = tid >> 2u;       // 0..31
+    const uint sub = tid & 3u;             // 0..3
+    const uint load_col = sub * 8u;        // 0, 8, 16, 24
+
+    const uint tm = (tid >> 3u) * 2u;      // 0..30 (token sub-tile)
+    const uint rn = (tid & 7u) * 4u;       // 0..28 (row sub-tile)
+
+    float acc00 = 0.0, acc01 = 0.0, acc02 = 0.0, acc03 = 0.0;
+    float acc10 = 0.0, acc11 = 0.0, acc12 = 0.0, acc13 = 0.0;
+
+    const uint nb = pc.n_in / 32u;
+    const bool valid_t = (t0 + load_row) < pc.n_tok;
+    const bool valid_r = (r0 + load_row) < pc.n_out;
+    const uint x_row_base = (t0 + load_row) * pc.n_in;
+    const uint w_row_base = (r0 + load_row) * pc.row_u16s;
+
+    for (uint ib = 0u; ib < nb; ++ib) {
+        if (valid_t) {
+            const uint xo = x_row_base + ib * 32u + load_col;
+            for (uint j = 0u; j < 8u; ++j) {
+                X_sh[load_row][load_col + j] = x[xo + j];
+            }
+        } else {
+            for (uint j = 0u; j < 8u; ++j) {
+                X_sh[load_row][load_col + j] = 0.0;
+            }
+        }
+
+        if (valid_r) {
+            if (DTYPE == 0u) {
+                const uint b = w_row_base + ib * 9u;
+                const float d = unpackHalf2x16(uint(w16[b])).x;
+                for (uint i = 0u; i < 2u; ++i) {
+                    const uint j = sub * 2u + i;
+                    const uint u = uint(w16[b + 1u + j]);
+                    const uint b0 = u & 0xFFu;
+                    const uint b1 = u >> 8u;
+                    W_sh[2u * j][load_row]       = (float(b0 & 15u) - 8.0) * d;
+                    W_sh[2u * j + 1u][load_row]  = (float(b1 & 15u) - 8.0) * d;
+                    W_sh[2u * j + 16u][load_row] = (float(b0 >> 4u) - 8.0) * d;
+                    W_sh[2u * j + 17u][load_row] = (float(b1 >> 4u) - 8.0) * d;
+                }
+            } else if (DTYPE == 1u) {
+                const uint b = w_row_base + ib * 10u;
+                const float d = unpackHalf2x16(uint(w16[b])).x;
+                const float m = unpackHalf2x16(uint(w16[b + 1u])).x;
+                for (uint i = 0u; i < 2u; ++i) {
+                    const uint j = sub * 2u + i;
+                    const uint u = uint(w16[b + 2u + j]);
+                    const uint b0 = u & 0xFFu;
+                    const uint b1 = u >> 8u;
+                    W_sh[2u * j][load_row]       = fma(float(b0 & 15u), d, m);
+                    W_sh[2u * j + 1u][load_row]  = fma(float(b1 & 15u), d, m);
+                    W_sh[2u * j + 16u][load_row] = fma(float(b0 >> 4u), d, m);
+                    W_sh[2u * j + 17u][load_row] = fma(float(b1 >> 4u), d, m);
+                }
+            } else if (DTYPE == 2u) {
+                const uint b = w_row_base + ib * 17u;
+                const float d = unpackHalf2x16(uint(w16[b])).x;
+                for (uint i = 0u; i < 4u; ++i) {
+                    const uint j = sub * 4u + i;
+                    const uint u = uint(w16[b + 1u + j]);
+                    W_sh[2u * j][load_row]      = float(sbyte_lo(u)) * d;
+                    W_sh[2u * j + 1u][load_row] = float(sbyte_hi(u)) * d;
+                }
+            } else {
+                const uint b = w_row_base + (ib * 32u + load_col) * 2u;
+                for (uint j = 0u; j < 8u; ++j) {
+                    const uint bits = uint(w16[b + 2u * j]) | (uint(w16[b + 2u * j + 1u]) << 16u);
+                    W_sh[load_col + j][load_row] = uintBitsToFloat(bits);
+                }
+            }
+        } else {
+            for (uint j = 0u; j < 8u; ++j) {
+                W_sh[load_col + j][load_row] = 0.0;
+            }
+        }
+
+        barrier();
+
+        for (uint k = 0u; k < 32u; ++k) {
+            const float x0 = X_sh[tm + 0u][k];
+            const float x1 = X_sh[tm + 1u][k];
+            const float w0 = W_sh[k][rn + 0u];
+            const float w1 = W_sh[k][rn + 1u];
+            const float w2 = W_sh[k][rn + 2u];
+            const float w3 = W_sh[k][rn + 3u];
+            acc00 = fma(x0, w0, acc00);
+            acc01 = fma(x0, w1, acc01);
+            acc02 = fma(x0, w2, acc02);
+            acc03 = fma(x0, w3, acc03);
+            acc10 = fma(x1, w0, acc10);
+            acc11 = fma(x1, w1, acc11);
+            acc12 = fma(x1, w2, acc12);
+            acc13 = fma(x1, w3, acc13);
+        }
+
+        barrier();
+    }
+
+    const float outs0[4] = float[4](acc00, acc01, acc02, acc03);
+    const float outs1[4] = float[4](acc10, acc11, acc12, acc13);
+
+    if (t0 + tm < pc.n_tok) {
+        const uint yb = (t0 + tm) * pc.n_out + r0 + rn;
+        for (uint j = 0u; j < 4u; ++j) {
+            if (r0 + rn + j < pc.n_out) {
+                y[yb + j] = (pc.add_residual != 0u) ? (y[yb + j] + outs0[j]) : outs0[j];
+            }
+        }
+    }
+    if (t0 + tm + 1u < pc.n_tok) {
+        const uint yb = (t0 + tm + 1u) * pc.n_out + r0 + rn;
+        for (uint j = 0u; j < 4u; ++j) {
+            if (r0 + rn + j < pc.n_out) {
+                y[yb + j] = (pc.add_residual != 0u) ? (y[yb + j] + outs1[j]) : outs1[j];
+            }
+        }
+    }
+}

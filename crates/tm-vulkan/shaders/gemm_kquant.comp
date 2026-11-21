@@ -1,0 +1,130 @@
+#version 450
+// Subgroup-portable batched K-quant GEMM (Q5_K = 3, Q6_K = 4):
+// 1 row per subgroup (`gl_NumSubgroups` rows per WG), BT = 8 tokens per WG.
+// Preserves per-token superblock accumulation order and supports fused `add_residual`.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(constant_id = 0) const uint WG = 128;
+layout(constant_id = 1) const uint DTYPE = 4; // 3 = Q5_K, 4 = Q6_K
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer W { uint16_t w16[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) buffer Y { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint n_in;
+    uint n_out;
+    uint n_tok;
+    uint add_residual;
+    uint row_u16s;
+} pc;
+
+const uint BT = 8u;
+
+uint ubyte_at(uint base_u16, uint byte_idx) {
+    uint w = uint(w16[base_u16 + (byte_idx >> 1u)]);
+    return ((byte_idx & 1u) == 0u) ? (w & 0xFFu) : (w >> 8u);
+}
+int sbyte_at(uint base_u16, uint byte_idx) {
+    uint b = ubyte_at(base_u16, byte_idx);
+    return bitfieldExtract(int(b), 0, 8);
+}
+
+void unpack_q5k_sc_m(uint sc_u16_base, uint is, out uint sc, out uint m) {
+    if (is < 4u) {
+        sc = ubyte_at(sc_u16_base, is) & 63u;
+        m  = ubyte_at(sc_u16_base, is + 4u) & 63u;
+    } else {
+        uint b4 = ubyte_at(sc_u16_base, is + 4u);
+        uint bm4 = ubyte_at(sc_u16_base, is - 4u);
+        uint b0 = ubyte_at(sc_u16_base, is);
+        sc = (b4 & 0x0Fu) | ((bm4 >> 6u) << 4u);
+        m  = (b4 >> 4u)   | ((b0  >> 6u) << 4u);
+    }
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+    const uint t0 = gl_WorkGroupID.y * BT;
+    if (row >= pc.n_out || t0 >= pc.n_tok) return;
+
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg_size = gl_SubgroupSize;
+    const uint nb = pc.n_in / 256u;
+    const uint row_b = row * pc.row_u16s;
+
+    uint x_off[BT];
+    float acc[BT];
+    for (uint k = 0u; k < BT; ++k) {
+        x_off[k] = min(t0 + k, pc.n_tok - 1u) * pc.n_in;
+        acc[k] = 0.0;
+    }
+
+    if (DTYPE == 3u) {
+        for (uint ib = 0u; ib < nb; ++ib) {
+            const uint b = row_b + ib * 88u;
+            const float d    = unpackHalf2x16(uint(w16[b])).x;
+            const float dmin = unpackHalf2x16(uint(w16[b + 1u])).x;
+            for (uint l = lane; l < 32u; l += sg_size) {
+                const uint qhv = ubyte_at(b + 8u, l);
+                for (uint chunk = 0u; chunk < 4u; ++chunk) {
+                    uint sc0, m0, sc1, m1;
+                    unpack_q5k_sc_m(b + 2u, 2u * chunk,      sc0, m0);
+                    unpack_q5k_sc_m(b + 2u, 2u * chunk + 1u, sc1, m1);
+                    const uint ql = ubyte_at(b + 24u, chunk * 32u + l);
+                    const float q_lo = float((ql & 0x0Fu) | (((qhv >> (2u * chunk)) & 1u) << 4u));
+                    const float q_hi = float((ql >> 4u)   | (((qhv >> (2u * chunk + 1u)) & 1u) << 4u));
+                    const float w_lo = fma(d * float(sc0), q_lo, -dmin * float(m0));
+                    const float w_hi = fma(d * float(sc1), q_hi, -dmin * float(m1));
+                    const uint xb = ib * 256u + chunk * 64u + l;
+                    for (uint k = 0u; k < BT; ++k) {
+                        acc[k] = fma(w_lo, x[x_off[k] + xb], fma(w_hi, x[x_off[k] + xb + 32u], acc[k]));
+                    }
+                }
+            }
+        }
+    } else {
+        for (uint ib = 0u; ib < nb; ++ib) {
+            const uint b = row_b + ib * 105u;
+            const float d = unpackHalf2x16(uint(w16[b + 104u])).x;
+            float sum_t[BT];
+            for (uint k = 0u; k < BT; ++k) sum_t[k] = 0.0;
+            for (uint l = lane; l < 32u; l += sg_size) {
+                const uint is = l >> 4u;
+                for (uint half_idx = 0u; half_idx < 2u; ++half_idx) {
+                    const uint ql0 = ubyte_at(b + half_idx * 32u, l);
+                    const uint ql1 = ubyte_at(b + half_idx * 32u, l + 32u);
+                    const uint qhv = ubyte_at(b + 64u + half_idx * 16u, l);
+                    const uint sc_b = b + 96u + half_idx * 4u;
+                    const float wa = float(sbyte_at(sc_b, is))      * float(int((ql0 & 0x0Fu) | ((qhv & 3u) << 4u)) - 32);
+                    const float wb = float(sbyte_at(sc_b, is + 2u)) * float(int((ql1 & 0x0Fu) | (((qhv >> 2u) & 3u) << 4u)) - 32);
+                    const float wc = float(sbyte_at(sc_b, is + 4u)) * float(int((ql0 >> 4u)   | (((qhv >> 4u) & 3u) << 4u)) - 32);
+                    const float wd = float(sbyte_at(sc_b, is + 6u)) * float(int((ql1 >> 4u)   | (((qhv >> 6u) & 3u) << 4u)) - 32);
+                    const uint xh = ib * 256u + half_idx * 128u + l;
+                    for (uint k = 0u; k < BT; ++k) {
+                        const uint xo = x_off[k] + xh;
+                        sum_t[k] = fma(wa, x[xo], sum_t[k]);
+                        sum_t[k] = fma(wb, x[xo + 32u], sum_t[k]);
+                        sum_t[k] = fma(wc, x[xo + 64u], sum_t[k]);
+                        sum_t[k] = fma(wd, x[xo + 96u], sum_t[k]);
+                    }
+                }
+            }
+            for (uint k = 0u; k < BT; ++k) {
+                acc[k] = fma(d, sum_t[k], acc[k]);
+            }
+        }
+    }
+
+    for (uint k = 0u; k < BT; ++k) {
+        const float out_v = subgroupAdd(acc[k]);
+        if (subgroupElect() && (t0 + k) < pc.n_tok) {
+            const uint yi = (t0 + k) * pc.n_out + row;
+            y[yi] = (pc.add_residual != 0u) ? (y[yi] + out_v) : out_v;
+        }
+    }
+}

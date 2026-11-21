@@ -1,0 +1,20 @@
+[package]
+name = "tm-vulkan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Vulkan GPU backend for tinymodel (ash + GLSL compute shaders compiled to SPIR-V)"
+build = "build.rs"
+
+[dependencies]
+ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }
+thiserror = "2"
+tm-core = { path = "../tm-core" }
+tm-gguf = { path = "../tm-gguf" }
+
+[dev-dependencies]
+tm-cpu = { path = "../tm-cpu" }
+tm-models = { path = "../tm-models" }
+

@@ -54,3 +54,9 @@
 - **背景**：这是 Rust 生态的惯例；它和要移植的上游许可证都兼容：ggml 和 Strata 是 MIT，KleidiAI 是 Apache-2.0。
 - **决策**：项目以 `MIT OR Apache-2.0` 双许可发布，许可证文本放在仓库根目录的 `LICENSE-MIT` 和 `LICENSE-APACHE`；每个 crate 的 `Cargo.toml` 都写 `license = "MIT OR Apache-2.0"`。
 - **后果**：移植的文件要保留上游的版权声明；第三方声明汇总在 `THIRD_PARTY_NOTICES.md` 中（第一次移植代码时创建）。
+
+### ADR-010 AMD GPU 支持走 Vulkan 后端，HIP 推迟到 M5
+- **状态**：Accepted（2026-11-21，用户确认）
+- **背景**：开发主机有 AMD Radeon RX 9060 XT（RDNA4/gfx1200，8 GiB），可选 Vulkan（RADV）或 HIP/ROCm 7.1.1。分析见 `research/11-amdgpu.md`。
+- **决策**：AMD 显卡通过 `tm-vulkan`（ash + GLSL→SPIR-V）支持，本机作为 Vulkan 主力开发机；HIP 不单独立项，等 V3 拿到 prefill 差距数据后，再评估是否在 M5 和 `tm-cuda` 共用 kernel 源码。
+- **后果**：Vulkan 后端从 M3 提前开始；kernel 需要兼容 subgroup 宽度 16/32/64；CI 用 lavapipe 跑对齐测试；普通构建不能强制依赖 `glslc`（需要提交预编译的 SPIR-V）。

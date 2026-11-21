@@ -1,0 +1,161 @@
+#version 450
+// Token embedding lookup (single-token decode via StepParams, or batched via token_ids[]).
+// Quantization block layouts match ggml (Copyright (c) 2023-2026 The ggml authors, MIT).
+//
+// DTYPE specialization constant:
+//   0 = Q4_0 (18B = 9 u16 per 32 elems)
+//   1 = Q4_1 (20B = 10 u16 per 32 elems)
+//   2 = Q8_0 (34B = 17 u16 per 32 elems)
+//   3 = Q5_K (176B = 88 u16 per 256 elems)
+//   4 = Q6_K (210B = 105 u16 per 256 elems)
+//   5 = F32  (4B per elem, read as u16 pairs)
+// BATCH specialization constant:
+//   0 = single token (reads token_id from step.token_id)
+//   1 = batched (reads token_ids[gl_WorkGroupID.y])
+
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(constant_id = 0) const uint WG = 64;
+layout(constant_id = 1) const uint DTYPE = 0;
+layout(constant_id = 2) const uint BATCH = 0;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer Embd { uint16_t embd16[]; };
+layout(std430, binding = 1) readonly buffer StepOrIds { uint ids[]; };
+layout(std430, binding = 2) writeonly buffer OutX { float x[]; };
+
+layout(push_constant) uniform PC {
+    uint n_embd;
+    uint row_u16s; // row_bytes / 2
+} pc;
+
+int sbyte_lo(uint u16) { return bitfieldExtract(int(u16), 0, 8); }
+int sbyte_hi(uint u16) { return bitfieldExtract(int(u16), 8, 8); }
+uint ubyte_at(uint base_u16, uint byte_idx) {
+    uint w = uint(embd16[base_u16 + (byte_idx >> 1u)]);
+    return ((byte_idx & 1u) == 0u) ? (w & 0xFFu) : (w >> 8u);
+}
+int sbyte_at(uint base_u16, uint byte_idx) {
+    uint b = ubyte_at(base_u16, byte_idx);
+    return bitfieldExtract(int(b), 0, 8);
+}
+
+void unpack_q5k_sc_m(uint sc_u16_base, uint is, out uint sc, out uint m) {
+    if (is < 4u) {
+        sc = ubyte_at(sc_u16_base, is) & 63u;
+        m  = ubyte_at(sc_u16_base, is + 4u) & 63u;
+    } else {
+        uint b4 = ubyte_at(sc_u16_base, is + 4u);
+        uint bm4 = ubyte_at(sc_u16_base, is - 4u);
+        uint b0 = ubyte_at(sc_u16_base, is);
+        sc = (b4 & 0x0Fu) | ((bm4 >> 6u) << 4u);
+        m  = (b4 >> 4u)   | ((b0  >> 6u) << 4u);
+    }
+}
+
+void main() {
+    const uint tid = gl_GlobalInvocationID.x;
+    const uint t = (BATCH == 0u) ? 0u : gl_WorkGroupID.y;
+    const uint tok = (BATCH == 0u) ? ids[0] : ids[t];
+    const uint row_base = tok * pc.row_u16s;
+    const uint x_row = t * pc.n_embd;
+
+    if (DTYPE == 0u) {
+        const uint nb = pc.n_embd / 32u;
+        if (tid >= nb) return;
+        const uint b = row_base + tid * 9u;
+        const float d = unpackHalf2x16(uint(embd16[b])).x;
+        const uint xo = x_row + tid * 32u;
+        for (uint j = 0u; j < 8u; ++j) {
+            const uint u = uint(embd16[b + 1u + j]);
+            const uint b0 = u & 0xFFu;
+            const uint b1 = u >> 8u;
+            x[xo + 2u * j]       = (float(b0 & 0x0Fu) - 8.0) * d;
+            x[xo + 2u * j + 1u]  = (float(b1 & 0x0Fu) - 8.0) * d;
+            x[xo + 2u * j + 16u] = (float(b0 >> 4u)   - 8.0) * d;
+            x[xo + 2u * j + 17u] = (float(b1 >> 4u)   - 8.0) * d;
+        }
+    } else if (DTYPE == 1u) {
+        const uint nb = pc.n_embd / 32u;
+        if (tid >= nb) return;
+        const uint b = row_base + tid * 10u;
+        const float d = unpackHalf2x16(uint(embd16[b])).x;
+        const float m = unpackHalf2x16(uint(embd16[b + 1u])).x;
+        const uint xo = x_row + tid * 32u;
+        for (uint j = 0u; j < 8u; ++j) {
+            const uint u = uint(embd16[b + 2u + j]);
+            const uint b0 = u & 0xFFu;
+            const uint b1 = u >> 8u;
+            x[xo + 2u * j]       = fma(float(b0 & 0x0Fu), d, m);
+            x[xo + 2u * j + 1u]  = fma(float(b1 & 0x0Fu), d, m);
+            x[xo + 2u * j + 16u] = fma(float(b0 >> 4u),   d, m);
+            x[xo + 2u * j + 17u] = fma(float(b1 >> 4u),   d, m);
+        }
+    } else if (DTYPE == 2u) {
+        const uint nb = pc.n_embd / 32u;
+        if (tid >= nb) return;
+        const uint b = row_base + tid * 17u;
+        const float d = unpackHalf2x16(uint(embd16[b])).x;
+        const uint xo = x_row + tid * 32u;
+        for (uint j = 0u; j < 16u; ++j) {
+            const uint u = uint(embd16[b + 1u + j]);
+            x[xo + 2u * j]      = float(sbyte_lo(u)) * d;
+            x[xo + 2u * j + 1u] = float(sbyte_hi(u)) * d;
+        }
+    } else if (DTYPE == 3u) {
+        const uint nb = pc.n_embd / 256u;
+        if (tid >= nb) return;
+        const uint b = row_base + tid * 88u;
+        const float d    = unpackHalf2x16(uint(embd16[b])).x;
+        const float dmin = unpackHalf2x16(uint(embd16[b + 1u])).x;
+        const uint xo = x_row + tid * 256u;
+        for (uint chunk = 0u; chunk < 4u; ++chunk) {
+            uint sc0, m0, sc1, m1;
+            unpack_q5k_sc_m(b + 2u, 2u * chunk,      sc0, m0);
+            unpack_q5k_sc_m(b + 2u, 2u * chunk + 1u, sc1, m1);
+            const float d0 = d * float(sc0);
+            const float dm0 = dmin * float(m0);
+            const float d1 = d * float(sc1);
+            const float dm1 = dmin * float(m1);
+            for (uint l = 0u; l < 32u; ++l) {
+                const uint qh = ubyte_at(b + 8u, l);
+                const uint ql = ubyte_at(b + 24u, chunk * 32u + l);
+                const uint q_lo = (ql & 0x0Fu) | (((qh >> (2u * chunk)) & 1u) << 4u);
+                const uint q_hi = (ql >> 4u)   | (((qh >> (2u * chunk + 1u)) & 1u) << 4u);
+                x[xo + chunk * 64u + l]       = fma(d0, float(q_lo), -dm0);
+                x[xo + chunk * 64u + 32u + l] = fma(d1, float(q_hi), -dm1);
+            }
+        }
+    } else if (DTYPE == 4u) {
+        const uint nb = pc.n_embd / 256u;
+        if (tid >= nb) return;
+        const uint b = row_base + tid * 105u;
+        const float d = unpackHalf2x16(uint(embd16[b + 104u])).x;
+        const uint xo = x_row + tid * 256u;
+        for (uint half_idx = 0u; half_idx < 2u; ++half_idx) {
+            const uint ql_b = b + half_idx * 32u;
+            const uint qh_b = b + 64u + half_idx * 16u;
+            const uint sc_b = b + 96u + half_idx * 4u;
+            const uint out_b = xo + half_idx * 128u;
+            for (uint l = 0u; l < 32u; ++l) {
+                const uint is = l >> 4u;
+                const uint ql0 = ubyte_at(ql_b, l);
+                const uint ql1 = ubyte_at(ql_b, l + 32u);
+                const uint qhv = ubyte_at(qh_b, l);
+                const int q1 = int((ql0 & 0x0Fu) | ((qhv & 3u) << 4u)) - 32;
+                const int q2 = int((ql1 & 0x0Fu) | (((qhv >> 2u) & 3u) << 4u)) - 32;
+                const int q3 = int((ql0 >> 4u)   | (((qhv >> 4u) & 3u) << 4u)) - 32;
+                const int q4 = int((ql1 >> 4u)   | (((qhv >> 6u) & 3u) << 4u)) - 32;
+                x[out_b + l]       = d * float(sbyte_at(sc_b, is))      * float(q1);
+                x[out_b + l + 32u] = d * float(sbyte_at(sc_b, is + 2u)) * float(q2);
+                x[out_b + l + 64u] = d * float(sbyte_at(sc_b, is + 4u)) * float(q3);
+                x[out_b + l + 96u] = d * float(sbyte_at(sc_b, is + 6u)) * float(q4);
+            }
+        }
+    } else {
+        if (tid >= pc.n_embd) return;
+        const uint idx = (tok * pc.n_embd + tid) * 2u;
+        const uint bits = uint(embd16[idx]) | (uint(embd16[idx + 1u]) << 16u);
+        x[x_row + tid] = uintBitsToFloat(bits);
+    }
+}

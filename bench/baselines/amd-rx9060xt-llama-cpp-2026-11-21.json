@@ -1,0 +1,227 @@
+{
+ "protocol": "llama-bench -p 512 -n 128 -r 5 -ngl 99 -fa 1",
+ "llama_cpp_commit": "9d817213a",
+ "host": "zhangpf-B660M-GAMING-AC-DDR4",
+ "results": [
+  {
+   "backend": "hip",
+   "model": "Llama-3.2-1B-Instruct-Q4_0.gguf",
+   "model_size": 765194368,
+   "n_prompt": 512,
+   "n_gen": 0,
+   "avg_ts": 13941.023885,
+   "stddev_ts": 1871.401093,
+   "gpu_info": "AMD Radeon RX 9060 XT",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "hip",
+   "model": "Llama-3.2-1B-Instruct-Q4_0.gguf",
+   "model_size": 765194368,
+   "n_prompt": 0,
+   "n_gen": 128,
+   "avg_ts": 259.127683,
+   "stddev_ts": 1.229857,
+   "gpu_info": "AMD Radeon RX 9060 XT",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "hip",
+   "model": "Qwen3.5-0.8B-Q4_0.gguf",
+   "model_size": 496192768,
+   "n_prompt": 512,
+   "n_gen": 0,
+   "avg_ts": 11662.859311,
+   "stddev_ts": 993.836001,
+   "gpu_info": "AMD Radeon RX 9060 XT",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "hip",
+   "model": "Qwen3.5-0.8B-Q4_0.gguf",
+   "model_size": 496192768,
+   "n_prompt": 0,
+   "n_gen": 128,
+   "avg_ts": 168.293525,
+   "stddev_ts": 2.330976,
+   "gpu_info": "AMD Radeon RX 9060 XT",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "hip",
+   "model": "Qwen3.5-2B-Q4_0.gguf",
+   "model_size": 1203911936,
+   "n_prompt": 512,
+   "n_gen": 0,
+   "avg_ts": 7536.120254,
+   "stddev_ts": 390.407021,
+   "gpu_info": "AMD Radeon RX 9060 XT",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "hip",
+   "model": "Qwen3.5-2B-Q4_0.gguf",
+   "model_size": 1203911936,
+   "n_prompt": 0,
+   "n_gen": 128,
+   "avg_ts": 134.270373,
+   "stddev_ts": 0.71135,
+   "gpu_info": "AMD Radeon RX 9060 XT",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "hip",
+   "model": "Qwen_Qwen3-8B-Q4_0.gguf",
+   "model_size": 4781375488,
+   "n_prompt": 512,
+   "n_gen": 0,
+   "avg_ts": 2548.011505,
+   "stddev_ts": 41.375288,
+   "gpu_info": "AMD Radeon RX 9060 XT",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "hip",
+   "model": "Qwen_Qwen3-8B-Q4_0.gguf",
+   "model_size": 4781375488,
+   "n_prompt": 0,
+   "n_gen": 128,
+   "avg_ts": 59.178625,
+   "stddev_ts": 0.040549,
+   "gpu_info": "AMD Radeon RX 9060 XT",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "hip",
+   "model": "SmolLM2-360M-Instruct-Q4_0.gguf",
+   "model_size": 227946240,
+   "n_prompt": 512,
+   "n_gen": 0,
+   "avg_ts": 21984.790672,
+   "stddev_ts": 2301.967184,
+   "gpu_info": "AMD Radeon RX 9060 XT",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "hip",
+   "model": "SmolLM2-360M-Instruct-Q4_0.gguf",
+   "model_size": 227946240,
+   "n_prompt": 0,
+   "n_gen": 128,
+   "avg_ts": 269.453591,
+   "stddev_ts": 4.685584,
+   "gpu_info": "AMD Radeon RX 9060 XT",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "vulkan",
+   "model": "Llama-3.2-1B-Instruct-Q4_0.gguf",
+   "model_size": 765194368,
+   "n_prompt": 512,
+   "n_gen": 0,
+   "avg_ts": 3334.16689,
+   "stddev_ts": 283.153737,
+   "gpu_info": "AMD Radeon RX 9060 XT (RADV GFX1200)",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "vulkan",
+   "model": "Llama-3.2-1B-Instruct-Q4_0.gguf",
+   "model_size": 765194368,
+   "n_prompt": 0,
+   "n_gen": 128,
+   "avg_ts": 294.228923,
+   "stddev_ts": 1.037964,
+   "gpu_info": "AMD Radeon RX 9060 XT (RADV GFX1200)",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "vulkan",
+   "model": "Qwen3.5-0.8B-Q4_0.gguf",
+   "model_size": 496192768,
+   "n_prompt": 512,
+   "n_gen": 0,
+   "avg_ts": 6665.955102,
+   "stddev_ts": 75.787223,
+   "gpu_info": "AMD Radeon RX 9060 XT (RADV GFX1200)",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "vulkan",
+   "model": "Qwen3.5-0.8B-Q4_0.gguf",
+   "model_size": 496192768,
+   "n_prompt": 0,
+   "n_gen": 128,
+   "avg_ts": 247.120695,
+   "stddev_ts": 17.314559,
+   "gpu_info": "AMD Radeon RX 9060 XT (RADV GFX1200)",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "vulkan",
+   "model": "Qwen3.5-2B-Q4_0.gguf",
+   "model_size": 1203911936,
+   "n_prompt": 512,
+   "n_gen": 0,
+   "avg_ts": 3617.356923,
+   "stddev_ts": 389.5766,
+   "gpu_info": "AMD Radeon RX 9060 XT (RADV GFX1200)",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "vulkan",
+   "model": "Qwen3.5-2B-Q4_0.gguf",
+   "model_size": 1203911936,
+   "n_prompt": 0,
+   "n_gen": 128,
+   "avg_ts": 101.383651,
+   "stddev_ts": 0.719177,
+   "gpu_info": "AMD Radeon RX 9060 XT (RADV GFX1200)",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "vulkan",
+   "model": "Qwen_Qwen3-8B-Q4_0.gguf",
+   "model_size": 4781375488,
+   "n_prompt": 512,
+   "n_gen": 0,
+   "avg_ts": 1117.682125,
+   "stddev_ts": 25.224233,
+   "gpu_info": "AMD Radeon RX 9060 XT (RADV GFX1200)",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "vulkan",
+   "model": "Qwen_Qwen3-8B-Q4_0.gguf",
+   "model_size": 4781375488,
+   "n_prompt": 0,
+   "n_gen": 128,
+   "avg_ts": 41.411971,
+   "stddev_ts": 0.098112,
+   "gpu_info": "AMD Radeon RX 9060 XT (RADV GFX1200)",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "vulkan",
+   "model": "SmolLM2-360M-Instruct-Q4_0.gguf",
+   "model_size": 227946240,
+   "n_prompt": 512,
+   "n_gen": 0,
+   "avg_ts": 4491.082854,
+   "stddev_ts": 155.448783,
+   "gpu_info": "AMD Radeon RX 9060 XT (RADV GFX1200)",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "vulkan",
+   "model": "SmolLM2-360M-Instruct-Q4_0.gguf",
+   "model_size": 227946240,
+   "n_prompt": 0,
+   "n_gen": 128,
+   "avg_ts": 416.314774,
+   "stddev_ts": 7.852397,
+   "gpu_info": "AMD Radeon RX 9060 XT (RADV GFX1200)",
+   "build_commit": "9d817213a"
+  }
+ ]
+}

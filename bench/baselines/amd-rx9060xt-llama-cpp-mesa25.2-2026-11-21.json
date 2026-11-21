@@ -1,0 +1,127 @@
+{
+ "protocol": "llama-bench -p 512 -n 128 -r 5 -ngl 99 -fa 1",
+ "llama_cpp_commit": "9d817213a",
+ "host": "zhangpf-B660M-GAMING-AC-DDR4",
+ "results": [
+  {
+   "backend": "vulkan-mesa25.2.8",
+   "model": "Llama-3.2-1B-Instruct-Q4_0.gguf",
+   "model_size": 765194368,
+   "n_prompt": 512,
+   "n_gen": 0,
+   "avg_ts": 3419.509764,
+   "stddev_ts": 221.093182,
+   "gpu_info": "AMD Radeon Graphics (RADV GFX1200)",
+   "driver": "Mesa 25.2.8-0ubuntu0.24.04.5 (VK_KHR_cooperative_matrix)",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "vulkan-mesa25.2.8",
+   "model": "Llama-3.2-1B-Instruct-Q4_0.gguf",
+   "model_size": 765194368,
+   "n_prompt": 0,
+   "n_gen": 128,
+   "avg_ts": 295.184747,
+   "stddev_ts": 1.132903,
+   "gpu_info": "AMD Radeon Graphics (RADV GFX1200)",
+   "driver": "Mesa 25.2.8-0ubuntu0.24.04.5 (VK_KHR_cooperative_matrix)",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "vulkan-mesa25.2.8",
+   "model": "Qwen3.5-0.8B-Q4_0.gguf",
+   "model_size": 496192768,
+   "n_prompt": 512,
+   "n_gen": 0,
+   "avg_ts": 8247.172241,
+   "stddev_ts": 111.183279,
+   "gpu_info": "AMD Radeon Graphics (RADV GFX1200)",
+   "driver": "Mesa 25.2.8-0ubuntu0.24.04.5 (VK_KHR_cooperative_matrix)",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "vulkan-mesa25.2.8",
+   "model": "Qwen3.5-0.8B-Q4_0.gguf",
+   "model_size": 496192768,
+   "n_prompt": 0,
+   "n_gen": 128,
+   "avg_ts": 245.722961,
+   "stddev_ts": 16.602751,
+   "gpu_info": "AMD Radeon Graphics (RADV GFX1200)",
+   "driver": "Mesa 25.2.8-0ubuntu0.24.04.5 (VK_KHR_cooperative_matrix)",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "vulkan-mesa25.2.8",
+   "model": "Qwen3.5-2B-Q4_0.gguf",
+   "model_size": 1203911936,
+   "n_prompt": 512,
+   "n_gen": 0,
+   "avg_ts": 4805.405127,
+   "stddev_ts": 15.389857,
+   "gpu_info": "AMD Radeon Graphics (RADV GFX1200)",
+   "driver": "Mesa 25.2.8-0ubuntu0.24.04.5 (VK_KHR_cooperative_matrix)",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "vulkan-mesa25.2.8",
+   "model": "Qwen3.5-2B-Q4_0.gguf",
+   "model_size": 1203911936,
+   "n_prompt": 0,
+   "n_gen": 128,
+   "avg_ts": 101.041857,
+   "stddev_ts": 0.7754,
+   "gpu_info": "AMD Radeon Graphics (RADV GFX1200)",
+   "driver": "Mesa 25.2.8-0ubuntu0.24.04.5 (VK_KHR_cooperative_matrix)",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "vulkan-mesa25.2.8",
+   "model": "Qwen_Qwen3-8B-Q4_0.gguf",
+   "model_size": 4781375488,
+   "n_prompt": 512,
+   "n_gen": 0,
+   "avg_ts": 1800.456643,
+   "stddev_ts": 211.463148,
+   "gpu_info": "AMD Radeon Graphics (RADV GFX1200)",
+   "driver": "Mesa 25.2.8-0ubuntu0.24.04.5 (VK_KHR_cooperative_matrix)",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "vulkan-mesa25.2.8",
+   "model": "Qwen_Qwen3-8B-Q4_0.gguf",
+   "model_size": 4781375488,
+   "n_prompt": 0,
+   "n_gen": 128,
+   "avg_ts": 58.539165,
+   "stddev_ts": 0.177542,
+   "gpu_info": "AMD Radeon Graphics (RADV GFX1200)",
+   "driver": "Mesa 25.2.8-0ubuntu0.24.04.5 (VK_KHR_cooperative_matrix)",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "vulkan-mesa25.2.8",
+   "model": "SmolLM2-360M-Instruct-Q4_0.gguf",
+   "model_size": 227946240,
+   "n_prompt": 512,
+   "n_gen": 0,
+   "avg_ts": 4362.211354,
+   "stddev_ts": 147.964069,
+   "gpu_info": "AMD Radeon Graphics (RADV GFX1200)",
+   "driver": "Mesa 25.2.8-0ubuntu0.24.04.5 (VK_KHR_cooperative_matrix)",
+   "build_commit": "9d817213a"
+  },
+  {
+   "backend": "vulkan-mesa25.2.8",
+   "model": "SmolLM2-360M-Instruct-Q4_0.gguf",
+   "model_size": 227946240,
+   "n_prompt": 0,
+   "n_gen": 128,
+   "avg_ts": 428.328242,
+   "stddev_ts": 2.578043,
+   "gpu_info": "AMD Radeon Graphics (RADV GFX1200)",
+   "driver": "Mesa 25.2.8-0ubuntu0.24.04.5 (VK_KHR_cooperative_matrix)",
+   "build_commit": "9d817213a"
+  }
+ ]
+}
