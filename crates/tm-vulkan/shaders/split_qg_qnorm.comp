@@ -1,0 +1,62 @@
+#version 450
+// De-interleaves Qwen3.5 full-attention `qg_full` `[n_tok, n_head, 2 * head_dim]` into
+// `q_out` (`[n_tok, n_head, head_dim]`, with fused per-head RMSNorm `q_norm`) and
+// `gate_out` (`[n_tok, n_head, head_dim]`).
+// Subgroup-portable across gl_SubgroupSize in {8, 16, 32, 64} with WG = 64.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(constant_id = 0) const uint WG = 64;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer QgFull  { float qg_full[]; };
+layout(std430, binding = 1) readonly buffer QNorm   { float q_norm[]; };
+layout(std430, binding = 2) writeonly buffer QOut   { float q_out[]; };
+layout(std430, binding = 3) writeonly buffer GateOut { float gate_out[]; };
+
+layout(push_constant) uniform PC {
+    uint n_head;
+    uint head_dim;
+    float eps;
+} pc;
+
+shared float sg_sums[8];
+
+void main() {
+    const uint head = gl_WorkGroupID.x;
+    const uint tok = gl_WorkGroupID.y;
+    if (head >= pc.n_head) return;
+
+    const uint hd = pc.head_dim;
+    const uint head_idx = tok * pc.n_head + head;
+    const uint src_off = head_idx * (2u * hd);
+    const uint dst_off = head_idx * hd;
+    const uint tid = gl_LocalInvocationID.x;
+
+    float ss = 0.0;
+    for (uint i = tid; i < hd; i += WG) {
+        const float v = qg_full[src_off + i];
+        ss = fma(v, v, ss);
+        gate_out[dst_off + i] = qg_full[src_off + hd + i];
+    }
+    ss = subgroupAdd(ss);
+    if (subgroupElect()) {
+        sg_sums[gl_SubgroupID] = ss;
+    }
+    barrier();
+
+    if (tid == 0u) {
+        float total = 0.0;
+        for (uint s = 0u; s < gl_NumSubgroups; ++s) {
+            total += sg_sums[s];
+        }
+        sg_sums[0] = inversesqrt(total / float(hd) + pc.eps);
+    }
+    barrier();
+
+    const float scale = sg_sums[0];
+    for (uint i = tid; i < hd; i += WG) {
+        q_out[dst_off + i] = qg_full[src_off + i] * scale * q_norm[i];
+    }
+}

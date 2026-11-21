@@ -1,0 +1,134 @@
+#version 450
+// Fused Qwen3.5 GDN depthwise causal Conv1d + SiLU (BEFORE q/k/v split!) + Q/K/V split
+// + per-head L2 normalization on Q and K ONLY (`AGENTS.md` §9: NEVER L2-normalize V!).
+//
+// Specialized on MODE (`constant_id = 1`):
+//   - MODE == 0 (Decode, `n_tok == 1`): `gx = 2*n_k_heads + n_v_heads, gy = 1`, reads & updates `conv_hist` in-place.
+//   - MODE == 1 (Batched Prefill compute): `gx = 2*n_k_heads + n_v_heads, gy = n_tok` (`24,576` parallel WGs on pp512!),
+//     reads `conv_hist` read-only for `t < hist_len` and `qkv` directly for `t >= hist_len` — zero sequential token loop!
+//   - MODE == 2 (Batched Prefill state commit): `gx = 2*n_k_heads + n_v_heads, gy = 1`, updates `conv_hist` with the
+//     last `hist_len` raw `qkv` steps after MODE == 1 finishes.
+//
+// Subgroup-portable across gl_SubgroupSize in {8, 16, 32, 64}; all 128 threads participate
+// uniformly in `barrier()` even when `s_dim < 128`.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(constant_id = 0) const uint WG = 128;
+layout(constant_id = 1) const uint MODE = 0; // 0 = decode, 1 = batch parallel, 2 = batch state update
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer Qkv     { float qkv[]; };
+layout(std430, binding = 1) readonly buffer Conv1d  { float conv1d[]; };
+layout(std430, binding = 2) buffer ConvHist         { float conv_hist[]; };
+layout(std430, binding = 3) writeonly buffer QOut   { float q_out[]; };
+layout(std430, binding = 4) writeonly buffer KOut   { float k_out[]; };
+layout(std430, binding = 5) writeonly buffer VOut   { float v_out[]; };
+
+layout(push_constant) uniform PC {
+    uint n_k_heads;
+    uint n_v_heads;
+    uint s_dim;
+    uint d_conv;
+    uint n_tok;
+    float eps;
+} pc;
+
+shared float sg_sums[32];
+
+void main() {
+    const uint group = gl_WorkGroupID.x;
+    const uint total_groups = 2u * pc.n_k_heads + pc.n_v_heads;
+    if (group >= total_groups) return;
+
+    const uint tid = gl_LocalInvocationID.x;
+    const bool in_bounds = (tid < pc.s_dim);
+    const uint conv_dim = total_groups * pc.s_dim;
+    const uint k_dim = pc.n_k_heads * pc.s_dim;
+    const uint v_dim = pc.n_v_heads * pc.s_dim;
+    const uint ch = group * pc.s_dim + tid;
+    const uint hist_len = pc.d_conv - 1u;
+
+    if (MODE == 2u) {
+        if (in_bounds && hist_len > 0u) {
+            float new_h[7];
+            const uint h_base = ch * hist_len;
+            for (uint m = 0u; m < hist_len; ++m) {
+                const int src_t = int(pc.n_tok) - int(hist_len) + int(m);
+                if (src_t >= 0) {
+                    new_h[m] = qkv[uint(src_t) * conv_dim + ch];
+                } else {
+                    new_h[m] = conv_hist[h_base + uint(int(hist_len) + src_t)];
+                }
+            }
+            for (uint m = 0u; m < hist_len; ++m) {
+                conv_hist[h_base + m] = new_h[m];
+            }
+        }
+        return;
+    }
+
+    const uint t = (MODE == 0u) ? 0u : gl_WorkGroupID.y;
+    const bool is_qk = (group < 2u * pc.n_k_heads);
+
+    float val = 0.0;
+    if (in_bounds) {
+        const uint h_base = ch * hist_len;
+        const uint w_base = ch * pc.d_conv;
+        float raw = 0.0;
+        for (uint k = 0u; k < hist_len; ++k) {
+            const int src_t = int(t) - int(hist_len) + int(k);
+            const float x_tap = (src_t >= 0)
+                ? qkv[uint(src_t) * conv_dim + ch]
+                : conv_hist[h_base + uint(int(hist_len) + src_t)];
+            raw = fma(x_tap, conv1d[w_base + k], raw);
+        }
+        const float cur = qkv[t * conv_dim + ch];
+        raw = fma(cur, conv1d[w_base + hist_len], raw);
+
+        if (MODE == 0u) {
+            for (uint k = 0u; k + 1u < hist_len; ++k) {
+                conv_hist[h_base + k] = conv_hist[h_base + k + 1u];
+            }
+            if (hist_len > 0u) {
+                conv_hist[h_base + hist_len - 1u] = cur;
+            }
+        }
+
+        // AGENTS.md §9 invariant #1: SiLU BEFORE splitting into Q / K / V!
+        val = raw / (1.0 + exp(-raw));
+    }
+
+    if (is_qk) {
+        float ss = subgroupAdd(val * val);
+        if (subgroupElect()) {
+            sg_sums[gl_SubgroupID] = ss;
+        }
+        barrier();
+
+        if (tid == 0u) {
+            float tot = 0.0;
+            for (uint s = 0u; s < gl_NumSubgroups; ++s) {
+                tot += sg_sums[s];
+            }
+            sg_sums[0] = inversesqrt(tot + pc.eps);
+        }
+        barrier();
+
+        val *= sg_sums[0];
+
+        if (in_bounds) {
+            if (group < pc.n_k_heads) {
+                q_out[t * k_dim + group * pc.s_dim + tid] = val;
+            } else {
+                const uint kh = group - pc.n_k_heads;
+                k_out[t * k_dim + kh * pc.s_dim + tid] = val;
+            }
+        }
+    } else if (in_bounds) {
+        // AGENTS.md §9 invariant #2: NEVER L2-normalize V!
+        const uint vh = group - 2u * pc.n_k_heads;
+        v_out[t * v_dim + vh * pc.s_dim + tid] = val;
+    }
+}

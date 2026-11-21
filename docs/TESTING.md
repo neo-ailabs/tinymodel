@@ -55,7 +55,7 @@
 ## 5. Vulkan 后端（`tm-vulkan`）
 
 - **对齐容差**：GPU 浮点累加顺序和标量参考实现不同，按 `|got − ref| / max(Σ|w·x|, 1) ≤ 1e-5` 判定（和 Metal 一致）；整数点积路径要求逐位一致。
-- **设备覆盖**：本机用户态已部署 **Mesa 25.2.8**（`~/.local/mesa-25.2.8/env.sh`，开启 RDNA4 `VK_KHR_cooperative_matrix`）。每次改 shader，都要在三种驱动/subgroup 宽度上跑 L1：`TM_VK_DEVICE=radv`（RADV wave32 + coopmat）、`TM_VK_DEVICE=UHD`（ANV，SIMD8–32）、`TM_VK_DEVICE=llvmpipe`（lavapipe，宽度 8，CI 用）。`TM_VK_DEVICE` 指定不存在的设备名时会直接报错失败，防止静默跳过。
+- **设备覆盖**：本机用户态已部署 **Mesa 25.2.8**（`~/.local/mesa-25.2.8/env.sh`，开启 RDNA4 `VK_KHR_cooperative_matrix`）。每次改 shader，都要在三种驱动/subgroup 宽度上跑 L1/L3（含 `parity_vk_q4_0`、`parity_vk_ops`、`parity_vk_coopmat` 及 `parity_vk_qwen35` FP64 GDN oracle）：`TM_VK_DEVICE=radv`（RADV wave32 + coopmat）、`TM_VK_DEVICE=UHD`（ANV，SIMD8–32）、`TM_VK_DEVICE=llvmpipe`（lavapipe，宽度 8，CI 用）。`TM_VK_DEVICE` 指定不存在的设备名时会直接报错失败，防止静默跳过。
   ```sh
   . ~/.local/mesa-25.2.8/env.sh
   for d in radv UHD llvmpipe; do TM_VK_DEVICE=$d cargo test -p tm-vulkan; done

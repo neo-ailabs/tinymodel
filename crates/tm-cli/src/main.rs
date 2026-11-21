@@ -954,10 +954,78 @@ fn print_vulkan_profile_report(
 fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
     let t_load = Instant::now();
     let gguf = std::sync::Arc::new(GgufFile::open(&opts.model)?);
+    let arch = gguf.req_str("general.architecture")?.to_string();
     let tok = Tokenizer::from_gguf(&gguf)?;
     let prompt_ids = resolve_prompt_ids(&opts, &tok)?;
     let is_pure_greedy =
         opts.sampler.temperature <= 0.0 && (opts.sampler.repeat_penalty - 1.0).abs() < 1e-6;
+
+    if arch == "qwen35" {
+        let mut runner = tm_vulkan::Qwen35VkRunner::from_gguf(gguf, opts.max_ctx)?;
+        let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "[tinymodel] arch=qwen35 backend=vulkan ({} · {}) load={:.1}ms prompt_tokens={} vocab={} layers={} (gdn={}, full={})",
+            runner.device_name(),
+            runner.driver_info(),
+            load_ms,
+            prompt_ids.len(),
+            runner.cfg.vocab_size,
+            runner.cfg.n_layers,
+            runner.cfg.n_gdn_layers,
+            runner.cfg.n_full_attn_layers,
+        );
+
+        let mut sampler = Sampler::new(opts.sampler, runner.cfg.vocab_size);
+        let mut history = prompt_ids.clone();
+
+        let t_pp = Instant::now();
+        let logits = runner.forward_batch(&prompt_ids, 0, true)?;
+        let mut next_id = sampler.sample(logits, &history);
+        let pp_sec = t_pp.elapsed().as_secs_f64();
+
+        let mut stdout = io::stdout().lock();
+        let mut pos = prompt_ids.len();
+        let mut generated = 0usize;
+        let t_gen = Instant::now();
+        while generated < opts.n_predict {
+            if tok.eos_id == Some(next_id) {
+                break;
+            }
+            stdout.write_all(&tok.decode_token_bytes(next_id))?;
+            stdout.flush()?;
+            history.push(next_id);
+            generated += 1;
+            if generated >= opts.n_predict {
+                break;
+            }
+            if is_pure_greedy {
+                next_id = runner.forward_token_greedy(next_id, pos)?;
+            } else {
+                let logits = runner.forward_token(next_id, pos, true)?;
+                next_id = sampler.sample(logits, &history);
+            }
+            pos += 1;
+        }
+        let gen_sec = t_gen.elapsed().as_secs_f64();
+        writeln!(stdout)?;
+        let pp_tps = (prompt_ids.len() as f64) / pp_sec.max(1e-9);
+        let tg_runs = generated.saturating_sub(1);
+        let tg_tps = if tg_runs > 0 {
+            (tg_runs as f64) / gen_sec.max(1e-9)
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[tinymodel] prompt: {:.2} ms / {} tok ({:.2} tok/s) | eval: {:.2} ms / {} runs ({:.2} tok/s)",
+            pp_sec * 1e3,
+            prompt_ids.len(),
+            pp_tps,
+            gen_sec * 1e3,
+            tg_runs,
+            tg_tps
+        );
+        return Ok(());
+    }
 
     let mut runner = tm_vulkan::LlamaVkRunner::from_gguf(gguf, opts.max_ctx)?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
@@ -1041,6 +1109,87 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
         .and_then(|s| s.to_str())
         .unwrap_or("?")
         .to_string();
+
+    if arch == "qwen35" {
+        let mut runner = tm_vulkan::Qwen35VkRunner::from_gguf(gguf, opts.max_ctx)?;
+        let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
+
+        let _ = runner.forward_token_greedy(1, 0)?;
+        let t_warm = Instant::now();
+        let mut warm_iters = 0usize;
+        while warm_iters < 2 || t_warm.elapsed().as_secs_f64() < 0.35 {
+            runner.reset_state()?;
+            let _ = runner.forward_batch(&pp_ids, 0, false)?;
+            warm_iters += 1;
+        }
+
+        runner.reset_state()?;
+        let t_pp = Instant::now();
+        let pp_logits = runner.forward_batch(&pp_ids, 0, corpus_mode)?;
+        let first_tok = if corpus_mode { argmax(pp_logits) } else { 0 };
+        let pp_sec = t_pp.elapsed().as_secs_f64();
+        let pp_tps = (n_pp as f64) / pp_sec.max(1e-9);
+
+        let n_gen = opts.n_predict;
+        let mut gen_tokens = Vec::with_capacity(n_gen + 1);
+        let (mut tok, base_pos) = if corpus_mode {
+            (first_tok, n_pp)
+        } else {
+            runner.reset_state()?;
+            (runner.forward_token_greedy(1, 0)?, 1)
+        };
+        gen_tokens.push(tok);
+        let t0 = Instant::now();
+        for step in 0..n_gen {
+            tok = runner.forward_token_greedy(tok, base_pos + step)?;
+            gen_tokens.push(tok);
+        }
+        let sec = t0.elapsed().as_secs_f64();
+        let tps = (n_gen as f64) / sec.max(1e-9);
+        let tel_after = probe::collect_telemetry();
+        let dev_name = runner.device_name().to_string();
+        let wmode = "vram-slab";
+        if opts.json {
+            BenchMetrics {
+                model_name: &model_name,
+                arch: &arch,
+                backend: "vulkan",
+                isa: "vulkan",
+                device_name: &dev_name,
+                weights_mode: wmode,
+                threads: 1,
+                max_ctx: opts.max_ctx,
+                corpus_mode,
+                active_decode_bytes,
+                load_ms,
+                ttft_ms: pp_sec * 1e3,
+                n_pp,
+                pp_ms: pp_sec * 1e3,
+                n_gen,
+                tg_ms: sec * 1e3,
+                last_tok: tok,
+                greedy_hash: probe::hash_token_sequence(&gen_tokens),
+                tel_before,
+                tel_after,
+            }
+            .print_json();
+        } else {
+            println!(
+                "bench: model={} backend=vulkan ({}) weights={} load={:.1}ms pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
+                model_name,
+                dev_name,
+                wmode,
+                load_ms,
+                n_pp,
+                pp_tps,
+                n_gen,
+                tps,
+                (sec * 1e3) / (n_gen as f64),
+                tok
+            );
+        }
+        return Ok(());
+    }
 
     let mut runner = tm_vulkan::LlamaVkRunner::from_gguf(gguf, opts.max_ctx)?;
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
@@ -1130,7 +1279,16 @@ fn cmd_profile_vulkan(opts: RunOpts) -> Result<()> {
         .unwrap_or("?")
         .to_string();
     let gguf = std::sync::Arc::new(GgufFile::open(&opts.model)?);
+    let arch = gguf.req_str("general.architecture")?.to_string();
     let n_runs = opts.n_predict.max(16);
+    if arch == "qwen35" {
+        let mut runner = tm_vulkan::Qwen35VkRunner::from_gguf(gguf, opts.max_ctx)?;
+        let dev = runner.device_name().to_string();
+        let drv = runner.driver_info().to_string();
+        let rep = runner.profile(n_runs, 512)?;
+        print_vulkan_profile_report(&model_name, &dev, &drv, &rep);
+        return Ok(());
+    }
     let mut runner = tm_vulkan::LlamaVkRunner::from_gguf(gguf, opts.max_ctx)?;
     let dev = runner.device_name().to_string();
     let drv = runner.driver_info().to_string();
@@ -1776,6 +1934,29 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
     if opts.use_vulkan {
         #[cfg(feature = "vulkan")]
         {
+            if arch == "qwen35" {
+                let mut runner = tm_vulkan::Qwen35VkRunner::from_gguf(gguf, opts.max_ctx)?;
+                let vocab = runner.cfg.vocab_size as u32;
+                writer.write_all(b"TMLG")?;
+                writer.write_all(&1u32.to_le_bytes())?;
+                writer.write_all(&(n_steps as u32).to_le_bytes())?;
+                writer.write_all(&vocab.to_le_bytes())?;
+                for &id in &input_ids {
+                    writer.write_all(&id.to_le_bytes())?;
+                }
+                for (pos, &id) in input_ids.iter().enumerate() {
+                    let logits = runner.forward_token(id, pos, true)?;
+                    write_f32_le(&mut writer, logits)?;
+                }
+                writer.flush()?;
+                eprintln!(
+                    "[tinymodel logits] wrote {} steps x {} vocab (vulkan qwen35) -> {}",
+                    n_steps,
+                    vocab,
+                    out_path.display()
+                );
+                return Ok(());
+            }
             let mut runner = tm_vulkan::LlamaVkRunner::from_gguf(gguf, opts.max_ctx)?;
             let vocab = runner.cfg.vocab_size as u32;
             writer.write_all(b"TMLG")?;

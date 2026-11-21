@@ -1,0 +1,124 @@
+#version 450
+// Fused 2-matrix quantized GEMV sharing input `x` (`ya = Wa * x`, `yb = Wb * x`) in 1 dispatch.
+// Used on Qwen3.5 GDN decode for `(wqkv, wz)` (`DTYPE = 0` Q4_0, `NR = 2`) and
+// `(ssm_alpha, ssm_beta)` (`DTYPE = 2` Q8_0, `NR = 1`).
+// Requires `a_rows` to be a multiple of `NR`. Subgroup-portable across {8, 16, 32, 64}.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(constant_id = 0) const uint WG = 128;
+layout(constant_id = 1) const uint DTYPE = 0; // 0 = Q4_0, 2 = Q8_0
+layout(constant_id = 2) const uint NR = 2;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer WA { uint16_t wa[]; };
+layout(std430, binding = 1) readonly buffer WB { uint16_t wb[]; };
+layout(std430, binding = 2) readonly buffer X  { float x[]; };
+layout(std430, binding = 3) writeonly buffer YA { float ya[]; };
+layout(std430, binding = 4) writeonly buffer YB { float yb[]; };
+
+layout(push_constant) uniform PC {
+    uint n_in;
+    uint a_rows;
+    uint b_rows;
+    uint row_u16s;
+} pc;
+
+int sbyte_at_pair(bool is_b, uint base_u16, uint byte_idx) {
+    uint w = is_b ? uint(wb[base_u16 + (byte_idx >> 1u)]) : uint(wa[base_u16 + (byte_idx >> 1u)]);
+    uint b = ((byte_idx & 1u) == 0u) ? (w & 0xFFu) : (w >> 8u);
+    return bitfieldExtract(int(b), 0, 8);
+}
+
+void main() {
+    const uint global_row0 = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * NR;
+    const uint total_rows = pc.a_rows + pc.b_rows;
+    if (global_row0 >= total_rows) return;
+
+    const bool is_b = (global_row0 >= pc.a_rows);
+    const uint local_row0 = is_b ? (global_row0 - pc.a_rows) : global_row0;
+    const uint mat_rows = is_b ? pc.b_rows : pc.a_rows;
+
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg_size = gl_SubgroupSize;
+
+    float acc[NR];
+    uint row_b[NR];
+    for (uint r = 0u; r < NR; ++r) {
+        acc[r] = 0.0;
+        const uint row = min(local_row0 + r, mat_rows - 1u);
+        row_b[r] = row * pc.row_u16s;
+    }
+
+    if (DTYPE == 0u) {
+        const uint nb = pc.n_in / 32u;
+        for (uint ib = lane; ib < nb; ib += sg_size) {
+            const uint xb = ib * 32u;
+            float sumx = 0.0;
+            float xv[32];
+            for (uint k = 0u; k < 32u; ++k) {
+                xv[k] = x[xb + k];
+                sumx += xv[k];
+            }
+            const float corr = -8.0 * sumx;
+            for (uint r = 0u; r < NR; ++r) {
+                const uint b = row_b[r] + ib * 9u;
+                const float d = unpackHalf2x16(is_b ? uint(wb[b]) : uint(wa[b])).x;
+                float s = 0.0;
+                for (uint j = 0u; j < 8u; ++j) {
+                    const uint u = is_b ? uint(wb[b + 1u + j]) : uint(wa[b + 1u + j]);
+                    const uint b0 = u & 0xFFu;
+                    const uint b1 = u >> 8u;
+                    s = fma(float(b0 & 15u), xv[2u * j], s);
+                    s = fma(float(b0 >> 4u), xv[2u * j + 16u], s);
+                    s = fma(float(b1 & 15u), xv[2u * j + 1u], s);
+                    s = fma(float(b1 >> 4u), xv[2u * j + 17u], s);
+                }
+                acc[r] = fma(d, s + corr, acc[r]);
+            }
+        }
+    } else {
+        const uint nb = pc.n_in / 32u;
+        if (sg_size <= 32u) {
+            for (uint ib = 0u; ib < nb; ++ib) {
+                float d[NR];
+                for (uint r = 0u; r < NR; ++r) {
+                    const uint b = row_b[r] + ib * 17u;
+                    d[r] = unpackHalf2x16(is_b ? uint(wb[b]) : uint(wa[b])).x;
+                }
+                for (uint e = lane; e < 32u; e += sg_size) {
+                    const float xv = x[ib * 32u + e];
+                    for (uint r = 0u; r < NR; ++r) {
+                        const int q = sbyte_at_pair(is_b, row_b[r] + ib * 17u + 1u, e);
+                        acc[r] = fma(d[r] * float(q), xv, acc[r]);
+                    }
+                }
+            }
+        } else {
+            const uint sub_blk = lane >> 5u;
+            const uint e = lane & 31u;
+            const uint step_blk = sg_size >> 5u;
+            for (uint ib = sub_blk; ib < nb; ib += step_blk) {
+                const float xv = x[ib * 32u + e];
+                for (uint r = 0u; r < NR; ++r) {
+                    const uint b = row_b[r] + ib * 17u;
+                    const float d = unpackHalf2x16(is_b ? uint(wb[b]) : uint(wa[b])).x;
+                    acc[r] = fma(d * float(sbyte_at_pair(is_b, b + 1u, e)), xv, acc[r]);
+                }
+            }
+        }
+    }
+
+    for (uint r = 0u; r < NR; ++r) {
+        const float out_v = subgroupAdd(acc[r]);
+        if (subgroupElect() && local_row0 + r < mat_rows) {
+            if (is_b) {
+                yb[local_row0 + r] = out_v;
+            } else {
+                ya[local_row0 + r] = out_v;
+            }
+        }
+    }
+}

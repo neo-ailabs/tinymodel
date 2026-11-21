@@ -387,6 +387,14 @@ def main() -> int:
                 cand_files["cpu"][1],
                 cand_files["metal"][1],
             )
+        if "cpu" in cand_files and "vulkan" in cand_files:
+            compare_dumps(
+                f"tinymodel(cpu) vs tinymodel(vulkan) [{args.model.name}]",
+                cand_files["cpu"][0],
+                cand_files["vulkan"][0],
+                cand_files["cpu"][1],
+                cand_files["vulkan"][1],
+            )
 
         return 1 if failed else 0
 

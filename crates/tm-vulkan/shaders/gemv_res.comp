@@ -15,9 +15,11 @@ layout(constant_id = 1) const uint DTYPE = 0;
 layout(constant_id = 2) const uint NR = 2;
 layout(local_size_x_id = 0) in;
 
-layout(std430, binding = 0) readonly buffer W { uint16_t w16[]; };
-layout(std430, binding = 1) readonly buffer X { float x[]; };
-layout(std430, binding = 2) buffer Y { float y[]; };
+layout(std430, binding = 0) readonly buffer W   { uint16_t w16[]; };
+layout(std430, binding = 0) readonly buffer W32 { uint w32[]; };
+layout(std430, binding = 1) readonly buffer X   { float x[]; };
+layout(std430, binding = 1) readonly buffer X4  { vec4 x4[]; };
+layout(std430, binding = 2) buffer Y            { float y[]; };
 
 layout(push_constant) uniform PC {
     uint n_in;
@@ -149,70 +151,114 @@ void main() {
             }
         }
     } else if (DTYPE == 3u) {
+        // Coalesced 32-bit/128-bit Q5_K GEMV: each superblock (256 elems = 176B = 44 u32) is
+        // split into 8 groups (`l4 = 0..7`, 4 contiguous elements each). Across `nb * 8` groups,
+        // wave32 processes 4 superblocks simultaneously with zero unaligned byte loads!
         const uint nb = pc.n_in / 256u;
-        for (uint ib = 0u; ib < nb; ++ib) {
-            float d[NR];
-            float dmin[NR];
-            for (uint r = 0u; r < NR; ++r) {
-                const uint b = row_b[r] + ib * 88u;
-                d[r]    = unpackHalf2x16(uint(w16[b])).x;
-                dmin[r] = unpackHalf2x16(uint(w16[b + 1u])).x;
+        const uint total_groups = nb * 8u;
+        for (uint idx = lane; idx < total_groups; idx += sg_size) {
+            const uint ib = idx >> 3u;
+            const uint l4 = idx & 7u;
+            vec4 x_lo[4];
+            vec4 x_hi[4];
+            for (uint chunk = 0u; chunk < 4u; ++chunk) {
+                const uint x4_base = ib * 64u + chunk * 16u + l4;
+                x_lo[chunk] = x4[x4_base];
+                x_hi[chunk] = x4[x4_base + 8u];
             }
-            for (uint l = lane; l < 32u; l += sg_size) {
-                uint qhv[NR];
-                for (uint r = 0u; r < NR; ++r) {
-                    qhv[r] = ubyte_at(row_b[r] + ib * 88u + 8u, l);
-                }
+            for (uint r = 0u; r < NR; ++r) {
+                const uint b32 = (row_b[r] >> 1u) + ib * 44u;
+                const vec2 dm = unpackHalf2x16(w32[b32]);
+                const uint s0 = w32[b32 + 1u];
+                const uint s1 = w32[b32 + 2u];
+                const uint s2 = w32[b32 + 3u];
+                const uint qh4 = w32[b32 + 4u + l4];
+                const uvec4 qh_bytes = uvec4(
+                    qh4 & 0xFFu,
+                    (qh4 >> 8u) & 0xFFu,
+                    (qh4 >> 16u) & 0xFFu,
+                    qh4 >> 24u
+                );
+
                 for (uint chunk = 0u; chunk < 4u; ++chunk) {
-                    const float x_lo = x[ib * 256u + chunk * 64u + l];
-                    const float x_hi = x[ib * 256u + chunk * 64u + 32u + l];
-                    for (uint r = 0u; r < NR; ++r) {
-                        const uint b = row_b[r] + ib * 88u;
-                        uint sc0, m0, sc1, m1;
-                        unpack_q5k_sc_m(b + 2u, 2u * chunk,      sc0, m0);
-                        unpack_q5k_sc_m(b + 2u, 2u * chunk + 1u, sc1, m1);
-                        const uint ql = ubyte_at(b + 24u, chunk * 32u + l);
-                        const float q_lo = float((ql & 0x0Fu) | (((qhv[r] >> (2u * chunk)) & 1u) << 4u));
-                        const float q_hi = float((ql >> 4u)   | (((qhv[r] >> (2u * chunk + 1u)) & 1u) << 4u));
-                        const float w_lo = fma(d[r] * float(sc0), q_lo, -dmin[r] * float(m0));
-                        const float w_hi = fma(d[r] * float(sc1), q_hi, -dmin[r] * float(m1));
-                        acc[r] = fma(w_lo, x_lo, fma(w_hi, x_hi, acc[r]));
+                    uint sc0, m0, sc1, m1;
+                    if (chunk < 2u) {
+                        const uint sh0 = (2u * chunk) * 8u;
+                        const uint sh1 = (2u * chunk + 1u) * 8u;
+                        sc0 = (s0 >> sh0) & 63u;
+                        m0  = (s1 >> sh0) & 63u;
+                        sc1 = (s0 >> sh1) & 63u;
+                        m1  = (s1 >> sh1) & 63u;
+                    } else {
+                        const uint k0 = (2u * chunk - 4u) * 8u;
+                        const uint k1 = (2u * chunk - 3u) * 8u;
+                        const uint b4_0  = (s2 >> k0) & 0xFFu;
+                        const uint bm4_0 = (s0 >> k0) & 0xFFu;
+                        const uint b0_0  = (s1 >> k0) & 0xFFu;
+                        sc0 = (b4_0 & 0x0Fu) | ((bm4_0 >> 6u) << 4u);
+                        m0  = (b4_0 >> 4u)   | ((b0_0  >> 6u) << 4u);
+
+                        const uint b4_1  = (s2 >> k1) & 0xFFu;
+                        const uint bm4_1 = (s0 >> k1) & 0xFFu;
+                        const uint b0_1  = (s1 >> k1) & 0xFFu;
+                        sc1 = (b4_1 & 0x0Fu) | ((bm4_1 >> 6u) << 4u);
+                        m1  = (b4_1 >> 4u)   | ((b0_1  >> 6u) << 4u);
                     }
+
+                    const uint ql4 = w32[b32 + 12u + chunk * 8u + l4];
+                    const uvec4 ql_bytes = uvec4(
+                        ql4 & 0xFFu,
+                        (ql4 >> 8u) & 0xFFu,
+                        (ql4 >> 16u) & 0xFFu,
+                        ql4 >> 24u
+                    );
+                    const vec4 q_lo = vec4((ql_bytes & 15u) | (((qh_bytes >> (2u * chunk)) & 1u) << 4u));
+                    const vec4 q_hi = vec4((ql_bytes >> 4u) | (((qh_bytes >> (2u * chunk + 1u)) & 1u) << 4u));
+                    const vec4 w_lo = fma(vec4(dm.x * float(sc0)), q_lo, vec4(-dm.y * float(m0)));
+                    const vec4 w_hi = fma(vec4(dm.x * float(sc1)), q_hi, vec4(-dm.y * float(m1)));
+                    acc[r] += dot(w_lo, x_lo[chunk]) + dot(w_hi, x_hi[chunk]);
                 }
             }
         }
     } else if (DTYPE == 4u) {
+        // Coalesced 16-bit paired Q6_K GEMV: each superblock (256 elems = 105 u16) is split into
+        // 16 pairs (`l2 = 0..15`, 2 contiguous elements sharing scale index `is = l2 >> 3`).
+        // Wave32 processes 2 superblocks per step with aligned `w16` loads!
         const uint nb = pc.n_in / 256u;
-        for (uint ib = 0u; ib < nb; ++ib) {
-            float d[NR];
-            for (uint r = 0u; r < NR; ++r) {
-                d[r] = unpackHalf2x16(uint(w16[row_b[r] + ib * 105u + 104u])).x;
-            }
-            for (uint l = lane; l < 32u; l += sg_size) {
-                const uint is = l >> 4u;
-                for (uint half_idx = 0u; half_idx < 2u; ++half_idx) {
-                    const uint xh = ib * 256u + half_idx * 128u + l;
-                    const float xa = x[xh];
-                    const float xb = x[xh + 32u];
-                    const float xc = x[xh + 64u];
-                    const float xd = x[xh + 96u];
-                    for (uint r = 0u; r < NR; ++r) {
-                        const uint b = row_b[r] + ib * 105u;
-                        const uint ql0 = ubyte_at(b + half_idx * 32u, l);
-                        const uint ql1 = ubyte_at(b + half_idx * 32u, l + 32u);
-                        const uint qhv = ubyte_at(b + 64u + half_idx * 16u, l);
-                        const uint sc_b = b + 96u + half_idx * 4u;
-                        const int qa = int((ql0 & 0x0Fu) | ((qhv & 3u) << 4u)) - 32;
-                        const int qb = int((ql1 & 0x0Fu) | (((qhv >> 2u) & 3u) << 4u)) - 32;
-                        const int qc = int((ql0 >> 4u)   | (((qhv >> 4u) & 3u) << 4u)) - 32;
-                        const int qd = int((ql1 >> 4u)   | (((qhv >> 6u) & 3u) << 4u)) - 32;
-                        float s = 0.0;
-                        s = fma(float(sbyte_at(sc_b, is))      * float(qa), xa, s);
-                        s = fma(float(sbyte_at(sc_b, is + 2u)) * float(qb), xb, s);
-                        s = fma(float(sbyte_at(sc_b, is + 4u)) * float(qc), xc, s);
-                        s = fma(float(sbyte_at(sc_b, is + 6u)) * float(qd), xd, s);
-                        acc[r] = fma(d[r], s, acc[r]);
-                    }
+        const uint total_pairs = nb * 16u;
+        for (uint idx = lane; idx < total_pairs; idx += sg_size) {
+            const uint ib = idx >> 4u;
+            const uint l2 = idx & 15u;
+            const uint is = l2 >> 3u;
+            for (uint half_idx = 0u; half_idx < 2u; ++half_idx) {
+                const uint xh = ib * 256u + half_idx * 128u + l2 * 2u;
+                const vec2 xa = vec2(x[xh],        x[xh + 1u]);
+                const vec2 xb = vec2(x[xh + 32u],  x[xh + 33u]);
+                const vec2 xc = vec2(x[xh + 64u],  x[xh + 65u]);
+                const vec2 xd = vec2(x[xh + 96u],  x[xh + 97u]);
+                for (uint r = 0u; r < NR; ++r) {
+                    const uint b = row_b[r] + ib * 105u;
+                    const float d = unpackHalf2x16(uint(w16[b + 104u])).x;
+                    const uint ql0_u = uint(w16[b + half_idx * 32u + l2]);
+                    const uint ql1_u = uint(w16[b + half_idx * 32u + 16u + l2]);
+                    const uint qh_u  = uint(w16[b + 64u + half_idx * 16u + l2]);
+                    const uint sc_b  = b + 96u + half_idx * 4u;
+
+                    const uvec2 ql0 = uvec2(ql0_u & 0xFFu, ql0_u >> 8u);
+                    const uvec2 ql1 = uvec2(ql1_u & 0xFFu, ql1_u >> 8u);
+                    const uvec2 qhv = uvec2(qh_u  & 0xFFu, qh_u  >> 8u);
+
+                    const vec2 qa = vec2(ivec2((ql0 & 15u) | ((qhv & 3u) << 4u)) - 32);
+                    const vec2 qb = vec2(ivec2((ql1 & 15u) | (((qhv >> 2u) & 3u) << 4u)) - 32);
+                    const vec2 qc = vec2(ivec2((ql0 >> 4u) | (((qhv >> 4u) & 3u) << 4u)) - 32);
+                    const vec2 qd = vec2(ivec2((ql1 >> 4u) | (((qhv >> 6u) & 3u) << 4u)) - 32);
+
+                    float s = 0.0;
+                    s = fma(float(sbyte_at(sc_b, is))      * dot(qa, xa), 1.0, s);
+                    s = fma(float(sbyte_at(sc_b, is + 2u)) * dot(qb, xb), 1.0, s);
+                    s = fma(float(sbyte_at(sc_b, is + 4u)) * dot(qc, xc), 1.0, s);
+                    s = fma(float(sbyte_at(sc_b, is + 6u)) * dot(qd, xd), 1.0, s);
+                    acc[r] = fma(d, s, acc[r]);
                 }
             }
         }

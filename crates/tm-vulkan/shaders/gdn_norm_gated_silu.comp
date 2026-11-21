@@ -1,0 +1,59 @@
+#version 450
+// Per-head gated RMSNorm with SiLU on `z` (`AGENTS.md` §9 invariant #5):
+//   out_h[i] = (out_h[i] * rsqrt(mean(out_h^2) + eps) * ssm_norm[i]) * silu(z_h[i])
+// Grid: `(n_v_heads, n_tok)` workgroups, `WG = 64` (subgroup-portable across {8, 16, 32, 64}).
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(constant_id = 0) const uint WG = 64;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) buffer Out          { float out_v[]; };
+layout(std430, binding = 1) readonly buffer Norm { float ssm_norm[]; };
+layout(std430, binding = 2) readonly buffer Z   { float z[]; };
+
+layout(push_constant) uniform PC {
+    uint n_v_heads;
+    uint s_dim;
+    float eps;
+} pc;
+
+shared float sg_sums[8];
+
+void main() {
+    const uint vh = gl_WorkGroupID.x;
+    const uint t = gl_WorkGroupID.y;
+    if (vh >= pc.n_v_heads) return;
+
+    const uint S = pc.s_dim;
+    const uint off = (t * pc.n_v_heads + vh) * S;
+    const uint tid = gl_LocalInvocationID.x;
+
+    float ss = 0.0;
+    for (uint i = tid; i < S; i += WG) {
+        const float v = out_v[off + i];
+        ss = fma(v, v, ss);
+    }
+    ss = subgroupAdd(ss);
+    if (subgroupElect()) {
+        sg_sums[gl_SubgroupID] = ss;
+    }
+    barrier();
+
+    if (tid == 0u) {
+        float total = 0.0;
+        for (uint s = 0u; s < gl_NumSubgroups; ++s) {
+            total += sg_sums[s];
+        }
+        sg_sums[0] = inversesqrt(total / float(S) + pc.eps);
+    }
+    barrier();
+
+    const float scale = sg_sums[0];
+    for (uint i = tid; i < S; i += WG) {
+        const float zv = z[off + i];
+        const float silu_z = zv / (1.0 + exp(-zv));
+        out_v[off + i] = (out_v[off + i] * scale * ssm_norm[i]) * silu_z;
+    }
+}

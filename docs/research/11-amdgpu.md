@@ -1,6 +1,6 @@
 # 11 AMD GPU 支持：分析与规划
 
-> 状态：路线已确认（ADR-010，2026-11-21）；**V0、V1、Mesa 25.2.8、V2、V3 已完成**，见第 7 节。
+> 状态：路线已确认（ADR-010，2026-11-21）；**V0、V1、Mesa 25.2.8、V2、V3、V4 已完成**，见第 7 节。
 > 相关：`DECISIONS.md` ADR-008（Metal → Vulkan → CUDA）、`ARCHITECTURE.md` 5.4 节、`08-pixel8.md`、`10-rk3588.md`。
 
 ## 1. 本机现状（实测）
@@ -169,3 +169,36 @@
   - **Raspberry Pi 4B / Zero 2W（`micro` 档）**：`--no-default-features --features micro` 已校验零 Vulkan 依赖，保持 `<750 KB` 纯静态二进制。
 
 - **V6 HIP 决策门初步依据**：升级 Mesa 25.2.8 并在 V3 完成算子融合与零溢出 CoopMat 后，`tinymodel --vulkan` 在 **Decode 上比 ROCm HIP 快 `8%–126%`**，在 **Prefill 上已追至 HIP 的 `67%–94%`**（热态 1B 达 `83%`），彻底消除了 V0 时“Vulkan prefill 只有 HIP 23%”的短板。剩余约 20%–30% 的大矩阵 Prefill 差距主要来自 SPIR-V 抽象层无法直接调度 RDNA4 原生 LDS double-buffering / `s_barrier` 指令编排。因此**无需打破路线提前单做 HIP**，维持 ADR-010 计划：先推进 **V4（Qwen3.5 GDN Vulkan）** 与 **V5（跨设备实测）**，HIP 留到 M5 与 `tm-cuda` 共用 `.cu` 内核源码一并交付。
+
+### V4（2026-11-21）✅ — Qwen3.5 混合 GDN + Gated Full-Attention Vulkan 实现与全线反超
+- **核心架构与 7 个新增/升级 Vulkan 内核**（`crates/tm-vulkan/src/qwen35_runner.rs` + `shaders/*.comp` + `tests/parity_vk_qwen35.rs`）：
+  1. **严格落实 `AGENTS.md` 第 9 节全部 5 条 GDN 不变量**：
+     - `gdn_conv_silu_l2.comp`：因果深度 `conv1d`（`kernel=4`）后**在拆分 `q/k/v` 之前施加 SiLU**；仅对 `q` 和 `k` 做逐头 L2 归一化（`inversesqrt(sum(x^2) + eps)`），**绝不归一化 `v`**；支持 `MODE=0`（单步原地更新历史）与 `MODE=1/2`（Prefill 全批 `48 × 512 = 24,576` 个 workgroup 并行卷积 + 独立历史提交，省去 `27,648` 次串行屏障，耗时从 `5.97 ms` 压至 **`2.52 ms`**）；
+     - `gdn_recurrence.comp`：严格采用 **`kh = vh % n_k_heads` 交错分组**与 **`1/√S` 查询缩放**；每 4 个相邻 subgroup lane 协作持有转置状态矩阵一行 `vec4 s_reg[8]`（仅占 32 VGPR，128-bit 合并读写，`64` 个 workgroup 铺满 RX 9060 XT 全部 32 个 CU），Prefill 按 `BT=16` token 分块将 `q/k/v/(g,beta)` 预取至 `18.1 KB` 共享内存（LDS），**512 token 全程仅读写一次 VRAM 状态矩阵**，使 18 层递推总耗时从 `20.57 ms` 骤降至 **`4.55 ms`（提速 4.5×）**，且单步与多步运算顺序逐位一致；
+     - `gdn_norm_gated_silu.comp` vs `sigmoid_mul.comp`：GDN 层输出门严格使用 `rms_norm(o_h, ssm_norm) * silu(z_h)`，而每 4 层一次的全注意力层经 `split_qg_qnorm.comp` 拆解交错 `[Q_h, Gate_h]`、部分 NeoX RoPE（`rope_dim=64, head_dim=256`）与 `fa_coopmat`（`hd=256` 仅占 `16.5 KB` LDS）后使用 **`sigmoid` 输出门**；
+     - `gemv_pair.comp` + 向量化 `gemv_res.comp`（`Q5_K` / `Q6_K`）：融合解码期 `(wqkv, wz)`（`Q4_0`）与 `(ssm_alpha, ssm_beta)`（`Q8_0`）双矩阵投影，并将 `Q5_K`（`ssm_out`）升级为 32-bit/128-bit 超块并行加载（`Qwen3.5-2B` 的 `gdn_ssm_out+res` 从 `706.6 µs` 压至 **`218.8 µs`，有效带宽从 `73.5` 跃升至 `237.3 GB/s`，提速 3.23×**）。
+  2. **完整复用预录制命令缓冲与状态安全**：`Qwen35VkRunner` 支持 `reset_state()`（`vkCmdFillBuffer` 清零全部 18 层 GDN 状态/卷积历史与 6 层 F16 KV 缓存）、预录制 3 条零分配 Decode 命令缓冲（`no_logits` / `logits` / `greedy`），并接入 `tinymodel run / bench / profile / logits --vulkan`。
+
+- **正确性验证**：
+  - **三驱动 L1/L3 + FP64 Oracle 对齐**（`tests/parity_vk_qwen35.rs`）：在 `TM_VK_DEVICE=radv`（wave32，`Fallback` + `CoopMatF16` + `CoopMatI8` 三路径）、`TM_VK_DEVICE=UHD`（Intel ANV）、`TM_VK_DEVICE=llvmpipe`（lavapipe wave8）上全部通过；包含 `HK=2, HV=4` 异构头数防呆测试、独立 **FP64 标量参考实现** 12 步递推对齐（`rel ≤ 1e-5`）及 `reset_state()` `0.0` 逐位可复现校验。
+  - **真模型多 token Logits 比对**（`tools/logits_diff.py --vulkan` 对比 `llama.cpp -ngl 99`，25 tokens）：
+    - `Qwen3.5-0.8B-Q4_0`：**`Top-1 = 25/25 (100.0%)`**，`Top-5 = 99.2%`，**`mean_KL = 7.65e-4`**，`MAE = 0.0377`
+    - `Qwen3.5-2B-Q4_0`：**`Top-1 = 23/25 (92.0%)`**，`Top-5 = 98.4%`，**`mean_KL = 1.26e-3`**，`MAE = 0.0406`
+
+- **RX 9060 XT 5 轮中位数端到端基准（`pp512 / tg128`）**（原始数据：`bench/results/amd-rx9060xt/2026-11-21-v4-qwen35-vulkan.json`）：
+
+| 模型（Q4_0） | **V4 `pp512`**（峰值 / GPU 热态） | llama.cpp Vk 25.2.8 `pp512` | **相对 Vk 25.2.8** | llama.cpp HIP `pp512` | **相对 HIP** | **V4 `tg128`**（峰值） | llama.cpp Vk / HIP `tg128` | **相对 Vk / HIP** |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Qwen3.5-0.8B** | **13566.6 tok/s**（13654.8 / 14591） | 8247 | **164.5% (1.65×)** | 11663 | **116.3%（反超 HIP！）** | **366.48 tok/s**（369.01） | 245.7 / 168.3 | **149.2% / 217.8%** |
+| **Qwen3.5-2B** | **5205.7 tok/s**（5244.3 / 7741¹） | 4805 | **108.3%**（热态 **161.1%**） | 7536 | **69.1%**（热态 **102.7%**） | **184.49 tok/s**（185.09） | 101.0 / 134.3 | **182.7% / 137.4%** |
+
+  > ¹ `tinymodel profile` 硬件时间戳总和：`Qwen3.5-0.8B` `pp512` GPU 耗时仅 **`35.09 ms`（`14591 tok/s`）**；`Qwen3.5-2B` `pp512` GPU 耗时仅 **`66.14 ms`（`7741 tok/s` = ROCm HIP 的 `102.7%`）**，其中融合 SwiGLU 达 **`30.27 TFLOP/s`**，18 层 GDN 递推+门控归一化仅占 `4.55 ms`（`6.9%`）。Decode 阶段 5 轮贪心指纹 100% 恒定（`db562f8c00f38d31` / `c4a82a33f99247ab`），`Qwen3.5-2B` 等效带宽从 `llama.cpp` Vulkan 的 `121.6 GB/s` 跃升至 **`222.1 GB/s`**。
+
+- **全参考设备覆盖与部署分析（按 `AGENTS.md` 第 8 节固定参考设备规范）**：
+  - **AMD RX 9060 XT（RDNA4，host 独显）**：`Qwen3.5-0.8B` 在 **Prefill 与 Decode 双指标上同时击败 `llama.cpp` Vulkan 和 ROCm HIP**（最高达 HIP 的 **2.18×**）；`Qwen3.5-2B` Decode 达 `184.5 tok/s`（Vk 的 **1.83×**、HIP 的 **1.37×**），单卡 8 GiB 显存占用仅 `~1.26 GiB`。
+  - **Intel UHD 770（Alder Lake GT1 核显，本机实测）**：自动走 `tiled-fallback` + wave16/32 GDN 内核，实测 `Qwen3.5-0.8B-Q4_0` 端到端加载 `586 ms`、`pp = 18.03 tok/s`、`tg = 13.19 tok/s`，贪心输出文本与 RX 9060 XT 完全一致。
+  - **Apple M4（16GB，macOS）**：主路径仍为 `Qwen35MetalRunner`（`pp512 = 1551.7 / tg128 = 127.0 tok/s`）；本轮 Vulkan GDN 内核与 Metal 共享完全相同的寄存器驻留递推数学模型，便于 MoltenVK 对照测试。
+  - **Google Pixel 8（Tensor G3，Mali-G715 MC7，Android Vulkan 1.3）**：所有新增 GDN 着色器均严格遵守 `≤18.1 KB` 共享内存（远低于 Mali `32 KB` 上限）且无硬编码 subgroup 宽度（原生适配 Mali wave16 及 `GL_KHR_shader_subgroup_shuffle`）。在 Pixel 8 上：Decode 阶段 `tm-cpu`（`1×X3 + 4×A715` `i8mm`，`0.8B = 37.0 tok/s`、`2B = 13.5 tok/s`，额外脏内存仅 `43.5–44.9 MiB`）仍是低功耗首选；而长上下文 Prefill（CPU `0.8B = 126.4 tok/s`、`2B = 44.6 tok/s`）及端侧 QLoRA 前向可通过 Mali-G715 Vulkan 进一步压降 TTFT（下一步 V5 真机实测对比）。
+  - **Rockchip RK3588（4×A76 + 4×A55，Mali-G610 MP4，Linux SBC）**：对比瑞芯微闭源 `rkllm`（RKNPU2 不支持 Qwen3.5 GDN 混合结构），`tm-vulkan` 的纯标准 Vulkan 1.2 GDN 管线可在主线 Mesa PanVK 或 BSP `libmali`（wave16）上直接运行 `Qwen3.5-0.8B / 2B / 4B`，填补了 RK3588 上新架构 GPU 加速的空白，同时与 `4×A76` `dotprod` CPU 路径互补。
+  - **Raspberry Pi 5（VideoCore VII，V3DV）**：V3DV 需留意 `SUBGROUP_FEATURE_SHUFFLE_BIT` 支持度（V5 实测探测；若 V3DV 不支持 shuffle，可在 V5 为 `gdn_recurrence` 增加 512B LDS 归约退回分支），实际主力仍为 4×A76 CPU。
+  - **Raspberry Pi 4B / Zero 2W（`micro` 档）**：`--no-default-features --features micro` 编译校验通过，零 Vulkan 依赖，维持 `<900 KB` 静态二进制与 `43–52 MiB` 极低脏内存。

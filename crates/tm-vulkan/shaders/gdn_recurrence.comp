@@ -1,0 +1,274 @@
+#version 450
+// Register-resident + LDS token-prefetched Qwen3.5 Gated DeltaNet recurrence (`s_dim % 16 == 0 && s_dim <= 128`).
+//
+// Strictly enforces `AGENTS.md` §9 & `GDN_CONTRACT`:
+//   - Tiled head mapping: `kh = vh % n_k_heads` (NEVER contiguous repeat).
+//   - Query scaling: `out_h = (S_updated * q_h) * (1 / sqrt(s_dim))`.
+//   - Per-token evaluation order for `n_tok > 1` is bit-identical to `n_tok == 1`.
+//
+// Hardware layout (tuned for 32-CU RDNA4 + portable across wave8/16/32/64):
+//   - 4 consecutive subgroup lanes (`sub = lane & 3`) cooperate on 1 transposed state row `j`,
+//     holding `vec4 s_reg[8]` (32 VGPRs/lane) with 100% coalesced 128-bit `vec4` state loads/stores.
+//   - For batched prefill (`n_tok > 1`), prefetches `BT = 16` tokens of `q_h, k_h, v_tile, (g, beta)`
+//     cooperatively into 18.1 KB of shared memory (`LDS`), eliminating per-token global memory stalls
+//     across all 32 rows `j` in the workgroup, with a branchless unrolled fast path for `S == 128`!
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+layout(constant_id = 0) const uint WG = 128;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer Q     { vec4 q4[]; };
+layout(std430, binding = 1) readonly buffer K     { vec4 k4[]; };
+layout(std430, binding = 2) readonly buffer V     { float v[]; };
+layout(std430, binding = 3) readonly buffer GExp  { float g_exp[]; };
+layout(std430, binding = 4) readonly buffer Beta  { float beta[]; };
+layout(std430, binding = 5) buffer State          { vec4 state4[]; };
+layout(std430, binding = 6) writeonly buffer Out  { float out_v[]; };
+
+layout(push_constant) uniform PC {
+    uint n_k_heads;
+    uint n_v_heads;
+    uint s_dim;
+    uint n_tok;
+} pc;
+
+const uint BT = 16u;
+const uint MAX_SV4 = 32u; // 128 / 4
+
+shared vec4 q_sh[BT * MAX_SV4]; // 8 KB
+shared vec4 k_sh[BT * MAX_SV4]; // 8 KB
+shared float v_sh[BT * 32u];    // 2 KB (32 `j` rows owned by this workgroup)
+shared vec2 gb_sh[BT];          // 128 B
+
+void main() {
+    const uint vh = gl_WorkGroupID.y;
+    if (vh >= pc.n_v_heads) return;
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint linear = gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID;
+    const uint j_loc = linear >> 2u; // 0..31
+    const uint j_base = gl_WorkGroupID.x * 32u;
+    const uint j = j_base + j_loc;
+    const bool row_valid = (j < pc.s_dim);
+    const uint sub = gl_SubgroupInvocationID & 3u;
+
+    // AGENTS.md §9 invariant #4: Tiled head mapping `kh = vh % HK`!
+    const uint kh = vh % pc.n_k_heads;
+    const uint S = pc.s_dim;
+    const uint s_v4 = S >> 2u;
+    const uint n_m = S >> 4u;
+    const float scale = inversesqrt(float(S));
+
+    const uint row_v4 = (vh * S + j) * s_v4;
+    vec4 s_reg[8];
+    if (row_valid) {
+        if (S == 128u) {
+            [[unroll]] for (uint m = 0u; m < 8u; ++m) {
+                s_reg[m] = state4[row_v4 + m * 4u + sub];
+            }
+        } else {
+            [[unroll]] for (uint m = 0u; m < 8u; ++m) {
+                s_reg[m] = (m < n_m) ? state4[row_v4 + m * 4u + sub] : vec4(0.0);
+            }
+        }
+    }
+
+    if (pc.n_tok == 1u) {
+        if (row_valid) {
+            const uint qk_v4 = kh * s_v4;
+            const float v_j = v[vh * S + j];
+            const float g = g_exp[vh];
+            const float b = beta[vh];
+
+            float partial_kv = 0.0;
+            if (S == 128u) {
+                [[unroll]] for (uint m = 0u; m < 8u; ++m) {
+                    const vec4 sv = s_reg[m] * g;
+                    s_reg[m] = sv;
+                    partial_kv += dot(sv, k4[qk_v4 + m * 4u + sub]);
+                }
+            } else {
+                [[unroll]] for (uint m = 0u; m < 8u; ++m) {
+                    if (m < n_m) {
+                        const vec4 sv = s_reg[m] * g;
+                        s_reg[m] = sv;
+                        partial_kv += dot(sv, k4[qk_v4 + m * 4u + sub]);
+                    }
+                }
+            }
+            float sum_kv = partial_kv + subgroupShuffleXor(partial_kv, 1u);
+            sum_kv += subgroupShuffleXor(sum_kv, 2u);
+            const float delta_j = (v_j - sum_kv) * b;
+
+            float partial_oq = 0.0;
+            if (S == 128u) {
+                [[unroll]] for (uint m = 0u; m < 8u; ++m) {
+                    const vec4 kv = k4[qk_v4 + m * 4u + sub];
+                    const vec4 qv = q4[qk_v4 + m * 4u + sub];
+                    const vec4 sv = fma(vec4(delta_j), kv, s_reg[m]);
+                    s_reg[m] = sv;
+                    partial_oq += dot(sv, qv);
+                }
+            } else {
+                [[unroll]] for (uint m = 0u; m < 8u; ++m) {
+                    if (m < n_m) {
+                        const vec4 kv = k4[qk_v4 + m * 4u + sub];
+                        const vec4 qv = q4[qk_v4 + m * 4u + sub];
+                        const vec4 sv = fma(vec4(delta_j), kv, s_reg[m]);
+                        s_reg[m] = sv;
+                        partial_oq += dot(sv, qv);
+                    }
+                }
+            }
+            float sum_oq = partial_oq + subgroupShuffleXor(partial_oq, 1u);
+            sum_oq += subgroupShuffleXor(sum_oq, 2u);
+
+            if (sub == 0u) {
+                out_v[vh * S + j] = sum_oq * scale;
+            }
+            if (S == 128u) {
+                [[unroll]] for (uint m = 0u; m < 8u; ++m) {
+                    state4[row_v4 + m * 4u + sub] = s_reg[m];
+                }
+            } else {
+                [[unroll]] for (uint m = 0u; m < 8u; ++m) {
+                    if (m < n_m) {
+                        state4[row_v4 + m * 4u + sub] = s_reg[m];
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    for (uint t0 = 0u; t0 < pc.n_tok; t0 += BT) {
+        const uint cnt = min(BT, pc.n_tok - t0);
+        const uint total_qk = cnt * s_v4;
+        for (uint idx = tid; idx < total_qk; idx += WG) {
+            const uint tt = idx / s_v4;
+            const uint c4 = idx % s_v4;
+            const uint gk = ((t0 + tt) * pc.n_k_heads + kh) * s_v4 + c4;
+            q_sh[tt * MAX_SV4 + c4] = q4[gk];
+            k_sh[tt * MAX_SV4 + c4] = k4[gk];
+        }
+        const uint total_v = cnt * 32u;
+        for (uint idx = tid; idx < total_v; idx += WG) {
+            const uint tt = idx >> 5u;
+            const uint jl = idx & 31u;
+            const uint gj = j_base + jl;
+            v_sh[idx] = (gj < S) ? v[((t0 + tt) * pc.n_v_heads + vh) * S + gj] : 0.0;
+        }
+        if (tid < cnt) {
+            const uint g_idx = (t0 + tid) * pc.n_v_heads + vh;
+            gb_sh[tid] = vec2(g_exp[g_idx], beta[g_idx]);
+        }
+        barrier();
+
+        if (row_valid) {
+            if (S == 128u) {
+                for (uint tt = 0u; tt < cnt; ++tt) {
+                    const uint sh_b = tt * MAX_SV4 + sub;
+                    const vec2 gb = gb_sh[tt];
+                    const float v_j = v_sh[tt * 32u + j_loc];
+
+                    vec4 k0 = k_sh[sh_b + 0u];
+                    vec4 k1 = k_sh[sh_b + 4u];
+                    vec4 k2 = k_sh[sh_b + 8u];
+                    vec4 k3 = k_sh[sh_b + 12u];
+                    vec4 k4v = k_sh[sh_b + 16u];
+                    vec4 k5 = k_sh[sh_b + 20u];
+                    vec4 k6 = k_sh[sh_b + 24u];
+                    vec4 k7 = k_sh[sh_b + 28u];
+
+                    s_reg[0] *= gb.x;
+                    s_reg[1] *= gb.x;
+                    s_reg[2] *= gb.x;
+                    s_reg[3] *= gb.x;
+                    s_reg[4] *= gb.x;
+                    s_reg[5] *= gb.x;
+                    s_reg[6] *= gb.x;
+                    s_reg[7] *= gb.x;
+
+                    float partial_kv = dot(s_reg[0], k0) + dot(s_reg[1], k1)
+                                     + dot(s_reg[2], k2) + dot(s_reg[3], k3)
+                                     + dot(s_reg[4], k4v) + dot(s_reg[5], k5)
+                                     + dot(s_reg[6], k6) + dot(s_reg[7], k7);
+                    float sum_kv = partial_kv + subgroupShuffleXor(partial_kv, 1u);
+                    sum_kv += subgroupShuffleXor(sum_kv, 2u);
+                    const vec4 dv = vec4((v_j - sum_kv) * gb.y);
+
+                    s_reg[0] = fma(dv, k0, s_reg[0]);
+                    s_reg[1] = fma(dv, k1, s_reg[1]);
+                    s_reg[2] = fma(dv, k2, s_reg[2]);
+                    s_reg[3] = fma(dv, k3, s_reg[3]);
+                    s_reg[4] = fma(dv, k4v, s_reg[4]);
+                    s_reg[5] = fma(dv, k5, s_reg[5]);
+                    s_reg[6] = fma(dv, k6, s_reg[6]);
+                    s_reg[7] = fma(dv, k7, s_reg[7]);
+
+                    float partial_oq = dot(s_reg[0], q_sh[sh_b + 0u])  + dot(s_reg[1], q_sh[sh_b + 4u])
+                                     + dot(s_reg[2], q_sh[sh_b + 8u])  + dot(s_reg[3], q_sh[sh_b + 12u])
+                                     + dot(s_reg[4], q_sh[sh_b + 16u]) + dot(s_reg[5], q_sh[sh_b + 20u])
+                                     + dot(s_reg[6], q_sh[sh_b + 24u]) + dot(s_reg[7], q_sh[sh_b + 28u]);
+                    float sum_oq = partial_oq + subgroupShuffleXor(partial_oq, 1u);
+                    sum_oq += subgroupShuffleXor(sum_oq, 2u);
+
+                    if (sub == 0u) {
+                        out_v[((t0 + tt) * pc.n_v_heads + vh) * S + j] = sum_oq * scale;
+                    }
+                }
+            } else {
+                for (uint tt = 0u; tt < cnt; ++tt) {
+                    const uint sh_b = tt * MAX_SV4 + sub;
+                    const vec2 gb = gb_sh[tt];
+                    const float v_j = v_sh[tt * 32u + j_loc];
+
+                    float partial_kv = 0.0;
+                    [[unroll]] for (uint m = 0u; m < 8u; ++m) {
+                        if (m < n_m) {
+                            const vec4 sv = s_reg[m] * gb.x;
+                            s_reg[m] = sv;
+                            partial_kv += dot(sv, k_sh[sh_b + m * 4u]);
+                        }
+                    }
+                    float sum_kv = partial_kv + subgroupShuffleXor(partial_kv, 1u);
+                    sum_kv += subgroupShuffleXor(sum_kv, 2u);
+                    const vec4 dv = vec4((v_j - sum_kv) * gb.y);
+
+                    float partial_oq = 0.0;
+                    [[unroll]] for (uint m = 0u; m < 8u; ++m) {
+                        if (m < n_m) {
+                            const vec4 sv = fma(dv, k_sh[sh_b + m * 4u], s_reg[m]);
+                            s_reg[m] = sv;
+                            partial_oq += dot(sv, q_sh[sh_b + m * 4u]);
+                        }
+                    }
+                    float sum_oq = partial_oq + subgroupShuffleXor(partial_oq, 1u);
+                    sum_oq += subgroupShuffleXor(sum_oq, 2u);
+
+                    if (sub == 0u) {
+                        out_v[((t0 + tt) * pc.n_v_heads + vh) * S + j] = sum_oq * scale;
+                    }
+                }
+            }
+        }
+        barrier();
+    }
+
+    if (row_valid) {
+        if (S == 128u) {
+            [[unroll]] for (uint m = 0u; m < 8u; ++m) {
+                state4[row_v4 + m * 4u + sub] = s_reg[m];
+            }
+        } else {
+            [[unroll]] for (uint m = 0u; m < 8u; ++m) {
+                if (m < n_m) {
+                    state4[row_v4 + m * 4u + sub] = s_reg[m];
+                }
+            }
+        }
+    }
+}
