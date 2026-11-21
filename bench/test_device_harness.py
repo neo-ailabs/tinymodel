@@ -70,6 +70,17 @@ class TestDeviceHarness(unittest.TestCase):
         self.assertAlmostEqual(summary["decode_joules_per_token"], 4.0 / 51.0, places=3)
         self.assertTrue(summary["deterministic_self_consistent"])
 
+    def test_paired_ratios_pct_resistant_to_thermal_drift(self) -> None:
+        # Both engines throttle identically by -25% on later rounds while candidate stays exactly 95% of ref
+        ref = [{"tg_tps": 40.0}, {"tg_tps": 35.0}, {"tg_tps": 30.0}]
+        cand = [{"tg_tps": 38.0}, {"tg_tps": 33.25}, {"tg_tps": 28.5}]
+        res = dh.compute_paired_ratios_pct(cand, ref, "tg_tps")
+        self.assertIsNotNone(res)
+        assert res is not None
+        self.assertEqual(res["median_pct"], 95.0)
+        self.assertEqual(res["min_pct"], 95.0)
+        self.assertEqual(res["max_pct"], 95.0)
+
 
 if __name__ == "__main__":
     unittest.main()

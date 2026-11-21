@@ -615,3 +615,199 @@ fn l1_parity_q4_1_q8_0_q5_k_q6_k_pow2_bit_exact() {
         );
     }
 }
+
+#[test]
+fn l1_parity_gdn_recurrence_and_norms_bit_exact_all_isas() {
+    let mut rng = Rng(0x91E2_73C4_55AA_0F1E);
+    let rand_f32 = |r: &mut Rng| -> f32 {
+        let u = (r.next_u64() & 0xFFFF) as f32 / 32768.0 - 1.0;
+        u * 0.731_92
+    };
+
+    let ref_kt = select_kernels(Isa::Generic);
+
+    // Test both standard Qwen3.5 dimension (128) and an unaligned tail dimension (67)
+    for &hd in &[128usize, 67usize] {
+        let x: Vec<f32> = (0..hd * 8 + 5).map(|_| rand_f32(&mut rng)).collect();
+        let w: Vec<f32> = (0..x.len()).map(|_| 0.5 + rand_f32(&mut rng)).collect();
+
+        let mut ref_rms = vec![0.0f32; x.len()];
+        (ref_kt.rms_norm_f32)(&mut ref_rms, &x, &w, 1e-6);
+
+        let mut ref_l2 = x.clone();
+        (ref_kt.l2_norm_f32)(&mut ref_l2, 1e-6);
+
+        let init_state: Vec<f32> = (0..hd * hd).map(|_| rand_f32(&mut rng) * 0.25).collect();
+        let steps = 4usize;
+        let qs: Vec<f32> = (0..steps * hd).map(|_| rand_f32(&mut rng)).collect();
+        let ks: Vec<f32> = (0..steps * hd).map(|_| rand_f32(&mut rng)).collect();
+        let vs: Vec<f32> = (0..steps * hd).map(|_| rand_f32(&mut rng)).collect();
+        let scale = 1.0 / (hd as f32).sqrt();
+
+        let mut ref_state = init_state.clone();
+        let mut ref_out = vec![0.0f32; steps * hd];
+        for t in 0..steps {
+            (ref_kt.gdn_recurrence_head)(
+                &qs[t * hd..(t + 1) * hd],
+                &ks[t * hd..(t + 1) * hd],
+                &vs[t * hd..(t + 1) * hd],
+                0.873_125,
+                0.419_875,
+                scale,
+                &mut ref_state,
+                &mut ref_out[t * hd..(t + 1) * hd],
+                hd,
+            );
+        }
+
+        for &isa in &[Isa::NeonV80, Isa::NeonDotprod, Isa::NeonI8mm] {
+            let kt = select_kernels(isa);
+            if kt.isa == Isa::Generic {
+                continue;
+            }
+
+            let mut got_rms = vec![0.0f32; x.len()];
+            (kt.rms_norm_f32)(&mut got_rms, &x, &w, 1e-6);
+            assert_eq!(
+                got_rms.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                ref_rms.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "rms_norm_f32 bit mismatch for isa={} hd={hd}",
+                isa.name()
+            );
+
+            let mut got_l2 = x.clone();
+            (kt.l2_norm_f32)(&mut got_l2, 1e-6);
+            assert_eq!(
+                got_l2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                ref_l2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "l2_norm_f32 bit mismatch for isa={} hd={hd}",
+                isa.name()
+            );
+
+            let mut got_state = init_state.clone();
+            let mut got_out = vec![0.0f32; steps * hd];
+            for t in 0..steps {
+                (kt.gdn_recurrence_head)(
+                    &qs[t * hd..(t + 1) * hd],
+                    &ks[t * hd..(t + 1) * hd],
+                    &vs[t * hd..(t + 1) * hd],
+                    0.873_125,
+                    0.419_875,
+                    scale,
+                    &mut got_state,
+                    &mut got_out[t * hd..(t + 1) * hd],
+                    hd,
+                );
+            }
+            assert_eq!(
+                got_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                ref_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "gdn_recurrence_head out bit mismatch for isa={} hd={hd}",
+                isa.name()
+            );
+            assert_eq!(
+                got_state.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                ref_state.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "gdn_recurrence_head state bit mismatch for isa={} hd={hd}",
+                isa.name()
+            );
+        }
+    }
+}
+
+#[test]
+fn parallel_prefill_non_matmul_ops_match_single_token_bit_exact() {
+    let mut rng = Rng(0x7711_8822_9933_AA44);
+    let rand_f32 = |r: &mut Rng| -> f32 { (r.next_u64() & 0xFFFF) as f32 / 32768.0 - 1.0 };
+
+    let pool1 = ThreadPool::new(1);
+    let pool4 = ThreadPool::new(4);
+    let kt = tm_cpu::active_kernels();
+
+    // 1. swiglu_inplace_parallel vs swiglu_inplace
+    let n_ff = 4099;
+    let gate_init: Vec<f32> = (0..n_ff).map(|_| rand_f32(&mut rng)).collect();
+    let up: Vec<f32> = (0..n_ff).map(|_| rand_f32(&mut rng)).collect();
+    let mut g_ref = gate_init.clone();
+    let mut g_par = gate_init;
+    tm_cpu::swiglu_inplace(&mut g_ref, &up);
+    tm_cpu::swiglu_inplace_parallel(&pool4, &mut g_par, &up);
+    assert_eq!(
+        g_par.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        g_ref.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+
+    // 2. gdn_conv1d_silu_split_parallel: 6-token batch on 4 threads == 6 single-token steps on 1 thread
+    let hk = 4usize;
+    let s_dim = 32usize;
+    let k_dim = hk * s_dim;
+    let v_dim = 8 * s_dim;
+    let conv_dim = 2 * k_dim + v_dim;
+    let d_conv = 4usize;
+    let n_tok = 6usize;
+    let qkv_all: Vec<f32> = (0..n_tok * conv_dim).map(|_| rand_f32(&mut rng)).collect();
+    let conv_w: Vec<f32> = (0..conv_dim * d_conv).map(|_| rand_f32(&mut rng)).collect();
+    let hist_init: Vec<f32> = (0..conv_dim * (d_conv - 1))
+        .map(|_| rand_f32(&mut rng))
+        .collect();
+
+    let mut hist_seq = hist_init.clone();
+    let mut q_seq = vec![0.0f32; n_tok * k_dim];
+    let mut k_seq = vec![0.0f32; n_tok * k_dim];
+    let mut v_seq = vec![0.0f32; n_tok * v_dim];
+    for t in 0..n_tok {
+        tm_cpu::gdn_conv1d_silu_split_parallel(
+            &pool1,
+            kt,
+            &qkv_all[t * conv_dim..(t + 1) * conv_dim],
+            &mut hist_seq,
+            &conv_w,
+            &mut q_seq[t * k_dim..(t + 1) * k_dim],
+            &mut k_seq[t * k_dim..(t + 1) * k_dim],
+            &mut v_seq[t * v_dim..(t + 1) * v_dim],
+            d_conv,
+            hk,
+            s_dim,
+            v_dim,
+            1e-6,
+            1,
+        );
+    }
+
+    let mut hist_bat = hist_init;
+    let mut q_bat = vec![0.0f32; n_tok * k_dim];
+    let mut k_bat = vec![0.0f32; n_tok * k_dim];
+    let mut v_bat = vec![0.0f32; n_tok * v_dim];
+    tm_cpu::gdn_conv1d_silu_split_parallel(
+        &pool4,
+        kt,
+        &qkv_all,
+        &mut hist_bat,
+        &conv_w,
+        &mut q_bat,
+        &mut k_bat,
+        &mut v_bat,
+        d_conv,
+        hk,
+        s_dim,
+        v_dim,
+        1e-6,
+        n_tok,
+    );
+    assert_eq!(
+        q_bat.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        q_seq.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        k_bat.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        k_seq.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        v_bat.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        v_seq.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        hist_bat.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        hist_seq.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+}

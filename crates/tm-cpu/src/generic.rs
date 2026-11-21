@@ -319,3 +319,126 @@ pub fn quantize_q8_0(src: &[f32], dst: &mut [BlockQ8_0]) {
 pub fn quantize_q8_1(src: &[f32], dst: &mut [BlockQ8_1]) {
     tm_core::quantize_row_q8_1(src, dst);
 }
+
+#[inline]
+fn sum_sq_8wide_f32(x: &[f32]) -> f32 {
+    let n = x.len();
+    let chunks8 = n / 8;
+    let mut acc0 = [0.0f32; 4];
+    let mut acc1 = [0.0f32; 4];
+    for c in 0..chunks8 {
+        let base = c * 8;
+        for lane in 0..4 {
+            let v0 = x[base + lane];
+            let v1 = x[base + 4 + lane];
+            acc0[lane] = v0.mul_add(v0, acc0[lane]);
+            acc1[lane] = v1.mul_add(v1, acc1[lane]);
+        }
+    }
+    let s0 = acc0[0] + acc1[0];
+    let s1 = acc0[1] + acc1[1];
+    let s2 = acc0[2] + acc1[2];
+    let s3 = acc0[3] + acc1[3];
+    let mut sum = (s0 + s1) + (s2 + s3);
+    for &v in &x[chunks8 * 8..] {
+        sum = v.mul_add(v, sum);
+    }
+    sum
+}
+
+/// Scalar reference `RMSNorm` matching 8-wide SIMD pairwise FMA reduction bit-for-bit.
+pub fn rms_norm_f32(out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
+    let n = x.len();
+    assert_eq!(out.len(), n);
+    assert_eq!(weight.len(), n);
+    if n == 0 {
+        return;
+    }
+    let ss = sum_sq_8wide_f32(x);
+    let scale = (1.0 / (((ss as f64) / (n as f64)) + (eps as f64)).sqrt()) as f32;
+    for i in 0..n {
+        out[i] = (x[i] * scale) * weight[i];
+    }
+}
+
+/// Scalar reference in-place `L2` normalization matching 8-wide SIMD pairwise FMA bit-for-bit.
+pub fn l2_norm_f32(x: &mut [f32], eps: f32) {
+    let ss = sum_sq_8wide_f32(x);
+    let scale = (1.0 / ((ss as f64) + (eps as f64)).sqrt()) as f32;
+    for v in x.iter_mut() {
+        *v *= scale;
+    }
+}
+
+/// Scalar reference single-head, single-token Gated DeltaNet recurrent step.
+///
+/// Uses 8-wide pairwise `f32::mul_add` accumulation + single state store per element so
+/// SIMD (`vfmaq_f32` + `vpaddq_f32`) matches this reference **bit-for-bit** (`to_bits()`).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_recurrence_head(
+    q_h: &[f32],
+    k_h: &[f32],
+    v_h: &[f32],
+    g: f32,
+    beta: f32,
+    scale: f32,
+    s_vh: &mut [f32],
+    o_h: &mut [f32],
+    head_dim: usize,
+) {
+    assert_eq!(q_h.len(), head_dim);
+    assert_eq!(k_h.len(), head_dim);
+    assert_eq!(v_h.len(), head_dim);
+    assert_eq!(s_vh.len(), head_dim * head_dim);
+    assert_eq!(o_h.len(), head_dim);
+
+    let chunks8 = head_dim / 8;
+    for j in 0..head_dim {
+        let s_row = &mut s_vh[j * head_dim..(j + 1) * head_dim];
+
+        // Pass 1: read-only dot product `sum_kv = sum_i ((s_row[i] * g) * k_h[i])`
+        let mut kv0 = [0.0f32; 4];
+        let mut kv1 = [0.0f32; 4];
+        for c in 0..chunks8 {
+            let base = c * 8;
+            for lane in 0..4 {
+                let d0 = s_row[base + lane] * g;
+                let d1 = s_row[base + 4 + lane] * g;
+                kv0[lane] = d0.mul_add(k_h[base + lane], kv0[lane]);
+                kv1[lane] = d1.mul_add(k_h[base + 4 + lane], kv1[lane]);
+            }
+        }
+        let mut sum_kv =
+            ((kv0[0] + kv1[0]) + (kv0[1] + kv1[1])) + ((kv0[2] + kv1[2]) + (kv0[3] + kv1[3]));
+        for i in chunks8 * 8..head_dim {
+            let d = s_row[i] * g;
+            sum_kv = d.mul_add(k_h[i], sum_kv);
+        }
+
+        let delta_j = (v_h[j] - sum_kv) * beta;
+
+        // Pass 2: single memory write `s_row[i] = delta_j * k_h[i] + (s_row[i] * g)` + query dot
+        let mut oq0 = [0.0f32; 4];
+        let mut oq1 = [0.0f32; 4];
+        for c in 0..chunks8 {
+            let base = c * 8;
+            for lane in 0..4 {
+                let u0 = delta_j.mul_add(k_h[base + lane], s_row[base + lane] * g);
+                let u1 = delta_j.mul_add(k_h[base + 4 + lane], s_row[base + 4 + lane] * g);
+                s_row[base + lane] = u0;
+                s_row[base + 4 + lane] = u1;
+                oq0[lane] = u0.mul_add(q_h[base + lane], oq0[lane]);
+                oq1[lane] = u1.mul_add(q_h[base + 4 + lane], oq1[lane]);
+            }
+        }
+        let mut sum_oq =
+            ((oq0[0] + oq1[0]) + (oq0[1] + oq1[1])) + ((oq0[2] + oq1[2]) + (oq0[3] + oq1[3]));
+        for i in chunks8 * 8..head_dim {
+            let u = delta_j.mul_add(k_h[i], s_row[i] * g);
+            s_row[i] = u;
+            sum_oq = u.mul_add(q_h[i], sum_oq);
+        }
+
+        o_h[j] = sum_oq * scale;
+    }
+}

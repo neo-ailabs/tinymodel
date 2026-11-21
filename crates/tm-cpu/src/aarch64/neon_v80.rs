@@ -1172,3 +1172,183 @@ pub unsafe fn gemv_q6_k_q8_k(
         }
     }
 }
+
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn hsum_pairwise_8wide_f32(acc0: float32x4_t, acc1: float32x4_t) -> f32 {
+    let s4 = vaddq_f32(acc0, acc1);
+    let p2 = vpaddq_f32(s4, s4);
+    let p1 = vpaddq_f32(p2, p2);
+    vgetq_lane_f32::<0>(p1)
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn sum_sq_8wide_neon(x: &[f32]) -> f32 {
+    let n = x.len();
+    let chunks8 = n / 8;
+    // SAFETY: Loop bounds `c * 8 + 8 <= n` are guaranteed by `chunks8 = n / 8`.
+    unsafe {
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let xp = x.as_ptr();
+        for c in 0..chunks8 {
+            let off = c * 8;
+            let v0 = vld1q_f32(xp.add(off));
+            let v1 = vld1q_f32(xp.add(off + 4));
+            acc0 = vfmaq_f32(acc0, v0, v0);
+            acc1 = vfmaq_f32(acc1, v1, v1);
+        }
+        let mut sum = hsum_pairwise_8wide_f32(acc0, acc1);
+        for &v in &x[chunks8 * 8..] {
+            sum = v.mul_add(v, sum);
+        }
+        sum
+    }
+}
+
+/// ARMv8.0 NEON `rms_norm_f32` matching `generic::rms_norm_f32` bit-for-bit.
+///
+/// # Safety
+/// Caller must ensure NEON is available.
+#[target_feature(enable = "neon")]
+pub unsafe fn rms_norm_f32(out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
+    let n = x.len();
+    assert_eq!(out.len(), n);
+    assert_eq!(weight.len(), n);
+    if n == 0 {
+        return;
+    }
+    // SAFETY: `out`, `x`, and `weight` all have verified length `n`.
+    unsafe {
+        let ss = sum_sq_8wide_neon(x);
+        let scale = (1.0 / (((ss as f64) / (n as f64)) + (eps as f64)).sqrt()) as f32;
+        let vscale = vdupq_n_f32(scale);
+        let chunks4 = n / 4;
+        let xp = x.as_ptr();
+        let wp = weight.as_ptr();
+        let op = out.as_mut_ptr();
+        for c in 0..chunks4 {
+            let off = c * 4;
+            let vx = vld1q_f32(xp.add(off));
+            let vw = vld1q_f32(wp.add(off));
+            vst1q_f32(op.add(off), vmulq_f32(vmulq_f32(vx, vscale), vw));
+        }
+        for i in chunks4 * 4..n {
+            *op.add(i) = (*xp.add(i) * scale) * *wp.add(i);
+        }
+    }
+}
+
+/// ARMv8.0 NEON in-place `l2_norm_f32` matching `generic::l2_norm_f32` bit-for-bit.
+///
+/// # Safety
+/// Caller must ensure NEON is available.
+#[target_feature(enable = "neon")]
+pub unsafe fn l2_norm_f32(x: &mut [f32], eps: f32) {
+    let n = x.len();
+    // SAFETY: `x` has length `n`; 4-wide chunks stay within `[0..n)`.
+    unsafe {
+        let ss = sum_sq_8wide_neon(x);
+        let scale = (1.0 / ((ss as f64) + (eps as f64)).sqrt()) as f32;
+        let vscale = vdupq_n_f32(scale);
+        let chunks4 = n / 4;
+        let xp = x.as_mut_ptr();
+        for c in 0..chunks4 {
+            let off = c * 4;
+            let vx = vld1q_f32(xp.add(off));
+            vst1q_f32(xp.add(off), vmulq_f32(vx, vscale));
+        }
+        for v in &mut x[chunks4 * 4..] {
+            *v *= scale;
+        }
+    }
+}
+
+/// ARMv8.0 NEON single-head, single-token Gated DeltaNet recurrent step.
+///
+/// Uses 8-wide dual-accumulator `vfmaq_f32` + pairwise `vpaddq_f32` + single state memory store,
+/// matching `generic::gdn_recurrence_head` **bit-for-bit** (`to_bits()`).
+///
+/// # Safety
+/// Caller must ensure NEON is available.
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gdn_recurrence_head(
+    q_h: &[f32],
+    k_h: &[f32],
+    v_h: &[f32],
+    g: f32,
+    beta: f32,
+    scale: f32,
+    s_vh: &mut [f32],
+    o_h: &mut [f32],
+    head_dim: usize,
+) {
+    assert_eq!(q_h.len(), head_dim);
+    assert_eq!(k_h.len(), head_dim);
+    assert_eq!(v_h.len(), head_dim);
+    assert_eq!(s_vh.len(), head_dim * head_dim);
+    assert_eq!(o_h.len(), head_dim);
+
+    let chunks8 = head_dim / 8;
+    // SAFETY: All slice bounds are asserted above; `c * 8 + 8 <= head_dim` and `j < head_dim`.
+    unsafe {
+        let vg = vdupq_n_f32(g);
+        let qp = q_h.as_ptr();
+        let kp = k_h.as_ptr();
+        let vp = v_h.as_ptr();
+        let sp_base = s_vh.as_mut_ptr();
+        let op = o_h.as_mut_ptr();
+
+        for j in 0..head_dim {
+            let sp = sp_base.add(j * head_dim);
+
+            let mut kv0 = vdupq_n_f32(0.0);
+            let mut kv1 = vdupq_n_f32(0.0);
+            for c in 0..chunks8 {
+                let off = c * 8;
+                let d0 = vmulq_f32(vld1q_f32(sp.add(off)), vg);
+                let d1 = vmulq_f32(vld1q_f32(sp.add(off + 4)), vg);
+                let k0 = vld1q_f32(kp.add(off));
+                let k1 = vld1q_f32(kp.add(off + 4));
+                kv0 = vfmaq_f32(kv0, d0, k0);
+                kv1 = vfmaq_f32(kv1, d1, k1);
+            }
+            let mut sum_kv = hsum_pairwise_8wide_f32(kv0, kv1);
+            for i in chunks8 * 8..head_dim {
+                let d = *sp.add(i) * g;
+                sum_kv = d.mul_add(*kp.add(i), sum_kv);
+            }
+
+            let delta_j = (*vp.add(j) - sum_kv) * beta;
+            let vdelta = vdupq_n_f32(delta_j);
+
+            let mut oq0 = vdupq_n_f32(0.0);
+            let mut oq1 = vdupq_n_f32(0.0);
+            for c in 0..chunks8 {
+                let off = c * 8;
+                let d0 = vmulq_f32(vld1q_f32(sp.add(off)), vg);
+                let d1 = vmulq_f32(vld1q_f32(sp.add(off + 4)), vg);
+                let k0 = vld1q_f32(kp.add(off));
+                let k1 = vld1q_f32(kp.add(off + 4));
+                let u0 = vfmaq_f32(d0, vdelta, k0);
+                let u1 = vfmaq_f32(d1, vdelta, k1);
+                vst1q_f32(sp.add(off), u0);
+                vst1q_f32(sp.add(off + 4), u1);
+                let q0 = vld1q_f32(qp.add(off));
+                let q1 = vld1q_f32(qp.add(off + 4));
+                oq0 = vfmaq_f32(oq0, u0, q0);
+                oq1 = vfmaq_f32(oq1, u1, q1);
+            }
+            let mut sum_oq = hsum_pairwise_8wide_f32(oq0, oq1);
+            for i in chunks8 * 8..head_dim {
+                let u = delta_j.mul_add(*kp.add(i), *sp.add(i) * g);
+                *sp.add(i) = u;
+                sum_oq = u.mul_add(*qp.add(i), sum_oq);
+            }
+
+            *op.add(j) = sum_oq * scale;
+        }
+    }
+}

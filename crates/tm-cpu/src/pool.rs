@@ -39,8 +39,11 @@ pub struct ThreadPool {
 
 impl ThreadPool {
     /// Creates a pool with `n_threads` total execution threads (including the caller).
+    /// On heterogeneous Linux/Android SoCs (e.g. Pixel 8, RK3588), automatically pins
+    /// caller and worker threads to performance cores unless already pinned via `taskset`.
     pub fn new(n_threads: usize) -> Self {
         let n_threads = n_threads.max(1);
+        crate::affinity::apply_pool_thread_affinity(n_threads);
         let shared = Arc::new(Shared {
             epoch: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
@@ -58,7 +61,10 @@ impl ThreadPool {
         let mut workers = Vec::with_capacity(n_threads - 1);
         for _ in 1..n_threads {
             let s = Arc::clone(&shared);
-            workers.push(thread::spawn(move || worker_loop(s)));
+            workers.push(thread::spawn(move || {
+                crate::affinity::apply_pool_thread_affinity(n_threads);
+                worker_loop(s);
+            }));
         }
 
         Self {

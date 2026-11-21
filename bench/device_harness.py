@@ -29,6 +29,7 @@ import hashlib
 import json
 import os
 import platform
+import random
 import re
 import resource
 import shlex
@@ -36,6 +37,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -856,6 +858,52 @@ def run_remote_shell_timed(
     return proc.stdout, proc.stderr, proc.returncode, rss_mib
 
 
+def compute_paired_ratios_pct(
+    cand_samples: List[Dict[str, Any]],
+    ref_samples: List[Dict[str, Any]],
+    key: str,
+) -> Optional[Dict[str, float]]:
+    """Computes paired per-round ratio `100 * cand[i][key] / ref[i][key]` (`median`, `min`, `max`)."""
+    n = min(len(cand_samples), len(ref_samples))
+    if n == 0:
+        return None
+    ratios = [
+        100.0 * float(cand_samples[i][key]) / max(float(ref_samples[i][key]), 1e-9)
+        for i in range(n)
+    ]
+    return {
+        "median_pct": round(statistics.median(ratios), 1),
+        "min_pct": round(min(ratios), 1),
+        "max_pct": round(max(ratios), 1),
+    }
+
+
+def wait_for_thermal_cooldown(
+    transport: DeviceTransport,
+    rbin_tm: str,
+    max_temp_c: Optional[float],
+    cooldown_sec: float,
+) -> Optional[float]:
+    """Optional inter-round thermal gate: sleeps `cooldown_sec` and waits until SoC max_temp_c <= threshold."""
+    if cooldown_sec > 0:
+        time.sleep(cooldown_sec)
+    if max_temp_c is None:
+        return None
+    deadline = time.monotonic() + 90.0
+    last_t: Optional[float] = None
+    while time.monotonic() < deadline:
+        proc, _ = transport.run_tinymodel(rbin_tm, ["probe", "--json", "--no-stream"])
+        if proc.returncode != 0:
+            break
+        info = parse_last_json_line(proc.stdout)
+        t_c = (info.get("telemetry") or {}).get("max_temp_c")
+        last_t = float(t_c) if t_c is not None else None
+        if last_t is None or last_t <= max_temp_c:
+            return last_t
+        time.sleep(3.0)
+    return last_t
+
+
 def parse_llama_bench_json(raw_output: str) -> Tuple[float, float]:
     start = raw_output.find("[")
     end = raw_output.rfind("]")
@@ -920,72 +968,94 @@ def cmd_compare(args: argparse.Namespace) -> int:
             "tinymodel": [],
             "llamacpp_norepack": [],
             "llamacpp_kleidiai": [],
-            "llamacpp_default_unpinned": [],
         }
+        if not args.skip_unpinned:
+            engines_data["llamacpp_default_unpinned"] = []
         if rbin_candle and not is_qwen35 and args.include_candle:
             engines_data["candle"] = []
 
-        # Interleave engines within each repetition so thermal drift affects all engines equally!
+        # Randomize per-round engine execution order + optional thermal gate so thermal drift cannot bias order!
         for rep in range(args.reps):
-            print(f"[{model_path.name}] Interleaved round {rep + 1}/{args.reps}...", file=sys.stderr)
-
-            # 1. tinymodel (pinned)
-            tm_cmd = (
-                f"{taskset_pfx}{shlex.quote(rbin_tm)} bench -m {shlex.quote(remote_model)} "
-                f"-n {args.n_predict} -t {eff_threads} -c 1024 --json"
+            temp_before = wait_for_thermal_cooldown(
+                transport, rbin_tm, args.cooldown_temp_c, args.cooldown_sec if rep > 0 else 0.0
             )
-            out, err, rc, rss = run_remote_shell_timed(transport, tm_cmd)
-            if rc != 0:
-                raise RuntimeError(f"tinymodel failed: {err or out}")
-            tm_rec = parse_last_json_line(out)
-            tm_rss = (
-                tm_rec["peak_rss_bytes"] / 1048576.0
-                if tm_rec.get("peak_rss_bytes")
-                else rss
-            )
-            engines_data["tinymodel"].append(
-                {"pp_tps": tm_rec["pp_tps"], "tg_tps": tm_rec["tg_tps"], "peak_rss_mib": tm_rss}
+            order = [
+                k for k in ("tinymodel", "llamacpp_norepack", "llamacpp_kleidiai", "llamacpp_default_unpinned")
+                if k in engines_data
+            ]
+            rng = random.Random(42 + rep)
+            rng.shuffle(order)
+            temp_note = f" (temp={temp_before:.1f}C)" if temp_before is not None else ""
+            print(
+                f"[{model_path.name}] Round {rep + 1}/{args.reps}{temp_note} order={order}...",
+                file=sys.stderr,
             )
 
-            # 2. llama.cpp (--repack 0, pinned, zero-copy mmap)
-            ll0_cmd = (
-                f"{taskset_pfx}{shlex.quote(rbin_llama)} -m {shlex.quote(remote_model)} "
-                f"-p 512 -n {args.n_predict} -t {eff_threads} -r 1 --repack 0 -o json"
-            )
-            out0, err0, rc0, rss0 = run_remote_shell_timed(transport, ll0_cmd)
-            if rc0 != 0:
-                raise RuntimeError(f"llama-bench (--repack 0) failed: {err0 or out0}")
-            pp0, tg0 = parse_llama_bench_json(out0 + "\n" + err0)
-            engines_data["llamacpp_norepack"].append(
-                {"pp_tps": pp0, "tg_tps": tg0, "peak_rss_mib": rss0}
-            )
+            for eng_key in order:
+                if eng_key == "tinymodel":
+                    tm_cmd = (
+                        f"{taskset_pfx}{shlex.quote(rbin_tm)} bench -m {shlex.quote(remote_model)} "
+                        f"-n {args.n_predict} -t {eff_threads} -c 1024 --json"
+                    )
+                    out, err, rc, rss = run_remote_shell_timed(transport, tm_cmd)
+                    if rc != 0:
+                        raise RuntimeError(f"tinymodel failed: {err or out}")
+                    tm_rec = parse_last_json_line(out)
+                    tm_rss = (
+                        tm_rec["peak_rss_bytes"] / 1048576.0
+                        if tm_rec.get("peak_rss_bytes")
+                        else rss
+                    )
+                    tm_dirty = (
+                        tm_rec["private_dirty_bytes"] / 1048576.0
+                        if tm_rec.get("private_dirty_bytes")
+                        else None
+                    )
+                    engines_data["tinymodel"].append(
+                        {
+                            "pp_tps": tm_rec["pp_tps"],
+                            "tg_tps": tm_rec["tg_tps"],
+                            "peak_rss_mib": tm_rss,
+                            "private_dirty_mib": tm_dirty,
+                        }
+                    )
+                elif eng_key == "llamacpp_norepack":
+                    ll0_cmd = (
+                        f"{taskset_pfx}{shlex.quote(rbin_llama)} -m {shlex.quote(remote_model)} "
+                        f"-p 512 -n {args.n_predict} -t {eff_threads} -r 1 --repack 0 -o json"
+                    )
+                    out0, err0, rc0, rss0 = run_remote_shell_timed(transport, ll0_cmd)
+                    if rc0 != 0:
+                        raise RuntimeError(f"llama-bench (--repack 0) failed: {err0 or out0}")
+                    pp0, tg0 = parse_llama_bench_json(out0 + "\n" + err0)
+                    engines_data["llamacpp_norepack"].append(
+                        {"pp_tps": pp0, "tg_tps": tg0, "peak_rss_mib": rss0}
+                    )
+                elif eng_key == "llamacpp_kleidiai":
+                    ll1_cmd = (
+                        f"{taskset_pfx}{shlex.quote(rbin_llama)} -m {shlex.quote(remote_model)} "
+                        f"-p 512 -n {args.n_predict} -t {eff_threads} -r 1 --repack 1 -o json"
+                    )
+                    out1, err1, rc1, rss1 = run_remote_shell_timed(transport, ll1_cmd)
+                    if rc1 != 0:
+                        raise RuntimeError(f"llama-bench (--repack 1) failed: {err1 or out1}")
+                    pp1, tg1 = parse_llama_bench_json(out1 + "\n" + err1)
+                    engines_data["llamacpp_kleidiai"].append(
+                        {"pp_tps": pp1, "tg_tps": tg1, "peak_rss_mib": rss1}
+                    )
+                elif eng_key == "llamacpp_default_unpinned":
+                    lld_cmd = (
+                        f"{shlex.quote(rbin_llama)} -m {shlex.quote(remote_model)} "
+                        f"-p 512 -n {args.n_predict} -r 1 --repack 1 -o json"
+                    )
+                    outd, errd, rcd, rssd = run_remote_shell_timed(transport, lld_cmd)
+                    if rcd == 0:
+                        ppd, tgd = parse_llama_bench_json(outd + "\n" + errd)
+                        engines_data["llamacpp_default_unpinned"].append(
+                            {"pp_tps": ppd, "tg_tps": tgd, "peak_rss_mib": rssd}
+                        )
 
-            # 3. llama.cpp (KleidiAI --repack 1, pinned)
-            ll1_cmd = (
-                f"{taskset_pfx}{shlex.quote(rbin_llama)} -m {shlex.quote(remote_model)} "
-                f"-p 512 -n {args.n_predict} -t {eff_threads} -r 1 --repack 1 -o json"
-            )
-            out1, err1, rc1, rss1 = run_remote_shell_timed(transport, ll1_cmd)
-            if rc1 != 0:
-                raise RuntimeError(f"llama-bench (--repack 1) failed: {err1 or out1}")
-            pp1, tg1 = parse_llama_bench_json(out1 + "\n" + err1)
-            engines_data["llamacpp_kleidiai"].append(
-                {"pp_tps": pp1, "tg_tps": tg1, "peak_rss_mib": rss1}
-            )
-
-            # 4. llama.cpp (out-of-the-box default: unpinned all cores, default threads, --repack 1)
-            lld_cmd = (
-                f"{shlex.quote(rbin_llama)} -m {shlex.quote(remote_model)} "
-                f"-p 512 -n {args.n_predict} -r 1 --repack 1 -o json"
-            )
-            outd, errd, rcd, rssd = run_remote_shell_timed(transport, lld_cmd)
-            if rcd == 0:
-                ppd, tgd = parse_llama_bench_json(outd + "\n" + errd)
-                engines_data["llamacpp_default_unpinned"].append(
-                    {"pp_tps": ppd, "tg_tps": tgd, "peak_rss_mib": rssd}
-                )
-
-            # 5. HuggingFace candle (run once on rep 0 since ~1 tok/s takes ~60s per model)
+            # HuggingFace candle (run once on rep 0 since ~1 tok/s takes ~60s per model)
             if "candle" in engines_data and rep == 0 and rbin_candle:
                 cd_cmd = (
                     f"RAYON_NUM_THREADS={eff_threads} {taskset_pfx}{shlex.quote(rbin_candle)} "
@@ -1002,6 +1072,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
                         }
                     )
 
+        ref_samples = engines_data.get("llamacpp_norepack", [])
         summarized_engines: Dict[str, Any] = {}
         for eng_name, samples in engines_data.items():
             if not samples:
@@ -1009,12 +1080,20 @@ def cmd_compare(args: argparse.Namespace) -> int:
             pps = [float(s["pp_tps"]) for s in samples]
             tgs = [float(s["tg_tps"]) for s in samples]
             rsss = [float(s["peak_rss_mib"]) for s in samples if s.get("peak_rss_mib") is not None]
+            dirtys = [
+                float(s["private_dirty_mib"])
+                for s in samples
+                if s.get("private_dirty_mib") is not None
+            ]
             summarized_engines[eng_name] = {
                 "runs": len(samples),
                 "pp512_tps_median": round(statistics.median(pps), 2),
                 "tg_tps_median": round(statistics.median(tgs), 2),
                 "tg_tps_max": round(max(tgs), 2),
                 "peak_rss_mib_max": round(max(rsss), 1) if rsss else None,
+                "private_dirty_mib_max": round(max(dirtys), 1) if dirtys else None,
+                "paired_pp_vs_norepack": compute_paired_ratios_pct(samples, ref_samples, "pp_tps"),
+                "paired_tg_vs_norepack": compute_paired_ratios_pct(samples, ref_samples, "tg_tps"),
                 "raw": samples,
             }
 
@@ -1037,7 +1116,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     out_json = out_dir / f"{today}-{commit}-multi-engine.json"
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "git_commit": commit,
         "target": transport.describe(),
@@ -1047,17 +1126,26 @@ def cmd_compare(args: argparse.Namespace) -> int:
     }
     out_json.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
-    print(f"\n### Multi-Engine Comparison on `{probe_info.get('device_model')}` (Interleaved, `{cpu_mask or 'all'}`, `{eff_threads}T`)")
-    print("| Model | Engine | pp512 (tok/s) | tg64 (tok/s) | vs llama.cpp (mmap) | Peak RSS (MiB) |")
-    print("|---|---|---:|---:|---:|---:|")
+    print(
+        f"\n### Multi-Engine Comparison on `{probe_info.get('device_model')}` "
+        f"(Randomized Interleaved, `{cpu_mask or 'all'}`, `{eff_threads}T`)"
+    )
+    print(
+        "| Model | Engine | pp512 (tok/s) | Paired pp vs mmap | tg64 (tok/s) | Paired tg vs mmap | Peak RSS / Dirty (MiB) |"
+    )
+    print("|---|---|---:|---:|---:|---:|---:|")
     for cm in comparison_models:
-        base_tg = cm["engines"].get("llamacpp_norepack", {}).get("tg_tps_median") or 1.0
         for eng, st in cm["engines"].items():
-            rel = 100.0 * st["tg_tps_median"] / base_tg
+            p_pp = (st.get("paired_pp_vs_norepack") or {}).get("median_pct")
+            p_tg = (st.get("paired_tg_vs_norepack") or {}).get("median_pct")
+            pp_rel_s = f"{p_pp:.1f}%" if p_pp is not None else "-"
+            tg_rel_s = f"{p_tg:.1f}%" if p_tg is not None else "-"
             rss_s = f"{st['peak_rss_mib_max']:.1f}" if st["peak_rss_mib_max"] is not None else "-"
+            if st.get("private_dirty_mib_max") is not None:
+                rss_s += f" (dirty {st['private_dirty_mib_max']:.1f})"
             print(
-                f"| `{cm['model']}` | `{eng}` | {st['pp512_tps_median']:.2f} | "
-                f"**{st['tg_tps_median']:.2f}** | {rel:.1f}% | {rss_s} |"
+                f"| `{cm['model']}` | `{eng}` | {st['pp512_tps_median']:.2f} | {pp_rel_s} | "
+                f"**{st['tg_tps_median']:.2f}** | {tg_rel_s} | {rss_s} |"
             )
     print(f"\nSaved multi-engine comparison JSON -> {out_json}")
     return 0
@@ -1109,11 +1197,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_cmp.add_argument("--profile", choices=["edge", "micro"], default="edge")
     p_cmp.add_argument("--build", action="store_true")
     p_cmp.add_argument("-m", "--models", action="append", required=True)
-    p_cmp.add_argument("--reps", type=int, default=3, help="Interleaved repetitions per model")
+    p_cmp.add_argument("--reps", type=int, default=5, help="Randomized interleaved repetitions per model (default 5)")
     p_cmp.add_argument("-n", "--n-predict", type=int, default=64)
     p_cmp.add_argument("-t", "--threads", type=int, default=None)
     p_cmp.add_argument("--cluster-policy", choices=["all", "no-little", "mid-only"], default="no-little")
     p_cmp.add_argument("--cpu-mask", default=None)
+    p_cmp.add_argument("--cooldown-sec", type=float, default=2.0, help="Inter-round cooldown sleep seconds")
+    p_cmp.add_argument("--cooldown-temp-c", type=float, default=None, help="Optional SoC max_temp_c ceiling before starting round")
+    p_cmp.add_argument("--skip-unpinned", action="store_true", help="Skip unpinned llama.cpp run to reduce SoC thermal load")
     p_cmp.add_argument(
         "--llama-bench-bin",
         default=str(REPO_ROOT / "bench" / "tmp" / "llama-aarch64-musl" / "bin" / "llama-bench"),

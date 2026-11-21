@@ -1,20 +1,20 @@
 # Google Pixel 8（Tensor G3）设备档案与真机实测报告
 
-> 更新日期：2026-11-20（**已完成真机实测**，序列号 `3B131FDJH00216`，Android 16）  
-> 固定参考设备之一（见 [AGENTS.md](../../AGENTS.md) §8）。原始基准结果存档于 [2026-11-20-a80228f.json](../../bench/results/pixel-8/2026-11-20-a80228f.json)。
+> 更新日期：2026-11-21（**已完成 P0 测量校准 + P1 异构自动绑核 + P2 GDN/Attention/SwiGLU 向量化与并行化真机复测**，序列号 `3B131FDJH00216`，Android 16）  
+> 固定参考设备之一（见 [AGENTS.md](../../AGENTS.md) §8）。原始基准与多引擎对比存档于 [2026-11-20-a80228f.json](../../bench/results/pixel-8/2026-11-20-a80228f.json)、[2026-11-20-8efe61d-multi-engine.json](../../bench/results/pixel-8/2026-11-20-8efe61d-multi-engine.json) 与最新 5 轮随机交错结果 [2026-11-21-47861b7-multi-engine.json](../../bench/results/pixel-8/2026-11-21-47861b7-multi-engine.json)。
 
 ---
 
-## 1. 真机探测硬件规格（`tinymodel probe` 实测确认）
+## 1. 真机探测硬件规格（`tinymodel probe` 校准后实测确认）
 
 | 项 | Pixel 8 真机实测值 | 对比 Pi 5 / RK3588 |
 |---|---|---|
 | **SoC / OS** | **Google Tensor G3**（三星 4nm），Android 16（`sched_pixel` 调频器） | Pi 5：BCM2712 (16nm)；RK3588：8nm |
 | **三丛集异构 CPU** | - `cpu0..3`：**4× Cortex-A510 @ 1704 MHz**（掩码 `0x0f`）<br>- `cpu4..7`：**4× Cortex-A715 @ 2367 MHz**（掩码 `0xf0`）<br>- `cpu8`：**1× Cortex-X3 @ 2914 MHz**（掩码 `0x100`） | Pi 5：4×A76 同构；RK3588：4×A76 + 4×A55 |
 | **ISA 与 L1 自检** | 自动命中 **`Isa::NeonI8mm`**（`neon`、`dotprod`、`i8mm` 全支持；真机 L1 逐位自检 **PASSED**） | Pi 5 / RK3588 仅到 `dotprod`（无 `i8mm`） |
-| **物理内存与可用水位** | 总计 `7.39 GiB`（`7,941,091,328 B`），空闲可用 **`3.81 GiB`** | 足够无压力常驻 `Qwen3.5-2B`（峰值 RSS `1.17 GiB`） |
-| **实测 STREAM 持续带宽** | - **仅绑 `4×A715`（`0xf0`, 4T）**：**Read `31.17 GB/s` / Copy `40.34 GB/s`**<br>- 绑 `X3 + 4×A715`（`0x1f0`, 5T）：Read `21.84 GB/s` / Copy `25.37 GB/s`<br>- 单核 `1×X3`（`0x100`, 1T）：Read `19.19 GB/s`<br>- 全核混跑（8T，含 A510）：Read `15.61 GB/s`（**被小核拖慢一半！**） | Pi 5 约 `11.5 GB/s`；RK3588 约 `17–23 GB/s` |
-| **GPU / NPU** | Arm Mali-G715 MC7（Vulkan 1.3，M3 接入）；TPU 仅限系统 AICore 使用 | — |
+| **物理内存与可用水位** | 总计 `7.39 GiB`（`7,941,091,328 B`），空闲可用 **`3.81 – 4.11 GiB`** | 足够无压力常驻 `Qwen3.5-2B`（峰值 RSS `1.17 GiB`，真实脏内存仅 **`44.9 MiB`**） |
+| **DVFS 预热后 STREAM 持续带宽** | - **绑 `X3 + 4×A715`（`0x1f0`, 5T，350ms 预热 + 1s 持续测量）**：**Read `31.32 GB/s` / Copy `40.15 GB/s`**（修复前冷跑 5 轮仅测到升频前的 `21.84 GB/s`）<br>- 仅绑 `4×A715`（`0xf0`, 4T）：**Read `31.17 GB/s` / Copy `40.34 GB/s`**<br>- 全核混跑（含 A510）：Read `15.61 GB/s`（被顺序小核同步屏障拖慢一半） | Pi 5 约 `11.5 GB/s`；RK3588 约 `17–23 GB/s`；M4 约 `102 GB/s` |
+| **免 Root 温度与脏内存遥测** | `/system/bin/dumpsys thermalservice` 直接读取 `BIG` / `MID` / `LITTLE` / `G3D` / `TPU` / `VIRTUAL-SKIN` 温度与 `Thermal Status`；`/proc/self/smaps_rollup` 直接分离 `Private_Dirty` 与 `Pss_Anon` | Linux SBC 走 `/sys/class/thermal` + `smaps_rollup` |
 
 ---
 
@@ -65,46 +65,51 @@
 
 ---
 
-## 5. 多引擎同机交替对比实测（`tinymodel` vs `llama.cpp` vs `HuggingFace candle`）
+## 5. 多引擎同机随机交错对比实测（P0+P1+P2 优化前后）
 
-严格按照 [TESTING.md](../TESTING.md) §3.2 基准协议，使用 [device_harness.py](../../bench/device_harness.py) 的 `compare` 子命令在同一台 Google Pixel 8 上**逐轮交替运行**（保证热包络完全一致），对比了 5 组配置（原始结果存档于 [2026-11-20-8efe61d-multi-engine.json](../../bench/results/pixel-8/2026-11-20-8efe61d-multi-engine.json)）：
-- **`tinymodel`**（纯 Rust，`880 KB` 静态 ELF，绑 `0x1f0` 5T，零拷贝 `mmap`）
-- **`llama.cpp (--repack 0)`**（`b001d7b`，绑 `0x1f0` 5T，零拷贝 `mmap` 同口径对比）
-- **`llama.cpp (KleidiAI --repack 1)`**（绑 `0x1f0` 5T，Arm 官方手写汇编微内核 + 加载时内存重排）
-- **`llama.cpp (默认未绑核)`**（开箱默认 `-t 9 --repack 1`）
-- **HuggingFace `candle` v0.9.2**（纯 Rust 对照基线，`2.8 MB` 静态 ELF，绑 `0x1f0` 5T；不支持 `Qwen3.5` GDN 结构）
+严格按照 [TESTING.md](../TESTING.md) §3.2 基准协议，使用校准后的 [device_harness.py](../../bench/device_harness.py) `compare` 子命令在同一台 Google Pixel 8 上执行 **5 轮随机打乱引擎顺序 + 轮间冷却 + 逐轮配对比率中位数 `median(tm_i / llama_i)`**（结果存档于 [2026-11-21-47861b7-multi-engine.json](../../bench/results/pixel-8/2026-11-21-47861b7-multi-engine.json)）。
 
-### 5.1 实测对比总表（3 轮交替取中位数，热稳态）
+### 5.1 P1（开箱自动异构绑核）与 P2（GDN/SwiGLU/GQA 向量化与并行化）前后对比
 
-| 模型（Q4_0） | 引擎配置 | Prefill `pp512` (tok/s) | **Decode `tg64` (tok/s)** | 相对 `llama.cpp (mmap)` | **峰值内存 RSS (MiB)** |
-|---|---|---:|---:|---:|---:|
-| **`SmolLM2-360M`**<br>（文件 `219.1 MiB`） | **`tinymodel` (`0x1f0`)** | 187.74 | **`89.23`** | **93.3%**（超默认未绑核 **+15.4%**） | **`259.0`**（最低！） |
-| | `llama.cpp (--repack 0)` | 239.59 | **95.62** | 100.0% | 286.2 |
-| | `llama.cpp (KleidiAI repack=1)` | 470.29 | **100.12** | 104.7% | **494.7（2.26× 文件大小！）** |
-| | `llama.cpp (默认 9T 未绑核)` | 400.44 | **77.29** | 80.8% | 494.9 |
-| | `HuggingFace candle` | 12.04 | **1.34** | 1.4% | **904.9（3.49× `tinymodel`！）** |
-| **`Qwen3.5-0.8B`**<br>（文件 `483.7 MiB`） | **`tinymodel` (`0x1f0`)** | 59.32 | **`24.16`** | **84.5%** | **`524.6`**（省 `100–612 MiB`！） |
-| | `llama.cpp (--repack 0)` | 91.72 | **28.58** | 100.0% | 625.1 |
-| | `llama.cpp (KleidiAI repack=1)` | 178.07 | **30.85** | 107.9% | **1136.5（2.17× `tinymodel`！）** |
-| | `llama.cpp (默认 9T 未绑核)` | 180.66 | **30.86** | 108.0% | 1137.4 |
-| **`Llama-3.2-1B`**<br>（文件 `737.2 MiB`） | **`tinymodel` (`0x1f0`)** | 53.45 | **`18.35`** | **87.5%**（Prefill **89.3%**） | **`773.8`**（省 `104–2868 MiB`！） |
-| | `llama.cpp (--repack 0)` | 59.87 | **20.98** | 100.0% | 878.2 |
-| | `llama.cpp (KleidiAI repack=1)` | 123.25 | **25.40** | 121.1% | **1625.3（2.10× `tinymodel`！）** |
-| | `llama.cpp (默认 9T 未绑核)` | 158.75 | **20.66** | 98.5% | 1625.2 |
-| | `HuggingFace candle` | 7.09 | **1.00** | 4.8% | **3641.9（4.71× `tinymodel`，逼近 OOM！）** |
-| **`Qwen3.5-2B`**<br>（文件 `1158.6 MiB`） | **`tinymodel` (`0x1f0`)** | **29.94** | **`9.15`** | Decode **75.2%** / **Prefill `107.8%`！** | **`1199.6`**（省 `118–1332 MiB`！） |
-| | `llama.cpp (--repack 0)` | 27.77 | **12.16** | 100.0% | 1318.1 |
-| | `llama.cpp (KleidiAI repack=1)` | 77.00 | **13.89** | 114.2% | **2531.9（净多吃 `1.33 GiB` 内存！）** |
-| | `llama.cpp (默认 9T 未绑核)` | 83.02 | **15.33** | 126.1% | 2531.9 |
+1. **P1 开箱裸跑（不传 `taskset`、不传 `-t`）**：
+   - [affinity.rs](../../crates/tm-cpu/src/affinity.rs) 自动识别异构 big.LITTLE（仅当同 SoC 存在非小核时排除 `A53/A55/A510/A520`，因此 Pi Zero 2W 同构 `4×A53` 保留全部 4 核；Pixel 8 自动选 `5` 核 `0x1f0`；RK3588 自动选 `4` 核 `0xf0`；Apple M4 自动通过 `hw.perflevel0.physicalcpu` 选 `4` 颗 P 核；外部已设 `taskset` 时严格尊重用户掩码）。
+   - Pixel 8 直接执行 `./tinymodel bench -m .../Qwen3.5-0.8B-Q4_0.gguf`（零参数调优）：**`pp512 = 143.77 tok/s`、`tg64 = 43.49 tok/s`**（对比优化前未绑核的 `8.76–13.34 tok/s`，**开箱速度提升 `3.3× – 5.0×`**）。
+2. **P2 算子级剖析（`tinymodel profile` `pp256` + `tg32` 真机同机对比）**：
+   - **Pixel 8 (`5T`, `Qwen3.5-0.8B`)**：Prefill `gdn_recur+gnorm` 从 `778.63 ms` 降至 **`179.95 ms`（`4.33×`）**，`gdn_conv_l2` 从 `423.76 ms` 降至 **`172.57 ms`（`2.46×`）**；Decode `gdn_recur+gnorm` 从 `2193.9 us` 降至 **`907.7 us`（`2.42×`）**，`gdn_conv_l2` 从 `1507.4 us` 降至 **`729.6 us`（`2.07×`）**。
+   - **Pixel 8 (`5T`, `SmolLM2-360M`)**：Prefill `swiglu` 从 `228.19 ms` 降至 **`70.06 ms`（`3.26×`）**，`pp256` 总吞吐 **`+20.5%`**（`220.2 → 265.4 tok/s`）。
+   - **Apple M4 (`4T`, `Qwen3.5-0.8B`)**：`pp512` 跃升至 **`406.77 tok/s`（`+52.3%`）**，`tg64` 跃升至 **`127.81 tok/s`（`+13.3%`，达 M4 CPU `llama.cpp` 的 `118.5%`）**。
 
-### 5.2 核心结论与下一阶段（M3）精准发力点
+### 5.2 校准后 5 轮随机交错多引擎总表（Pixel 8，`0x1f0`，`5T`）
 
-1. **对比纯 Rust 生态（`HuggingFace candle`）：代际级领先**
-   - `tinymodel` 的 Decode 速度快 **`18.4× – 66.6×`**，Prefill 快 **`7.5× – 15.6×`**，内存占用仅为 `candle` 的 **`1/3.5 – 1/4.7`**（`Llama-1B` 上 `candle` 飙至 `3.64 GiB` 濒临触发 Android LMK 杀进程，而 `tinymodel` 仅 `773.8 MiB`），且原生支持 `Qwen3.5` GDN 混合结构。
-2. **对比 `llama.cpp` 的巨大内存优势（手机端生死线）**
-   - `tinymodel` 在全部四款模型上内存占用均为全场最低：比同为零拷贝的 `llama.cpp (--repack 0)` 省 **`27 – 118 MiB`**；
-   - **揭开了 `llama.cpp` 默认开启 `KleidiAI repack=1` 在手机端的隐蔽代价**：由于在加载时把权重重排进匿名堆内存同时保留 `mmap` 页，`llama.cpp (KleidiAI)` 的峰值 RSS 直接**翻了 2.1 倍**（`Qwen3.5-2B` 从 `1.20 GiB` 暴涨到 **`2.53 GiB`**；若跑 4B 模型将突破 `5 GiB` 直接在 8GB 手机上 OOM 崩溃！）。
-   - **对 `tinymodel` 的直接启示（验证 `F-04` 设计前瞻性！）**：在 M3 实现 **`Q4_0_4x8` 离线文件重排 + 直接零拷贝 `mmap`**，就能**同时白拿 KleidiAI 的 `2.5×` Prefill 提速与 `+15%` Decode 提速，且保持 `1.20 GiB` 的极低零拷贝内存，不花 1 字节额外脏内存**！
-3. **定位出的 2 个具体 CPU 内核提速点（M3 优先攻克）**
-   - **① `Qwen3.5` GDN 递推与卷积的 NEON 向量化**：目前 [ops.rs](../../crates/tm-cpu/src/ops.rs) 中的 `gdn_recurrence_parallel` 与 `l2_norm_inplace` 仍是标量循环（占 Pixel 8 单步耗时的 `15.2%`），改为手写 NEON `vfmaq_f32` 后预计直接追平 `Qwen3.5` 与 `llama.cpp (--repack 0)` 的大半差距；
-   - **② `Q4_0_4x8` 重排微内核 + `Q6_K` 4 行展开 `i8mm` 内核**：攻克 Prefill `pp512` 的 `2×` 差距以及 248k 词表 `lm_head`（占 `27.6%` 时间）的带宽效率。
+| 模型（Q4_0） | 引擎配置 | Prefill `pp512` (tok/s) | **配对 `pp` vs mmap** | **Decode `tg64` (tok/s)** | **配对 `tg` vs mmap** | **峰值 RSS / 真实脏内存 (MiB)** |
+|---|---|---:|---:|---:|---:|---:|
+| **`SmolLM2-360M`**<br>（文件 `219.1 MiB`） | **`tinymodel`** | **214.33**（前 187.7） | **89.7%**（前 78.4%） | **`88.26`** | **91.6%** | **`259.8`（dirty `43.6`）** |
+| | `llama.cpp (--repack 0)` | 238.38 | 100.0% | **95.20** | 100.0% | 286.0 |
+| | `llama.cpp (KleidiAI repack=1)` | 488.53 | 203.8% | **105.92** | 107.7% | **494.7（2.26× 文件！）** |
+| | `HuggingFace candle`¹ | 12.04 | 5.0% | **1.34** | 1.4% | **904.9（3.48× `tinymodel`！）** |
+| **`Qwen3.5-0.8B`**<br>（文件 `483.7 MiB`） | **`tinymodel`** | **126.40**（前 59.3！） | **`101.2%`（反超！）** | **`37.00`**（前 24.2！） | **`101.5%`（反超！）** | **`522.4`（dirty `43.5`）** |
+| | `llama.cpp (--repack 0)` | 122.61 | 100.0% | **36.57** | 100.0% | 624.8（多占 102 MiB） |
+| | `llama.cpp (KleidiAI repack=1)` | 236.42 | 192.8% | **40.15** | 108.4% | **1135.9（多占 `613.5 MiB`！）** |
+| **`Llama-3.2-1B`**<br>（文件 `737.2 MiB`） | **`tinymodel`** | **73.75**（前 53.5！） | **`106.9%`（反超！）** | **`21.69`** | **90.1%**（前 87.5%） | **`775.4`（dirty `41.1`）** |
+| | `llama.cpp (--repack 0)` | 62.45 | 100.0% | **23.07** | 100.0% | 876.8（多占 101 MiB） |
+| | `llama.cpp (KleidiAI repack=1)` | 160.99 | 237.1% | **27.96** | 118.3% | **1623.8（多占 `848.4 MiB`！）** |
+| | `HuggingFace candle`¹ | 7.09 | 11.4% | **1.00** | 4.3% | **3641.9（4.70× `tinymodel`！）** |
+| **`Qwen3.5-2B`**<br>（文件 `1158.6 MiB`） | **`tinymodel`** | **44.55**（前 29.9！） | **`108.5%`（反超！）** | **`13.53`**（前 9.15！） | **96.5%**（前 75.2%！） | **`1201.2`（dirty `44.9`）** |
+| | `llama.cpp (--repack 0)` | 41.84 | 100.0% | **14.52** | 100.0% | 1316.7（多占 116 MiB） |
+| | `llama.cpp (KleidiAI repack=1)` | 93.77 | 223.0% | **15.26** | 106.2% | **2530.4（多占 `1.30 GiB`！）** |
+
+> ¹ `candle` v0.9.2 数据取自首轮多引擎基线（不支持 `Qwen3.5` GDN 结构）。
+
+### 5.3 六大固定参考设备收益汇总与下一阶段（M3）焦点
+
+| 参考设备 | 本轮（P0 + P1 + P2）直接收益 |
+|---|---|
+| **Apple M4（macOS Host）** | 自动按 `hw.perflevel0.physicalcpu` 默认选 `4` 颗 P 核；`Qwen3.5-0.8B` CPU `pp512` **`+52.3%`**（`406.8 tok/s`）、`tg64` **`+13.3%`**（`127.8 tok/s`，追平本机 Metal 解码） |
+| **Google Pixel 8（Tensor G3）** | 开箱免 `taskset` 提速 **`3.3×–5.0×`**；同口径零拷贝下 **3 款模型 Prefill 反超 `llama.cpp (--repack 0)`（`101.2%–108.5%`）**，`Qwen3.5-0.8B` **Prefill 与 Decode 双双反超**；真实脏内存恒定 **`41.1–44.9 MiB`** |
+| **Rockchip RK3588（4×A76 + 4×A55）** | `ThreadPool` 自动排除 `4×A55` 小核绑定 `0xf0`（`4×A76`）；由于无 `i8mm`，纯 ARMv8.0 NEON 实现的 `gdn_recurrence_head` / `rms_norm_f32` / 并行 `conv1d` 与 `swiglu` 在 `Isa::NeonDotprod` 上同样获得完整 `2.5×–4×` 非矩阵算子提速 |
+| **Raspberry Pi 5（4×A76 同构）** | 自动保持 `4` 线程且 `n_thr <= 4` 维持单段连续权重预取；`Qwen3.5` GDN 非矩阵阶段从占 Prefill `~40%` 压至 `< 17%` |
+| **Pi 4B / Pi Zero 2W（`micro` 同构）** | 同构 `4×A53`（Zero 2W）不被误排核，保留全部 4 核；`NEON_V80_TABLE` 直接挂载新增 NEON `gdn_recurrence_head` / `rms_norm` / `l2_norm`，`micro` 纯静态二进制（`887 KB`）实测 **`0` 条 `sdot`/`smmla` 指令** |
+
+- **下一阶段（M3）最值得投入的两项硬核工作**：
+  1. **离线 `Q4_0_4x8` 交错权重重排（`F-04`）+ 零拷贝 `mmap` 微内核**：把 `llama.cpp (KleidiAI --repack 1)` 剩下的 **`2×` Prefill 优势与 `6%–18%` Decode 优势**拿到手，同时完全避免其 **`2.1×` 内存翻倍（省 `613 MiB – 1.30 GiB`）** 的致命缺陷；
+  2. **`lm_head (Q6_K)` `i8mm` / 多行展开与 MTP/Suffix 投机解码 + Mali-G715 Vulkan 后端**：当前 `Qwen3.5-0.8B` Decode 中 `248k` 词表 `lm_head` 已占 **31.4%**（`7.65 ms/tok`），是单步解码最大单一耗时项。

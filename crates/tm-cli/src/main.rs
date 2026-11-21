@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use tm_core::probe_process_rss_bytes;
+use tm_core::probe_process_memory_stats;
 use tm_cpu::{ThreadPool, active_kernels};
 use tm_gguf::GgufFile;
 use tm_models::{
@@ -79,7 +79,7 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
     let mut explicit_tokens: Option<Vec<u32>> = None;
     let mut out_path: Option<PathBuf> = None;
     let mut n_predict = 64usize;
-    let mut threads = 4usize;
+    let mut threads = tm_cpu::recommended_threads();
     let mut max_ctx = 2048usize;
     let mut use_metal = false;
     let mut json = false;
@@ -558,7 +558,7 @@ impl<'a> BenchMetrics<'a> {
         } else {
             0.0
         };
-        let (rss_bytes, peak_rss_bytes) = probe_process_rss_bytes();
+        let mstats = probe_process_memory_stats();
         println!(
             "{{\"schema_version\":1,\"model\":\"{}\",\"arch\":\"{}\",\"backend\":\"{}\",\
             \"isa\":\"{}\",\"device_name\":\"{}\",\"weights_mode\":\"{}\",\
@@ -566,7 +566,8 @@ impl<'a> BenchMetrics<'a> {
             \"load_ms\":{:.2},\"ttft_ms\":{:.2},\"pp_tokens\":{},\"pp_ms\":{:.2},\"pp_tps\":{:.2},\
             \"tg_tokens\":{},\"tg_ms\":{:.2},\"tg_tps\":{:.2},\"ms_per_tok\":{:.3},\
             \"decode_eff_bw_gbs\":{:.2},\"last_tok\":{},\"greedy_tokens_fnv1a64\":\"{}\",\
-            \"rss_bytes\":{},\"peak_rss_bytes\":{},\"telemetry_before\":{},\"telemetry_after\":{}}}",
+            \"rss_bytes\":{},\"peak_rss_bytes\":{},\"private_dirty_bytes\":{},\"pss_anon_bytes\":{},\
+            \"telemetry_before\":{},\"telemetry_after\":{}}}",
             probe::json_escape(self.model_name),
             probe::json_escape(self.arch),
             probe::json_escape(self.backend),
@@ -589,8 +590,10 @@ impl<'a> BenchMetrics<'a> {
             eff_bw_gbs,
             self.last_tok,
             self.greedy_hash,
-            probe::opt_u64_json(rss_bytes),
-            probe::opt_u64_json(peak_rss_bytes),
+            probe::opt_u64_json(mstats.rss_bytes),
+            probe::opt_u64_json(mstats.peak_rss_bytes),
+            probe::opt_u64_json(mstats.private_dirty_bytes),
+            probe::opt_u64_json(mstats.pss_anon_bytes),
             self.tel_before.to_json(),
             self.tel_after.to_json(),
         );
@@ -1218,11 +1221,13 @@ fn cmd_profile(opts: RunOpts) -> Result<()> {
             model.forward_token(&mut state, &pool, kt, 1, i, true)?;
         }
         state.reset();
-        let n_pp = 64usize.min(opts.max_ctx / 2);
-        let pp_ids = vec![1u32; n_pp];
+        let n_pp = 256usize.min(opts.max_ctx / 2);
+        let pp_ids: Vec<u32> = (0..n_pp).map(|i| ((i % 1000) + 1) as u32).collect();
+        let mut pp_prof = Qwen35DecodeProfile::default();
         let t_pp = Instant::now();
-        model.forward_batch(&mut state, &pool, kt, &pp_ids, 0, true)?;
-        let pp_ms = t_pp.elapsed().as_secs_f64() * 1e3;
+        model.forward_batch_profiled(&mut state, &pool, kt, &pp_ids, 0, true, &mut pp_prof)?;
+        let pp_total_ns = t_pp.elapsed().as_nanos() as u64;
+        let pp_ms = pp_total_ns as f64 / 1e6;
         let pp_tps = (n_pp as f64) / (pp_ms * 1e-3).max(1e-9);
 
         let n_runs = opts.n_predict.max(16);
@@ -1248,6 +1253,28 @@ fn cmd_profile(opts: RunOpts) -> Result<()> {
             "Prefill pp{}: {:.2} ms ({:.2} tok/s) | Decode tg{}: {:.1} us/tok ({:.2} tok/s)",
             n_pp, pp_ms, pp_tps, n_runs, total_us, dec_tps
         );
+        println!("{:<22} {:>10} {:>8}", "Prefill Stage", "Total ms", "Share%");
+        println!("{}", "-".repeat(44));
+        let pp_rows = [
+            ("embed+rope_tbl", pp_prof.embed_ns),
+            ("rms_norm", pp_prof.rms_norm_ns),
+            ("gdn_proj", pp_prof.gdn_proj_ns),
+            ("gdn_conv_l2", pp_prof.gdn_conv_norm_ns),
+            ("gdn_recur+gnorm", pp_prof.gdn_recur_ns),
+            ("gdn_ssm_out (Q5_K)", pp_prof.gdn_out_ns),
+            ("full_qkv", pp_prof.full_qkv_ns),
+            ("full_attn", pp_prof.full_attn_ns),
+            ("full_wo", pp_prof.full_wo_ns),
+            ("ffn_gate_up+silu", pp_prof.ffn_gate_up_ns),
+            ("ffn_down", pp_prof.ffn_down_ns),
+            ("lm_head (Q6_K)", pp_prof.lm_head_ns),
+        ];
+        for (name, ns) in pp_rows {
+            let ms = ns as f64 / 1e6;
+            let pct = 100.0 * (ns as f64) / (pp_total_ns as f64).max(1.0);
+            println!("{:<22} {:>10.2} {:>7.1}%", name, ms, pct);
+        }
+        println!();
         println!("{:<22} {:>10} {:>8}", "Decode Stage", "Wall us", "Share%");
         println!("{}", "-".repeat(44));
         let rows = [
@@ -1283,10 +1310,11 @@ fn cmd_profile(opts: RunOpts) -> Result<()> {
         model.forward_token(&mut state, &pool, kt, 1, i, true)?;
     }
 
-    let n_pp = 64usize.min(opts.max_ctx / 2);
-    let pp_ids = vec![1u32; n_pp];
+    let n_pp = 256usize.min(opts.max_ctx / 2);
+    let pp_ids: Vec<u32> = (0..n_pp).map(|i| ((i % 1000) + 1) as u32).collect();
+    let mut pp_prof = CpuDecodeProfile::default();
     let t_pp = Instant::now();
-    model.forward_batch(&mut state, &pool, kt, &pp_ids, 0, true)?;
+    model.forward_batch_profiled(&mut state, &pool, kt, &pp_ids, 0, true, &mut pp_prof)?;
     let pp_ms = t_pp.elapsed().as_secs_f64() * 1e3;
     let pp_tps = (n_pp as f64) / (pp_ms * 1e-3).max(1e-9);
 
@@ -1322,6 +1350,30 @@ fn cmd_profile(opts: RunOpts) -> Result<()> {
         "Prefill pp{}: {:.2} ms ({:.2} tok/s) | Decode tg{}: {:.1} us/tok ({:.2} tok/s, eff_bw={:.2} GB/s)",
         n_pp, pp_ms, pp_tps, n_runs, total_us, dec_tps, e2e_gbs
     );
+    println!();
+    println!("{:<20} {:>10} {:>8}", "Prefill Stage", "Total ms", "Share%");
+    println!("{}", "-".repeat(42));
+    let pp_rows: [(&str, u64); 11] = [
+        ("embed+rope_tbl", pp_prof.embed_ns),
+        ("attn_norm", pp_prof.attn_norm_ns),
+        ("attn_qkv", pp_prof.attn_qkv_ns),
+        ("rope+kv_store", pp_prof.rope_kv_ns),
+        ("gqa_attn", pp_prof.gqa_attn_ns),
+        ("attn_wo+res", pp_prof.attn_wo_ns),
+        ("ffn_norm", pp_prof.ffn_norm_ns),
+        ("ffn_gate_up", pp_prof.ffn_gate_up_ns),
+        ("swiglu", pp_prof.swiglu_ns),
+        ("ffn_down+res", pp_prof.ffn_down_ns),
+        ("lm_head", pp_prof.lm_head_ns),
+    ];
+    for (name, ns) in pp_rows {
+        if ns == 0 {
+            continue;
+        }
+        let ms = ns as f64 / 1e6;
+        let pct = 100.0 * (ns as f64) / (pp_prof.total_ns as f64).max(1.0);
+        println!("{:<20} {:>10.2} {:>7.1}%", name, ms, pct);
+    }
     println!();
     println!(
         "{:<20} {:>10} {:>8} {:>10} {:>12}",

@@ -286,20 +286,47 @@ pub fn matvec_f32(
 }
 
 /// RMS normalization: `out[i] = x[i] / sqrt(mean(x^2) + eps) * weight[i]`.
+#[inline]
 pub fn rms_norm(out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
-    let n = x.len();
-    debug_assert_eq!(out.len(), n);
-    debug_assert_eq!(weight.len(), n);
+    (crate::registry::active_kernels().rms_norm_f32)(out, x, weight, eps);
+}
 
-    let mut ss = 0.0f64;
-    for &v in x {
-        let vf = v as f64;
-        ss += vf * vf;
+/// Parallel multi-token RMS normalization across `n_tok` contiguous rows of width `dim`.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_batch_parallel(
+    pool: &ThreadPool,
+    kt: &KernelTable,
+    out: &mut [f32],
+    x: &[f32],
+    weight: &[f32],
+    eps: f32,
+    dim: usize,
+    n_tok: usize,
+) {
+    assert_eq!(out.len(), n_tok * dim);
+    assert_eq!(x.len(), n_tok * dim);
+    assert_eq!(weight.len(), dim);
+    if pool.num_threads() == 1 || n_tok <= 2 {
+        for t in 0..n_tok {
+            (kt.rms_norm_f32)(
+                &mut out[t * dim..(t + 1) * dim],
+                &x[t * dim..(t + 1) * dim],
+                weight,
+                eps,
+            );
+        }
+        return;
     }
-    let scale = (1.0 / ((ss / n as f64) + eps as f64).sqrt()) as f32;
-    for i in 0..n {
-        out[i] = x[i] * scale * weight[i];
-    }
+    let out_ptr = out.as_mut_ptr() as usize;
+    let chunk = dynamic_row_chunk(n_tok, pool.num_threads());
+    pool.parallel_for(n_tok, chunk, |t0, t1| {
+        for t in t0..t1 {
+            // SAFETY: Each token `t` writes to disjoint `[t * dim .. (t + 1) * dim)`.
+            let out_t =
+                unsafe { core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(t * dim), dim) };
+            (kt.rms_norm_f32)(out_t, &x[t * dim..(t + 1) * dim], weight, eps);
+        }
+    });
 }
 
 /// In-place Rotary Position Embedding across `n_heads` heads of dimension `head_dim`.
@@ -365,6 +392,30 @@ pub fn swiglu_inplace(gate: &mut [f32], up: &[f32]) {
         let silu = x / (1.0 + (-x).exp());
         *g = silu * u;
     }
+}
+
+/// Multi-threaded in-place SwiGLU activation (`gate[i] = silu(gate[i]) * up[i]`).
+/// Purely elementwise so parallel execution is bit-for-bit identical to `swiglu_inplace`.
+pub fn swiglu_inplace_parallel(pool: &ThreadPool, gate: &mut [f32], up: &[f32]) {
+    let n = gate.len();
+    assert_eq!(n, up.len());
+    if pool.num_threads() == 1 || n < 2048 {
+        swiglu_inplace(gate, up);
+        return;
+    }
+    let gate_ptr = gate.as_mut_ptr() as usize;
+    let blocks64 = n.div_ceil(64);
+    let chunk_blocks = dynamic_row_chunk(blocks64, pool.num_threads());
+    pool.parallel_for(blocks64, chunk_blocks, |b0, b1| {
+        let s = b0 * 64;
+        let e = (b1 * 64).min(n);
+        if s < e {
+            // SAFETY: Disjoint `[s..e)` 256-byte cache-line-aligned slices of `gate`.
+            let g_slice =
+                unsafe { core::slice::from_raw_parts_mut((gate_ptr as *mut f32).add(s), e - s) };
+            swiglu_inplace(g_slice, &up[s..e]);
+        }
+    });
 }
 
 /// In-place numerically stable softmax.
@@ -1089,18 +1140,214 @@ pub fn matmul_f32(
     }
 }
 
+/// Batched multi-token causal GQA attention against F16 KV cache (`start_pos .. start_pos + n_tok`).
+///
+/// Assumes `k_cache` and `v_cache` are already populated up through `start_pos + n_tok - 1`.
+/// Dispatches all `n_tok * n_heads` independent `(token, head)` pairs in ONE `ThreadPool` barrier,
+/// preserving the exact per-token, per-head operation order of single-token `gqa_attention_f16_kv`
+/// (`0` ULP difference, zero heap allocations).
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_f16_kv_batch_parallel(
+    pool: &ThreadPool,
+    kt: &KernelTable,
+    out: &mut [f32],
+    q: &[f32],
+    k_cache: &[u16],
+    v_cache: &[u16],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    start_pos: usize,
+    n_tok: usize,
+    max_ctx: usize,
+    scores: &mut [f32],
+) {
+    let q_dim = n_heads * head_dim;
+    assert_eq!(out.len(), n_tok * q_dim);
+    assert_eq!(q.len(), n_tok * q_dim);
+
+    const STACK_SCORES_CAP: usize = 2048;
+    if pool.num_threads() == 1 || n_tok == 0 || start_pos + n_tok > STACK_SCORES_CAP {
+        for t in 0..n_tok {
+            gqa_attention_f16_kv_parallel(
+                pool,
+                kt,
+                &mut out[t * q_dim..(t + 1) * q_dim],
+                &q[t * q_dim..(t + 1) * q_dim],
+                k_cache,
+                v_cache,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                start_pos + t + 1,
+                max_ctx,
+                scores,
+            );
+        }
+        return;
+    }
+
+    let kv_dim = n_kv_heads * head_dim;
+    let group = n_heads / n_kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let out_ptr = out.as_mut_ptr() as usize;
+    let total_tasks = n_tok * n_heads;
+    let chunk = dynamic_row_chunk(total_tasks, pool.num_threads());
+
+    pool.parallel_for(total_tasks, chunk, |idx0, idx1| {
+        let mut sc_buf = [0.0f32; STACK_SCORES_CAP];
+        for idx in idx0..idx1 {
+            let t = idx / n_heads;
+            let h = idx % n_heads;
+            let seq_len = start_pos + t + 1;
+            let kv_h = h / group;
+            let qh = &q[t * q_dim + h * head_dim..t * q_dim + (h + 1) * head_dim];
+            let sc = &mut sc_buf[..seq_len];
+
+            for (step, s_slot) in sc.iter_mut().enumerate() {
+                let k_off = step * kv_dim + kv_h * head_dim;
+                let kh = &k_cache[k_off..k_off + head_dim];
+                *s_slot = (kt.dot_f32_f16)(qh, kh) * scale;
+            }
+
+            softmax_inplace(sc);
+
+            // SAFETY: Each `idx = t * n_heads + h` owns a disjoint `[head_dim]` slice of `out`.
+            let oh = unsafe {
+                core::slice::from_raw_parts_mut(
+                    (out_ptr as *mut f32).add(t * q_dim + h * head_dim),
+                    head_dim,
+                )
+            };
+            oh.fill(0.0);
+            for (step, &w) in sc.iter().enumerate() {
+                let v_off = step * kv_dim + kv_h * head_dim;
+                let vh = &v_cache[v_off..v_off + head_dim];
+                (kt.axpy_f32_f16)(oh, w, vh);
+            }
+        }
+    });
+}
+
 /// In-place L2 normalization per head: `x[i] /= sqrt(sum(x^2) + eps)`.
 /// Matches `build_gdn_l2_norm` in llama.cpp (`models.h`).
 #[inline]
 pub fn l2_norm_inplace(x: &mut [f32], eps: f32) {
-    let mut ss = 0.0f64;
-    for &v in x.iter() {
-        let vf = v as f64;
-        ss += vf * vf;
-    }
-    let scale = (1.0 / (ss + eps as f64).sqrt()) as f32;
-    for v in x.iter_mut() {
-        *v *= scale;
+    (crate::registry::active_kernels().l2_norm_f32)(x, eps);
+}
+
+/// Parallelized Qwen3.5 GDN depthwise causal `conv1d + SiLU` + `q/k/v` split + `q/k` per-head `L2` norm.
+///
+/// Parallelizes across all `conv_dim = 2 * k_gdn_dim + v_gdn_dim` independent channels (`6144` on
+/// Qwen3.5-0.8B/2B) and then across all `n_tok * 2 * hk` independent `q`/`k` head slices,
+/// preserving the exact per-channel state update and per-token arithmetic order of `n_tok == 1`.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_conv1d_silu_split_parallel(
+    pool: &ThreadPool,
+    kt: &KernelTable,
+    qkv_buf: &[f32],
+    conv_hist: &mut [f32],
+    conv1d: &[f32],
+    q_buf: &mut [f32],
+    k_buf: &mut [f32],
+    v_buf: &mut [f32],
+    d_conv: usize,
+    hk: usize,
+    s_dim: usize,
+    v_gdn_dim: usize,
+    rms_eps: f32,
+    n_tok: usize,
+) {
+    let k_gdn_dim = hk * s_dim;
+    let conv_dim = 2 * k_gdn_dim + v_gdn_dim;
+    let hist_len = d_conv - 1;
+    assert_eq!(qkv_buf.len(), n_tok * conv_dim);
+    assert_eq!(conv_hist.len(), conv_dim * hist_len);
+    assert_eq!(conv1d.len(), conv_dim * d_conv);
+    assert_eq!(q_buf.len(), n_tok * k_gdn_dim);
+    assert_eq!(k_buf.len(), n_tok * k_gdn_dim);
+    assert_eq!(v_buf.len(), n_tok * v_gdn_dim);
+
+    // 1. Parallelize depthwise causal conv1d + SiLU across independent channels `[0..conv_dim)`
+    let hist_ptr = conv_hist.as_mut_ptr() as usize;
+    let q_ptr = q_buf.as_mut_ptr() as usize;
+    let k_ptr = k_buf.as_mut_ptr() as usize;
+    let v_ptr = v_buf.as_mut_ptr() as usize;
+    let ch_blocks = conv_dim.div_ceil(32);
+    let ch_chunk = dynamic_row_chunk(ch_blocks, pool.num_threads());
+
+    pool.parallel_for(ch_blocks, ch_chunk, |b0, b1| {
+        let ch_start = b0 * 32;
+        let ch_end = (b1 * 32).min(conv_dim);
+        for ch in ch_start..ch_end {
+            // SAFETY: Each channel `ch` owns disjoint `[ch * hist_len .. (ch + 1) * hist_len]`.
+            let h_slice = unsafe {
+                core::slice::from_raw_parts_mut((hist_ptr as *mut f32).add(ch * hist_len), hist_len)
+            };
+            let w_slice = &conv1d[ch * d_conv..(ch + 1) * d_conv];
+
+            for t in 0..n_tok {
+                let cur_val = qkv_buf[t * conv_dim + ch];
+                let mut sum = 0.0f32;
+                for tap in 0..hist_len {
+                    sum += h_slice[tap] * w_slice[tap];
+                }
+                sum += cur_val * w_slice[hist_len];
+                for tap in 0..hist_len.saturating_sub(1) {
+                    h_slice[tap] = h_slice[tap + 1];
+                }
+                if hist_len > 0 {
+                    h_slice[hist_len - 1] = cur_val;
+                }
+                let activated = sum / (1.0 + (-sum).exp());
+                // SAFETY: Each `(t, ch)` maps to a unique index in `q_buf`, `k_buf`, or `v_buf`.
+                unsafe {
+                    if ch < k_gdn_dim {
+                        *(q_ptr as *mut f32).add(t * k_gdn_dim + ch) = activated;
+                    } else if ch < 2 * k_gdn_dim {
+                        *(k_ptr as *mut f32).add(t * k_gdn_dim + (ch - k_gdn_dim)) = activated;
+                    } else {
+                        *(v_ptr as *mut f32).add(t * v_gdn_dim + (ch - 2 * k_gdn_dim)) = activated;
+                    }
+                }
+            }
+        }
+    });
+
+    // 2. Per-head L2 norm on `q_buf` and `k_buf` (`2 * n_tok * hk` independent `[s_dim]` slices)
+    let total_qk_heads = 2 * n_tok * hk;
+    if pool.num_threads() == 1 || n_tok == 1 {
+        for t in 0..n_tok {
+            for kh in 0..hk {
+                let off = t * k_gdn_dim + kh * s_dim;
+                (kt.l2_norm_f32)(&mut q_buf[off..off + s_dim], rms_eps);
+                (kt.l2_norm_f32)(&mut k_buf[off..off + s_dim], rms_eps);
+            }
+        }
+    } else {
+        let qk_chunk = dynamic_row_chunk(total_qk_heads, pool.num_threads());
+        pool.parallel_for(total_qk_heads, qk_chunk, |idx0, idx1| {
+            let n_q_heads = n_tok * hk;
+            for idx in idx0..idx1 {
+                if idx < n_q_heads {
+                    // SAFETY: Disjoint `[idx * s_dim .. (idx + 1) * s_dim)` slice in `q_buf`.
+                    let slice = unsafe {
+                        core::slice::from_raw_parts_mut((q_ptr as *mut f32).add(idx * s_dim), s_dim)
+                    };
+                    (kt.l2_norm_f32)(slice, rms_eps);
+                } else {
+                    let k_idx = idx - n_q_heads;
+                    // SAFETY: Disjoint `[k_idx * s_dim .. (k_idx + 1) * s_dim)` slice in `k_buf`.
+                    let slice = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            (k_ptr as *mut f32).add(k_idx * s_dim),
+                            s_dim,
+                        )
+                    };
+                    (kt.l2_norm_f32)(slice, rms_eps);
+                }
+            }
+        });
     }
 }
 
@@ -1128,6 +1375,69 @@ pub fn gdn_recurrence_parallel(
     head_dim: usize,
     n_tok: usize,
 ) {
+    let kt = crate::registry::active_kernels();
+    gdn_recurrence_with_gate_inner(
+        pool, kt, q, k, v, g_exp, beta, state, out, None, n_k_heads, n_v_heads, head_dim, n_tok,
+    );
+}
+
+/// Multi-head Gated DeltaNet recurrent step + fused L1-resident per-head gated `RMSNorm * SiLU(z)`.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_recurrence_gated_parallel(
+    pool: &ThreadPool,
+    kt: &KernelTable,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g_exp: &[f32],
+    beta: &[f32],
+    state: &mut [f32],
+    out: &mut [f32],
+    gate_z: &[f32],
+    ssm_norm: &[f32],
+    rms_eps: f32,
+    n_k_heads: usize,
+    n_v_heads: usize,
+    head_dim: usize,
+    n_tok: usize,
+) {
+    assert_eq!(gate_z.len(), n_tok * n_v_heads * head_dim);
+    assert_eq!(ssm_norm.len(), head_dim);
+    gdn_recurrence_with_gate_inner(
+        pool,
+        kt,
+        q,
+        k,
+        v,
+        g_exp,
+        beta,
+        state,
+        out,
+        Some((gate_z, ssm_norm, rms_eps)),
+        n_k_heads,
+        n_v_heads,
+        head_dim,
+        n_tok,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gdn_recurrence_with_gate_inner(
+    pool: &ThreadPool,
+    kt: &KernelTable,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g_exp: &[f32],
+    beta: &[f32],
+    state: &mut [f32],
+    out: &mut [f32],
+    gate_norm: Option<(&[f32], &[f32], f32)>,
+    n_k_heads: usize,
+    n_v_heads: usize,
+    head_dim: usize,
+    n_tok: usize,
+) {
     let k_dim = n_k_heads * head_dim;
     let v_dim = n_v_heads * head_dim;
     let state_per_head = head_dim * head_dim;
@@ -1149,6 +1459,7 @@ pub fn gdn_recurrence_parallel(
     };
 
     pool.parallel_for(n_v_heads, chunk, |vh0, vh1| {
+        let mut norm_tmp = [0.0f32; 256];
         for vh in vh0..vh1 {
             let kh = vh % n_k_heads;
             // SAFETY: Each value head `vh` owns disjoint `[vh * state_per_head .. (vh + 1) * state_per_head]`.
@@ -1174,25 +1485,30 @@ pub fn gdn_recurrence_parallel(
                     )
                 };
 
-                for j in 0..head_dim {
-                    let s_row = &mut s_vh[j * head_dim..(j + 1) * head_dim];
-                    let mut sum_kv = 0.0f32;
-                    for (s_val, &kv) in s_row.iter_mut().zip(k_h.iter()) {
-                        let decayed = *s_val * g;
-                        *s_val = decayed;
-                        sum_kv += decayed * kv;
+                (kt.gdn_recurrence_head)(q_h, k_h, v_h, g, b, scale, s_vh, o_h, head_dim);
+
+                if let Some((gate_z, ssm_norm, rms_eps)) = gate_norm {
+                    let z_off = t * v_dim + vh * head_dim;
+                    let z_h = &gate_z[z_off..z_off + head_dim];
+                    if head_dim <= norm_tmp.len() {
+                        (kt.rms_norm_f32)(&mut norm_tmp[..head_dim], o_h, ssm_norm, rms_eps);
+                        for i in 0..head_dim {
+                            let z = z_h[i];
+                            o_h[i] = norm_tmp[i] * (z / (1.0 + (-z).exp()));
+                        }
+                    } else {
+                        let mut ss = 0.0f64;
+                        for &ov in o_h.iter() {
+                            let vf = ov as f64;
+                            ss += vf * vf;
+                        }
+                        let n_scale =
+                            (1.0 / ((ss / head_dim as f64) + rms_eps as f64).sqrt()) as f32;
+                        for i in 0..head_dim {
+                            let z = z_h[i];
+                            o_h[i] = ((o_h[i] * n_scale) * ssm_norm[i]) * (z / (1.0 + (-z).exp()));
+                        }
                     }
-
-                    let delta_j = (v_h[j] - sum_kv) * b;
-
-                    let mut sum_oq = 0.0f32;
-                    for ((s_val, &kv), &qv) in s_row.iter_mut().zip(k_h.iter()).zip(q_h.iter()) {
-                        let updated = *s_val + delta_j * kv;
-                        *s_val = updated;
-                        sum_oq += updated * qv;
-                    }
-
-                    o_h[j] = sum_oq * scale;
                 }
             }
         }

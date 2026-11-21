@@ -370,4 +370,76 @@ fn main() {
             out_q6.iter().take(8).sum::<f32>()
         );
     }
+
+    // Benchmark Qwen3.5 GDN Recurrence (16 heads x 128x128 state) + RMSNorm across ISAs
+    let hv = 16usize;
+    let hd = 128usize;
+    let q_gdn: Vec<f32> = (0..hv * hd)
+        .map(|i| ((i % 97) as f32 - 48.0) * 0.002)
+        .collect();
+    let k_gdn: Vec<f32> = (0..hv * hd)
+        .map(|i| ((i % 89) as f32 - 44.0) * 0.002)
+        .collect();
+    let v_gdn: Vec<f32> = (0..hv * hd)
+        .map(|i| ((i % 83) as f32 - 41.0) * 0.005)
+        .collect();
+    let norm_w: Vec<f32> = vec![1.0; 2048];
+    println!("\n--- GDN Recurrence (16 heads x 128x128, 4 threads) & RMSNorm(2048) ---");
+    for &isa in &isas {
+        let kt = select_kernels(isa);
+        let mut s_all = vec![0.01f32; hv * hd * hd];
+        let mut o_all = vec![0.0f32; hv * hd];
+        let s_ptr = s_all.as_mut_ptr() as usize;
+        let o_ptr = o_all.as_mut_ptr() as usize;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let run_gdn = || {
+            pool4.parallel_for(hv, 4, |h0, h1| {
+                for h in h0..h1 {
+                    // SAFETY: Disjoint state and output slices per head `h`.
+                    let (sh, oh) = unsafe {
+                        (
+                            core::slice::from_raw_parts_mut(
+                                (s_ptr as *mut f32).add(h * hd * hd),
+                                hd * hd,
+                            ),
+                            core::slice::from_raw_parts_mut((o_ptr as *mut f32).add(h * hd), hd),
+                        )
+                    };
+                    (kt.gdn_recurrence_head)(
+                        &q_gdn[h * hd..(h + 1) * hd],
+                        &k_gdn[h * hd..(h + 1) * hd],
+                        &v_gdn[h * hd..(h + 1) * hd],
+                        0.92,
+                        0.35,
+                        scale,
+                        sh,
+                        oh,
+                        hd,
+                    );
+                }
+            });
+        };
+        run_gdn();
+        let iters = 500;
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            run_gdn();
+        }
+        let gdn_us = t0.elapsed().as_secs_f64() * 1e6 / (iters as f64);
+
+        let mut rms_out = vec![0.0f32; 2048];
+        let t_r = Instant::now();
+        for _ in 0..2000 {
+            (kt.rms_norm_f32)(&mut rms_out, &src_f32[..2048], &norm_w, 1e-6);
+        }
+        let rms_us = t_r.elapsed().as_secs_f64() * 1e6 / 2000.0;
+
+        println!(
+            "{:<10} gdn_recur_16h={:>6.2} us/layer | rms_norm(2048)={:>5.3} us | chk={:.3}",
+            isa.name(),
+            gdn_us,
+            rms_us,
+            o_all[0] + rms_out[0]
+        );
+    }
 }

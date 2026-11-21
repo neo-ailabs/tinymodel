@@ -12,7 +12,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use tm_core::{
     BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, f32_to_f16,
-    probe_process_rss_bytes, probe_system_memory,
+    probe_process_memory_stats, probe_system_memory,
 };
 use tm_cpu::isa::{detect_caps, effective_isa, supported_isas};
 use tm_cpu::{ThreadPool, generic, select_kernels};
@@ -54,6 +54,8 @@ pub fn opt_f64_json(v: Option<f64>, decimals: usize) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct TelemetrySnapshot {
     pub max_temp_c: Option<f64>,
+    pub skin_temp_c: Option<f64>,
+    pub thermal_status: Option<i64>,
     pub zones: Vec<(String, f64)>,
     pub cur_freq_mhz_max: Option<f64>,
     pub governor: Option<String>,
@@ -66,7 +68,7 @@ impl TelemetrySnapshot {
         let zones_json: Vec<String> = self
             .zones
             .iter()
-            .take(8)
+            .take(10)
             .map(|(k, v)| format!("{{\"zone\":\"{}\",\"temp_c\":{v:.2}}}", json_escape(k)))
             .collect();
         let gov = match &self.governor {
@@ -77,9 +79,15 @@ impl TelemetrySnapshot {
             Some(s) => format!("\"{}\"", json_escape(s)),
             None => "null".to_string(),
         };
+        let t_stat = match self.thermal_status {
+            Some(s) => s.to_string(),
+            None => "null".to_string(),
+        };
         format!(
-            "{{\"max_temp_c\":{},\"cur_freq_mhz_max\":{},\"governor\":{},\"battery_power_mw\":{},\"battery_status\":{},\"zones\":[{}]}}",
+            "{{\"max_temp_c\":{},\"skin_temp_c\":{},\"thermal_status\":{},\"cur_freq_mhz_max\":{},\"governor\":{},\"battery_power_mw\":{},\"battery_status\":{},\"zones\":[{}]}}",
             opt_f64_json(self.max_temp_c, 2),
+            opt_f64_json(self.skin_temp_c, 2),
+            t_stat,
             opt_f64_json(self.cur_freq_mhz_max, 1),
             gov,
             opt_f64_json(self.battery_power_mw, 1),
@@ -87,6 +95,67 @@ impl TelemetrySnapshot {
             zones_json.join(",")
         )
     }
+}
+
+/// Parses Android `dumpsys thermalservice` output (`Cached temperatures:` + `Thermal Status:`).
+pub fn parse_android_dumpsys_thermal(raw: &str) -> (Option<i64>, Option<f64>, Vec<(String, f64)>) {
+    let mut status: Option<i64> = None;
+    let mut skin_c: Option<f64> = None;
+    let mut zones: Vec<(String, f64)> = Vec::new();
+    let mut in_cached = false;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Thermal Status:") {
+            status = rest.trim().parse::<i64>().ok();
+            continue;
+        }
+        if trimmed.starts_with("Cached temperatures:") {
+            in_cached = true;
+            continue;
+        }
+        if in_cached && !trimmed.starts_with("Temperature{") {
+            in_cached = false;
+        }
+        if !in_cached {
+            continue;
+        }
+        // Format: `Temperature{mValue=60.000004, mType=0, mName=BIG, mStatus=0}`
+        let Some(inner) = trimmed
+            .strip_prefix("Temperature{")
+            .and_then(|s| s.strip_suffix('}'))
+        else {
+            continue;
+        };
+        let mut val_opt: Option<f64> = None;
+        let mut type_opt: Option<i64> = None;
+        let mut name_opt: Option<&str> = None;
+        for part in inner.split(',') {
+            let Some((k, v)) = part.trim().split_once('=') else {
+                continue;
+            };
+            match k.trim() {
+                "mValue" => val_opt = v.trim().parse::<f64>().ok(),
+                "mType" => type_opt = v.trim().parse::<i64>().ok(),
+                "mName" => name_opt = Some(v.trim()),
+                _ => {}
+            }
+        }
+        if let (Some(temp_c), Some(name)) = (val_opt, name_opt)
+            && (5.0..=130.0).contains(&temp_c)
+        {
+            if name == "VIRTUAL-SKIN" || type_opt == Some(3) {
+                skin_c = Some(temp_c);
+            }
+            // Keep primary SoC/skin/battery sensors (`mType >= 0` or `soc_therm`)
+            if type_opt.unwrap_or(-1) >= 0 || name == "soc_therm" {
+                zones.push((name.to_string(), temp_c));
+            }
+        }
+    }
+
+    zones.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(core::cmp::Ordering::Equal));
+    (status, skin_c, zones)
 }
 
 /// Collects non-privileged thermal, cpufreq, and battery power telemetry from sysfs when present.
@@ -125,6 +194,22 @@ pub fn collect_telemetry() -> TelemetrySnapshot {
             }
         }
         zones.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(core::cmp::Ordering::Equal));
+        snap.max_temp_c = zones.first().map(|z| z.1);
+        snap.zones = zones;
+    }
+
+    // 1b. Android fallback: `/system/bin/dumpsys thermalservice` when SELinux hides `/sys/class/thermal`
+    if snap.zones.is_empty()
+        && Path::new("/system/bin/dumpsys").exists()
+        && let Ok(out) = std::process::Command::new("/system/bin/dumpsys")
+            .arg("thermalservice")
+            .output()
+        && out.status.success()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        let (st, skin, zones) = parse_android_dumpsys_thermal(&text);
+        snap.thermal_status = st;
+        snap.skin_temp_c = skin;
         snap.max_temp_c = zones.first().map(|z| z.1);
         snap.zones = zones;
     }
@@ -531,25 +616,33 @@ pub fn run_stream_bandwidth(
         });
     };
 
-    // Warmup Read + Copy
-    run_read();
+    // Ramp DVFS governor (`sched_pixel` / `schedutil`) for >= 350 ms BEFORE measuring,
+    // otherwise mobile cores start at 500 MHz and under-report DRAM bandwidth!
+    let t_warm = Instant::now();
+    while t_warm.elapsed().as_secs_f64() < 0.35 {
+        run_read();
+    }
     dst.copy_from_slice(&src);
 
+    // Measure sustained Read for >= 1.0 s (and >= 8 sweeps), taking the best steady-state sweep
+    // and also keeping the sustained mean if needed.
     let mut best_read_sec = f64::MAX;
-    for _ in 0..6 {
+    let mut read_iters = 0usize;
+    let t_read_total = Instant::now();
+    while read_iters < 8 || t_read_total.elapsed().as_secs_f64() < 1.0 {
         let t0 = Instant::now();
         run_read();
         let sec = t0.elapsed().as_secs_f64();
         if sec < best_read_sec {
             best_read_sec = sec;
         }
+        read_iters += 1;
     }
 
-    // Multi-threaded Copy via safe slice splitting? No `unsafe` allowed in `tm-cli`:
-    // for 1 thread `copy_from_slice` is optimal; for multi-thread we use `std::thread::scope`
-    // over `dst.chunks_mut(chunk)` which is 100% safe Rust!
     let mut best_copy_sec = f64::MAX;
-    for _ in 0..6 {
+    let mut copy_iters = 0usize;
+    let t_copy_total = Instant::now();
+    while copy_iters < 8 || t_copy_total.elapsed().as_secs_f64() < 1.0 {
         let t0 = Instant::now();
         std::thread::scope(|s| {
             for (d_chunk, s_chunk) in dst.chunks_mut(chunk).zip(src.chunks(chunk)) {
@@ -562,6 +655,7 @@ pub fn run_stream_bandwidth(
         if sec < best_copy_sec {
             best_copy_sec = sec;
         }
+        copy_iters += 1;
     }
 
     let sink: u64 = partials
@@ -595,10 +689,7 @@ pub struct ProbeOpts {
 }
 
 pub fn parse_probe_opts(args: &[String]) -> Result<ProbeOpts> {
-    let default_threads = std::thread::available_parallelism()
-        .map(|n| n.get().min(8))
-        .unwrap_or(4);
-    let mut threads = default_threads;
+    let mut threads = tm_cpu::recommended_threads();
     let mut stream_mib: Option<usize> = None;
     let mut skip_stream = false;
     let mut json = false;
@@ -651,9 +742,7 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
     let active = effective_isa();
     let clusters = detect_host_clusters();
     let mem_budget = probe_system_memory().ok();
-    let (rss_bytes, peak_rss_bytes) = probe_process_rss_bytes();
     let (self_ok, tested_isas, self_err) = run_kernel_self_check();
-    let telemetry = collect_telemetry();
 
     let stream = if opts.skip_stream {
         None
@@ -664,6 +753,8 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
             mem_budget.map(|b| b.available_bytes),
         ))
     };
+    let mem_stats = probe_process_memory_stats();
+    let telemetry = collect_telemetry();
 
     if opts.json {
         let isas_json: Vec<String> = tested_isas.iter().map(|s| format!("\"{s}\"")).collect();
@@ -711,6 +802,7 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
             \"caps\":{{\"neon\":{},\"dotprod\":{},\"i8mm\":{},\"avx2\":{},\"avx512_vnni\":{}}},\
             \"supported_isas\":[{}],\"clusters\":[{}],\"memory\":{},\
             \"process_rss_bytes\":{},\"process_peak_rss_bytes\":{},\
+            \"process_private_dirty_bytes\":{},\"process_pss_anon_bytes\":{},\
             \"kernel_self_check\":{{\"passed\":{},\"error\":{}}},\
             \"stream_bw\":{},\"telemetry\":{}}}",
             json_escape(&model_name),
@@ -726,8 +818,10 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
             isas_json.join(","),
             clusters_json.join(","),
             mem_json,
-            opt_u64_json(rss_bytes),
-            opt_u64_json(peak_rss_bytes),
+            opt_u64_json(mem_stats.rss_bytes),
+            opt_u64_json(mem_stats.peak_rss_bytes),
+            opt_u64_json(mem_stats.private_dirty_bytes),
+            opt_u64_json(mem_stats.pss_anon_bytes),
             self_ok,
             err_json,
             stream_json,
@@ -839,5 +933,23 @@ mod tests {
         let (ok, isas, err) = run_kernel_self_check();
         assert!(ok, "self-check failed: {err:?}");
         assert!(!isas.is_empty());
+    }
+
+    #[test]
+    fn parses_android_dumpsys_thermal_output() {
+        let sample = "\
+Thermal Status: 1
+Cached temperatures:
+\tTemperature{mValue=57.000004, mType=0, mName=LITTLE, mStatus=0}
+\tTemperature{mValue=27.765001, mType=-1, mName=neutral_therm, mStatus=0}
+\tTemperature{mValue=60.000004, mType=0, mName=BIG, mStatus=0}
+\tTemperature{mValue=37.05332, mType=3, mName=VIRTUAL-SKIN, mStatus=0}
+HAL Ready: true
+";
+        let (st, skin, zones) = parse_android_dumpsys_thermal(sample);
+        assert_eq!(st, Some(1));
+        assert!((skin.unwrap() - 37.05332).abs() < 1e-3);
+        assert_eq!(zones[0].0, "BIG");
+        assert!((zones[0].1 - 60.0).abs() < 1e-3);
     }
 }

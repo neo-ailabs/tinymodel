@@ -201,6 +201,15 @@ pub fn probe_system_memory() -> Result<MemoryBudget, MemProbeError> {
     Err(MemProbeError::UnsupportedPlatform)
 }
 
+/// Detailed process memory counters distinguishing clean file-backed `mmap` pages from private dirty RAM.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcessMemoryStats {
+    pub rss_bytes: Option<u64>,
+    pub peak_rss_bytes: Option<u64>,
+    pub private_dirty_bytes: Option<u64>,
+    pub pss_anon_bytes: Option<u64>,
+}
+
 /// Parses `(VmRSS, VmHWM)` in bytes from `/proc/self/status` text (current & peak RSS).
 pub fn parse_proc_status_rss(status_text: &str) -> (Option<u64>, Option<u64>) {
     let mut rss_kb: Option<u64> = None;
@@ -224,18 +233,61 @@ pub fn parse_proc_status_rss(status_text: &str) -> (Option<u64>, Option<u64>) {
     (rss_kb.map(|v| v * 1024), hwm_kb.map(|v| v * 1024))
 }
 
+/// Parses `(Private_Dirty, Pss_Anon)` in bytes from `/proc/self/smaps_rollup` text.
+pub fn parse_smaps_rollup(rollup_text: &str) -> (Option<u64>, Option<u64>) {
+    let mut priv_dirty_kb: Option<u64> = None;
+    let mut pss_anon_kb: Option<u64> = None;
+    for line in rollup_text.lines() {
+        let Some((k, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Some(tok) = rest.split_whitespace().next() else {
+            continue;
+        };
+        let Ok(val) = tok.parse::<u64>() else {
+            continue;
+        };
+        match k.trim() {
+            "Private_Dirty" => priv_dirty_kb = Some(val),
+            "Pss_Anon" => pss_anon_kb = Some(val),
+            _ => {}
+        }
+    }
+    (
+        priv_dirty_kb.map(|v| v * 1024),
+        pss_anon_kb.map(|v| v * 1024),
+    )
+}
+
 /// Reads current `(rss_bytes, peak_rss_bytes)` of the running process when `/proc/self/status` is available.
 pub fn probe_process_rss_bytes() -> (Option<u64>, Option<u64>) {
+    let st = probe_process_memory_stats();
+    (st.rss_bytes, st.peak_rss_bytes)
+}
+
+/// Reads RSS, peak RSS (`VmHWM`), `Private_Dirty`, and `Pss_Anon` from `/proc/self/{status,smaps_rollup}`.
+pub fn probe_process_memory_stats() -> ProcessMemoryStats {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        if let Ok(text) = std::fs::read_to_string("/proc/self/status") {
-            return parse_proc_status_rss(&text);
+        let (rss_bytes, peak_rss_bytes) = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .map(|t| parse_proc_status_rss(&t))
+            .unwrap_or((None, None));
+        let (private_dirty_bytes, pss_anon_bytes) =
+            std::fs::read_to_string("/proc/self/smaps_rollup")
+                .ok()
+                .map(|t| parse_smaps_rollup(&t))
+                .unwrap_or((None, None));
+        ProcessMemoryStats {
+            rss_bytes,
+            peak_rss_bytes,
+            private_dirty_bytes,
+            pss_anon_bytes,
         }
-        (None, None)
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
-        (None, None)
+        ProcessMemoryStats::default()
     }
 }
 
@@ -300,5 +352,16 @@ VmRSS:\t  544128 kB
         let (rss, hwm) = parse_proc_status_rss(status);
         assert_eq!(rss, Some(544_128 * 1024));
         assert_eq!(hwm, Some(548_000 * 1024));
+
+        let rollup = "\
+62eebf4000-7fffcc0000 ---p 00000000 00:00 0 [rollup]
+Rss:              544128 kB
+Pss_Anon:          39120 kB
+Private_Clean:    504000 kB
+Private_Dirty:     40128 kB
+";
+        let (pdirty, panon) = parse_smaps_rollup(rollup);
+        assert_eq!(pdirty, Some(40_128 * 1024));
+        assert_eq!(panon, Some(39_120 * 1024));
     }
 }

@@ -6,9 +6,10 @@
 use thiserror::Error;
 use tm_core::{DType, dequantize_row_bytes};
 use tm_cpu::{
-    KernelTable, MAX_CPU_BATCH, MatvecScratch, RopeType, ThreadPool, gqa_attention_f16_kv_parallel,
-    matmul_f32, matvec_f32, matvec_pair_f32, matvec_triple_f32, rms_norm, rope_compute_cos_sin,
-    rope_inplace_tables, swiglu_inplace,
+    KernelTable, MAX_CPU_BATCH, MatvecScratch, RopeType, ThreadPool,
+    gqa_attention_f16_kv_batch_parallel, gqa_attention_f16_kv_parallel, matmul_f32, matvec_f32,
+    matvec_pair_f32, matvec_triple_f32, rms_norm, rms_norm_batch_parallel, rope_compute_cos_sin,
+    rope_inplace_tables, swiglu_inplace_parallel,
 };
 use tm_gguf::{GgufError, GgufFile};
 
@@ -518,7 +519,7 @@ impl<'a> LlamaModel<'a> {
                 &mut state.mv_scratch,
                 n_embd,
             );
-            swiglu_inplace(&mut state.hb[..n_ff], &state.hb2[..n_ff]);
+            swiglu_inplace_parallel(pool, &mut state.hb[..n_ff], &state.hb2[..n_ff]);
             matvec_f32(
                 pool,
                 kt,
@@ -572,6 +573,52 @@ impl<'a> LlamaModel<'a> {
         start_pos: usize,
         compute_last_logits: bool,
     ) -> Result<(), ModelError> {
+        self.forward_batch_inner(
+            state,
+            pool,
+            kt,
+            token_ids,
+            start_pos,
+            compute_last_logits,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_batch_profiled(
+        &self,
+        state: &mut LlamaState,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        token_ids: &[u32],
+        start_pos: usize,
+        compute_last_logits: bool,
+        prof: &mut CpuDecodeProfile,
+    ) -> Result<(), ModelError> {
+        self.forward_batch_inner(
+            state,
+            pool,
+            kt,
+            token_ids,
+            start_pos,
+            compute_last_logits,
+            Some(prof),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_batch_inner(
+        &self,
+        state: &mut LlamaState,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        token_ids: &[u32],
+        start_pos: usize,
+        compute_last_logits: bool,
+        mut prof: Option<&mut CpuDecodeProfile>,
+    ) -> Result<(), ModelError> {
+        use std::time::Instant;
+
         if token_ids.is_empty() {
             return Ok(());
         }
@@ -591,6 +638,17 @@ impl<'a> LlamaModel<'a> {
             }
         }
         if token_ids.len() == 1 {
+            if let Some(p) = prof {
+                return self.forward_token_profiled(
+                    state,
+                    pool,
+                    kt,
+                    token_ids[0],
+                    start_pos,
+                    compute_last_logits,
+                    p,
+                );
+            }
             return self.forward_token(
                 state,
                 pool,
@@ -601,6 +659,7 @@ impl<'a> LlamaModel<'a> {
             );
         }
 
+        let t_total = prof.as_ref().map(|_| Instant::now());
         let n_embd = self.cfg.n_embd;
         let n_ff = self.cfg.n_ff;
         let q_dim = self.cfg.n_head * self.cfg.head_dim;
@@ -616,6 +675,7 @@ impl<'a> LlamaModel<'a> {
             let is_last = offset + b == total;
 
             // 1. Batched embedding lookup
+            let t0 = prof.as_ref().map(|_| Instant::now());
             for (t, &tok) in chunk.iter().enumerate() {
                 let tid = tok as usize;
                 let emb_row = &self.token_embd.bytes[tid * row_bytes..(tid + 1) * row_bytes];
@@ -625,18 +685,28 @@ impl<'a> LlamaModel<'a> {
                     &mut state.x[t * n_embd..(t + 1) * n_embd],
                 );
             }
+            if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
+                p.embed_ns += ts.elapsed().as_nanos() as u64;
+            }
 
             // 2. Transformer layers with multi-token GEMM
             for (l, layer) in self.layers.iter().enumerate() {
-                for t in 0..b {
-                    rms_norm(
-                        &mut state.xb[t * n_embd..(t + 1) * n_embd],
-                        &state.x[t * n_embd..(t + 1) * n_embd],
-                        &layer.attn_norm,
-                        self.cfg.rms_eps,
-                    );
+                let t0 = prof.as_ref().map(|_| Instant::now());
+                rms_norm_batch_parallel(
+                    pool,
+                    kt,
+                    &mut state.xb[..b * n_embd],
+                    &state.x[..b * n_embd],
+                    &layer.attn_norm,
+                    self.cfg.rms_eps,
+                    n_embd,
+                    b,
+                );
+                if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
+                    p.attn_norm_ns += ts.elapsed().as_nanos() as u64;
                 }
 
+                let t0 = prof.as_ref().map(|_| Instant::now());
                 matmul_f32(
                     pool,
                     kt,
@@ -673,8 +743,12 @@ impl<'a> LlamaModel<'a> {
                     n_embd,
                     b,
                 );
+                if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
+                    p.attn_qkv_ns += ts.elapsed().as_nanos() as u64;
+                }
 
                 // Per-token QK-Norm, RoPE, and F16 KV store (so all `b` keys/values are in cache)
+                let t0 = prof.as_ref().map(|_| Instant::now());
                 for t in 0..b {
                     let pos = chunk_pos + t;
                     let qt = &mut state.q[t * q_dim..(t + 1) * q_dim];
@@ -727,27 +801,33 @@ impl<'a> LlamaModel<'a> {
                     (kt.f32_to_f16_slice)(kt_vec, &mut state.k_cache[l][kv_off..kv_off + kv_dim]);
                     (kt.f32_to_f16_slice)(vt_vec, &mut state.v_cache[l][kv_off..kv_off + kv_dim]);
                 }
+                if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
+                    p.rope_kv_ns += ts.elapsed().as_nanos() as u64;
+                }
 
-                // Causal GQA attention for each token `t` in the chunk
-                for t in 0..b {
-                    let pos = chunk_pos + t;
-                    gqa_attention_f16_kv_parallel(
-                        pool,
-                        kt,
-                        &mut state.xb[t * q_dim..(t + 1) * q_dim],
-                        &state.q[t * q_dim..(t + 1) * q_dim],
-                        &state.k_cache[l],
-                        &state.v_cache[l],
-                        self.cfg.n_head,
-                        self.cfg.n_head_kv,
-                        self.cfg.head_dim,
-                        pos + 1,
-                        state.max_ctx,
-                        &mut state.scores,
-                    );
+                // Causal GQA attention for all `b` tokens in a single parallel dispatch
+                let t0 = prof.as_ref().map(|_| Instant::now());
+                gqa_attention_f16_kv_batch_parallel(
+                    pool,
+                    kt,
+                    &mut state.xb[..b * q_dim],
+                    &state.q[..b * q_dim],
+                    &state.k_cache[l],
+                    &state.v_cache[l],
+                    self.cfg.n_head,
+                    self.cfg.n_head_kv,
+                    self.cfg.head_dim,
+                    chunk_pos,
+                    b,
+                    state.max_ctx,
+                    &mut state.scores,
+                );
+                if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
+                    p.gqa_attn_ns += ts.elapsed().as_nanos() as u64;
                 }
 
                 // Batched Wo + residual
+                let t0 = prof.as_ref().map(|_| Instant::now());
                 matmul_f32(
                     pool,
                     kt,
@@ -763,16 +843,27 @@ impl<'a> LlamaModel<'a> {
                 for i in 0..(b * n_embd) {
                     state.x[i] += state.xb2[i];
                 }
+                if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
+                    p.attn_wo_ns += ts.elapsed().as_nanos() as u64;
+                }
 
                 // Batched FFN
-                for t in 0..b {
-                    rms_norm(
-                        &mut state.xb[t * n_embd..(t + 1) * n_embd],
-                        &state.x[t * n_embd..(t + 1) * n_embd],
-                        &layer.ffn_norm,
-                        self.cfg.rms_eps,
-                    );
+                let t0 = prof.as_ref().map(|_| Instant::now());
+                rms_norm_batch_parallel(
+                    pool,
+                    kt,
+                    &mut state.xb[..b * n_embd],
+                    &state.x[..b * n_embd],
+                    &layer.ffn_norm,
+                    self.cfg.rms_eps,
+                    n_embd,
+                    b,
+                );
+                if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
+                    p.ffn_norm_ns += ts.elapsed().as_nanos() as u64;
                 }
+
+                let t0 = prof.as_ref().map(|_| Instant::now());
                 matmul_f32(
                     pool,
                     kt,
@@ -797,7 +888,17 @@ impl<'a> LlamaModel<'a> {
                     n_embd,
                     b,
                 );
-                swiglu_inplace(&mut state.hb[..b * n_ff], &state.hb2[..b * n_ff]);
+                if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
+                    p.ffn_gate_up_ns += ts.elapsed().as_nanos() as u64;
+                }
+
+                let t0 = prof.as_ref().map(|_| Instant::now());
+                swiglu_inplace_parallel(pool, &mut state.hb[..b * n_ff], &state.hb2[..b * n_ff]);
+                if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
+                    p.swiglu_ns += ts.elapsed().as_nanos() as u64;
+                }
+
+                let t0 = prof.as_ref().map(|_| Instant::now());
                 matmul_f32(
                     pool,
                     kt,
@@ -813,9 +914,13 @@ impl<'a> LlamaModel<'a> {
                 for i in 0..(b * n_embd) {
                     state.x[i] += state.xb2[i];
                 }
+                if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
+                    p.ffn_down_ns += ts.elapsed().as_nanos() as u64;
+                }
             }
 
             if is_last && compute_last_logits {
+                let t0 = prof.as_ref().map(|_| Instant::now());
                 let last_x = &state.x[(b - 1) * n_embd..b * n_embd];
                 rms_norm(
                     &mut state.xb[..n_embd],
@@ -823,6 +928,10 @@ impl<'a> LlamaModel<'a> {
                     &self.output_norm,
                     self.cfg.rms_eps,
                 );
+                if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
+                    p.output_norm_ns += ts.elapsed().as_nanos() as u64;
+                }
+                let t0 = prof.as_ref().map(|_| Instant::now());
                 matvec_f32(
                     pool,
                     kt,
@@ -834,9 +943,17 @@ impl<'a> LlamaModel<'a> {
                     self.output.rows,
                     self.output.cols,
                 );
+                if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
+                    p.lm_head_ns += ts.elapsed().as_nanos() as u64;
+                }
             }
 
             offset += b;
+        }
+
+        if let (Some(p), Some(tt)) = (prof, t_total) {
+            p.runs += total;
+            p.total_ns += tt.elapsed().as_nanos() as u64;
         }
 
         Ok(())
@@ -1040,7 +1157,7 @@ impl<'a> LlamaModel<'a> {
             prof.ffn_gate_up_bytes += (layer.w_gate.bytes.len() + layer.w_up.bytes.len()) as u64;
 
             let t0 = Instant::now();
-            swiglu_inplace(&mut state.hb[..n_ff], &state.hb2[..n_ff]);
+            swiglu_inplace_parallel(pool, &mut state.hb[..n_ff], &state.hb2[..n_ff]);
             prof.swiglu_ns += t0.elapsed().as_nanos() as u64;
 
             let t0 = Instant::now();

@@ -19,9 +19,11 @@ use std::time::Instant;
 
 use tm_core::{DType, dequantize_row_bytes};
 use tm_cpu::{
-    KernelTable, MAX_CPU_BATCH, MatvecScratch, RopeType, ThreadPool, gdn_recurrence_parallel,
-    gqa_attention_f16_kv_parallel, l2_norm_inplace, matmul_f32, matvec_f32, matvec_pair_f32,
-    matvec_triple_f32, rms_norm, rope_compute_cos_sin, rope_inplace_tables, swiglu_inplace,
+    KernelTable, MAX_CPU_BATCH, MatvecScratch, RopeType, ThreadPool,
+    gdn_conv1d_silu_split_parallel, gdn_recurrence_gated_parallel,
+    gqa_attention_f16_kv_batch_parallel, gqa_attention_f16_kv_parallel, matmul_f32, matvec_f32,
+    matvec_pair_f32, matvec_triple_f32, rms_norm, rms_norm_batch_parallel, rope_compute_cos_sin,
+    rope_inplace_tables, swiglu_inplace_parallel,
 };
 use tm_gguf::{GgufError, GgufFile};
 
@@ -312,11 +314,6 @@ fn softplus_f32(x: f32) -> f32 {
 #[inline]
 fn sigmoid_f32(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
-}
-
-#[inline]
-fn silu_f32(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
 }
 
 impl<'a> Qwen35Model<'a> {
@@ -627,7 +624,6 @@ impl<'a> Qwen35Model<'a> {
         let k_gdn_dim = hk * s_dim;
         let v_gdn_dim = self.cfg.ssm_d_inner;
         let d_conv = self.cfg.ssm_conv_kernel;
-        let hist_len = d_conv - 1;
 
         rope_compute_cos_sin(
             &self.rope_inv_freqs,
@@ -706,46 +702,28 @@ impl<'a> Qwen35Model<'a> {
                         state.beta_buf[vh] = sigmoid_f32(state.beta_buf[vh]);
                     }
 
-                    // 3. Causal Conv1d + SiLU BEFORE splitting into q, k, v (`AGENTS.md` §9)
-                    let qkv_raw = &mut state.qkv_buf[..conv_dim];
-                    for ch in 0..conv_dim {
-                        let h_slice = &mut conv_hist[ch * hist_len..(ch + 1) * hist_len];
-                        let w_slice = &conv1d[ch * d_conv..(ch + 1) * d_conv];
-                        let cur_val = qkv_raw[ch];
-                        let mut sum = 0.0f32;
-                        for tap in 0..hist_len {
-                            sum += h_slice[tap] * w_slice[tap];
-                        }
-                        sum += cur_val * w_slice[hist_len];
-                        for tap in 0..hist_len.saturating_sub(1) {
-                            h_slice[tap] = h_slice[tap + 1];
-                        }
-                        if hist_len > 0 {
-                            h_slice[hist_len - 1] = cur_val;
-                        }
-                        qkv_raw[ch] = silu_f32(sum);
-                    }
-
-                    state.q_buf[..k_gdn_dim].copy_from_slice(&qkv_raw[..k_gdn_dim]);
-                    state.k_buf[..k_gdn_dim].copy_from_slice(&qkv_raw[k_gdn_dim..2 * k_gdn_dim]);
-                    state.v_buf[..v_gdn_dim]
-                        .copy_from_slice(&qkv_raw[2 * k_gdn_dim..2 * k_gdn_dim + v_gdn_dim]);
-
-                    // 4. L2-normalize q and k per head (`AGENTS.md` §9: NEVER normalize v!)
-                    for kh in 0..hk {
-                        l2_norm_inplace(
-                            &mut state.q_buf[kh * s_dim..(kh + 1) * s_dim],
-                            self.cfg.rms_eps,
-                        );
-                        l2_norm_inplace(
-                            &mut state.k_buf[kh * s_dim..(kh + 1) * s_dim],
-                            self.cfg.rms_eps,
-                        );
-                    }
-
-                    // 5. Parallel GDN recurrence across value heads (`kh = vh % hk`, `scale = 1/sqrt(S)`)
-                    gdn_recurrence_parallel(
+                    // 3 & 4. Parallel causal Conv1d + SiLU BEFORE q/k/v split + per-head q/k L2-norm (`AGENTS.md` §9)
+                    gdn_conv1d_silu_split_parallel(
                         pool,
+                        kt,
+                        &state.qkv_buf[..conv_dim],
+                        conv_hist,
+                        conv1d,
+                        &mut state.q_buf[..k_gdn_dim],
+                        &mut state.k_buf[..k_gdn_dim],
+                        &mut state.v_buf[..v_gdn_dim],
+                        d_conv,
+                        hk,
+                        s_dim,
+                        v_gdn_dim,
+                        self.cfg.rms_eps,
+                        1,
+                    );
+
+                    // 5 & 6. Parallel NEON GDN recurrence + L1-fused gated RMSNorm * SiLU(z) (`kh = vh % hk`)
+                    gdn_recurrence_gated_parallel(
+                        pool,
+                        kt,
                         &state.q_buf[..k_gdn_dim],
                         &state.k_buf[..k_gdn_dim],
                         &state.v_buf[..v_gdn_dim],
@@ -753,28 +731,14 @@ impl<'a> Qwen35Model<'a> {
                         &state.beta_buf[..hv],
                         ssm_state,
                         &mut state.attn_out[..v_gdn_dim],
+                        &state.gate_buf[..v_gdn_dim],
+                        ssm_norm,
+                        self.cfg.rms_eps,
                         hk,
                         hv,
                         s_dim,
                         1,
                     );
-
-                    // 6. Per-head gated RMSNorm with SiLU on z (`rms_norm(o_h, ssm_norm) * silu(z_h)`)
-                    for vh in 0..hv {
-                        let off = vh * s_dim;
-                        let o_h = &mut state.attn_out[off..off + s_dim];
-                        let z_h = &state.gate_buf[off..off + s_dim];
-                        let mut ss = 0.0f64;
-                        for &v in o_h.iter() {
-                            let vf = v as f64;
-                            ss += vf * vf;
-                        }
-                        let scale =
-                            (1.0 / ((ss / s_dim as f64) + self.cfg.rms_eps as f64).sqrt()) as f32;
-                        for i in 0..s_dim {
-                            o_h[i] = (o_h[i] * scale * ssm_norm[i]) * silu_f32(z_h[i]);
-                        }
-                    }
 
                     // 7. Output projection (`ssm_out`, Q5_K) + residual add
                     matvec_f32(
@@ -834,17 +798,15 @@ impl<'a> Qwen35Model<'a> {
                         state.gate_buf[h * hd..(h + 1) * hd].copy_from_slice(src_g);
                     }
                     for h in 0..self.cfg.n_head_kv {
-                        let kh = &mut state.k_buf[h * hd..(h + 1) * hd];
-                        let mut ss = 0.0f64;
-                        for &v in kh.iter() {
-                            let vf = v as f64;
-                            ss += vf * vf;
-                        }
-                        let scale =
-                            (1.0 / ((ss / hd as f64) + self.cfg.rms_eps as f64).sqrt()) as f32;
-                        for (val, &w) in kh.iter_mut().zip(k_norm.iter()) {
-                            *val = *val * scale * w;
-                        }
+                        let s = h * hd;
+                        let e = s + hd;
+                        rms_norm(
+                            &mut state.xb2[..hd],
+                            &state.k_buf[s..e],
+                            k_norm,
+                            self.cfg.rms_eps,
+                        );
+                        state.k_buf[s..e].copy_from_slice(&state.xb2[..hd]);
                     }
 
                     // Partial NeoX RoPE on first `rope_dim` elements of each Q and K head
@@ -941,7 +903,7 @@ impl<'a> Qwen35Model<'a> {
                 &mut state.mv_scratch,
                 n_embd,
             );
-            swiglu_inplace(&mut state.hb[..n_ff], &state.hb2[..n_ff]);
+            swiglu_inplace_parallel(pool, &mut state.hb[..n_ff], &state.hb2[..n_ff]);
             matvec_f32(
                 pool,
                 kt,
@@ -994,6 +956,50 @@ impl<'a> Qwen35Model<'a> {
         start_pos: usize,
         compute_last_logits: bool,
     ) -> Result<(), ModelError> {
+        self.forward_batch_inner(
+            state,
+            pool,
+            kt,
+            token_ids,
+            start_pos,
+            compute_last_logits,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_batch_profiled(
+        &self,
+        state: &mut Qwen35State,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        token_ids: &[u32],
+        start_pos: usize,
+        compute_last_logits: bool,
+        prof: &mut Qwen35DecodeProfile,
+    ) -> Result<(), ModelError> {
+        self.forward_batch_inner(
+            state,
+            pool,
+            kt,
+            token_ids,
+            start_pos,
+            compute_last_logits,
+            Some(prof),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_batch_inner(
+        &self,
+        state: &mut Qwen35State,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        token_ids: &[u32],
+        start_pos: usize,
+        compute_last_logits: bool,
+        mut prof: Option<&mut Qwen35DecodeProfile>,
+    ) -> Result<(), ModelError> {
         if token_ids.is_empty() {
             return Ok(());
         }
@@ -1014,6 +1020,9 @@ impl<'a> Qwen35Model<'a> {
         }
 
         if token_ids.len() == 1 {
+            if let Some(p) = prof {
+                return self.forward_token_profiled(state, pool, kt, token_ids[0], start_pos, p);
+            }
             return self.forward_token(
                 state,
                 pool,
@@ -1035,12 +1044,17 @@ impl<'a> Qwen35Model<'a> {
                 &token_ids[offset..offset + b],
                 start_pos + offset,
                 is_last && compute_last_logits,
+                prof.as_deref_mut(),
             );
             offset += b;
+        }
+        if let Some(p) = prof {
+            p.n_steps += token_ids.len();
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_chunk(
         &self,
         state: &mut Qwen35State,
@@ -1049,6 +1063,7 @@ impl<'a> Qwen35Model<'a> {
         tokens: &[u32],
         start_pos: usize,
         compute_last_logits: bool,
+        mut prof: Option<&mut Qwen35DecodeProfile>,
     ) {
         let b = tokens.len();
         let n_embd = self.cfg.n_embd;
@@ -1064,8 +1079,8 @@ impl<'a> Qwen35Model<'a> {
         let k_gdn_dim = hk * s_dim;
         let v_gdn_dim = self.cfg.ssm_d_inner;
         let d_conv = self.cfg.ssm_conv_kernel;
-        let hist_len = d_conv - 1;
 
+        let t_emb = prof.as_ref().map(|_| Instant::now());
         let row_bytes = self.token_embd.dtype.row_bytes(n_embd);
         for (t, &tok) in tokens.iter().enumerate() {
             let tid = tok as usize;
@@ -1076,15 +1091,24 @@ impl<'a> Qwen35Model<'a> {
                 &mut state.x[t * n_embd..(t + 1) * n_embd],
             );
         }
+        if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t_emb) {
+            p.embed_ns += ts.elapsed().as_nanos() as u64;
+        }
 
         for (l, layer) in self.layers.iter().enumerate() {
-            for t in 0..b {
-                rms_norm(
-                    &mut state.xb[t * n_embd..(t + 1) * n_embd],
-                    &state.x[t * n_embd..(t + 1) * n_embd],
-                    &layer.attn_norm,
-                    self.cfg.rms_eps,
-                );
+            let t_rn = prof.as_ref().map(|_| Instant::now());
+            rms_norm_batch_parallel(
+                pool,
+                kt,
+                &mut state.xb[..b * n_embd],
+                &state.x[..b * n_embd],
+                &layer.attn_norm,
+                self.cfg.rms_eps,
+                n_embd,
+                b,
+            );
+            if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t_rn) {
+                p.rms_norm_ns += ts.elapsed().as_nanos() as u64;
             }
 
             match (&layer.attn, &mut state.layers[l]) {
@@ -1105,6 +1129,7 @@ impl<'a> Qwen35Model<'a> {
                         conv_hist,
                     },
                 ) => {
+                    let tp = prof.as_ref().map(|_| Instant::now());
                     matmul_f32(
                         pool,
                         kt,
@@ -1153,7 +1178,11 @@ impl<'a> Qwen35Model<'a> {
                         n_embd,
                         b,
                     );
+                    if let (Some(p), Some(ts)) = (prof.as_deref_mut(), tp) {
+                        p.gdn_proj_ns += ts.elapsed().as_nanos() as u64;
+                    }
 
+                    let tc = prof.as_ref().map(|_| Instant::now());
                     for t in 0..b {
                         for vh in 0..hv {
                             let idx = t * hv + vh;
@@ -1161,48 +1190,32 @@ impl<'a> Qwen35Model<'a> {
                             state.g_exp_buf[idx] = (sp * ssm_a[vh]).exp();
                             state.beta_buf[idx] = sigmoid_f32(state.beta_buf[idx]);
                         }
-
-                        let qkv_t = &mut state.qkv_buf[t * conv_dim..(t + 1) * conv_dim];
-                        for ch in 0..conv_dim {
-                            let h_slice = &mut conv_hist[ch * hist_len..(ch + 1) * hist_len];
-                            let w_slice = &conv1d[ch * d_conv..(ch + 1) * d_conv];
-                            let cur_val = qkv_t[ch];
-                            let mut sum = 0.0f32;
-                            for tap in 0..hist_len {
-                                sum += h_slice[tap] * w_slice[tap];
-                            }
-                            sum += cur_val * w_slice[hist_len];
-                            for tap in 0..hist_len.saturating_sub(1) {
-                                h_slice[tap] = h_slice[tap + 1];
-                            }
-                            if hist_len > 0 {
-                                h_slice[hist_len - 1] = cur_val;
-                            }
-                            qkv_t[ch] = silu_f32(sum);
-                        }
-
-                        let q_t = &mut state.q_buf[t * k_gdn_dim..(t + 1) * k_gdn_dim];
-                        let k_t = &mut state.k_buf[t * k_gdn_dim..(t + 1) * k_gdn_dim];
-                        let v_t = &mut state.v_buf[t * v_gdn_dim..(t + 1) * v_gdn_dim];
-                        q_t.copy_from_slice(&qkv_t[..k_gdn_dim]);
-                        k_t.copy_from_slice(&qkv_t[k_gdn_dim..2 * k_gdn_dim]);
-                        v_t.copy_from_slice(&qkv_t[2 * k_gdn_dim..2 * k_gdn_dim + v_gdn_dim]);
-
-                        for kh in 0..hk {
-                            l2_norm_inplace(
-                                &mut q_t[kh * s_dim..(kh + 1) * s_dim],
-                                self.cfg.rms_eps,
-                            );
-                            l2_norm_inplace(
-                                &mut k_t[kh * s_dim..(kh + 1) * s_dim],
-                                self.cfg.rms_eps,
-                            );
-                        }
+                    }
+                    gdn_conv1d_silu_split_parallel(
+                        pool,
+                        kt,
+                        &state.qkv_buf[..b * conv_dim],
+                        conv_hist,
+                        conv1d,
+                        &mut state.q_buf[..b * k_gdn_dim],
+                        &mut state.k_buf[..b * k_gdn_dim],
+                        &mut state.v_buf[..b * v_gdn_dim],
+                        d_conv,
+                        hk,
+                        s_dim,
+                        v_gdn_dim,
+                        self.cfg.rms_eps,
+                        b,
+                    );
+                    if let (Some(p), Some(ts)) = (prof.as_deref_mut(), tc) {
+                        p.gdn_conv_norm_ns += ts.elapsed().as_nanos() as u64;
                     }
 
-                    // Run multi-token GDN recurrence in a single parallel dispatch!
-                    gdn_recurrence_parallel(
+                    // Run multi-token NEON GDN recurrence + L1-fused gated RMSNorm * SiLU(z)!
+                    let tr = prof.as_ref().map(|_| Instant::now());
+                    gdn_recurrence_gated_parallel(
                         pool,
+                        kt,
                         &state.q_buf[..b * k_gdn_dim],
                         &state.k_buf[..b * k_gdn_dim],
                         &state.v_buf[..b * v_gdn_dim],
@@ -1210,31 +1223,19 @@ impl<'a> Qwen35Model<'a> {
                         &state.beta_buf[..b * hv],
                         ssm_state,
                         &mut state.attn_out[..b * v_gdn_dim],
+                        &state.gate_buf[..b * v_gdn_dim],
+                        ssm_norm,
+                        self.cfg.rms_eps,
                         hk,
                         hv,
                         s_dim,
                         b,
                     );
-
-                    for t in 0..b {
-                        for vh in 0..hv {
-                            let off = t * v_gdn_dim + vh * s_dim;
-                            let o_h = &mut state.attn_out[off..off + s_dim];
-                            let z_h = &state.gate_buf[off..off + s_dim];
-                            let mut ss = 0.0f64;
-                            for &v in o_h.iter() {
-                                let vf = v as f64;
-                                ss += vf * vf;
-                            }
-                            let scale = (1.0
-                                / ((ss / s_dim as f64) + self.cfg.rms_eps as f64).sqrt())
-                                as f32;
-                            for i in 0..s_dim {
-                                o_h[i] = (o_h[i] * scale * ssm_norm[i]) * silu_f32(z_h[i]);
-                            }
-                        }
+                    if let (Some(p), Some(ts)) = (prof.as_deref_mut(), tr) {
+                        p.gdn_recur_ns += ts.elapsed().as_nanos() as u64;
                     }
 
+                    let to = prof.as_ref().map(|_| Instant::now());
                     matmul_f32(
                         pool,
                         kt,
@@ -1247,6 +1248,9 @@ impl<'a> Qwen35Model<'a> {
                         w_out.cols,
                         b,
                     );
+                    if let (Some(p), Some(ts)) = (prof.as_deref_mut(), to) {
+                        p.gdn_out_ns += ts.elapsed().as_nanos() as u64;
+                    }
                 }
                 (
                     AttnWeights::FullAttn {
@@ -1259,6 +1263,7 @@ impl<'a> Qwen35Model<'a> {
                     },
                     LayerState::Kv { k_cache, v_cache },
                 ) => {
+                    let tq = prof.as_ref().map(|_| Instant::now());
                     matmul_f32(
                         pool,
                         kt,
@@ -1295,7 +1300,11 @@ impl<'a> Qwen35Model<'a> {
                         n_embd,
                         b,
                     );
+                    if let (Some(p), Some(ts)) = (prof.as_deref_mut(), tq) {
+                        p.full_qkv_ns += ts.elapsed().as_nanos() as u64;
+                    }
 
+                    let ta = prof.as_ref().map(|_| Instant::now());
                     for t in 0..b {
                         let pos = start_pos + t;
                         let qg_t = &state.qkv_buf[t * qg_dim..(t + 1) * qg_dim];
@@ -1315,17 +1324,10 @@ impl<'a> Qwen35Model<'a> {
                                 .copy_from_slice(&qg_t[h * 2 * hd + hd..(h + 1) * 2 * hd]);
                         }
                         for h in 0..self.cfg.n_head_kv {
-                            let kh = &mut k_t[h * hd..(h + 1) * hd];
-                            let mut ss = 0.0f64;
-                            for &v in kh.iter() {
-                                let vf = v as f64;
-                                ss += vf * vf;
-                            }
-                            let scale =
-                                (1.0 / ((ss / hd as f64) + self.cfg.rms_eps as f64).sqrt()) as f32;
-                            for (val, &w) in kh.iter_mut().zip(k_norm.iter()) {
-                                *val = *val * scale * w;
-                            }
+                            let s = h * hd;
+                            let e = s + hd;
+                            rms_norm(&mut state.xb2[..hd], &k_t[s..e], k_norm, self.cfg.rms_eps);
+                            k_t[s..e].copy_from_slice(&state.xb2[..hd]);
                         }
 
                         rope_compute_cos_sin(
@@ -1358,30 +1360,32 @@ impl<'a> Qwen35Model<'a> {
                         (kt.f32_to_f16_slice)(v_t, &mut v_cache[cache_off..cache_off + kv_dim]);
                     }
 
-                    for t in 0..b {
-                        let pos = start_pos + t;
-                        let q_t = &state.q_buf[t * q_dim..(t + 1) * q_dim];
-                        let g_t = &state.gate_buf[t * q_dim..(t + 1) * q_dim];
-                        let out_t = &mut state.attn_out[t * q_dim..(t + 1) * q_dim];
-                        gqa_attention_f16_kv_parallel(
-                            pool,
-                            kt,
-                            out_t,
-                            q_t,
-                            k_cache,
-                            v_cache,
-                            self.cfg.n_head,
-                            self.cfg.n_head_kv,
-                            hd,
-                            pos + 1,
-                            state.max_ctx,
-                            &mut state.scores,
-                        );
-                        for (o, &g) in out_t.iter_mut().zip(g_t.iter()) {
-                            *o *= sigmoid_f32(g);
-                        }
+                    gqa_attention_f16_kv_batch_parallel(
+                        pool,
+                        kt,
+                        &mut state.attn_out[..b * q_dim],
+                        &state.q_buf[..b * q_dim],
+                        k_cache,
+                        v_cache,
+                        self.cfg.n_head,
+                        self.cfg.n_head_kv,
+                        hd,
+                        start_pos,
+                        b,
+                        state.max_ctx,
+                        &mut state.scores,
+                    );
+                    for (o, &g) in state.attn_out[..b * q_dim]
+                        .iter_mut()
+                        .zip(state.gate_buf[..b * q_dim].iter())
+                    {
+                        *o *= sigmoid_f32(g);
+                    }
+                    if let (Some(p), Some(ts)) = (prof.as_deref_mut(), ta) {
+                        p.full_attn_ns += ts.elapsed().as_nanos() as u64;
                     }
 
+                    let two = prof.as_ref().map(|_| Instant::now());
                     matmul_f32(
                         pool,
                         kt,
@@ -1394,6 +1398,9 @@ impl<'a> Qwen35Model<'a> {
                         wo.cols,
                         b,
                     );
+                    if let (Some(p), Some(ts)) = (prof.as_deref_mut(), two) {
+                        p.full_wo_ns += ts.elapsed().as_nanos() as u64;
+                    }
                 }
                 _ => unreachable!("LayerState variant always matches Qwen35LayerWeights::attn"),
             }
@@ -1402,14 +1409,21 @@ impl<'a> Qwen35Model<'a> {
                 state.x[i] += state.xb2[i];
             }
 
-            for t in 0..b {
-                rms_norm(
-                    &mut state.xb[t * n_embd..(t + 1) * n_embd],
-                    &state.x[t * n_embd..(t + 1) * n_embd],
-                    &layer.post_attn_norm,
-                    self.cfg.rms_eps,
-                );
+            let t_pn = prof.as_ref().map(|_| Instant::now());
+            rms_norm_batch_parallel(
+                pool,
+                kt,
+                &mut state.xb[..b * n_embd],
+                &state.x[..b * n_embd],
+                &layer.post_attn_norm,
+                self.cfg.rms_eps,
+                n_embd,
+                b,
+            );
+            if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t_pn) {
+                p.rms_norm_ns += ts.elapsed().as_nanos() as u64;
             }
+            let t_gu = prof.as_ref().map(|_| Instant::now());
             matmul_f32(
                 pool,
                 kt,
@@ -1434,7 +1448,11 @@ impl<'a> Qwen35Model<'a> {
                 n_embd,
                 b,
             );
-            swiglu_inplace(&mut state.hb[..b * n_ff], &state.hb2[..b * n_ff]);
+            swiglu_inplace_parallel(pool, &mut state.hb[..b * n_ff], &state.hb2[..b * n_ff]);
+            if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t_gu) {
+                p.ffn_gate_up_ns += ts.elapsed().as_nanos() as u64;
+            }
+            let t_fd = prof.as_ref().map(|_| Instant::now());
             matmul_f32(
                 pool,
                 kt,
@@ -1450,9 +1468,13 @@ impl<'a> Qwen35Model<'a> {
             for i in 0..b * n_embd {
                 state.x[i] += state.xb2[i];
             }
+            if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t_fd) {
+                p.ffn_down_ns += ts.elapsed().as_nanos() as u64;
+            }
         }
 
         if compute_last_logits {
+            let t_rn = prof.as_ref().map(|_| Instant::now());
             let last = (b - 1) * n_embd;
             rms_norm(
                 &mut state.xb[..n_embd],
@@ -1460,6 +1482,10 @@ impl<'a> Qwen35Model<'a> {
                 &self.output_norm,
                 self.cfg.rms_eps,
             );
+            if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t_rn) {
+                p.rms_norm_ns += ts.elapsed().as_nanos() as u64;
+            }
+            let t_lm = prof.as_ref().map(|_| Instant::now());
             matvec_f32(
                 pool,
                 kt,
@@ -1471,6 +1497,9 @@ impl<'a> Qwen35Model<'a> {
                 self.output.rows,
                 self.output.cols,
             );
+            if let (Some(p), Some(ts)) = (prof, t_lm) {
+                p.lm_head_ns += ts.elapsed().as_nanos() as u64;
+            }
         }
     }
 
@@ -1511,7 +1540,6 @@ impl<'a> Qwen35Model<'a> {
         let k_gdn_dim = hk * s_dim;
         let v_gdn_dim = self.cfg.ssm_d_inner;
         let d_conv = self.cfg.ssm_conv_kernel;
-        let hist_len = d_conv - 1;
 
         let t0 = Instant::now();
         rope_compute_cos_sin(
@@ -1592,43 +1620,28 @@ impl<'a> Qwen35Model<'a> {
                         state.g_exp_buf[vh] = (sp * ssm_a[vh]).exp();
                         state.beta_buf[vh] = sigmoid_f32(state.beta_buf[vh]);
                     }
-                    let qkv_raw = &mut state.qkv_buf[..conv_dim];
-                    for ch in 0..conv_dim {
-                        let h_slice = &mut conv_hist[ch * hist_len..(ch + 1) * hist_len];
-                        let w_slice = &conv1d[ch * d_conv..(ch + 1) * d_conv];
-                        let cur_val = qkv_raw[ch];
-                        let mut sum = 0.0f32;
-                        for tap in 0..hist_len {
-                            sum += h_slice[tap] * w_slice[tap];
-                        }
-                        sum += cur_val * w_slice[hist_len];
-                        for tap in 0..hist_len.saturating_sub(1) {
-                            h_slice[tap] = h_slice[tap + 1];
-                        }
-                        if hist_len > 0 {
-                            h_slice[hist_len - 1] = cur_val;
-                        }
-                        qkv_raw[ch] = silu_f32(sum);
-                    }
-                    state.q_buf[..k_gdn_dim].copy_from_slice(&qkv_raw[..k_gdn_dim]);
-                    state.k_buf[..k_gdn_dim].copy_from_slice(&qkv_raw[k_gdn_dim..2 * k_gdn_dim]);
-                    state.v_buf[..v_gdn_dim]
-                        .copy_from_slice(&qkv_raw[2 * k_gdn_dim..2 * k_gdn_dim + v_gdn_dim]);
-                    for kh in 0..hk {
-                        l2_norm_inplace(
-                            &mut state.q_buf[kh * s_dim..(kh + 1) * s_dim],
-                            self.cfg.rms_eps,
-                        );
-                        l2_norm_inplace(
-                            &mut state.k_buf[kh * s_dim..(kh + 1) * s_dim],
-                            self.cfg.rms_eps,
-                        );
-                    }
+                    gdn_conv1d_silu_split_parallel(
+                        pool,
+                        kt,
+                        &state.qkv_buf[..conv_dim],
+                        conv_hist,
+                        conv1d,
+                        &mut state.q_buf[..k_gdn_dim],
+                        &mut state.k_buf[..k_gdn_dim],
+                        &mut state.v_buf[..v_gdn_dim],
+                        d_conv,
+                        hk,
+                        s_dim,
+                        v_gdn_dim,
+                        self.cfg.rms_eps,
+                        1,
+                    );
                     prof.gdn_conv_norm_ns += tc.elapsed().as_nanos() as u64;
 
                     let tr = Instant::now();
-                    gdn_recurrence_parallel(
+                    gdn_recurrence_gated_parallel(
                         pool,
+                        kt,
                         &state.q_buf[..k_gdn_dim],
                         &state.k_buf[..k_gdn_dim],
                         &state.v_buf[..v_gdn_dim],
@@ -1636,26 +1649,14 @@ impl<'a> Qwen35Model<'a> {
                         &state.beta_buf[..hv],
                         ssm_state,
                         &mut state.attn_out[..v_gdn_dim],
+                        &state.gate_buf[..v_gdn_dim],
+                        ssm_norm,
+                        self.cfg.rms_eps,
                         hk,
                         hv,
                         s_dim,
                         1,
                     );
-                    for vh in 0..hv {
-                        let off = vh * s_dim;
-                        let o_h = &mut state.attn_out[off..off + s_dim];
-                        let z_h = &state.gate_buf[off..off + s_dim];
-                        let mut ss = 0.0f64;
-                        for &v in o_h.iter() {
-                            let vf = v as f64;
-                            ss += vf * vf;
-                        }
-                        let scale =
-                            (1.0 / ((ss / s_dim as f64) + self.cfg.rms_eps as f64).sqrt()) as f32;
-                        for i in 0..s_dim {
-                            o_h[i] = (o_h[i] * scale * ssm_norm[i]) * silu_f32(z_h[i]);
-                        }
-                    }
                     prof.gdn_recur_ns += tr.elapsed().as_nanos() as u64;
 
                     let to = Instant::now();
@@ -1717,17 +1718,15 @@ impl<'a> Qwen35Model<'a> {
                             .copy_from_slice(&state.qkv_buf[h * 2 * hd + hd..(h + 1) * 2 * hd]);
                     }
                     for h in 0..self.cfg.n_head_kv {
-                        let kh = &mut state.k_buf[h * hd..(h + 1) * hd];
-                        let mut ss = 0.0f64;
-                        for &v in kh.iter() {
-                            let vf = v as f64;
-                            ss += vf * vf;
-                        }
-                        let scale =
-                            (1.0 / ((ss / hd as f64) + self.cfg.rms_eps as f64).sqrt()) as f32;
-                        for (val, &w) in kh.iter_mut().zip(k_norm.iter()) {
-                            *val = *val * scale * w;
-                        }
+                        let s = h * hd;
+                        let e = s + hd;
+                        rms_norm(
+                            &mut state.xb2[..hd],
+                            &state.k_buf[s..e],
+                            k_norm,
+                            self.cfg.rms_eps,
+                        );
+                        state.k_buf[s..e].copy_from_slice(&state.xb2[..hd]);
                     }
                     rope_inplace_tables(
                         &mut state.q_buf[..q_dim],
@@ -1824,7 +1823,7 @@ impl<'a> Qwen35Model<'a> {
                 &mut state.mv_scratch,
                 n_embd,
             );
-            swiglu_inplace(&mut state.hb[..n_ff], &state.hb2[..n_ff]);
+            swiglu_inplace_parallel(pool, &mut state.hb[..n_ff], &state.hb2[..n_ff]);
             prof.ffn_gate_up_ns += tf1.elapsed().as_nanos() as u64;
 
             let tf2 = Instant::now();
@@ -1873,7 +1872,7 @@ impl<'a> Qwen35Model<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tm_cpu::active_kernels;
+    use tm_cpu::{active_kernels, gdn_recurrence_parallel};
 
     #[test]
     fn gdn_recurrence_matches_fp64_reference_and_batch_bit_exact() {

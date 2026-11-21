@@ -25,6 +25,10 @@ pub type AxpyF32F16Fn = fn(&mut [f32], f32, &[u16]);
 pub type F32ToF16SliceFn = fn(&[f32], &mut [u16]);
 pub type QuantQ8_0Fn = fn(&[f32], &mut [BlockQ8_0]);
 pub type QuantQ8_1Fn = fn(&[f32], &mut [BlockQ8_1]);
+pub type RmsNormF32Fn = fn(&mut [f32], &[f32], &[f32], f32);
+pub type L2NormF32Fn = fn(&mut [f32], f32);
+pub type GdnRecurrenceHeadFn =
+    fn(&[f32], &[f32], &[f32], f32, f32, f32, &mut [f32], &mut [f32], usize);
 
 /// Function-pointer table for CPU compute kernels at a given ISA tier.
 #[derive(Clone, Copy)]
@@ -46,6 +50,9 @@ pub struct KernelTable {
     pub f32_to_f16_slice: F32ToF16SliceFn,
     pub quantize_q8_0: QuantQ8_0Fn,
     pub quantize_q8_1: QuantQ8_1Fn,
+    pub rms_norm_f32: RmsNormF32Fn,
+    pub l2_norm_f32: L2NormF32Fn,
+    pub gdn_recurrence_head: GdnRecurrenceHeadFn,
 }
 
 const GENERIC_TABLE: KernelTable = KernelTable {
@@ -66,6 +73,9 @@ const GENERIC_TABLE: KernelTable = KernelTable {
     f32_to_f16_slice: generic::f32_to_f16_slice,
     quantize_q8_0: generic::quantize_q8_0,
     quantize_q8_1: generic::quantize_q8_1,
+    rms_norm_f32: generic::rms_norm_f32,
+    l2_norm_f32: generic::l2_norm_f32,
+    gdn_recurrence_head: generic::gdn_recurrence_head,
 };
 
 #[cfg(target_arch = "aarch64")]
@@ -310,6 +320,32 @@ mod aarch64_wrappers {
         unsafe { dotprod::gemv_q4_1_q8_1(w, x, out, rows, cols_blocks) }
     }
 
+    fn neon_rms_norm_f32(out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { neon_v80::rms_norm_f32(out, x, weight, eps) }
+    }
+
+    fn neon_l2_norm_f32(x: &mut [f32], eps: f32) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { neon_v80::l2_norm_f32(x, eps) }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn neon_gdn_recurrence_head(
+        q_h: &[f32],
+        k_h: &[f32],
+        v_h: &[f32],
+        g: f32,
+        beta: f32,
+        scale: f32,
+        s_vh: &mut [f32],
+        o_h: &mut [f32],
+        head_dim: usize,
+    ) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { neon_v80::gdn_recurrence_head(q_h, k_h, v_h, g, beta, scale, s_vh, o_h, head_dim) }
+    }
+
     pub const NEON_V80_TABLE: KernelTable = KernelTable {
         isa: Isa::NeonV80,
         vec_dot_q4_0_q8_0: neon_v80_vec_dot,
@@ -328,6 +364,9 @@ mod aarch64_wrappers {
         f32_to_f16_slice: neon_f32_to_f16_slice,
         quantize_q8_0: neon_quant_q8_0,
         quantize_q8_1: neon_quant_q8_1,
+        rms_norm_f32: neon_rms_norm_f32,
+        l2_norm_f32: neon_l2_norm_f32,
+        gdn_recurrence_head: neon_gdn_recurrence_head,
     };
 
     #[cfg(feature = "dotprod")]
@@ -349,6 +388,9 @@ mod aarch64_wrappers {
         f32_to_f16_slice: neon_f32_to_f16_slice,
         quantize_q8_0: neon_quant_q8_0,
         quantize_q8_1: neon_quant_q8_1,
+        rms_norm_f32: neon_rms_norm_f32,
+        l2_norm_f32: neon_l2_norm_f32,
+        gdn_recurrence_head: neon_gdn_recurrence_head,
     };
 
     #[cfg(feature = "i8mm")]
@@ -370,6 +412,9 @@ mod aarch64_wrappers {
         f32_to_f16_slice: neon_f32_to_f16_slice,
         quantize_q8_0: neon_quant_q8_0,
         quantize_q8_1: neon_quant_q8_1,
+        rms_norm_f32: neon_rms_norm_f32,
+        l2_norm_f32: neon_l2_norm_f32,
+        gdn_recurrence_head: neon_gdn_recurrence_head,
     };
 }
 
