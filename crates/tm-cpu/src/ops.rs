@@ -5,8 +5,9 @@
 //! pre-allocated scratch buffers.
 
 use tm_core::{
-    BlockQ4_0, BlockQ4_0x4, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, DType,
-    QK_K, QK4_0, QK4_1, QK8_0,
+    BlockIQ2XXS, BlockIQ3XXS, BlockIQ4NL, BlockQ2_0, BlockQ4_0, BlockQ4_0x4, BlockQ4_1, BlockQ5K,
+    BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, BlockTQ2_0, DType, QK_K, QK2_0, QK4_0, QK4_1, QK4_NL,
+    QK8_0,
 };
 
 use crate::{KernelTable, ThreadPool, generic};
@@ -267,6 +268,159 @@ pub fn matvec_f32(
                 let o =
                     unsafe { core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(r0), len) };
                 (kt.gemv_q6_k_q8_k)(
+                    &w[r0 * cols_blocks..r1 * cols_blocks],
+                    xq_ref,
+                    o,
+                    len,
+                    cols_blocks,
+                );
+            });
+        }
+        DType::Q2_0 => {
+            let cols_blocks = cols / QK2_0;
+            let q8_blocks = cols / QK8_0;
+            let xq = &mut scratch.q8_0[..q8_blocks];
+            (kt.quantize_q8_0)(x, xq);
+            let xq_ref: &[BlockQ8_0] = xq;
+            assert!(
+                (w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockQ2_0>()),
+                "Q2_0 tensor pointer misaligned"
+            );
+            // SAFETY: Length and alignment verified above; `BlockQ2_0` is `#[repr(C)]` POD.
+            let w: &[BlockQ2_0] = unsafe {
+                core::slice::from_raw_parts(
+                    w_bytes.as_ptr() as *const BlockQ2_0,
+                    rows * cols_blocks,
+                )
+            };
+            let chunk16 = chunk.next_multiple_of(16).max(16);
+            pool.parallel_for(rows, chunk16, |r0, r1| {
+                let len = r1 - r0;
+                // SAFETY: Disjoint `[r0..r1)` output ranges per parallel chunk.
+                let o =
+                    unsafe { core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(r0), len) };
+                (kt.gemv_q2_0_q8_0)(
+                    &w[r0 * cols_blocks..r1 * cols_blocks],
+                    xq_ref,
+                    o,
+                    len,
+                    cols_blocks,
+                );
+            });
+        }
+        DType::TQ2_0 => {
+            let cols_blocks = cols / QK_K;
+            let xq = &mut scratch.q8_k[..cols_blocks];
+            (kt.quantize_q8_k)(x, xq);
+            let xq_ref: &[BlockQ8K] = xq;
+            assert!(
+                (w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockTQ2_0>()),
+                "TQ2_0 tensor pointer misaligned"
+            );
+            // SAFETY: Length and alignment verified above; `BlockTQ2_0` is `#[repr(C)]` POD.
+            let w: &[BlockTQ2_0] = unsafe {
+                core::slice::from_raw_parts(
+                    w_bytes.as_ptr() as *const BlockTQ2_0,
+                    rows * cols_blocks,
+                )
+            };
+            let chunk16 = chunk.next_multiple_of(16).max(16);
+            pool.parallel_for(rows, chunk16, |r0, r1| {
+                let len = r1 - r0;
+                // SAFETY: Disjoint `[r0..r1)` output ranges per parallel chunk.
+                let o =
+                    unsafe { core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(r0), len) };
+                (kt.gemv_tq2_0_q8_k)(
+                    &w[r0 * cols_blocks..r1 * cols_blocks],
+                    xq_ref,
+                    o,
+                    len,
+                    cols_blocks,
+                );
+            });
+        }
+        DType::Iq2Xxs => {
+            let cols_blocks = cols / QK_K;
+            let xq = &mut scratch.q8_k[..cols_blocks];
+            (kt.quantize_q8_k)(x, xq);
+            let xq_ref: &[BlockQ8K] = xq;
+            assert!(
+                (w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockIQ2XXS>()),
+                "IQ2_XXS tensor pointer misaligned"
+            );
+            // SAFETY: Length and alignment verified above; `BlockIQ2XXS` is `#[repr(C)]` POD.
+            let w: &[BlockIQ2XXS] = unsafe {
+                core::slice::from_raw_parts(
+                    w_bytes.as_ptr() as *const BlockIQ2XXS,
+                    rows * cols_blocks,
+                )
+            };
+            pool.parallel_for(rows, chunk, |r0, r1| {
+                let len = r1 - r0;
+                // SAFETY: Disjoint `[r0..r1)` output ranges per parallel chunk.
+                let o =
+                    unsafe { core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(r0), len) };
+                (kt.gemv_iq2_xxs_q8_k)(
+                    &w[r0 * cols_blocks..r1 * cols_blocks],
+                    xq_ref,
+                    o,
+                    len,
+                    cols_blocks,
+                );
+            });
+        }
+        DType::Iq3Xxs => {
+            let cols_blocks = cols / QK_K;
+            let xq = &mut scratch.q8_k[..cols_blocks];
+            (kt.quantize_q8_k)(x, xq);
+            let xq_ref: &[BlockQ8K] = xq;
+            assert!(
+                (w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockIQ3XXS>()),
+                "IQ3_XXS tensor pointer misaligned"
+            );
+            // SAFETY: Length and alignment verified above; `BlockIQ3XXS` is `#[repr(C)]` POD.
+            let w: &[BlockIQ3XXS] = unsafe {
+                core::slice::from_raw_parts(
+                    w_bytes.as_ptr() as *const BlockIQ3XXS,
+                    rows * cols_blocks,
+                )
+            };
+            pool.parallel_for(rows, chunk, |r0, r1| {
+                let len = r1 - r0;
+                // SAFETY: Disjoint `[r0..r1)` output ranges per parallel chunk.
+                let o =
+                    unsafe { core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(r0), len) };
+                (kt.gemv_iq3_xxs_q8_k)(
+                    &w[r0 * cols_blocks..r1 * cols_blocks],
+                    xq_ref,
+                    o,
+                    len,
+                    cols_blocks,
+                );
+            });
+        }
+        DType::Iq4Nl => {
+            let cols_blocks = cols / QK4_NL;
+            let xq = &mut scratch.q8_0[..cols_blocks];
+            (kt.quantize_q8_0)(x, xq);
+            let xq_ref: &[BlockQ8_0] = xq;
+            assert!(
+                (w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockIQ4NL>()),
+                "IQ4_NL tensor pointer misaligned"
+            );
+            // SAFETY: Length and alignment verified above; `BlockIQ4NL` is `#[repr(C)]` POD.
+            let w: &[BlockIQ4NL] = unsafe {
+                core::slice::from_raw_parts(
+                    w_bytes.as_ptr() as *const BlockIQ4NL,
+                    rows * cols_blocks,
+                )
+            };
+            pool.parallel_for(rows, chunk, |r0, r1| {
+                let len = r1 - r0;
+                // SAFETY: Disjoint `[r0..r1)` output ranges per parallel chunk.
+                let o =
+                    unsafe { core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(r0), len) };
+                (kt.gemv_iq4_nl_q8_0)(
                     &w[r0 * cols_blocks..r1 * cols_blocks],
                     xq_ref,
                     o,
@@ -1369,6 +1523,247 @@ pub fn matmul_f32(
                     );
                     for t in 0..n_tok {
                         // SAFETY: Disjoint `[t * rows + r .. t * rows + r + b_rows)` per worker.
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                (out_ptr as *mut f32).add(t * rows + r),
+                                b_rows,
+                            )
+                        };
+                        dst.copy_from_slice(&tile[t * b_rows..(t + 1) * b_rows]);
+                    }
+                    r += b_rows;
+                }
+            });
+        }
+        DType::Q2_0 => {
+            let cols_blocks = cols / QK2_0;
+            let q8_blocks = cols / QK8_0;
+            let xq = &mut scratch.q8_0[..n_tok * q8_blocks];
+            for t in 0..n_tok {
+                (kt.quantize_q8_0)(
+                    &x[t * cols..(t + 1) * cols],
+                    &mut xq[t * q8_blocks..(t + 1) * q8_blocks],
+                );
+            }
+            let xq_ref: &[BlockQ8_0] = xq;
+            assert!((w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockQ2_0>()));
+            // SAFETY: Alignment and length verified; `BlockQ2_0` is `#[repr(C)]` POD.
+            let w: &[BlockQ2_0] = unsafe {
+                core::slice::from_raw_parts(
+                    w_bytes.as_ptr() as *const BlockQ2_0,
+                    rows * cols_blocks,
+                )
+            };
+            let chunk16 = chunk.next_multiple_of(16).max(16);
+            pool.parallel_for(rows, chunk16, |r0, r1| {
+                let mut r = r0;
+                let mut tile = [0.0f32; 16 * MAX_CPU_BATCH];
+                while r < r1 {
+                    let b_rows = (r1 - r).min(16);
+                    let wr = &w[r * cols_blocks..(r + b_rows) * cols_blocks];
+                    (kt.gemm_q2_0_q8_0)(
+                        wr,
+                        xq_ref,
+                        &mut tile[..b_rows * n_tok],
+                        b_rows,
+                        cols_blocks,
+                        n_tok,
+                    );
+                    for t in 0..n_tok {
+                        // SAFETY: Disjoint `[t * rows + r .. + b_rows)` per worker.
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                (out_ptr as *mut f32).add(t * rows + r),
+                                b_rows,
+                            )
+                        };
+                        dst.copy_from_slice(&tile[t * b_rows..(t + 1) * b_rows]);
+                    }
+                    r += b_rows;
+                }
+            });
+        }
+        DType::TQ2_0 => {
+            let cols_blocks = cols / QK_K;
+            let xq = &mut scratch.q8_k[..n_tok * cols_blocks];
+            for t in 0..n_tok {
+                (kt.quantize_q8_k)(
+                    &x[t * cols..(t + 1) * cols],
+                    &mut xq[t * cols_blocks..(t + 1) * cols_blocks],
+                );
+            }
+            let xq_ref: &[BlockQ8K] = xq;
+            assert!(
+                (w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockTQ2_0>())
+            );
+            // SAFETY: Alignment and length verified; `BlockTQ2_0` is `#[repr(C)]` POD.
+            let w: &[BlockTQ2_0] = unsafe {
+                core::slice::from_raw_parts(
+                    w_bytes.as_ptr() as *const BlockTQ2_0,
+                    rows * cols_blocks,
+                )
+            };
+            let chunk16 = chunk.next_multiple_of(16).max(16);
+            pool.parallel_for(rows, chunk16, |r0, r1| {
+                let mut r = r0;
+                let mut tile = [0.0f32; 16 * MAX_CPU_BATCH];
+                while r < r1 {
+                    let b_rows = (r1 - r).min(16);
+                    let wr = &w[r * cols_blocks..(r + b_rows) * cols_blocks];
+                    (kt.gemm_tq2_0_q8_k)(
+                        wr,
+                        xq_ref,
+                        &mut tile[..b_rows * n_tok],
+                        b_rows,
+                        cols_blocks,
+                        n_tok,
+                    );
+                    for t in 0..n_tok {
+                        // SAFETY: Disjoint `[t * rows + r .. + b_rows)` per worker.
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                (out_ptr as *mut f32).add(t * rows + r),
+                                b_rows,
+                            )
+                        };
+                        dst.copy_from_slice(&tile[t * b_rows..(t + 1) * b_rows]);
+                    }
+                    r += b_rows;
+                }
+            });
+        }
+        DType::Iq2Xxs => {
+            let cols_blocks = cols / QK_K;
+            let xq = &mut scratch.q8_k[..n_tok * cols_blocks];
+            for t in 0..n_tok {
+                (kt.quantize_q8_k)(
+                    &x[t * cols..(t + 1) * cols],
+                    &mut xq[t * cols_blocks..(t + 1) * cols_blocks],
+                );
+            }
+            let xq_ref: &[BlockQ8K] = xq;
+            assert!(
+                (w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockIQ2XXS>())
+            );
+            // SAFETY: Alignment and length verified; `BlockIQ2XXS` is `#[repr(C)]` POD.
+            let w: &[BlockIQ2XXS] = unsafe {
+                core::slice::from_raw_parts(
+                    w_bytes.as_ptr() as *const BlockIQ2XXS,
+                    rows * cols_blocks,
+                )
+            };
+            pool.parallel_for(rows, chunk, |r0, r1| {
+                let mut r = r0;
+                let mut tile = [0.0f32; 16 * MAX_CPU_BATCH];
+                while r < r1 {
+                    let b_rows = (r1 - r).min(16);
+                    let wr = &w[r * cols_blocks..(r + b_rows) * cols_blocks];
+                    (kt.gemm_iq2_xxs_q8_k)(
+                        wr,
+                        xq_ref,
+                        &mut tile[..b_rows * n_tok],
+                        b_rows,
+                        cols_blocks,
+                        n_tok,
+                    );
+                    for t in 0..n_tok {
+                        // SAFETY: Disjoint `[t * rows + r .. + b_rows)` per worker.
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                (out_ptr as *mut f32).add(t * rows + r),
+                                b_rows,
+                            )
+                        };
+                        dst.copy_from_slice(&tile[t * b_rows..(t + 1) * b_rows]);
+                    }
+                    r += b_rows;
+                }
+            });
+        }
+        DType::Iq3Xxs => {
+            let cols_blocks = cols / QK_K;
+            let xq = &mut scratch.q8_k[..n_tok * cols_blocks];
+            for t in 0..n_tok {
+                (kt.quantize_q8_k)(
+                    &x[t * cols..(t + 1) * cols],
+                    &mut xq[t * cols_blocks..(t + 1) * cols_blocks],
+                );
+            }
+            let xq_ref: &[BlockQ8K] = xq;
+            assert!(
+                (w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockIQ3XXS>())
+            );
+            // SAFETY: Alignment and length verified; `BlockIQ3XXS` is `#[repr(C)]` POD.
+            let w: &[BlockIQ3XXS] = unsafe {
+                core::slice::from_raw_parts(
+                    w_bytes.as_ptr() as *const BlockIQ3XXS,
+                    rows * cols_blocks,
+                )
+            };
+            pool.parallel_for(rows, chunk, |r0, r1| {
+                let mut r = r0;
+                let mut tile = [0.0f32; 16 * MAX_CPU_BATCH];
+                while r < r1 {
+                    let b_rows = (r1 - r).min(16);
+                    let wr = &w[r * cols_blocks..(r + b_rows) * cols_blocks];
+                    (kt.gemm_iq3_xxs_q8_k)(
+                        wr,
+                        xq_ref,
+                        &mut tile[..b_rows * n_tok],
+                        b_rows,
+                        cols_blocks,
+                        n_tok,
+                    );
+                    for t in 0..n_tok {
+                        // SAFETY: Disjoint `[t * rows + r .. + b_rows)` per worker.
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                (out_ptr as *mut f32).add(t * rows + r),
+                                b_rows,
+                            )
+                        };
+                        dst.copy_from_slice(&tile[t * b_rows..(t + 1) * b_rows]);
+                    }
+                    r += b_rows;
+                }
+            });
+        }
+        DType::Iq4Nl => {
+            let cols_blocks = cols / QK4_NL;
+            let xq = &mut scratch.q8_0[..n_tok * cols_blocks];
+            for t in 0..n_tok {
+                (kt.quantize_q8_0)(
+                    &x[t * cols..(t + 1) * cols],
+                    &mut xq[t * cols_blocks..(t + 1) * cols_blocks],
+                );
+            }
+            let xq_ref: &[BlockQ8_0] = xq;
+            assert!(
+                (w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockIQ4NL>())
+            );
+            // SAFETY: Alignment and length verified; `BlockIQ4NL` is `#[repr(C)]` POD.
+            let w: &[BlockIQ4NL] = unsafe {
+                core::slice::from_raw_parts(
+                    w_bytes.as_ptr() as *const BlockIQ4NL,
+                    rows * cols_blocks,
+                )
+            };
+            pool.parallel_for(rows, chunk, |r0, r1| {
+                let mut r = r0;
+                let mut tile = [0.0f32; 16 * MAX_CPU_BATCH];
+                while r < r1 {
+                    let b_rows = (r1 - r).min(16);
+                    let wr = &w[r * cols_blocks..(r + b_rows) * cols_blocks];
+                    (kt.gemm_iq4_nl_q8_0)(
+                        wr,
+                        xq_ref,
+                        &mut tile[..b_rows * n_tok],
+                        b_rows,
+                        cols_blocks,
+                        n_tok,
+                    );
+                    for t in 0..n_tok {
+                        // SAFETY: Disjoint `[t * rows + r .. + b_rows)` per worker.
                         let dst = unsafe {
                             core::slice::from_raw_parts_mut(
                                 (out_ptr as *mut f32).add(t * rows + r),

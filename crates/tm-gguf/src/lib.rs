@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 use thiserror::Error;
-use tm_core::{DType, QK4_0, repack_q4_0_bytes_to_q4_0x4};
+use tm_core::{
+    DType, QK4_0, dequantize_q4_0x4_single_row, dequantize_row_bytes, quantize_row_to_bytes,
+    repack_q4_0_bytes_to_q4_0x4,
+};
 
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const DEFAULT_ALIGNMENT: usize = 32;
@@ -79,6 +82,8 @@ pub enum GgufError {
         expected: Vec<usize>,
         actual: Vec<usize>,
     },
+    #[error("GGUF '{path}': invalid convert option: {detail}")]
+    InvalidConvertOption { path: String, detail: String },
 }
 
 /// Typed GGUF metadata value.
@@ -753,6 +758,913 @@ pub struct ConvertStats {
     pub repacked_tensors: usize,
     pub repacked_bytes: usize,
     pub total_file_bytes: usize,
+}
+
+/// Options for offline GGUF weight quantization, layout repacking, and BPE-closed vocabulary pruning (`F-04`).
+#[derive(Debug, Clone, Default)]
+pub struct ConvertOptions {
+    /// Target quantization for 2D linear projection weights (`None` defaults to `Q4_0x4` repacking).
+    pub quant: Option<DType>,
+    /// Optional separate quantization format for the LM head (`output.weight` or tied `token_embd.weight`).
+    pub lm_head_quant: Option<DType>,
+    /// Optional target vocabulary size `N` (`0 < N < old_vocab_size`) for BPE-closed vocabulary pruning.
+    pub prune_vocab: Option<usize>,
+    /// Optional UTF-8 domain corpus whose BPE subwords (and recursive merge ancestors) are prioritized.
+    pub vocab_corpus: Option<String>,
+}
+
+/// Summary report returned by `GgufFile::convert_with_options`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConvertReport {
+    pub total_tensors: usize,
+    pub converted_tensors: usize,
+    pub old_vocab_size: usize,
+    pub new_vocab_size: usize,
+    pub old_merges: usize,
+    pub kept_merges: usize,
+    pub input_file_bytes: usize,
+    pub output_file_bytes: usize,
+}
+
+struct VocabPrunePlan {
+    kept_old_ids: Vec<usize>,
+    old_to_new: Vec<Option<u32>>,
+    kept_tokens: Vec<String>,
+    kept_merges: Vec<String>,
+}
+
+fn build_gpt2_byte_to_char_array() -> [char; 256] {
+    let mut is_direct = [false; 256];
+    for b in b'!'..=b'~' {
+        is_direct[b as usize] = true;
+    }
+    for b in 0xA1u8..=0xACu8 {
+        is_direct[b as usize] = true;
+    }
+    for b in 0xAEu8..=0xFFu8 {
+        is_direct[b as usize] = true;
+    }
+    let mut out = ['\0'; 256];
+    let mut n = 0u32;
+    for b in 0u16..256 {
+        out[b as usize] = if is_direct[b as usize] {
+            char::from_u32(b as u32).unwrap_or('\0')
+        } else {
+            let c = char::from_u32(256 + n).unwrap_or('\0');
+            n += 1;
+            c
+        };
+    }
+    out
+}
+
+fn resolve_quant_dtype(req: DType, cols: usize, rows: usize, orig: DType) -> DType {
+    if req == DType::Q4_0x4 {
+        if cols.is_multiple_of(QK4_0) && rows.is_multiple_of(4) {
+            return DType::Q4_0x4;
+        }
+        if cols.is_multiple_of(QK4_0) {
+            return DType::Q4_0;
+        }
+        return orig;
+    }
+    if cols.is_multiple_of(req.block_elements()) {
+        return req;
+    }
+    // Automatic per-tensor fallback when `cols % 256 != 0` (e.g. `SmolLM2-360M` `n_embd = 960`):
+    match req {
+        DType::TQ2_0 | DType::Iq2Xxs => {
+            if cols.is_multiple_of(64) {
+                DType::Q2_0
+            } else if cols.is_multiple_of(32) {
+                DType::Iq4Nl
+            } else {
+                orig
+            }
+        }
+        DType::Iq3Xxs => {
+            if cols.is_multiple_of(32) {
+                DType::Iq4Nl
+            } else {
+                orig
+            }
+        }
+        _ => {
+            if cols.is_multiple_of(32) {
+                DType::Q4_0
+            } else {
+                orig
+            }
+        }
+    }
+}
+
+fn write_gguf_str<W: Write>(w: &mut W, s: &str, out_path: &str) -> Result<(), GgufError> {
+    w.write_all(&(s.len() as u64).to_le_bytes())
+        .and_then(|_| w.write_all(s.as_bytes()))
+        .map_err(|source| GgufError::Io {
+            path: out_path.to_string(),
+            source,
+        })
+}
+
+fn write_gguf_val<W: Write>(
+    w: &mut W,
+    val: &MetadataValue,
+    backing_bytes: &[u8],
+    write_tag: bool,
+    out_path: &str,
+) -> Result<(), GgufError> {
+    let io_err = |source: std::io::Error| GgufError::Io {
+        path: out_path.to_string(),
+        source,
+    };
+    let tag: u32 = match val {
+        MetadataValue::U8(_) => 0,
+        MetadataValue::I8(_) => 1,
+        MetadataValue::U16(_) => 2,
+        MetadataValue::I16(_) => 3,
+        MetadataValue::U32(_) => 4,
+        MetadataValue::I32(_) => 5,
+        MetadataValue::F32(_) => 6,
+        MetadataValue::Bool(_) => 7,
+        MetadataValue::String(_) => 8,
+        MetadataValue::StringSpans { .. }
+        | MetadataValue::U32Array(_)
+        | MetadataValue::I32Array(_)
+        | MetadataValue::F32Array(_)
+        | MetadataValue::Array(_) => 9,
+        MetadataValue::U64(_) => 10,
+        MetadataValue::I64(_) => 11,
+        MetadataValue::F64(_) => 12,
+    };
+    if write_tag {
+        w.write_all(&tag.to_le_bytes()).map_err(io_err)?;
+    }
+    match val {
+        MetadataValue::U8(v) => w.write_all(&[*v]).map_err(io_err),
+        MetadataValue::I8(v) => w.write_all(&[*v as u8]).map_err(io_err),
+        MetadataValue::U16(v) => w.write_all(&v.to_le_bytes()).map_err(io_err),
+        MetadataValue::I16(v) => w.write_all(&v.to_le_bytes()).map_err(io_err),
+        MetadataValue::U32(v) => w.write_all(&v.to_le_bytes()).map_err(io_err),
+        MetadataValue::I32(v) => w.write_all(&v.to_le_bytes()).map_err(io_err),
+        MetadataValue::F32(v) => w.write_all(&v.to_le_bytes()).map_err(io_err),
+        MetadataValue::Bool(v) => w.write_all(&[u8::from(*v)]).map_err(io_err),
+        MetadataValue::String(s) => write_gguf_str(w, s, out_path),
+        MetadataValue::U64(v) => w.write_all(&v.to_le_bytes()).map_err(io_err),
+        MetadataValue::I64(v) => w.write_all(&v.to_le_bytes()).map_err(io_err),
+        MetadataValue::F64(v) => w.write_all(&v.to_le_bytes()).map_err(io_err),
+        MetadataValue::StringSpans { spans, .. } => {
+            w.write_all(&8u32.to_le_bytes()).map_err(io_err)?;
+            w.write_all(&(spans.len() as u64).to_le_bytes())
+                .map_err(io_err)?;
+            for &(start, len) in spans {
+                let s = start as usize;
+                let l = len as usize;
+                w.write_all(&(l as u64).to_le_bytes()).map_err(io_err)?;
+                w.write_all(&backing_bytes[s..s + l]).map_err(io_err)?;
+            }
+            Ok(())
+        }
+        MetadataValue::U32Array(arr) => {
+            w.write_all(&4u32.to_le_bytes()).map_err(io_err)?;
+            w.write_all(&(arr.len() as u64).to_le_bytes())
+                .map_err(io_err)?;
+            for &x in arr {
+                w.write_all(&x.to_le_bytes()).map_err(io_err)?;
+            }
+            Ok(())
+        }
+        MetadataValue::I32Array(arr) => {
+            w.write_all(&5u32.to_le_bytes()).map_err(io_err)?;
+            w.write_all(&(arr.len() as u64).to_le_bytes())
+                .map_err(io_err)?;
+            for &x in arr {
+                w.write_all(&x.to_le_bytes()).map_err(io_err)?;
+            }
+            Ok(())
+        }
+        MetadataValue::F32Array(arr) => {
+            w.write_all(&6u32.to_le_bytes()).map_err(io_err)?;
+            w.write_all(&(arr.len() as u64).to_le_bytes())
+                .map_err(io_err)?;
+            for &x in arr {
+                w.write_all(&x.to_le_bytes()).map_err(io_err)?;
+            }
+            Ok(())
+        }
+        MetadataValue::Array(items) => {
+            let elem_tag: u32 = match items.first() {
+                Some(MetadataValue::U8(_)) => 0,
+                Some(MetadataValue::I8(_)) => 1,
+                Some(MetadataValue::U16(_)) => 2,
+                Some(MetadataValue::I16(_)) => 3,
+                Some(MetadataValue::U32(_)) => 4,
+                Some(MetadataValue::I32(_)) => 5,
+                Some(MetadataValue::F32(_)) => 6,
+                Some(MetadataValue::Bool(_)) => 7,
+                Some(MetadataValue::String(_)) | None => 8,
+                Some(MetadataValue::U64(_)) => 10,
+                Some(MetadataValue::I64(_)) => 11,
+                Some(MetadataValue::F64(_)) => 12,
+                _ => 9,
+            };
+            w.write_all(&elem_tag.to_le_bytes()).map_err(io_err)?;
+            w.write_all(&(items.len() as u64).to_le_bytes())
+                .map_err(io_err)?;
+            for item in items {
+                write_gguf_val(w, item, backing_bytes, false, out_path)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+impl GgufFile {
+    fn build_vocab_prune_plan(
+        &self,
+        target_vocab: usize,
+        corpus: Option<&str>,
+    ) -> Result<VocabPrunePlan, GgufError> {
+        let path_str = self.path.display().to_string();
+        let (_, tok_iter) = self
+            .string_array_iter("tokenizer.ggml.tokens")
+            .ok_or_else(|| GgufError::MissingMetadata {
+                path: path_str.clone(),
+                key: "tokenizer.ggml.tokens".to_string(),
+            })?;
+        let tokens: Vec<&str> = tok_iter.collect();
+        let v_old = tokens.len();
+
+        let embd_rows = self
+            .tensors
+            .get("token_embd.weight")
+            .and_then(|t| t.dims.get(1).copied())
+            .unwrap_or(v_old);
+        let max_valid = v_old.min(embd_rows);
+
+        if target_vocab < 264 || target_vocab >= max_valid {
+            return Err(GgufError::InvalidConvertOption {
+                path: path_str,
+                detail: format!(
+                    "--prune-vocab {target_vocab} must be in 264..{max_valid} (current vocab={v_old})"
+                ),
+            });
+        }
+
+        let mut str_to_id: HashMap<&str, usize> = HashMap::with_capacity(v_old * 2);
+        for (idx, &s) in tokens.iter().enumerate() {
+            if idx < max_valid {
+                str_to_id.entry(s).or_insert(idx);
+            }
+        }
+
+        let mut raw_merges: Vec<&str> = Vec::new();
+        if let Some((_, m_iter)) = self.string_array_iter("tokenizer.ggml.merges") {
+            raw_merges = m_iter.collect();
+        }
+
+        let mut parsed_merges: Vec<(usize, usize, usize, usize)> =
+            Vec::with_capacity(raw_merges.len()); // (line_idx, id_a, id_b, id_ab)
+        let mut parent_of: Vec<Option<(usize, usize)>> = vec![None; max_valid];
+        let mut ab_buf = String::with_capacity(64);
+        for (m_idx, &line) in raw_merges.iter().enumerate() {
+            if let Some((a, b)) = line.split_once(' ')
+                && let (Some(&ia), Some(&ib)) = (str_to_id.get(a), str_to_id.get(b))
+            {
+                ab_buf.clear();
+                ab_buf.push_str(a);
+                ab_buf.push_str(b);
+                if let Some(&iab) = str_to_id.get(ab_buf.as_str()) {
+                    parsed_merges.push((m_idx, ia, ib, iab));
+                    if parent_of[iab].is_none() {
+                        parent_of[iab] = Some((ia, ib));
+                    }
+                }
+            }
+        }
+
+        let mut keep = vec![false; max_valid];
+        let mut kept_count = 0usize;
+
+        let mark_plain = |id: usize, keep: &mut [bool], cnt: &mut usize, cap: usize| {
+            if id < keep.len() && !keep[id] && *cnt < cap {
+                keep[id] = true;
+                *cnt += 1;
+            }
+        };
+
+        // 1. Mandatory special IDs from GGUF metadata
+        for meta_key in [
+            "tokenizer.ggml.bos_token_id",
+            "tokenizer.ggml.eos_token_id",
+            "tokenizer.ggml.eot_token_id",
+            "tokenizer.ggml.unknown_token_id",
+            "tokenizer.ggml.padding_token_id",
+            "tokenizer.ggml.sep_token_id",
+            "tokenizer.ggml.nl_token_id",
+        ] {
+            if let Some(id) = self.metadata.get(meta_key).and_then(|v| v.as_usize()) {
+                mark_plain(id, &mut keep, &mut kept_count, target_vocab);
+            }
+        }
+
+        // 2. Mandatory base byte fallback tokens (`<= 300` slots) + control/chat markers
+        if let Some(ttypes) = self
+            .metadata
+            .get("tokenizer.ggml.token_type")
+            .and_then(|v| v.as_i32_array())
+        {
+            // Keep BYTE (`6`), UNKNOWN (`2`), CONTROL (`3`), USER_DEFINED (`4`) up to half of `target_vocab`
+            let special_cap = (target_vocab / 2).max(260);
+            for (idx, &tt) in ttypes.iter().enumerate().take(max_valid) {
+                if matches!(tt, 2 | 3 | 4 | 6) && kept_count < special_cap {
+                    mark_plain(idx, &mut keep, &mut kept_count, target_vocab);
+                }
+            }
+        }
+        for (idx, &s) in tokens.iter().enumerate().take(max_valid) {
+            let mut chars = s.chars();
+            let is_base_byte_char = match (chars.next(), chars.next()) {
+                (Some(c), None) => (c as u32) <= 0x024F || c == '\u{2581}',
+                _ => false,
+            };
+            let is_angle_special = s.starts_with('<') && s.ends_with('>') && s.len() <= 32;
+            if is_base_byte_char || is_angle_special {
+                mark_plain(idx, &mut keep, &mut kept_count, target_vocab);
+            }
+        }
+
+        // Helper: mark `id` together with ALL recursive BPE merge ancestors so BPE merge closure holds!
+        let mark_bpe_closed = |root: usize,
+                               keep: &mut [bool],
+                               cnt: &mut usize,
+                               parents: &[Option<(usize, usize)>],
+                               cap: usize| {
+            if root >= keep.len() || keep[root] {
+                return;
+            }
+            let mut stack = vec![root];
+            let mut to_add: Vec<usize> = Vec::new();
+            while let Some(cur) = stack.pop() {
+                if cur >= keep.len() || keep[cur] || to_add.contains(&cur) {
+                    continue;
+                }
+                to_add.push(cur);
+                if let Some((pa, pb)) = parents[cur] {
+                    stack.push(pa);
+                    stack.push(pb);
+                }
+            }
+            if *cnt + to_add.len() <= cap {
+                for id in to_add {
+                    keep[id] = true;
+                    *cnt += 1;
+                }
+            }
+        };
+
+        // 3. Optional domain corpus (`--vocab-corpus`): simulate full BPE merges on corpus words & rank by frequency
+        if let Some(text) = corpus
+            && !text.is_empty()
+        {
+            let tok_model = self
+                .metadata
+                .get("tokenizer.ggml.model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("gpt2");
+            let byte_to_char = build_gpt2_byte_to_char_array();
+            let mut pair_map: HashMap<(usize, usize), (usize, usize)> =
+                HashMap::with_capacity(parsed_merges.len());
+            for &(rank, ia, ib, iab) in &parsed_merges {
+                pair_map.entry((ia, ib)).or_insert((rank, iab));
+            }
+
+            let mut word_counts: HashMap<String, usize> = HashMap::new();
+            let mut cur = String::new();
+            let mut prev_ws = false;
+            for ch in text.chars() {
+                let ws = ch.is_whitespace();
+                if !cur.is_empty() && ws != prev_ws && !prev_ws {
+                    *word_counts.entry(std::mem::take(&mut cur)).or_insert(0) += 1;
+                }
+                cur.push(ch);
+                prev_ws = ws;
+                if cur.len() >= 48 {
+                    *word_counts.entry(std::mem::take(&mut cur)).or_insert(0) += 1;
+                }
+            }
+            if !cur.is_empty() {
+                *word_counts.entry(cur).or_insert(0) += 1;
+            }
+
+            let mut freq = vec![0usize; max_valid];
+            let mut cbuf = [0u8; 4];
+            for (piece, occ) in word_counts {
+                let mut syms: Vec<usize> = Vec::with_capacity(piece.len());
+                if tok_model == "gemma4" {
+                    for ch in piece.chars() {
+                        let mapped = if ch == ' ' { '\u{2581}' } else { ch };
+                        let s = mapped.encode_utf8(&mut cbuf);
+                        if let Some(&id) = str_to_id.get(s) {
+                            syms.push(id);
+                        }
+                    }
+                } else {
+                    for &b in piece.as_bytes() {
+                        let c = byte_to_char[b as usize];
+                        let s = c.encode_utf8(&mut cbuf);
+                        if let Some(&id) = str_to_id.get(s) {
+                            syms.push(id);
+                        }
+                    }
+                }
+                while syms.len() >= 2 {
+                    let mut best_rank = usize::MAX;
+                    let mut best_pos = 0usize;
+                    let mut best_id = 0usize;
+                    for i in 0..(syms.len() - 1) {
+                        if let Some(&(r, mid)) = pair_map.get(&(syms[i], syms[i + 1]))
+                            && r < best_rank
+                        {
+                            best_rank = r;
+                            best_pos = i;
+                            best_id = mid;
+                        }
+                    }
+                    if best_rank == usize::MAX {
+                        break;
+                    }
+                    syms[best_pos] = best_id;
+                    syms.remove(best_pos + 1);
+                }
+                for id in syms {
+                    freq[id] += occ;
+                }
+            }
+
+            let mut ranked: Vec<(usize, usize)> = freq
+                .into_iter()
+                .enumerate()
+                .filter(|&(_, f)| f > 0)
+                .collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            for (id, _) in ranked {
+                if kept_count >= target_vocab {
+                    break;
+                }
+                mark_bpe_closed(id, &mut keep, &mut kept_count, &parent_of, target_vocab);
+            }
+        }
+
+        // 4. Fill remaining budget in BPE merge rank order (preserves highest-frequency subwords & closure)
+        for &(_, ia, ib, iab) in &parsed_merges {
+            if kept_count >= target_vocab {
+                break;
+            }
+            mark_bpe_closed(ia, &mut keep, &mut kept_count, &parent_of, target_vocab);
+            mark_bpe_closed(ib, &mut keep, &mut kept_count, &parent_of, target_vocab);
+            mark_bpe_closed(iab, &mut keep, &mut kept_count, &parent_of, target_vocab);
+        }
+
+        // 5. Top up any remaining slots in ascending token ID order
+        for id in 0..max_valid {
+            if kept_count >= target_vocab {
+                break;
+            }
+            mark_plain(id, &mut keep, &mut kept_count, target_vocab);
+        }
+
+        let mut kept_old_ids = Vec::with_capacity(target_vocab);
+        let mut old_to_new: Vec<Option<u32>> = vec![None; embd_rows.max(v_old)];
+        for (old_id, &is_kept) in keep.iter().enumerate() {
+            if is_kept {
+                let new_id = kept_old_ids.len() as u32;
+                kept_old_ids.push(old_id);
+                old_to_new[old_id] = Some(new_id);
+            }
+        }
+
+        let kept_tokens: Vec<String> = kept_old_ids
+            .iter()
+            .map(|&old_id| tokens[old_id].to_string())
+            .collect();
+
+        let mut kept_merges: Vec<String> = Vec::new();
+        for &(m_idx, ia, ib, iab) in &parsed_merges {
+            if old_to_new[ia].is_some() && old_to_new[ib].is_some() && old_to_new[iab].is_some() {
+                kept_merges.push(raw_merges[m_idx].to_string());
+            }
+        }
+
+        Ok(VocabPrunePlan {
+            kept_old_ids,
+            old_to_new,
+            kept_tokens,
+            kept_merges,
+        })
+    }
+
+    /// Streams and converts this GGUF model to `dst_path` with optional low-bit quantization
+    /// (`Q2_0`, `TQ2_0`, `IQ2_XXS`, `IQ3_XXS`, `IQ4_NL`, `Q4_0x4`, `Q4_0`, `Q8_0`), separate
+    /// `--lm-head-quant`, and BPE-closed `--prune-vocab` (`F-04`, `ARCHITECTURE.md` §5.6).
+    pub fn convert_with_options<P: AsRef<Path>>(
+        &self,
+        dst_path: P,
+        opts: &ConvertOptions,
+    ) -> Result<ConvertReport, GgufError> {
+        let raw = self.backing.as_slice();
+        let old_vocab = self
+            .string_array_iter("tokenizer.ggml.tokens")
+            .map(|(_, it)| it.len())
+            .or_else(|| {
+                self.tensors
+                    .get("token_embd.weight")
+                    .and_then(|t| t.dims.get(1).copied())
+            })
+            .unwrap_or(0);
+        let old_merges = self
+            .string_array_iter("tokenizer.ggml.merges")
+            .map(|(_, it)| it.len())
+            .unwrap_or(0);
+
+        // Fast zero-overhead path when only repacking existing `Q4_0 -> Q4_0x4` without vocab pruning:
+        let is_pure_q4x4 = opts.prune_vocab.is_none()
+            && opts.lm_head_quant.is_none()
+            && matches!(opts.quant, None | Some(DType::Q4_0x4))
+            && self
+                .tensors
+                .values()
+                .filter(|t| t.dims.len() == 2 && t.name != "per_layer_token_embd.weight")
+                .any(|t| t.dtype == DType::Q4_0);
+        if is_pure_q4x4 && opts.quant.is_none() {
+            let st = self.convert_to_q4_0x4(&dst_path)?;
+            return Ok(ConvertReport {
+                total_tensors: st.total_tensors,
+                converted_tensors: st.repacked_tensors,
+                old_vocab_size: old_vocab,
+                new_vocab_size: old_vocab,
+                old_merges,
+                kept_merges: old_merges,
+                input_file_bytes: st.total_file_bytes,
+                output_file_bytes: st.total_file_bytes,
+            });
+        }
+
+        let out_path = dst_path.as_ref();
+        let out_str = out_path.display().to_string();
+        let prune_plan = match opts.prune_vocab {
+            Some(n) => Some(self.build_vocab_prune_plan(n, opts.vocab_corpus.as_deref())?),
+            None => None,
+        };
+        let new_vocab = prune_plan
+            .as_ref()
+            .map(|p| p.kept_old_ids.len())
+            .unwrap_or(old_vocab);
+        let kept_merges_cnt = prune_plan
+            .as_ref()
+            .map(|p| p.kept_merges.len())
+            .unwrap_or(old_merges);
+
+        // 1. Prepare updated metadata dictionary
+        let mut meta = self.metadata.clone();
+        meta.insert(
+            "general.alignment".to_string(),
+            MetadataValue::U32(self.alignment as u32),
+        );
+        if let Some(ref plan) = prune_plan {
+            meta.insert(
+                "tokenizer.ggml.tokens".to_string(),
+                MetadataValue::Array(
+                    plan.kept_tokens
+                        .iter()
+                        .cloned()
+                        .map(MetadataValue::String)
+                        .collect(),
+                ),
+            );
+            if meta.contains_key("tokenizer.ggml.merges") {
+                meta.insert(
+                    "tokenizer.ggml.merges".to_string(),
+                    MetadataValue::Array(
+                        plan.kept_merges
+                            .iter()
+                            .cloned()
+                            .map(MetadataValue::String)
+                            .collect(),
+                    ),
+                );
+            }
+            if let Some(MetadataValue::F32Array(scores)) =
+                meta.get("tokenizer.ggml.scores").cloned()
+            {
+                let new_scores: Vec<f32> = plan
+                    .kept_old_ids
+                    .iter()
+                    .map(|&i| scores.get(i).copied().unwrap_or(0.0))
+                    .collect();
+                meta.insert(
+                    "tokenizer.ggml.scores".to_string(),
+                    MetadataValue::F32Array(new_scores),
+                );
+            }
+            if let Some(tt_arr) = meta
+                .get("tokenizer.ggml.token_type")
+                .and_then(|v| v.as_i32_array())
+            {
+                let new_tt: Vec<i32> = plan
+                    .kept_old_ids
+                    .iter()
+                    .map(|&i| tt_arr.get(i).copied().unwrap_or(1))
+                    .collect();
+                meta.insert(
+                    "tokenizer.ggml.token_type".to_string(),
+                    MetadataValue::I32Array(new_tt),
+                );
+            }
+            for id_key in [
+                "tokenizer.ggml.bos_token_id",
+                "tokenizer.ggml.eos_token_id",
+                "tokenizer.ggml.eot_token_id",
+                "tokenizer.ggml.unknown_token_id",
+                "tokenizer.ggml.padding_token_id",
+                "tokenizer.ggml.sep_token_id",
+                "tokenizer.ggml.nl_token_id",
+            ] {
+                if let Some(old_id) = meta.get(id_key).and_then(|v| v.as_usize()) {
+                    if let Some(Some(remapped)) = plan.old_to_new.get(old_id) {
+                        meta.insert(id_key.to_string(), MetadataValue::U32(*remapped));
+                    } else {
+                        meta.remove(id_key);
+                    }
+                }
+            }
+            if let Some(arch) = meta
+                .get("general.architecture")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+            {
+                let arch_vocab_key = format!("{arch}.vocab_size");
+                if meta.contains_key(&arch_vocab_key) {
+                    meta.insert(arch_vocab_key, MetadataValue::U32(new_vocab as u32));
+                }
+            }
+        }
+
+        // 2. Plan output tensors (`dims`, `dtype`, `byte_len`, `aligned_offset`)
+        struct OutTensorPlan {
+            name: String,
+            dims: Vec<usize>,
+            new_dtype: DType,
+            byte_len: usize,
+            offset: usize,
+            vocab_sliced: bool,
+        }
+
+        let has_separate_output = self.tensors.contains_key("output.weight");
+        let default_quant = opts.quant;
+        let mut plans: Vec<OutTensorPlan> = Vec::with_capacity(self.tensor_order.len());
+        let mut cur_data_off = 0usize;
+        let mut converted_tensors = 0usize;
+
+        for name in &self.tensor_order {
+            let info = &self.tensors[name];
+            let is_vocab_tensor = matches!(
+                name.as_str(),
+                "token_embd.weight" | "output.weight" | "per_layer_token_embd.weight"
+            );
+            let vocab_sliced = prune_plan.is_some() && is_vocab_tensor && info.dims.len() == 2;
+            let mut new_dims = info.dims.clone();
+            if let Some(ref plan) = prune_plan
+                && vocab_sliced
+            {
+                new_dims[1] = plan.kept_old_ids.len();
+            }
+
+            let new_dtype = if info.dims.len() == 2 {
+                let cols = new_dims[0];
+                let rows = new_dims[1];
+                if name == "per_layer_token_embd.weight" {
+                    info.dtype
+                } else if name == "output.weight"
+                    || (name == "token_embd.weight" && !has_separate_output)
+                {
+                    match opts.lm_head_quant.or(default_quant) {
+                        Some(req) => resolve_quant_dtype(req, cols, rows, info.dtype),
+                        None => info.dtype,
+                    }
+                } else if name == "token_embd.weight" && has_separate_output {
+                    // Untied input embedding: keep compact `<= 4.5 bpw` types untouched; if wider (`F16`/`Q8_0`), compress to `IQ4_NL` when `--quant` is low-bit.
+                    match default_quant {
+                        Some(req)
+                            if matches!(
+                                req,
+                                DType::Q2_0
+                                    | DType::TQ2_0
+                                    | DType::Iq2Xxs
+                                    | DType::Iq3Xxs
+                                    | DType::Iq4Nl
+                            ) && info.dtype.block_bytes() * 32
+                                > 18 * info.dtype.block_elements() =>
+                        {
+                            resolve_quant_dtype(DType::Iq4Nl, cols, rows, info.dtype)
+                        }
+                        _ => info.dtype,
+                    }
+                } else {
+                    match default_quant {
+                        Some(req) => resolve_quant_dtype(req, cols, rows, info.dtype),
+                        None => info.dtype,
+                    }
+                }
+            } else {
+                info.dtype
+            };
+
+            if new_dtype != info.dtype || vocab_sliced {
+                converted_tensors += 1;
+            }
+
+            let n_elems: usize = new_dims.iter().product();
+            let byte_len = (n_elems / new_dtype.block_elements()) * new_dtype.block_bytes();
+            let aligned_off = cur_data_off.next_multiple_of(self.alignment);
+            cur_data_off = aligned_off + byte_len;
+
+            plans.push(OutTensorPlan {
+                name: name.clone(),
+                dims: new_dims,
+                new_dtype,
+                byte_len,
+                offset: aligned_off,
+                vocab_sliced,
+            });
+        }
+
+        // 3. Serialize GGUF v3 header + sorted KV metadata + tensor directory into `hdr_buf`
+        let mut hdr_buf: Vec<u8> = Vec::with_capacity(self.data_offset + 4096);
+        let io_err = |source: std::io::Error| GgufError::Io {
+            path: out_str.clone(),
+            source,
+        };
+        hdr_buf.extend_from_slice(GGUF_MAGIC);
+        hdr_buf.extend_from_slice(&3u32.to_le_bytes());
+        hdr_buf.extend_from_slice(&(plans.len() as u64).to_le_bytes());
+        hdr_buf.extend_from_slice(&(meta.len() as u64).to_le_bytes());
+
+        let mut sorted_keys: Vec<&String> = meta.keys().collect();
+        sorted_keys.sort();
+        for k in sorted_keys {
+            write_gguf_str(&mut hdr_buf, k, &out_str)?;
+            write_gguf_val(&mut hdr_buf, &meta[k], raw, true, &out_str)?;
+        }
+
+        for p in &plans {
+            write_gguf_str(&mut hdr_buf, &p.name, &out_str)?;
+            hdr_buf.extend_from_slice(&(p.dims.len() as u32).to_le_bytes());
+            for &d in &p.dims {
+                hdr_buf.extend_from_slice(&(d as u64).to_le_bytes());
+            }
+            hdr_buf.extend_from_slice(&p.new_dtype.to_ggml_type().to_le_bytes());
+            hdr_buf.extend_from_slice(&(p.offset as u64).to_le_bytes());
+        }
+
+        let new_data_offset = hdr_buf.len().next_multiple_of(self.alignment);
+        hdr_buf.resize(new_data_offset, 0u8);
+
+        // 4. Stream header + converted/sliced tensor payloads to `out_path`
+        let file = File::create(out_path).map_err(io_err)?;
+        let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+        writer.write_all(&hdr_buf).map_err(io_err)?;
+
+        let mut written_data = 0usize;
+        let mut f32_row: Vec<f32> = Vec::new();
+        let mut out_row_buf: Vec<u8> = Vec::new();
+        let mut q4_group_raw: Vec<u8> = Vec::new();
+        let mut q4_group_rep: Vec<u8> = Vec::new();
+        let zero_pad = [0u8; 64];
+
+        for p in &plans {
+            while written_data < p.offset {
+                let pad_n = (p.offset - written_data).min(zero_pad.len());
+                writer.write_all(&zero_pad[..pad_n]).map_err(io_err)?;
+                written_data += pad_n;
+            }
+
+            let src_info = &self.tensors[&p.name];
+            let src_bytes = &raw[self.data_offset + src_info.offset
+                ..self.data_offset + src_info.offset + src_info.byte_len];
+
+            if !p.vocab_sliced && p.new_dtype == src_info.dtype {
+                // Direct zero-copy byte stream
+                writer.write_all(src_bytes).map_err(io_err)?;
+            } else if !p.vocab_sliced
+                && src_info.dtype == DType::Q4_0
+                && p.new_dtype == DType::Q4_0x4
+            {
+                // Lossless `Q4_0 -> Q4_0x4` super-block repack
+                let cols = p.dims[0];
+                let rows = p.dims[1];
+                let group_bytes = (cols / QK4_0) * 72;
+                q4_group_rep.resize(group_bytes, 0);
+                for rg in 0..(rows / 4) {
+                    let s0 = rg * group_bytes;
+                    repack_q4_0_bytes_to_q4_0x4(
+                        &src_bytes[s0..s0 + group_bytes],
+                        &mut q4_group_rep,
+                        4,
+                        cols,
+                    );
+                    writer.write_all(&q4_group_rep).map_err(io_err)?;
+                }
+            } else if p.vocab_sliced
+                && p.new_dtype == src_info.dtype
+                && src_info.dtype != DType::Q4_0x4
+            {
+                // Lossless row-slicing without re-quantization!
+                let cols = p.dims[0];
+                let rb = src_info.dtype.row_bytes(cols);
+                let kept = &prune_plan
+                    .as_ref()
+                    .expect("vocab_sliced implies plan")
+                    .kept_old_ids;
+                for &old_r in kept {
+                    writer
+                        .write_all(&src_bytes[old_r * rb..(old_r + 1) * rb])
+                        .map_err(io_err)?;
+                }
+            } else {
+                // General row-streaming dequantize -> quantize (and optional 4-row `Q4_0x4` repack)
+                let cols = p.dims[0];
+                let out_rows = p.dims[1];
+                f32_row.resize(cols, 0.0);
+
+                let decode_src_row = |old_r: usize, dst_f32: &mut [f32]| {
+                    if src_info.dtype == DType::Q4_0x4 {
+                        dequantize_q4_0x4_single_row(src_bytes, cols, old_r, dst_f32);
+                    } else {
+                        let s_rb = src_info.dtype.row_bytes(cols);
+                        dequantize_row_bytes(
+                            src_info.dtype,
+                            &src_bytes[old_r * s_rb..(old_r + 1) * s_rb],
+                            dst_f32,
+                        );
+                    }
+                };
+
+                if p.new_dtype == DType::Q4_0x4 {
+                    let row_q4_bytes = DType::Q4_0.row_bytes(cols);
+                    let group_bytes = row_q4_bytes * 4;
+                    q4_group_raw.resize(group_bytes, 0);
+                    q4_group_rep.resize(group_bytes, 0);
+                    for rg in 0..(out_rows / 4) {
+                        for m in 0..4 {
+                            let logical_r = rg * 4 + m;
+                            let old_r = match prune_plan {
+                                Some(ref plan) if p.vocab_sliced => plan.kept_old_ids[logical_r],
+                                _ => logical_r,
+                            };
+                            decode_src_row(old_r, &mut f32_row);
+                            quantize_row_to_bytes(
+                                DType::Q4_0,
+                                &f32_row,
+                                &mut q4_group_raw[m * row_q4_bytes..(m + 1) * row_q4_bytes],
+                            );
+                        }
+                        repack_q4_0_bytes_to_q4_0x4(&q4_group_raw, &mut q4_group_rep, 4, cols);
+                        writer.write_all(&q4_group_rep).map_err(io_err)?;
+                    }
+                } else {
+                    let out_rb = p.new_dtype.row_bytes(cols);
+                    out_row_buf.resize(out_rb, 0);
+                    for logical_r in 0..out_rows {
+                        let old_r = match prune_plan {
+                            Some(ref plan) if p.vocab_sliced => plan.kept_old_ids[logical_r],
+                            _ => logical_r,
+                        };
+                        decode_src_row(old_r, &mut f32_row);
+                        quantize_row_to_bytes(p.new_dtype, &f32_row, &mut out_row_buf);
+                        writer.write_all(&out_row_buf).map_err(io_err)?;
+                    }
+                }
+            }
+
+            written_data += p.byte_len;
+        }
+
+        writer.flush().map_err(io_err)?;
+        let output_file_bytes = new_data_offset + written_data;
+
+        Ok(ConvertReport {
+            total_tensors: self.tensor_order.len(),
+            converted_tensors,
+            old_vocab_size: old_vocab,
+            new_vocab_size: new_vocab,
+            old_merges,
+            kept_merges: kept_merges_cnt,
+            input_file_bytes: raw.len(),
+            output_file_bytes,
+        })
+    }
 }
 
 struct Cursor<'a> {

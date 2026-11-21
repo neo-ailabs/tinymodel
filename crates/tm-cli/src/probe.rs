@@ -11,8 +11,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use tm_core::{
-    BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, f32_to_f16,
-    probe_process_memory_stats, probe_system_memory,
+    BlockIQ2XXS, BlockIQ3XXS, BlockIQ4NL, BlockQ2_0, BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ6K,
+    BlockQ8_0, BlockQ8_1, BlockQ8K, BlockTQ2_0, f32_to_f16, probe_process_memory_stats,
+    probe_system_memory,
 };
 use tm_cpu::isa::{detect_caps, effective_isa, supported_isas};
 use tm_cpu::{ThreadPool, generic, select_kernels};
@@ -519,11 +520,59 @@ pub fn run_kernel_self_check() -> (bool, Vec<&'static str>, Option<String>) {
         bsums: [80; 16],
     }];
 
+    let w_q20: Vec<BlockQ2_0> = (0..17)
+        .map(|r| BlockQ2_0 {
+            d: if r % 2 == 0 { d_pos } else { d_neg },
+            qs: [0x93u8.wrapping_add((r as u8) * 11); 16],
+        })
+        .collect();
+    let w_tq20: Vec<BlockTQ2_0> = (0..17)
+        .map(|r| {
+            let mut qs = [0u8; 64];
+            for (i, b) in qs.iter_mut().enumerate() {
+                let c0 = ((r + i) % 3) as u8;
+                let c1 = ((r * 3 + i * 5) % 3) as u8;
+                let c2 = ((r * 7 + i * 2) % 3) as u8;
+                let c3 = ((r + i * 7) % 3) as u8;
+                *b = c0 | (c1 << 2) | (c2 << 4) | (c3 << 6);
+            }
+            BlockTQ2_0 {
+                qs,
+                d: if r % 3 == 0 { d_neg } else { d_pos },
+            }
+        })
+        .collect();
+    let w_iq2 = [BlockIQ2XXS {
+        d: d_pos,
+        qs: [0x1234; 32],
+    }];
+    let w_iq3 = [BlockIQ3XXS {
+        d: d_pos,
+        qs: [0x5A; 96],
+    }];
+    let w_iq4 = [
+        BlockIQ4NL {
+            d: d_pos,
+            qs: [0x3C; 16],
+        },
+        BlockIQ4NL {
+            d: d_neg,
+            qs: [0x96; 16],
+        },
+    ];
+
     let ref_q40 = generic::vec_dot_q4_0_q8_0(&w_q40, &x_q80);
     let ref_q80 = generic::vec_dot_q8_0_q8_0(&x_q80, &x_q80);
     let ref_q41 = generic::vec_dot_q4_1_q8_1(&w_q41, &x_q81);
     let ref_q5k = generic::vec_dot_q5_k_q8_k(&w_q5k, &x_q8k);
     let ref_q6k = generic::vec_dot_q6_k_q8_k(&w_q6k, &x_q8k);
+    let ref_iq2 = generic::vec_dot_iq2_xxs_q8_k(&w_iq2, &x_q8k);
+    let ref_iq3 = generic::vec_dot_iq3_xxs_q8_k(&w_iq3, &x_q8k);
+    let ref_iq4 = generic::vec_dot_iq4_nl_q8_0(&w_iq4, &x_q80);
+    let mut ref_q20_gemv = [0.0f32; 17];
+    let mut ref_tq20_gemv = [0.0f32; 17];
+    generic::gemv_q2_0_q8_0(&w_q20, &x_q80, &mut ref_q20_gemv, 17, 1);
+    generic::gemv_tq2_0_q8_k(&w_tq20, &x_q8k, &mut ref_tq20_gemv, 17, 1);
 
     for &isa in &isas {
         let kt = select_kernels(isa);
@@ -533,6 +582,17 @@ pub fn run_kernel_self_check() -> (bool, Vec<&'static str>, Option<String>) {
             ("Q4_1", (kt.vec_dot_q4_1_q8_1)(&w_q41, &x_q81), ref_q41),
             ("Q5_K", (kt.vec_dot_q5_k_q8_k)(&w_q5k, &x_q8k), ref_q5k),
             ("Q6_K", (kt.vec_dot_q6_k_q8_k)(&w_q6k, &x_q8k), ref_q6k),
+            (
+                "IQ2_XXS",
+                (kt.vec_dot_iq2_xxs_q8_k)(&w_iq2, &x_q8k),
+                ref_iq2,
+            ),
+            (
+                "IQ3_XXS",
+                (kt.vec_dot_iq3_xxs_q8_k)(&w_iq3, &x_q8k),
+                ref_iq3,
+            ),
+            ("IQ4_NL", (kt.vec_dot_iq4_nl_q8_0)(&w_iq4, &x_q80), ref_iq4),
         ];
         for (tag, got, exp) in checks {
             if got.to_bits() != exp.to_bits() {
@@ -547,6 +607,36 @@ pub fn run_kernel_self_check() -> (bool, Vec<&'static str>, Option<String>) {
                         got.to_bits(),
                         exp,
                         exp.to_bits()
+                    )),
+                );
+            }
+        }
+        let mut got_q20 = [0.0f32; 17];
+        let mut got_tq20 = [0.0f32; 17];
+        (kt.gemv_q2_0_q8_0)(&w_q20, &x_q80, &mut got_q20, 17, 1);
+        (kt.gemv_tq2_0_q8_k)(&w_tq20, &x_q8k, &mut got_tq20, 17, 1);
+        for r in 0..17 {
+            if got_q20[r].to_bits() != ref_q20_gemv[r].to_bits() {
+                return (
+                    false,
+                    names,
+                    Some(format!(
+                        "ISA '{}' failed Q2_0 LUT GEMV row {r}: got={} != ref={}",
+                        isa.name(),
+                        got_q20[r],
+                        ref_q20_gemv[r]
+                    )),
+                );
+            }
+            if got_tq20[r].to_bits() != ref_tq20_gemv[r].to_bits() {
+                return (
+                    false,
+                    names,
+                    Some(format!(
+                        "ISA '{}' failed TQ2_0 LUT GEMV row {r}: got={} != ref={}",
+                        isa.name(),
+                        got_tq20[r],
+                        ref_tq20_gemv[r]
                     )),
                 );
             }

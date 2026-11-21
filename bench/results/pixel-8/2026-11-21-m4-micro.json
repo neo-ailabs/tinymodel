@@ -1,0 +1,260 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-21",
+  "device": "Google Pixel 8 (Tensor G3, 3B131FDJH00216)",
+  "binary": "target/aarch64-unknown-linux-musl/release/tinymodel (--no-default-features --features micro)",
+  "micro_elf_audit": {
+    "elf_bytes": 1234480,
+    "elf_kib": 1205.5,
+    "elf_mib": 1.177,
+    "exec_instructions_scanned": 248260,
+    "sdot_udot_count": 0,
+    "smmla_ummla_count": 0,
+    "neon_tbl_tbx_count": 344
+  },
+  "probe_4xA510_inorder": {
+    "schema_version": 1,
+    "device_model": "Pixel 8",
+    "os": "linux",
+    "arch": "aarch64",
+    "logical_cpus": 4,
+    "active_isa": "i8mm",
+    "caps": {
+      "neon": true,
+      "dotprod": true,
+      "i8mm": true,
+      "avx2": false,
+      "avx512_vnni": false
+    },
+    "supported_isas": [
+      "generic",
+      "neon",
+      "dotprod",
+      "i8mm"
+    ],
+    "clusters": [
+      {
+        "uarch": "Cortex-A510",
+        "max_freq_mhz": 1704,
+        "count": 4,
+        "cpus": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "cpu_mask_hex": "0xf"
+      },
+      {
+        "uarch": "Cortex-A715",
+        "max_freq_mhz": 2367,
+        "count": 4,
+        "cpus": [
+          4,
+          5,
+          6,
+          7
+        ],
+        "cpu_mask_hex": "0xf0"
+      },
+      {
+        "uarch": "Cortex-X3",
+        "max_freq_mhz": 2914,
+        "count": 1,
+        "cpus": [
+          8
+        ],
+        "cpu_mask_hex": "0x100"
+      }
+    ],
+    "memory": {
+      "total_bytes": 7941091328,
+      "available_bytes": 4580364288,
+      "cgroup_max_bytes": null
+    },
+    "process_rss_bytes": 1294336,
+    "process_peak_rss_bytes": 68419584,
+    "process_private_dirty_bytes": 249856,
+    "process_pss_anon_bytes": 249856,
+    "kernel_self_check": {
+      "passed": true,
+      "error": null
+    },
+    "vulkan": null,
+    "stream_bw": {
+      "threads": 4,
+      "array_mib": 32,
+      "read_gbs": 20.77,
+      "copy_gbs": 24.73
+    },
+    "telemetry": {
+      "max_temp_c": 60.0,
+      "skin_temp_c": 37.05,
+      "thermal_status": 0,
+      "cur_freq_mhz_max": 610.0,
+      "governor": "sched_pixel",
+      "battery_power_mw": 10971.1,
+      "battery_status": "Full",
+      "zones": [
+        {
+          "zone": "BIG",
+          "temp_c": 60.0
+        },
+        {
+          "zone": "MID",
+          "temp_c": 60.0
+        },
+        {
+          "zone": "LITTLE",
+          "temp_c": 57.0
+        },
+        {
+          "zone": "G3D",
+          "temp_c": 46.0
+        },
+        {
+          "zone": "TPU",
+          "temp_c": 41.0
+        },
+        {
+          "zone": "VIRTUAL-SKIN",
+          "temp_c": 37.05
+        },
+        {
+          "zone": "soc_therm",
+          "temp_c": 28.14
+        },
+        {
+          "zone": "cellular-emergency",
+          "temp_c": 26.92
+        },
+        {
+          "zone": "battery",
+          "temp_c": 24.9
+        }
+      ]
+    }
+  },
+  "benchmarks": {
+    "smollm2_q4_0x4__4xA510_inorder_micro": {
+      "file_mib": 196.0,
+      "isa": "neon",
+      "pp_tokens": 142,
+      "tg_tokens": 48,
+      "pp_tps": 22.5,
+      "tg_tps": 18.6,
+      "eff_bw_gbs": 3.79,
+      "peak_rss_mib": 200.4,
+      "private_dirty_mib": 8.7,
+      "greedy_tokens_fnv1a64": "587653a5f6fde21b"
+    },
+    "smollm2_q4_0x4__5T_X3_A715_micro": {
+      "file_mib": 196.0,
+      "isa": "neon",
+      "pp_tokens": 190,
+      "tg_tokens": 64,
+      "pp_tps": 98.41,
+      "tg_tps": 81.52,
+      "eff_bw_gbs": 16.61,
+      "peak_rss_mib": 202.18,
+      "private_dirty_mib": 10.27,
+      "greedy_tokens_fnv1a64": "73f8ec830f09595f"
+    },
+    "smollm2_q4_0x4_v16384__4xA510_inorder_micro": {
+      "file_mib": 177.98,
+      "isa": "neon",
+      "pp_tokens": 142,
+      "tg_tokens": 48,
+      "pp_tps": 22.88,
+      "tg_tps": 20.47,
+      "eff_bw_gbs": 3.81,
+      "peak_rss_mib": 177.97,
+      "private_dirty_mib": 181.93,
+      "greedy_tokens_fnv1a64": "5ab24473516b5c02"
+    },
+    "smollm2_q4_0x4_v16384__5T_X3_A715_micro": {
+      "file_mib": 177.98,
+      "isa": "neon",
+      "pp_tokens": 190,
+      "tg_tokens": 64,
+      "pp_tps": 94.52,
+      "tg_tps": 90.19,
+      "eff_bw_gbs": 16.78,
+      "peak_rss_mib": 183.34,
+      "private_dirty_mib": 9.53,
+      "greedy_tokens_fnv1a64": "a04e23a95fdc87d2"
+    },
+    "smollm2_q2_0_lut__4xA510_inorder_micro": {
+      "file_mib": 111.63,
+      "isa": "neon",
+      "pp_tokens": 142,
+      "tg_tokens": 48,
+      "pp_tps": 11.67,
+      "tg_tps": 18.7,
+      "eff_bw_gbs": 2.16,
+      "peak_rss_mib": 116.59,
+      "private_dirty_mib": 8.68,
+      "greedy_tokens_fnv1a64": "1935af6eefc4ec43"
+    },
+    "smollm2_q2_0_lut__5T_X3_A715_micro": {
+      "file_mib": 111.63,
+      "isa": "neon",
+      "pp_tokens": 190,
+      "tg_tokens": 64,
+      "pp_tps": 48.25,
+      "tg_tps": 73.32,
+      "eff_bw_gbs": 8.45,
+      "peak_rss_mib": 113.89,
+      "private_dirty_mib": 10.26,
+      "greedy_tokens_fnv1a64": "a58d0734b75545c3"
+    },
+    "smollm2_q2_0_v16384__4xA510_inorder_micro": {
+      "file_mib": 93.61,
+      "isa": "neon",
+      "pp_tokens": 142,
+      "tg_tokens": 48,
+      "pp_tps": 11.69,
+      "tg_tps": 20.92,
+      "eff_bw_gbs": 2.04,
+      "peak_rss_mib": 96.38,
+      "private_dirty_mib": 7.93,
+      "greedy_tokens_fnv1a64": "4b79328ecf1e2773"
+    },
+    "smollm2_q2_0_v16384__5T_X3_A715_micro": {
+      "file_mib": 93.61,
+      "isa": "neon",
+      "pp_tokens": 190,
+      "tg_tokens": 64,
+      "pp_tps": 48.35,
+      "tg_tps": 78.96,
+      "eff_bw_gbs": 7.7,
+      "peak_rss_mib": 98.86,
+      "private_dirty_mib": 9.51,
+      "greedy_tokens_fnv1a64": "2477045f7e34c70a"
+    },
+    "qwen35_0.8b_tq2_0_v16384__4xA510_inorder_micro": {
+      "file_mib": 129.29,
+      "isa": "neon",
+      "pp_tokens": 142,
+      "tg_tokens": 48,
+      "pp_tps": 6.76,
+      "tg_tps": 14.21,
+      "eff_bw_gbs": 1.92,
+      "peak_rss_mib": 154.17,
+      "private_dirty_mib": 30.95,
+      "greedy_tokens_fnv1a64": "83f2cd0f8700ff76"
+    },
+    "qwen35_0.8b_tq2_0_v16384__5T_X3_A715_micro": {
+      "file_mib": 129.29,
+      "isa": "neon",
+      "pp_tokens": 190,
+      "tg_tokens": 64,
+      "pp_tps": 28.64,
+      "tg_tps": 59.59,
+      "eff_bw_gbs": 8.05,
+      "peak_rss_mib": 156.47,
+      "private_dirty_mib": 31.42,
+      "greedy_tokens_fnv1a64": "0cb30347945895d5"
+    }
+  }
+}

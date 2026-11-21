@@ -4,7 +4,8 @@
 //! (MIT License, Copyright (c) 2026 Niko1221 and the Strata contributors).
 
 use tm_core::{
-    BlockQ4_0, BlockQ4_0x4, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K,
+    BlockIQ2XXS, BlockIQ3XXS, BlockIQ4NL, BlockQ2_0, BlockQ4_0, BlockQ4_0x4, BlockQ4_1, BlockQ5K,
+    BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, BlockTQ2_0,
 };
 
 use crate::generic;
@@ -26,6 +27,21 @@ pub type GemvQ5KFn = fn(&[BlockQ5K], &[BlockQ8K], &mut [f32], usize, usize);
 pub type VecDotQ6KFn = fn(&[BlockQ6K], &[BlockQ8K]) -> f32;
 pub type GemvQ6KFn = fn(&[BlockQ6K], &[BlockQ8K], &mut [f32], usize, usize);
 pub type GemmQ6KFn = fn(&[BlockQ6K], &[BlockQ8K], &mut [f32], usize, usize, usize);
+pub type VecDotQ2_0Fn = fn(&[BlockQ2_0], &[BlockQ8_0]) -> f32;
+pub type GemvQ2_0Fn = fn(&[BlockQ2_0], &[BlockQ8_0], &mut [f32], usize, usize);
+pub type GemmQ2_0Fn = fn(&[BlockQ2_0], &[BlockQ8_0], &mut [f32], usize, usize, usize);
+pub type VecDotTQ2_0Fn = fn(&[BlockTQ2_0], &[BlockQ8K]) -> f32;
+pub type GemvTQ2_0Fn = fn(&[BlockTQ2_0], &[BlockQ8K], &mut [f32], usize, usize);
+pub type GemmTQ2_0Fn = fn(&[BlockTQ2_0], &[BlockQ8K], &mut [f32], usize, usize, usize);
+pub type VecDotIQ2XXSFn = fn(&[BlockIQ2XXS], &[BlockQ8K]) -> f32;
+pub type GemvIQ2XXSFn = fn(&[BlockIQ2XXS], &[BlockQ8K], &mut [f32], usize, usize);
+pub type GemmIQ2XXSFn = fn(&[BlockIQ2XXS], &[BlockQ8K], &mut [f32], usize, usize, usize);
+pub type VecDotIQ3XXSFn = fn(&[BlockIQ3XXS], &[BlockQ8K]) -> f32;
+pub type GemvIQ3XXSFn = fn(&[BlockIQ3XXS], &[BlockQ8K], &mut [f32], usize, usize);
+pub type GemmIQ3XXSFn = fn(&[BlockIQ3XXS], &[BlockQ8K], &mut [f32], usize, usize, usize);
+pub type VecDotIQ4NLFn = fn(&[BlockIQ4NL], &[BlockQ8_0]) -> f32;
+pub type GemvIQ4NLFn = fn(&[BlockIQ4NL], &[BlockQ8_0], &mut [f32], usize, usize);
+pub type GemmIQ4NLFn = fn(&[BlockIQ4NL], &[BlockQ8_0], &mut [f32], usize, usize, usize);
 pub type DotF32F16Fn = fn(&[f32], &[u16]) -> f32;
 pub type DotF32Bf16Fn = fn(&[f32], &[u16]) -> f32;
 pub type DotF32Q8_0Fn = fn(&[f32], &[BlockQ8_0]) -> f32;
@@ -59,6 +75,21 @@ pub struct KernelTable {
     pub vec_dot_q6_k_q8_k: VecDotQ6KFn,
     pub gemv_q6_k_q8_k: GemvQ6KFn,
     pub gemm_q6_k_q8_k: GemmQ6KFn,
+    pub vec_dot_q2_0_q8_0: VecDotQ2_0Fn,
+    pub gemv_q2_0_q8_0: GemvQ2_0Fn,
+    pub gemm_q2_0_q8_0: GemmQ2_0Fn,
+    pub vec_dot_tq2_0_q8_k: VecDotTQ2_0Fn,
+    pub gemv_tq2_0_q8_k: GemvTQ2_0Fn,
+    pub gemm_tq2_0_q8_k: GemmTQ2_0Fn,
+    pub vec_dot_iq2_xxs_q8_k: VecDotIQ2XXSFn,
+    pub gemv_iq2_xxs_q8_k: GemvIQ2XXSFn,
+    pub gemm_iq2_xxs_q8_k: GemmIQ2XXSFn,
+    pub vec_dot_iq3_xxs_q8_k: VecDotIQ3XXSFn,
+    pub gemv_iq3_xxs_q8_k: GemvIQ3XXSFn,
+    pub gemm_iq3_xxs_q8_k: GemmIQ3XXSFn,
+    pub vec_dot_iq4_nl_q8_0: VecDotIQ4NLFn,
+    pub gemv_iq4_nl_q8_0: GemvIQ4NLFn,
+    pub gemm_iq4_nl_q8_0: GemmIQ4NLFn,
     pub dot_f32_f16: DotF32F16Fn,
     pub dot_f32_bf16: DotF32Bf16Fn,
     pub dot_f32_q8_0: DotF32Q8_0Fn,
@@ -90,6 +121,21 @@ const GENERIC_TABLE: KernelTable = KernelTable {
     vec_dot_q6_k_q8_k: generic::vec_dot_q6_k_q8_k,
     gemv_q6_k_q8_k: generic::gemv_q6_k_q8_k,
     gemm_q6_k_q8_k: generic::gemm_q6_k_q8_k,
+    vec_dot_q2_0_q8_0: generic::vec_dot_q2_0_q8_0,
+    gemv_q2_0_q8_0: generic::gemv_q2_0_q8_0,
+    gemm_q2_0_q8_0: generic::gemm_q2_0_q8_0,
+    vec_dot_tq2_0_q8_k: generic::vec_dot_tq2_0_q8_k,
+    gemv_tq2_0_q8_k: generic::gemv_tq2_0_q8_k,
+    gemm_tq2_0_q8_k: generic::gemm_tq2_0_q8_k,
+    vec_dot_iq2_xxs_q8_k: generic::vec_dot_iq2_xxs_q8_k,
+    gemv_iq2_xxs_q8_k: generic::gemv_iq2_xxs_q8_k,
+    gemm_iq2_xxs_q8_k: generic::gemm_iq2_xxs_q8_k,
+    vec_dot_iq3_xxs_q8_k: generic::vec_dot_iq3_xxs_q8_k,
+    gemv_iq3_xxs_q8_k: generic::gemv_iq3_xxs_q8_k,
+    gemm_iq3_xxs_q8_k: generic::gemm_iq3_xxs_q8_k,
+    vec_dot_iq4_nl_q8_0: generic::vec_dot_iq4_nl_q8_0,
+    gemv_iq4_nl_q8_0: generic::gemv_iq4_nl_q8_0,
+    gemm_iq4_nl_q8_0: generic::gemm_iq4_nl_q8_0,
     dot_f32_f16: generic::dot_f32_f16,
     dot_f32_bf16: generic::dot_f32_bf16,
     dot_f32_q8_0: generic::dot_f32_q8_0,
@@ -111,6 +157,8 @@ mod aarch64_wrappers {
     use crate::aarch64::dotprod;
     #[cfg(feature = "i8mm")]
     use crate::aarch64::i8mm;
+    #[cfg(feature = "lut")]
+    use crate::aarch64::lut;
     use crate::aarch64::neon_v80;
 
     fn neon_v80_vec_dot(x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
@@ -533,6 +581,284 @@ mod aarch64_wrappers {
         unsafe { neon_v80::axpy_f32_q8_0(out, w, v_q8) }
     }
 
+    #[cfg(feature = "lut")]
+    fn lut_vec_dot_q2_0(x: &[BlockQ2_0], y: &[BlockQ8_0]) -> f32 {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { lut::vec_dot_q2_0_q8_0(x, y) }
+    }
+    #[cfg(not(feature = "lut"))]
+    use generic::vec_dot_q2_0_q8_0 as lut_vec_dot_q2_0;
+
+    #[cfg(feature = "lut")]
+    fn lut_gemv_q2_0(
+        w: &[BlockQ2_0],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { lut::gemv_q2_0_q8_0(w, x, out, rows, cols_blocks) }
+    }
+    #[cfg(not(feature = "lut"))]
+    use generic::gemv_q2_0_q8_0 as lut_gemv_q2_0;
+
+    #[cfg(feature = "lut")]
+    fn lut_gemm_q2_0(
+        w: &[BlockQ2_0],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { lut::gemm_q2_0_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+    #[cfg(not(feature = "lut"))]
+    use generic::gemm_q2_0_q8_0 as lut_gemm_q2_0;
+
+    #[cfg(feature = "lut")]
+    fn lut_vec_dot_tq2_0(x: &[BlockTQ2_0], y: &[BlockQ8K]) -> f32 {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { lut::vec_dot_tq2_0_q8_k(x, y) }
+    }
+    #[cfg(not(feature = "lut"))]
+    use generic::vec_dot_tq2_0_q8_k as lut_vec_dot_tq2_0;
+
+    #[cfg(feature = "lut")]
+    fn lut_gemv_tq2_0(
+        w: &[BlockTQ2_0],
+        x: &[BlockQ8K],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { lut::gemv_tq2_0_q8_k(w, x, out, rows, cols_blocks) }
+    }
+    #[cfg(not(feature = "lut"))]
+    use generic::gemv_tq2_0_q8_k as lut_gemv_tq2_0;
+
+    #[cfg(feature = "lut")]
+    fn lut_gemm_tq2_0(
+        w: &[BlockTQ2_0],
+        x: &[BlockQ8K],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { lut::gemm_tq2_0_q8_k(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+    #[cfg(not(feature = "lut"))]
+    use generic::gemm_tq2_0_q8_k as lut_gemm_tq2_0;
+
+    #[cfg(feature = "lut")]
+    fn lut_vec_dot_iq2_xxs(x: &[BlockIQ2XXS], y: &[BlockQ8K]) -> f32 {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { lut::vec_dot_iq2_xxs_q8_k(x, y) }
+    }
+    #[cfg(not(feature = "lut"))]
+    use generic::vec_dot_iq2_xxs_q8_k as lut_vec_dot_iq2_xxs;
+
+    #[cfg(feature = "lut")]
+    fn lut_gemv_iq2_xxs(
+        w: &[BlockIQ2XXS],
+        x: &[BlockQ8K],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { lut::gemv_iq2_xxs_q8_k(w, x, out, rows, cols_blocks) }
+    }
+    #[cfg(not(feature = "lut"))]
+    use generic::gemv_iq2_xxs_q8_k as lut_gemv_iq2_xxs;
+
+    #[cfg(feature = "lut")]
+    fn lut_gemm_iq2_xxs(
+        w: &[BlockIQ2XXS],
+        x: &[BlockQ8K],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { lut::gemm_iq2_xxs_q8_k(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+    #[cfg(not(feature = "lut"))]
+    use generic::gemm_iq2_xxs_q8_k as lut_gemm_iq2_xxs;
+
+    #[cfg(feature = "lut")]
+    fn lut_vec_dot_iq3_xxs(x: &[BlockIQ3XXS], y: &[BlockQ8K]) -> f32 {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { lut::vec_dot_iq3_xxs_q8_k(x, y) }
+    }
+    #[cfg(not(feature = "lut"))]
+    use generic::vec_dot_iq3_xxs_q8_k as lut_vec_dot_iq3_xxs;
+
+    #[cfg(feature = "lut")]
+    fn lut_gemv_iq3_xxs(
+        w: &[BlockIQ3XXS],
+        x: &[BlockQ8K],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { lut::gemv_iq3_xxs_q8_k(w, x, out, rows, cols_blocks) }
+    }
+    #[cfg(not(feature = "lut"))]
+    use generic::gemv_iq3_xxs_q8_k as lut_gemv_iq3_xxs;
+
+    #[cfg(feature = "lut")]
+    fn lut_gemm_iq3_xxs(
+        w: &[BlockIQ3XXS],
+        x: &[BlockQ8K],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { lut::gemm_iq3_xxs_q8_k(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+    #[cfg(not(feature = "lut"))]
+    use generic::gemm_iq3_xxs_q8_k as lut_gemm_iq3_xxs;
+
+    #[cfg(feature = "lut")]
+    fn lut_vec_dot_iq4_nl(x: &[BlockIQ4NL], y: &[BlockQ8_0]) -> f32 {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { lut::vec_dot_iq4_nl_q8_0(x, y) }
+    }
+    #[cfg(not(feature = "lut"))]
+    use generic::vec_dot_iq4_nl_q8_0 as lut_vec_dot_iq4_nl;
+
+    #[cfg(feature = "lut")]
+    fn lut_gemv_iq4_nl(
+        w: &[BlockIQ4NL],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { lut::gemv_iq4_nl_q8_0(w, x, out, rows, cols_blocks) }
+    }
+    #[cfg(not(feature = "lut"))]
+    use generic::gemv_iq4_nl_q8_0 as lut_gemv_iq4_nl;
+
+    #[cfg(feature = "lut")]
+    fn lut_gemm_iq4_nl(
+        w: &[BlockIQ4NL],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { lut::gemm_iq4_nl_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+    #[cfg(not(feature = "lut"))]
+    use generic::gemm_iq4_nl_q8_0 as lut_gemm_iq4_nl;
+
+    #[cfg(feature = "dotprod")]
+    fn dotprod_vec_dot_iq2_xxs(x: &[BlockIQ2XXS], y: &[BlockQ8K]) -> f32 {
+        // SAFETY: `DOTPROD_TABLE` is only selected after runtime `dotprod` detection.
+        unsafe { lut::dotprod_vec_dot_iq2_xxs_q8_k(x, y) }
+    }
+
+    #[cfg(feature = "dotprod")]
+    fn dotprod_gemv_iq2_xxs(
+        w: &[BlockIQ2XXS],
+        x: &[BlockQ8K],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: `DOTPROD_TABLE` is only selected after runtime `dotprod` detection.
+        unsafe { lut::dotprod_gemv_iq2_xxs_q8_k(w, x, out, rows, cols_blocks) }
+    }
+
+    #[cfg(feature = "dotprod")]
+    fn dotprod_gemm_iq2_xxs(
+        w: &[BlockIQ2XXS],
+        x: &[BlockQ8K],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: `DOTPROD_TABLE` is only selected after runtime `dotprod` detection.
+        unsafe { lut::dotprod_gemm_iq2_xxs_q8_k(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+
+    #[cfg(feature = "dotprod")]
+    fn dotprod_vec_dot_iq3_xxs(x: &[BlockIQ3XXS], y: &[BlockQ8K]) -> f32 {
+        // SAFETY: `DOTPROD_TABLE` is only selected after runtime `dotprod` detection.
+        unsafe { lut::dotprod_vec_dot_iq3_xxs_q8_k(x, y) }
+    }
+
+    #[cfg(feature = "dotprod")]
+    fn dotprod_gemv_iq3_xxs(
+        w: &[BlockIQ3XXS],
+        x: &[BlockQ8K],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: `DOTPROD_TABLE` is only selected after runtime `dotprod` detection.
+        unsafe { lut::dotprod_gemv_iq3_xxs_q8_k(w, x, out, rows, cols_blocks) }
+    }
+
+    #[cfg(feature = "dotprod")]
+    fn dotprod_gemm_iq3_xxs(
+        w: &[BlockIQ3XXS],
+        x: &[BlockQ8K],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: `DOTPROD_TABLE` is only selected after runtime `dotprod` detection.
+        unsafe { lut::dotprod_gemm_iq3_xxs_q8_k(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+
+    #[cfg(feature = "dotprod")]
+    fn dotprod_vec_dot_iq4_nl(x: &[BlockIQ4NL], y: &[BlockQ8_0]) -> f32 {
+        // SAFETY: `DOTPROD_TABLE` is only selected after runtime `dotprod` detection.
+        unsafe { lut::dotprod_vec_dot_iq4_nl_q8_0(x, y) }
+    }
+
+    #[cfg(feature = "dotprod")]
+    fn dotprod_gemv_iq4_nl(
+        w: &[BlockIQ4NL],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: `DOTPROD_TABLE` is only selected after runtime `dotprod` detection.
+        unsafe { lut::dotprod_gemv_iq4_nl_q8_0(w, x, out, rows, cols_blocks) }
+    }
+
+    #[cfg(feature = "dotprod")]
+    fn dotprod_gemm_iq4_nl(
+        w: &[BlockIQ4NL],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: `DOTPROD_TABLE` is only selected after runtime `dotprod` detection.
+        unsafe { lut::dotprod_gemm_iq4_nl_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+
     pub const NEON_V80_TABLE: KernelTable = KernelTable {
         isa: Isa::NeonV80,
         vec_dot_q4_0_q8_0: neon_v80_vec_dot,
@@ -550,6 +876,21 @@ mod aarch64_wrappers {
         vec_dot_q6_k_q8_k: neon_v80_vec_dot_q6_k,
         gemv_q6_k_q8_k: neon_v80_gemv_q6_k,
         gemm_q6_k_q8_k: neon_v80_gemm_q6_k,
+        vec_dot_q2_0_q8_0: lut_vec_dot_q2_0,
+        gemv_q2_0_q8_0: lut_gemv_q2_0,
+        gemm_q2_0_q8_0: lut_gemm_q2_0,
+        vec_dot_tq2_0_q8_k: lut_vec_dot_tq2_0,
+        gemv_tq2_0_q8_k: lut_gemv_tq2_0,
+        gemm_tq2_0_q8_k: lut_gemm_tq2_0,
+        vec_dot_iq2_xxs_q8_k: lut_vec_dot_iq2_xxs,
+        gemv_iq2_xxs_q8_k: lut_gemv_iq2_xxs,
+        gemm_iq2_xxs_q8_k: lut_gemm_iq2_xxs,
+        vec_dot_iq3_xxs_q8_k: lut_vec_dot_iq3_xxs,
+        gemv_iq3_xxs_q8_k: lut_gemv_iq3_xxs,
+        gemm_iq3_xxs_q8_k: lut_gemm_iq3_xxs,
+        vec_dot_iq4_nl_q8_0: lut_vec_dot_iq4_nl,
+        gemv_iq4_nl_q8_0: lut_gemv_iq4_nl,
+        gemm_iq4_nl_q8_0: lut_gemm_iq4_nl,
         dot_f32_f16: neon_dot_f32_f16,
         dot_f32_bf16: neon_dot_f32_bf16,
         dot_f32_q8_0: neon_dot_f32_q8_0,
@@ -582,6 +923,21 @@ mod aarch64_wrappers {
         vec_dot_q6_k_q8_k: dotprod_vec_dot_q6_k,
         gemv_q6_k_q8_k: dotprod_gemv_q6_k,
         gemm_q6_k_q8_k: dotprod_gemm_q6_k,
+        vec_dot_q2_0_q8_0: lut_vec_dot_q2_0,
+        gemv_q2_0_q8_0: lut_gemv_q2_0,
+        gemm_q2_0_q8_0: lut_gemm_q2_0,
+        vec_dot_tq2_0_q8_k: lut_vec_dot_tq2_0,
+        gemv_tq2_0_q8_k: lut_gemv_tq2_0,
+        gemm_tq2_0_q8_k: lut_gemm_tq2_0,
+        vec_dot_iq2_xxs_q8_k: dotprod_vec_dot_iq2_xxs,
+        gemv_iq2_xxs_q8_k: dotprod_gemv_iq2_xxs,
+        gemm_iq2_xxs_q8_k: dotprod_gemm_iq2_xxs,
+        vec_dot_iq3_xxs_q8_k: dotprod_vec_dot_iq3_xxs,
+        gemv_iq3_xxs_q8_k: dotprod_gemv_iq3_xxs,
+        gemm_iq3_xxs_q8_k: dotprod_gemm_iq3_xxs,
+        vec_dot_iq4_nl_q8_0: dotprod_vec_dot_iq4_nl,
+        gemv_iq4_nl_q8_0: dotprod_gemv_iq4_nl,
+        gemm_iq4_nl_q8_0: dotprod_gemm_iq4_nl,
         dot_f32_f16: neon_dot_f32_f16,
         dot_f32_bf16: neon_dot_f32_bf16,
         dot_f32_q8_0: neon_dot_f32_q8_0,
@@ -614,6 +970,21 @@ mod aarch64_wrappers {
         vec_dot_q6_k_q8_k: dotprod_vec_dot_q6_k,
         gemv_q6_k_q8_k: dotprod_gemv_q6_k,
         gemm_q6_k_q8_k: dotprod_gemm_q6_k,
+        vec_dot_q2_0_q8_0: lut_vec_dot_q2_0,
+        gemv_q2_0_q8_0: lut_gemv_q2_0,
+        gemm_q2_0_q8_0: lut_gemm_q2_0,
+        vec_dot_tq2_0_q8_k: lut_vec_dot_tq2_0,
+        gemv_tq2_0_q8_k: lut_gemv_tq2_0,
+        gemm_tq2_0_q8_k: lut_gemm_tq2_0,
+        vec_dot_iq2_xxs_q8_k: dotprod_vec_dot_iq2_xxs,
+        gemv_iq2_xxs_q8_k: dotprod_gemv_iq2_xxs,
+        gemm_iq2_xxs_q8_k: dotprod_gemm_iq2_xxs,
+        vec_dot_iq3_xxs_q8_k: dotprod_vec_dot_iq3_xxs,
+        gemv_iq3_xxs_q8_k: dotprod_gemv_iq3_xxs,
+        gemm_iq3_xxs_q8_k: dotprod_gemm_iq3_xxs,
+        vec_dot_iq4_nl_q8_0: dotprod_vec_dot_iq4_nl,
+        gemv_iq4_nl_q8_0: dotprod_gemv_iq4_nl,
+        gemm_iq4_nl_q8_0: dotprod_gemm_iq4_nl,
         dot_f32_f16: neon_dot_f32_f16,
         dot_f32_bf16: neon_dot_f32_bf16,
         dot_f32_q8_0: neon_dot_f32_q8_0,

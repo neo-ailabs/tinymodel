@@ -1,0 +1,4 @@
+# Frozen L4 quantization quality evaluation token IDs (`docs/TESTING.md` L4)
+# Model family: SmolLM2-135M / SmolLM2-360M (`tokenizer.ggml.model = gpt2`, vocab_size = 49152)
+# Prompt: "The Raspberry Pi Zero 2W has 512 MB of LPDDR2 RAM and a quad-core ARM Cortex-A53 CPU. In Python, def fib(n): return n if n < 2 else fib(n-1) + fib(n-2)."
+504,26557,9688,16244,216,34,71,553,216,37,33,34,7695,282,392,15871,24675,34,15175,284,253,16789,29,3754,28445,35547,29,49,37,35,14692,30,577,8582,28,1391,20309,24,94,957,1406,302,429,302,1076,216,34,1938,20309,24,94,29,33,25,624,20309,24,94,29,34,1425

@@ -8,7 +8,7 @@ This repository contains code ported from or directly inspired by the following 
 - **Copyright**: Copyright (c) 2023-2026 The ggml authors
 - **Upstream**: https://github.com/ggml-org/llama.cpp
 - **Pinned commit**: `3cf03257f219afbe7334045ff7c6a06ac68c627d` (via Strata) and `b001d7b` (M0 baseline)
-- **Used in**: Quantization block layouts (`BlockQ4_0`, `BlockQ8_0`) and ARM NEON / dotprod / i8mm vector dot product algorithms in `crates/tm-core` and `crates/tm-cpu`.
+- **Used in**: Quantization block layouts (`BlockQ4_0`, `BlockQ8_0`, `BlockQ2_0`, `BlockTQ2_0`, `BlockIQ2XXS`, `BlockIQ3XXS`, `BlockIQ4NL`), importance-quantization codebooks (`crates/tm-core/src/iq_tables.rs`), and ARM NEON / dotprod / i8mm vector dot product algorithms in `crates/tm-core` and `crates/tm-cpu`.
 
 ## Strata
 

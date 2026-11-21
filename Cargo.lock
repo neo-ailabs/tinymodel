@@ -405,6 +405,7 @@ dependencies = [
  "tm-cpu",
  "tm-gguf",
  "tm-models",
+ "tm-tokenizer",
 ]
 
 [[package]]

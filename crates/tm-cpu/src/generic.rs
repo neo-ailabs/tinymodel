@@ -6,8 +6,9 @@
 //! Upstream reference: llama.cpp `ggml/src/ggml-cpu/quants.c` (commit `3cf03257`).
 
 use tm_core::{
-    BlockQ4_0, BlockQ4_0x4, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, QK_K,
-    QK8_0, QK8_1, f16_to_f32, unpack_q5k_scales_mins,
+    BlockIQ2XXS, BlockIQ3XXS, BlockIQ4NL, BlockQ2_0, BlockQ4_0, BlockQ4_0x4, BlockQ4_1, BlockQ5K,
+    BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, BlockTQ2_0, IQ2XXS_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS,
+    KVALUES_IQ4NL, QK_K, QK4_NL, QK8_0, QK8_1, f16_to_f32, unpack_q5k_scales_mins,
 };
 
 /// Scalar dot product between one row of `BlockQ4_0` and one vector of `BlockQ8_0`.
@@ -625,5 +626,340 @@ pub fn axpy_f32_q8_0(out: &mut [f32], w: f32, v_q8: &[BlockQ8_0]) {
         for (o, &vq) in o_blk.iter_mut().zip(blk.qs.iter()) {
             *o = (vq as f32).mul_add(scale, *o);
         }
+    }
+}
+
+/// Scalar dot product between `BlockQ2_0` (64 weights, 2.25 bpw) and `BlockQ8_0` (2 blocks per `BlockQ2_0`).
+/// Adapted from `Strata/src/quant/dot_generic.cpp` (`dot_q2_0_q8_0_generic`, MIT License).
+#[inline]
+pub fn vec_dot_q2_0_q8_0(x: &[BlockQ2_0], y: &[BlockQ8_0]) -> f32 {
+    debug_assert_eq!(y.len(), x.len() * 2);
+    let mut sumf = 0.0f32;
+    for (ib, bx) in x.iter().enumerate() {
+        let d0 = f16_to_f32(bx.d);
+        let yb0 = &y[ib * 2];
+        let yb1 = &y[ib * 2 + 1];
+        let mut s0: i32 = 0;
+        let mut s1: i32 = 0;
+        for b in 0..8 {
+            let byte0 = bx.qs[b];
+            s0 += (((byte0 & 3) as i32) - 1) * (yb0.qs[b * 4] as i32)
+                + ((((byte0 >> 2) & 3) as i32) - 1) * (yb0.qs[b * 4 + 1] as i32)
+                + ((((byte0 >> 4) & 3) as i32) - 1) * (yb0.qs[b * 4 + 2] as i32)
+                + ((((byte0 >> 6) & 3) as i32) - 1) * (yb0.qs[b * 4 + 3] as i32);
+            let byte1 = bx.qs[8 + b];
+            s1 += (((byte1 & 3) as i32) - 1) * (yb1.qs[b * 4] as i32)
+                + ((((byte1 >> 2) & 3) as i32) - 1) * (yb1.qs[b * 4 + 1] as i32)
+                + ((((byte1 >> 4) & 3) as i32) - 1) * (yb1.qs[b * 4 + 2] as i32)
+                + ((((byte1 >> 6) & 3) as i32) - 1) * (yb1.qs[b * 4 + 3] as i32);
+        }
+        let sub = (s0 as f32) * f16_to_f32(yb0.d) + (s1 as f32) * f16_to_f32(yb1.d);
+        sumf = d0.mul_add(sub, sumf);
+    }
+    sumf
+}
+
+pub fn gemv_q2_0_q8_0(
+    w: &[BlockQ2_0],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), cols_blocks * 2);
+    assert_eq!(out.len(), rows);
+    for (r, o) in out.iter_mut().enumerate() {
+        *o = vec_dot_q2_0_q8_0(&w[r * cols_blocks..(r + 1) * cols_blocks], x);
+    }
+}
+
+pub fn gemm_q2_0_q8_0(
+    w: &[BlockQ2_0],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+    n_tokens: usize,
+) {
+    let q8_blocks = cols_blocks * 2;
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), n_tokens * q8_blocks);
+    assert_eq!(out.len(), n_tokens * rows);
+    for t in 0..n_tokens {
+        gemv_q2_0_q8_0(
+            w,
+            &x[t * q8_blocks..(t + 1) * q8_blocks],
+            &mut out[t * rows..(t + 1) * rows],
+            rows,
+            cols_blocks,
+        );
+    }
+}
+
+/// Scalar dot product between BitNet b1.58 ternary `BlockTQ2_0` (256 weights) and `BlockQ8K`.
+/// Adapted from llama.cpp `ggml_vec_dot_tq2_0_q8_K_generic` (MIT License).
+#[inline]
+pub fn vec_dot_tq2_0_q8_k(x: &[BlockTQ2_0], y: &[BlockQ8K]) -> f32 {
+    debug_assert_eq!(x.len(), y.len());
+    let mut sumf = 0.0f32;
+    for (bx, by) in x.iter().zip(y.iter()) {
+        let mut sumi: i32 = 0;
+        for half in 0..2 {
+            let qs = &bx.qs[half * 32..(half + 1) * 32];
+            let qy = &by.qs[half * 128..(half + 1) * 128];
+            for l in 0..4 {
+                let sh = l * 2;
+                for k in 0..32 {
+                    sumi += (qy[l * 32 + k] as i32) * ((((qs[k] >> sh) & 3) as i32) - 1);
+                }
+            }
+        }
+        let d = f16_to_f32(bx.d) * by.d;
+        sumf = (sumi as f32).mul_add(d, sumf);
+    }
+    sumf
+}
+
+pub fn gemv_tq2_0_q8_k(
+    w: &[BlockTQ2_0],
+    x: &[BlockQ8K],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), cols_blocks);
+    assert_eq!(out.len(), rows);
+    for (r, o) in out.iter_mut().enumerate() {
+        *o = vec_dot_tq2_0_q8_k(&w[r * cols_blocks..(r + 1) * cols_blocks], x);
+    }
+}
+
+pub fn gemm_tq2_0_q8_k(
+    w: &[BlockTQ2_0],
+    x: &[BlockQ8K],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+    n_tokens: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), n_tokens * cols_blocks);
+    assert_eq!(out.len(), n_tokens * rows);
+    for t in 0..n_tokens {
+        gemv_tq2_0_q8_k(
+            w,
+            &x[t * cols_blocks..(t + 1) * cols_blocks],
+            &mut out[t * rows..(t + 1) * rows],
+            rows,
+            cols_blocks,
+        );
+    }
+}
+
+/// Scalar dot product between `BlockIQ2XXS` (2.0625 bpw) and `BlockQ8K`.
+/// Adapted from llama.cpp / Strata `dot_iq2_xxs_q8_K_generic` (MIT License).
+#[inline]
+pub fn vec_dot_iq2_xxs_q8_k(x: &[BlockIQ2XXS], y: &[BlockQ8K]) -> f32 {
+    debug_assert_eq!(x.len(), y.len());
+    let mut sumf = 0.0f32;
+    for (bx, by) in x.iter().zip(y.iter()) {
+        let mut bsum: i32 = 0;
+        for ib32 in 0..8 {
+            let aux0 = (bx.qs[ib32 * 4] as u32) | ((bx.qs[ib32 * 4 + 1] as u32) << 16);
+            let aux1 = (bx.qs[ib32 * 4 + 2] as u32) | ((bx.qs[ib32 * 4 + 3] as u32) << 16);
+            let g_idx = aux0.to_le_bytes();
+            let ls = (2 * (aux1 >> 28) + 1) as i32;
+            let mut sumi: i32 = 0;
+            for l in 0..4 {
+                let grid = IQ2XXS_GRID[g_idx[l] as usize].to_le_bytes();
+                let signs = KSIGNS_IQ2XS[((aux1 >> (7 * l)) & 127) as usize];
+                let q8 = &by.qs[ib32 * 32 + l * 8..ib32 * 32 + (l + 1) * 8];
+                for j in 0..8 {
+                    let s = if (signs & (1u8 << j)) != 0 { -1 } else { 1 };
+                    sumi += (grid[j] as i32) * (q8[j] as i32) * s;
+                }
+            }
+            bsum += sumi * ls;
+        }
+        let d = f16_to_f32(bx.d) * by.d;
+        sumf = (bsum as f32).mul_add(d, sumf);
+    }
+    0.125 * sumf
+}
+
+pub fn gemv_iq2_xxs_q8_k(
+    w: &[BlockIQ2XXS],
+    x: &[BlockQ8K],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), cols_blocks);
+    assert_eq!(out.len(), rows);
+    for (r, o) in out.iter_mut().enumerate() {
+        *o = vec_dot_iq2_xxs_q8_k(&w[r * cols_blocks..(r + 1) * cols_blocks], x);
+    }
+}
+
+pub fn gemm_iq2_xxs_q8_k(
+    w: &[BlockIQ2XXS],
+    x: &[BlockQ8K],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+    n_tokens: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), n_tokens * cols_blocks);
+    assert_eq!(out.len(), n_tokens * rows);
+    for t in 0..n_tokens {
+        gemv_iq2_xxs_q8_k(
+            w,
+            &x[t * cols_blocks..(t + 1) * cols_blocks],
+            &mut out[t * rows..(t + 1) * rows],
+            rows,
+            cols_blocks,
+        );
+    }
+}
+
+/// Scalar dot product between `BlockIQ3XXS` (3.0625 bpw) and `BlockQ8K`.
+/// Adapted from llama.cpp / Strata `dot_iq3_xxs_q8_K_generic` (MIT License).
+#[inline]
+pub fn vec_dot_iq3_xxs_q8_k(x: &[BlockIQ3XXS], y: &[BlockQ8K]) -> f32 {
+    debug_assert_eq!(x.len(), y.len());
+    let mut sumf = 0.0f32;
+    for (bx, by) in x.iter().zip(y.iter()) {
+        let q3 = &bx.qs[0..QK_K / 4];
+        let gas = &bx.qs[QK_K / 4..];
+        let mut bsum: i32 = 0;
+        for ib32 in 0..8 {
+            let aux32 = u32::from_le_bytes([
+                gas[ib32 * 4],
+                gas[ib32 * 4 + 1],
+                gas[ib32 * 4 + 2],
+                gas[ib32 * 4 + 3],
+            ]);
+            let ls = (2 * (aux32 >> 28) + 1) as i32;
+            let q3_sub = &q3[ib32 * 8..(ib32 + 1) * 8];
+            let mut sumi: i32 = 0;
+            for l in 0..4 {
+                let g1 = IQ3XXS_GRID[q3_sub[2 * l] as usize].to_le_bytes();
+                let g2 = IQ3XXS_GRID[q3_sub[2 * l + 1] as usize].to_le_bytes();
+                let signs = KSIGNS_IQ2XS[((aux32 >> (7 * l)) & 127) as usize];
+                let q8 = &by.qs[ib32 * 32 + l * 8..ib32 * 32 + (l + 1) * 8];
+                for j in 0..4 {
+                    let s0 = if (signs & (1u8 << j)) != 0 { -1 } else { 1 };
+                    let s1 = if (signs & (1u8 << (j + 4))) != 0 {
+                        -1
+                    } else {
+                        1
+                    };
+                    sumi += (g1[j] as i32) * (q8[j] as i32) * s0
+                        + (g2[j] as i32) * (q8[j + 4] as i32) * s1;
+                }
+            }
+            bsum += sumi * ls;
+        }
+        let d = f16_to_f32(bx.d) * by.d;
+        sumf = (bsum as f32).mul_add(d, sumf);
+    }
+    0.25 * sumf
+}
+
+pub fn gemv_iq3_xxs_q8_k(
+    w: &[BlockIQ3XXS],
+    x: &[BlockQ8K],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), cols_blocks);
+    assert_eq!(out.len(), rows);
+    for (r, o) in out.iter_mut().enumerate() {
+        *o = vec_dot_iq3_xxs_q8_k(&w[r * cols_blocks..(r + 1) * cols_blocks], x);
+    }
+}
+
+pub fn gemm_iq3_xxs_q8_k(
+    w: &[BlockIQ3XXS],
+    x: &[BlockQ8K],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+    n_tokens: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), n_tokens * cols_blocks);
+    assert_eq!(out.len(), n_tokens * rows);
+    for t in 0..n_tokens {
+        gemv_iq3_xxs_q8_k(
+            w,
+            &x[t * cols_blocks..(t + 1) * cols_blocks],
+            &mut out[t * rows..(t + 1) * rows],
+            rows,
+            cols_blocks,
+        );
+    }
+}
+
+/// Scalar dot product between `BlockIQ4NL` (non-linear 4-bit codebook) and `BlockQ8_0`.
+/// Adapted from llama.cpp / Strata `dot_iq4_nl_q8_0_generic` (MIT License).
+#[inline]
+pub fn vec_dot_iq4_nl_q8_0(x: &[BlockIQ4NL], y: &[BlockQ8_0]) -> f32 {
+    debug_assert_eq!(x.len(), y.len());
+    let mut sumf = 0.0f32;
+    for (bx, by) in x.iter().zip(y.iter()) {
+        let mut sumi1: i32 = 0;
+        let mut sumi2: i32 = 0;
+        for j in 0..(QK4_NL / 2) {
+            let b = bx.qs[j];
+            sumi1 += (by.qs[j] as i32) * (KVALUES_IQ4NL[(b & 0x0F) as usize] as i32);
+            sumi2 += (by.qs[j + QK4_NL / 2] as i32) * (KVALUES_IQ4NL[(b >> 4) as usize] as i32);
+        }
+        let d = f16_to_f32(bx.d) * f16_to_f32(by.d);
+        sumf = ((sumi1 + sumi2) as f32).mul_add(d, sumf);
+    }
+    sumf
+}
+
+pub fn gemv_iq4_nl_q8_0(
+    w: &[BlockIQ4NL],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), cols_blocks);
+    assert_eq!(out.len(), rows);
+    for (r, o) in out.iter_mut().enumerate() {
+        *o = vec_dot_iq4_nl_q8_0(&w[r * cols_blocks..(r + 1) * cols_blocks], x);
+    }
+}
+
+pub fn gemm_iq4_nl_q8_0(
+    w: &[BlockIQ4NL],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+    n_tokens: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), n_tokens * cols_blocks);
+    assert_eq!(out.len(), n_tokens * rows);
+    for t in 0..n_tokens {
+        gemv_iq4_nl_q8_0(
+            w,
+            &x[t * cols_blocks..(t + 1) * cols_blocks],
+            &mut out[t * rows..(t + 1) * rows],
+            rows,
+            cols_blocks,
+        );
     }
 }

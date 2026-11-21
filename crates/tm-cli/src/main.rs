@@ -11,9 +11,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use tm_core::{KvType, probe_process_memory_stats};
+use tm_core::{DType, KvType, probe_process_memory_stats};
 use tm_cpu::{ThreadPool, active_kernels};
-use tm_gguf::GgufFile;
+use tm_gguf::{ConvertOptions, GgufFile};
 use tm_models::{
     CpuDecodeProfile, LlamaModel, LlamaState, Qwen35DecodeProfile, Qwen35Model, Qwen35State,
     Sampler, SamplerConfig, argmax,
@@ -26,7 +26,7 @@ fn print_usage() {
         "Usage:
   tinymodel probe [-t <threads>] [--stream-mib <mib>] [--no-stream] [--vulkan] [--json]
   tinymodel inspect <model.gguf>
-  tinymodel convert -i <in.gguf> -o <out.gguf>
+  tinymodel convert -i <in.gguf> -o <out.gguf> [--quant q4_0x4|q4_0|q8_0|iq4_nl|iq3_xxs|q2_0|iq2_xxs|tq2_0] [--lm-head-quant <fmt>] [--prune-vocab <N>] [--vocab-corpus <file>]
   tinymodel run -m <model.gguf> [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--spec off|auto|suffix] [--metal | --vulkan]
   tinymodel bench -m <model.gguf> [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--spec off|auto|suffix] [--metal | --vulkan] [--json]
   tinymodel profile -m <model.gguf> [-n <tokens>] [-t <threads>] [-c <ctx>] [--metal]
@@ -34,9 +34,34 @@ fn print_usage() {
     );
 }
 
+fn parse_convert_dtype(flag: &str, raw: &str) -> Result<DType> {
+    let dt = DType::from_cli_name(raw).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unsupported {flag} '{raw}' (expected q4_0x4, q4_0, q8_0, iq4_nl, iq3_xxs, q2_0, iq2_xxs, tq2_0, f16, f32)"
+        )
+    })?;
+    if !matches!(
+        dt,
+        DType::Q4_0x4
+            | DType::Q4_0
+            | DType::Q8_0
+            | DType::Iq4Nl
+            | DType::Iq3Xxs
+            | DType::Q2_0
+            | DType::Iq2Xxs
+            | DType::TQ2_0
+            | DType::F16
+            | DType::F32
+    ) {
+        bail!("unsupported target quantization {flag} '{raw}'");
+    }
+    Ok(dt)
+}
+
 fn cmd_convert(args: &[String]) -> Result<()> {
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
+    let mut opts = ConvertOptions::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -52,6 +77,33 @@ fn cmd_convert(args: &[String]) -> Result<()> {
                     args.get(i).context("missing value for -o/--output")?,
                 ));
             }
+            "-q" | "--quant" => {
+                i += 1;
+                let raw = args.get(i).context("missing value for --quant")?;
+                opts.quant = Some(parse_convert_dtype("--quant", raw)?);
+            }
+            "--lm-head-quant" => {
+                i += 1;
+                let raw = args.get(i).context("missing value for --lm-head-quant")?;
+                opts.lm_head_quant = Some(parse_convert_dtype("--lm-head-quant", raw)?);
+            }
+            "--prune-vocab" => {
+                i += 1;
+                opts.prune_vocab = Some(
+                    args.get(i)
+                        .context("missing value for --prune-vocab")?
+                        .parse()
+                        .context("invalid --prune-vocab")?,
+                );
+            }
+            "--vocab-corpus" => {
+                i += 1;
+                let cpath = args.get(i).context("missing value for --vocab-corpus")?;
+                opts.vocab_corpus = Some(
+                    std::fs::read_to_string(cpath)
+                        .with_context(|| format!("failed to read --vocab-corpus '{cpath}'"))?,
+                );
+            }
             other => bail!("unknown convert argument: {other}"),
         }
         i += 1;
@@ -60,18 +112,40 @@ fn cmd_convert(args: &[String]) -> Result<()> {
     let out_path = output.context("convert requires -o <out.gguf>")?;
     let t0 = Instant::now();
     let gguf = GgufFile::open(&in_path)?;
-    let stats = gguf.convert_to_q4_0x4(&out_path)?;
+    let rep = gguf.convert_with_options(&out_path, &opts)?;
     let ms = t0.elapsed().as_secs_f64() * 1e3;
-    println!(
-        "convert: {} -> {} | repacked {}/{} tensors ({:.2} MiB / {:.2} MiB total, zero size bloat) in {:.1} ms",
-        in_path.display(),
-        out_path.display(),
-        stats.repacked_tensors,
-        stats.total_tensors,
-        stats.repacked_bytes as f64 / (1024.0 * 1024.0),
-        stats.total_file_bytes as f64 / (1024.0 * 1024.0),
-        ms
-    );
+    let in_mib = rep.input_file_bytes as f64 / (1024.0 * 1024.0);
+    let out_mib = rep.output_file_bytes as f64 / (1024.0 * 1024.0);
+    let pct = 100.0 * out_mib / in_mib.max(1e-9);
+    if rep.old_vocab_size != rep.new_vocab_size {
+        println!(
+            "convert: {} -> {} | converted {}/{} tensors | vocab {} -> {} (merges {} -> {}) | {:.2} MiB -> {:.2} MiB ({:.1}%) in {:.1} ms",
+            in_path.display(),
+            out_path.display(),
+            rep.converted_tensors,
+            rep.total_tensors,
+            rep.old_vocab_size,
+            rep.new_vocab_size,
+            rep.old_merges,
+            rep.kept_merges,
+            in_mib,
+            out_mib,
+            pct,
+            ms
+        );
+    } else {
+        println!(
+            "convert: {} -> {} | converted {}/{} tensors | {:.2} MiB -> {:.2} MiB ({:.1}%) in {:.1} ms",
+            in_path.display(),
+            out_path.display(),
+            rep.converted_tensors,
+            rep.total_tensors,
+            in_mib,
+            out_mib,
+            pct,
+            ms
+        );
+    }
     Ok(())
 }
 
