@@ -12,6 +12,7 @@ use std::time::Instant;
 pub use tm_core::KvType;
 use tm_cpu::{KernelTable, ThreadPool, active_kernels};
 use tm_gguf::GgufFile;
+pub use tm_lora::{LoraAdapter, LoraError, LoraMergeOptions, LoraMergeReport, LoraSet};
 use tm_models::{
     Gemma4Model, Gemma4State, LayerState, Lfm2Model, Lfm2State, LlamaModel, LlamaState,
     MAX_SPEC_WINDOW, ModelError, Qwen35Model, Qwen35State, SpecVerifyBuf, argmax,
@@ -24,6 +25,7 @@ pub use spec::{
 };
 
 /// Unified CPU model wrapper supporting all `tinymodel` architectures.
+#[allow(clippy::large_enum_variant)]
 pub enum CpuModel<'a> {
     Llama(LlamaModel<'a>),
     Qwen35(Qwen35Model<'a>),
@@ -149,7 +151,7 @@ impl<'a> CpuModel<'a> {
     }
 
     pub fn new_state_with_kv(&self, max_ctx: usize, kv_type: KvType) -> CpuState {
-        match self {
+        let mut st = match self {
             CpuModel::Llama(m) => {
                 CpuState::Llama(LlamaState::new_with_kv_type(&m.cfg, max_ctx, kv_type))
             }
@@ -160,6 +162,30 @@ impl<'a> CpuModel<'a> {
                 CpuState::Gemma4(Gemma4State::new_with_kv_type(m, max_ctx, kv_type))
             }
             CpuModel::Lfm2(m) => CpuState::Lfm2(Lfm2State::new_with_kv_type(m, max_ctx, kv_type)),
+        };
+        st.ensure_lora_rank(self.max_lora_rank());
+        st
+    }
+
+    /// Validates `loras` against `base_gguf` BEFORE mutating model state (`AGENTS.md` Rule #6),
+    /// then binds all matching LoRA slots across the model.
+    pub fn bind_lora(&mut self, base_gguf: &GgufFile, loras: &LoraSet) -> Result<(), LoraError> {
+        loras.validate_against_gguf(base_gguf)?;
+        match self {
+            CpuModel::Llama(m) => m.bind_lora(loras),
+            CpuModel::Qwen35(m) => m.bind_lora(loras),
+            CpuModel::Gemma4(m) => m.bind_lora(loras),
+            CpuModel::Lfm2(m) => m.bind_lora(loras),
+        }
+        Ok(())
+    }
+
+    pub fn max_lora_rank(&self) -> usize {
+        match self {
+            CpuModel::Llama(m) => m.lora.max_rank,
+            CpuModel::Qwen35(m) => m.lora.max_rank,
+            CpuModel::Gemma4(m) => m.lora.max_rank,
+            CpuModel::Lfm2(m) => m.lora.max_rank,
         }
     }
 
@@ -299,6 +325,23 @@ impl<'a> CpuModel<'a> {
         }
     }
 
+    /// Returns `(output_norm, rms_eps, output_dtype, output_bytes, final_logit_softcap)`
+    /// for frozen output-head training (`ADR-015` Phase T2a `train-mtp`).
+    pub fn output_head_raw(&self) -> (&[f32], f32, tm_core::DType, &'a [u8], Option<f32>) {
+        match self {
+            CpuModel::Llama(m) => (
+                &m.output_norm,
+                m.cfg.rms_eps,
+                m.output.dtype,
+                m.output.bytes,
+                None,
+            ),
+            CpuModel::Qwen35(m) => m.output_head_raw(),
+            CpuModel::Gemma4(m) => m.output_head_raw(),
+            CpuModel::Lfm2(m) => m.output_head_raw(),
+        }
+    }
+
     pub fn project_logits_from_hidden(
         &self,
         state: &mut CpuState,
@@ -341,6 +384,15 @@ impl CpuState {
             CpuState::Qwen35(s) => s.reset(),
             CpuState::Gemma4(s) => s.reset(),
             CpuState::Lfm2(s) => s.reset(),
+        }
+    }
+
+    pub fn ensure_lora_rank(&mut self, max_rank: usize) {
+        match self {
+            CpuState::Llama(s) => s.lora_scratch.ensure_rank(max_rank),
+            CpuState::Qwen35(s) => s.lora_scratch.ensure_rank(max_rank),
+            CpuState::Gemma4(s) => s.lora_scratch.ensure_rank(max_rank),
+            CpuState::Lfm2(s) => s.lora_scratch.ensure_rank(max_rank),
         }
     }
 

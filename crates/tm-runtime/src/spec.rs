@@ -450,6 +450,186 @@ impl LinearMtpHead {
             mv_scratch: MatvecScratch::new(2 * n_embd),
         }
     }
+
+    pub fn n_embd(&self) -> usize {
+        self.n_embd
+    }
+
+    pub fn rms_eps(&self) -> f32 {
+        self.rms_eps
+    }
+
+    pub fn h_norm(&self) -> &[f32] {
+        &self.h_norm
+    }
+
+    pub fn e_norm(&self) -> &[f32] {
+        &self.e_norm
+    }
+
+    pub fn proj_dtype(&self) -> DType {
+        self.proj_dtype
+    }
+
+    pub fn proj_bytes(&self) -> &[u8] {
+        &self.proj_bytes
+    }
+
+    /// Loads a trained [`LinearMtpHead`] from a GGUF v3 file (`general.type == "mtp"`),
+    /// validating architecture and `n_embd` against the base model (`ADR-015` Phase T2a).
+    pub fn open<P: AsRef<std::path::Path>>(
+        path: P,
+        expected_arch: &str,
+        expected_n_embd: usize,
+    ) -> Result<Self, tm_gguf::GgufError> {
+        let gguf = tm_gguf::GgufFile::open(path)?;
+        Self::from_gguf(&gguf, expected_arch, expected_n_embd)
+    }
+
+    /// Parses a [`LinearMtpHead`] from an opened [`tm_gguf::GgufFile`].
+    pub fn from_gguf(
+        gguf: &tm_gguf::GgufFile,
+        expected_arch: &str,
+        expected_n_embd: usize,
+    ) -> Result<Self, tm_gguf::GgufError> {
+        let path_str = gguf.path().display().to_string();
+        let gtype = gguf
+            .get_meta("general.type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if gtype != "mtp" {
+            return Err(tm_gguf::GgufError::InvalidConvertOption {
+                path: path_str,
+                detail: format!("expected general.type='mtp', got '{gtype}'"),
+            });
+        }
+        let arch = gguf.req_str("general.architecture")?;
+        if arch != expected_arch {
+            return Err(tm_gguf::GgufError::InvalidConvertOption {
+                path: path_str,
+                detail: format!(
+                    "MTP architecture '{arch}' does not match base model '{expected_arch}'"
+                ),
+            });
+        }
+        let n_embd = gguf.req_usize("mtp.n_embd")?;
+        if n_embd != expected_n_embd {
+            return Err(tm_gguf::GgufError::InvalidConvertOption {
+                path: path_str,
+                detail: format!("MTP n_embd {n_embd} != base model n_embd {expected_n_embd}"),
+            });
+        }
+        let rms_eps = gguf
+            .get_meta("mtp.rms_eps")
+            .and_then(|v| v.as_f32())
+            .unwrap_or(1e-5);
+
+        let decode_1d = |name: &str| -> Result<Vec<f32>, tm_gguf::GgufError> {
+            let (info, bytes) = gguf.req_tensor(name, "mtp", &[n_embd])?;
+            let mut out = vec![0.0f32; n_embd];
+            tm_core::dequantize_row_bytes(info.dtype, bytes, &mut out);
+            Ok(out)
+        };
+        let h_norm = decode_1d("mtp.h_norm.weight")?;
+        let e_norm = decode_1d("mtp.e_norm.weight")?;
+        let (p_info, p_bytes) = gguf.req_tensor("mtp.proj.weight", "mtp", &[2 * n_embd, n_embd])?;
+
+        Ok(Self::new(
+            n_embd,
+            rms_eps,
+            h_norm,
+            e_norm,
+            p_info.dtype,
+            p_bytes.to_vec(),
+        ))
+    }
+
+    /// Saves this [`LinearMtpHead`] atomically to a GGUF v3 file (`general.type = "mtp"`).
+    pub fn save_gguf<P: AsRef<std::path::Path>>(
+        &self,
+        dst_path: P,
+        arch: &str,
+        out_dtype: DType,
+    ) -> Result<usize, tm_gguf::GgufError> {
+        let d = self.n_embd;
+        let meta = vec![
+            (
+                "general.type".to_string(),
+                tm_gguf::MetadataValue::String("mtp".to_string()),
+            ),
+            (
+                "general.architecture".to_string(),
+                tm_gguf::MetadataValue::String(arch.to_string()),
+            ),
+            (
+                "mtp.n_embd".to_string(),
+                tm_gguf::MetadataValue::U32(d as u32),
+            ),
+            (
+                "mtp.rms_eps".to_string(),
+                tm_gguf::MetadataValue::F32(self.rms_eps),
+            ),
+        ];
+
+        let encode_f32 = |v: &[f32]| -> Vec<u8> {
+            let mut b = Vec::with_capacity(v.len() * 4);
+            for &x in v {
+                b.extend_from_slice(&x.to_le_bytes());
+            }
+            b
+        };
+        let h_bytes = encode_f32(&self.h_norm);
+        let e_bytes = encode_f32(&self.e_norm);
+
+        let proj_out_bytes = if out_dtype == self.proj_dtype {
+            self.proj_bytes.clone()
+        } else {
+            let cols = 2 * d;
+            let src_rb = self.proj_dtype.row_bytes(cols);
+            let dst_rb = out_dtype.row_bytes(cols);
+            let mut row_f32 = vec![0.0f32; cols];
+            let mut row_out = vec![0u8; dst_rb];
+            let mut all = Vec::with_capacity(d * dst_rb);
+            for r in 0..d {
+                if self.proj_dtype == DType::Q4_0x4 {
+                    tm_core::dequantize_q4_0x4_single_row(&self.proj_bytes, cols, r, &mut row_f32);
+                } else {
+                    tm_core::dequantize_row_bytes(
+                        self.proj_dtype,
+                        &self.proj_bytes[r * src_rb..(r + 1) * src_rb],
+                        &mut row_f32,
+                    );
+                }
+                tm_core::quantize_row_to_bytes(out_dtype, &row_f32, &mut row_out);
+                all.extend_from_slice(&row_out);
+            }
+            all
+        };
+
+        let d1 = [d];
+        let d2 = [2 * d, d];
+        let tensors = [
+            tm_gguf::NewGgufTensor {
+                name: "mtp.h_norm.weight",
+                dims: &d1,
+                dtype: DType::F32,
+                data: &h_bytes,
+            },
+            tm_gguf::NewGgufTensor {
+                name: "mtp.e_norm.weight",
+                dims: &d1,
+                dtype: DType::F32,
+                data: &e_bytes,
+            },
+            tm_gguf::NewGgufTensor {
+                name: "mtp.proj.weight",
+                dims: &d2,
+                dtype: out_dtype,
+                data: &proj_out_bytes,
+            },
+        ];
+        tm_gguf::write_gguf_file_atomic(dst_path, &meta, &tensors, 32)
+    }
 }
 
 impl MtpDrafter for LinearMtpHead {

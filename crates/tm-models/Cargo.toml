@@ -12,3 +12,4 @@ thiserror = "2"
 tm-core = { path = "../tm-core" }
 tm-cpu = { path = "../tm-cpu", default-features = false }
 tm-gguf = { path = "../tm-gguf" }
+tm-lora = { path = "../tm-lora" }

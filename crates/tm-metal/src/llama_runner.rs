@@ -1714,7 +1714,34 @@ impl LlamaMetalRunner {
                     },
                 );
             } else {
-                return Err(MetalError::UnsupportedDType(layer.w_gate.dtype));
+                self.encode_gemv(enc, &layer.w_gate, &self.xb, &self.hb, false)?;
+                self.encode_gemv(enc, &layer.w_up, &self.xb, &self.hb2, false)?;
+                const TG: usize = 256;
+                let total_ff = self.cfg.n_ff as u32;
+                require_fit(&self.pipes.silu_mul, "silu_mul", TG)?;
+                enc.setComputePipelineState(&self.pipes.silu_mul);
+                // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
+                unsafe {
+                    enc.setBuffer_offset_atIndex(Some(&self.hb), 0, 0);
+                    enc.setBuffer_offset_atIndex(Some(&self.hb2), 0, 1);
+                    enc.setBytes_length_atIndex(
+                        NonNull::from(&total_ff).cast::<c_void>(),
+                        core::mem::size_of::<u32>(),
+                        2,
+                    );
+                }
+                enc.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: (total_ff as usize).div_ceil(TG),
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: TG,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
             }
 
             self.encode_gemv(enc, &layer.w_down, &self.hb, &self.x, true)?;

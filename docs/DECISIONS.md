@@ -96,3 +96,14 @@
   3. **单后端跨厂商复用**：同一套 `tm-vulkan` 在 **Intel UHD 770** 核显上 Decode 超越 `llama.cpp` Vulkan **`18.2%–50.0%`**，且通过 `aarch64-linux-android` 与 `aarch64-unknown-linux-gnu` 交叉编译检查。
 - **决策**：**不单独提前开辟 HIP 后端**，`tm-vulkan` 作为 AMD、Intel 及 Arm 端侧 GPU 的正式主力后端；待 M5 建设 `tm-cuda` 时，再按需评估 `.cu` 内核对 `hipcc` 的共源复用。
 - **后果**：省去维护第三套 GPU 后端及 `~2 GiB` ROCm 运行时依赖，直接衔接 M5 服务层与 `tm-cuda`。
+
+### ADR-015 支持 GGUF LoRA 推理与量化基座上的手写逐层微调（QLoRA + MTP 草稿头）
+- **状态**：Accepted（2026-11-22，用户确认）
+- **背景**：端侧与单机场景存在强烈的本地指令对齐、工具调用微调与 MTP 投机草稿头自举需求。对比上游 `llama.cpp` 当前重新引入的 `llama-finetune`（仅支持 FP32 全参数微调，1B 模型约需 `24 GB` 内存且关闭 FlashAttention），`tinymodel` 需要一条能在几百 MiB 脏内存内直接基于冻结量化权重（`Q4_0 / Q4_0x4 / Q5_K / Q6_K / 低比特`）训练 LoRA 的路径，同时不能污染 `micro` 档 `≤ 2 MB` 的纯静态二进制（`N-05`），也不能破坏推理热路径的零堆分配契约（`MUST #4`）。此外，推理前向采用了 `Q8_0` 动态激活量化，不能直接套用纯 FP32 框架的 `1e-4` 梯度阈值。
+- **决策**：
+  1. **范围界定**：调整 `REQUIREMENTS.md` 第 5 节——正式支持 **GGUF LoRA 动态挂载/离线合并、MTP 投机草稿头训练，以及冻结量化基座上的 LoRA 微调（QLoRA）**；**不做全参数预训练/全参数微调**。
+  2. **模块与 Feature 隔离**：新增两个 `#![forbid(unsafe_code)]` crate——`crates/tm-lora`（兼容 `llama.cpp` `general.type = "adapter"` / `adapter.type = "lora"` 规范的零拷贝/轻量适配器加载、多适配器缩放叠加与 `lora-merge` 离线融合）和 `crates/tm-train`（通过 `tm-cli` 的 `train` feature 开关挂载，默认不编入 `micro` 档）；所有 `unsafe` 反向算子（如 `matmul_q_transposed_f32`）严格留在 `tm-cpu / tm-metal / tm-vulkan` 内并配齐三件套（`MUST #2, #3`）。
+  3. **独立训练前向 + 零 LoRA 逐位一致门禁**：不把激活保存逻辑塞进零分配推理路径，而是在 `tm-train` 编写调用同一套底层算子的独立训练前向（含逐层 `FP16` 入口检查点、单层静态 `TrainArena` 与跳过 `label = -100` 的分块交叉熵），并用硬性测试强制约束 **“LoRA 权重全零时，训练前向输出的 logits 与推理 `forward_batch` 逐位一致（0 ULP）”**，防止训练与部署数值漂移。
+  4. **Q8 激活直通估计（STE）与三层梯度验收**：前向保持与部署一致的量化点积，反向采用 STE + FP32 累加（固定归约顺序以保证确定性 `N-10`）；按 ① 算子级 `f64` 中心差分（`< 1e-5`）、② 含同款 `Q8` fake-quant 的模拟量化 Oracle（`< 1e-3`）、③ 纯 FP32 PEFT 梯度方向余弦（`> 0.99`）与多步 loss 收敛三层验收。
+  5. **渐进实施顺序**：按 **`T1`（LoRA 加载与合并）→ `T2a`（MTP 投机头训练与 CLI `--mtp` 接入）→ `T2b`（标准 Transformer CPU QLoRA）→ `T3`（Qwen3.5 GDN / Gemma 4 / LFM2 混合反向）→ `T4`（Metal / Vulkan GPU 反向加速）** 推进。
+- **后果**：`micro` 推理产物保持 `< 1.2 MB` 零体积膨胀；M3 已实现的 `--spec mtp` 获得真实模型可用的训练闭环；端侧与主机可在数百 MiB 额外内存下直接微调量化 GGUF 模型并导出与 `llama.cpp --lora` 互通的适配器。

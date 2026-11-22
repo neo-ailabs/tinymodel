@@ -8,7 +8,7 @@
 use tm_core::{
     BlockIQ2XXS, BlockIQ3XXS, BlockIQ4NL, BlockQ2_0, BlockQ4_0, BlockQ4_0x4, BlockQ4_1, BlockQ5K,
     BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, BlockTQ2_0, IQ2XXS_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS,
-    KVALUES_IQ4NL, QK_K, QK4_NL, QK8_0, QK8_1, f16_to_f32, unpack_q5k_scales_mins,
+    KVALUES_IQ4NL, QK_K, QK4_0, QK4_NL, QK8_0, QK8_1, f16_to_f32, unpack_q5k_scales_mins,
 };
 
 /// Scalar dot product between one row of `BlockQ4_0` and one vector of `BlockQ8_0`.
@@ -962,5 +962,49 @@ pub fn gemm_iq4_nl_q8_0(
             rows,
             cols_blocks,
         );
+    }
+}
+
+/// Scalar `out[i] = w.mul_add(x[i], out[i])` (`out += w * x`).
+#[inline]
+pub fn axpy_f32(out: &mut [f32], w: f32, x: &[f32]) {
+    assert_eq!(out.len(), x.len());
+    for (o, &xi) in out.iter_mut().zip(x.iter()) {
+        *o = xi.mul_add(w, *o);
+    }
+}
+
+/// Scalar transposed `Q4_0` column-block accumulation (`dx_tile[t, 0..32] += sum_r dy[t, r] * W[r, cb]`),
+/// preserving strict `r = 0..rows` FMA rounding order per `(t, c)`.
+pub fn gemm_q4_0_transposed_tile(
+    w: &[BlockQ4_0],
+    cols_blocks: usize,
+    cb: usize,
+    dy: &[f32],
+    dx_tile: &mut [f32],
+    rows: usize,
+    n_tok: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert!(cb < cols_blocks);
+    assert_eq!(dy.len(), n_tok * rows);
+    assert_eq!(dx_tile.len(), n_tok * QK4_0);
+
+    for r in 0..rows {
+        let blk = &w[r * cols_blocks + cb];
+        let d = f16_to_f32(blk.d);
+        let mut wf = [0.0f32; QK4_0];
+        for j in 0..(QK4_0 / 2) {
+            let byte = blk.qs[j];
+            wf[j] = (((byte & 0x0F) as i32 - 8) as f32) * d;
+            wf[j + QK4_0 / 2] = (((byte >> 4) as i32 - 8) as f32) * d;
+        }
+        for t in 0..n_tok {
+            let dy_val = dy[t * rows + r];
+            let dst = &mut dx_tile[t * QK4_0..(t + 1) * QK4_0];
+            for j in 0..QK4_0 {
+                dst[j] = wf[j].mul_add(dy_val, dst[j]);
+            }
+        }
     }
 }

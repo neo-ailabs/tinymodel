@@ -1679,6 +1679,150 @@ impl GgufFile {
     }
 }
 
+/// Descriptor for writing a tensor into a new GGUF v3 file.
+#[derive(Debug, Clone, Copy)]
+pub struct NewGgufTensor<'a> {
+    pub name: &'a str,
+    pub dims: &'a [usize],
+    pub dtype: DType,
+    pub data: &'a [u8],
+}
+
+/// Writes a standalone GGUF v3 file containing `metadata` and `tensors` aligned to `alignment`
+/// (defaults to 32 bytes when `alignment == 0`). Returns total bytes written.
+pub fn write_gguf_file<P: AsRef<Path>>(
+    dst_path: P,
+    metadata: &[(String, MetadataValue)],
+    tensors: &[NewGgufTensor<'_>],
+    alignment: usize,
+) -> Result<usize, GgufError> {
+    let align = if alignment == 0 {
+        DEFAULT_ALIGNMENT
+    } else {
+        alignment
+    };
+    if !align.is_power_of_two() {
+        return Err(GgufError::InvalidAlignment {
+            path: dst_path.as_ref().display().to_string(),
+            alignment: align,
+        });
+    }
+    let out_path = dst_path.as_ref();
+    let out_str = out_path.display().to_string();
+    let io_err = |source: std::io::Error| GgufError::Io {
+        path: out_str.clone(),
+        source,
+    };
+
+    let mut meta_map: HashMap<String, MetadataValue> = HashMap::with_capacity(metadata.len() + 1);
+    for (k, v) in metadata {
+        meta_map.insert(k.clone(), v.clone());
+    }
+    if align != DEFAULT_ALIGNMENT {
+        meta_map.insert(
+            "general.alignment".to_string(),
+            MetadataValue::U32(align as u32),
+        );
+    }
+
+    let mut offsets = Vec::with_capacity(tensors.len());
+    let mut cur_off = 0usize;
+    for t in tensors {
+        let n_elems: usize = t.dims.iter().product();
+        let expected_bytes = (n_elems / t.dtype.block_elements()) * t.dtype.block_bytes();
+        if t.data.len() != expected_bytes {
+            return Err(GgufError::InvalidConvertOption {
+                path: out_str,
+                detail: format!(
+                    "tensor '{}' data byte length {} != expected {} for {:?} dims {:?}",
+                    t.name,
+                    t.data.len(),
+                    expected_bytes,
+                    t.dtype,
+                    t.dims
+                ),
+            });
+        }
+        let aligned = cur_off.next_multiple_of(align);
+        offsets.push(aligned);
+        cur_off = aligned + t.data.len();
+    }
+
+    let mut hdr_buf: Vec<u8> = Vec::with_capacity(4096);
+    hdr_buf.extend_from_slice(GGUF_MAGIC);
+    hdr_buf.extend_from_slice(&3u32.to_le_bytes());
+    hdr_buf.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+    hdr_buf.extend_from_slice(&(meta_map.len() as u64).to_le_bytes());
+
+    let mut sorted_keys: Vec<&String> = meta_map.keys().collect();
+    sorted_keys.sort();
+    for k in sorted_keys {
+        write_gguf_str(&mut hdr_buf, k, &out_str)?;
+        write_gguf_val(&mut hdr_buf, &meta_map[k], &[], true, &out_str)?;
+    }
+
+    for (t, &off) in tensors.iter().zip(offsets.iter()) {
+        write_gguf_str(&mut hdr_buf, t.name, &out_str)?;
+        hdr_buf.extend_from_slice(&(t.dims.len() as u32).to_le_bytes());
+        for &d in t.dims {
+            hdr_buf.extend_from_slice(&(d as u64).to_le_bytes());
+        }
+        hdr_buf.extend_from_slice(&t.dtype.to_ggml_type().to_le_bytes());
+        hdr_buf.extend_from_slice(&(off as u64).to_le_bytes());
+    }
+
+    let data_offset = hdr_buf.len().next_multiple_of(align);
+    hdr_buf.resize(data_offset, 0u8);
+
+    let file = File::create(out_path).map_err(io_err)?;
+    let mut writer = BufWriter::with_capacity(512 * 1024, file);
+    writer.write_all(&hdr_buf).map_err(io_err)?;
+
+    let zero_pad = [0u8; 64];
+    let mut written = 0usize;
+    for (t, &off) in tensors.iter().zip(offsets.iter()) {
+        while written < off {
+            let pad = (off - written).min(zero_pad.len());
+            writer.write_all(&zero_pad[..pad]).map_err(io_err)?;
+            written += pad;
+        }
+        writer.write_all(t.data).map_err(io_err)?;
+        written += t.data.len();
+    }
+    writer.flush().map_err(io_err)?;
+    if let Ok(f) = writer.into_inner() {
+        let _ = f.sync_all();
+    }
+    Ok(data_offset + written)
+}
+
+/// Crash-safe atomic GGUF v3 writer: writes and syncs `<dst>.tmp`, then atomically renames to `dst`.
+pub fn write_gguf_file_atomic<P: AsRef<Path>>(
+    dst_path: P,
+    metadata: &[(String, MetadataValue)],
+    tensors: &[NewGgufTensor<'_>],
+    alignment: usize,
+) -> Result<usize, GgufError> {
+    let dst = dst_path.as_ref();
+    let mut tmp_os = dst.as_os_str().to_os_string();
+    tmp_os.push(format!(".tmp.{}", std::process::id()));
+    let tmp_path = PathBuf::from(tmp_os);
+    let res = write_gguf_file(&tmp_path, metadata, tensors, alignment);
+    match res {
+        Ok(bytes) => {
+            std::fs::rename(&tmp_path, dst).map_err(|source| GgufError::Io {
+                path: dst.display().to_string(),
+                source,
+            })?;
+            Ok(bytes)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(e)
+        }
+    }
+}
+
 struct Cursor<'a> {
     data: &'a [u8],
     pos: usize,

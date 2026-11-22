@@ -14,11 +14,14 @@ use anyhow::{Context, Result, bail};
 use tm_core::{DType, KvType, probe_process_memory_stats};
 use tm_cpu::{ThreadPool, active_kernels};
 use tm_gguf::{ConvertOptions, GgufFile};
+use tm_lora::{LoraAdapter, LoraMergeOptions, LoraSet, merge_lora_gguf, parse_lora_spec};
 use tm_models::{
     CpuDecodeProfile, LlamaModel, LlamaState, Qwen35DecodeProfile, Qwen35Model, Qwen35State,
     Sampler, SamplerConfig, argmax,
 };
-use tm_runtime::{CpuModel, Session, SpecController, SpecMode, SuffixDrafter};
+use tm_runtime::{
+    CpuModel, LinearMtpHead, MtpDrafter, Session, SpecController, SpecMode, SuffixDrafter,
+};
 use tm_tokenizer::Tokenizer;
 
 fn print_usage() {
@@ -27,10 +30,13 @@ fn print_usage() {
   tinymodel probe [-t <threads>] [--stream-mib <mib>] [--no-stream] [--vulkan] [--json]
   tinymodel inspect <model.gguf>
   tinymodel convert -i <in.gguf> -o <out.gguf> [--quant q4_0x4|q4_0|q8_0|iq4_nl|iq3_xxs|q2_0|iq2_xxs|tq2_0] [--lm-head-quant <fmt>] [--prune-vocab <N>] [--vocab-corpus <file>]
-  tinymodel run -m <model.gguf> [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--spec off|auto|suffix] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]
-  tinymodel bench -m <model.gguf> [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--spec off|auto|suffix] [--vulkan | --metal | --gpu <vulkan|metal|cpu>] [--json]
-  tinymodel profile -m <model.gguf> [-n <tokens>] [-t <threads>] [-c <ctx>] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]
-  tinymodel logits -m <model.gguf> -o <out.bin> [-p <prompt> | --tokens 1,2,3] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]"
+  tinymodel lora-merge -m <base.gguf> --lora <adapter.gguf>[:scale] -o <out.gguf> [--quant <fmt>] [--lm-head-quant <fmt>]
+  tinymodel run -m <model.gguf> [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--spec off|auto|suffix|mtp] [--mtp <mtp.gguf>] [--lora <adapter.gguf>[:scale]] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]
+  tinymodel bench -m <model.gguf> [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--spec off|auto|suffix|mtp] [--mtp <mtp.gguf>] [--lora <adapter.gguf>[:scale]] [--vulkan | --metal | --gpu <vulkan|metal|cpu>] [--json]
+  tinymodel profile -m <model.gguf> [-n <tokens>] [-t <threads>] [-c <ctx>] [--lora <adapter.gguf>[:scale]] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]
+  tinymodel logits -m <model.gguf> -o <out.bin> [-p <prompt> | --tokens 1,2,3] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--lora <adapter.gguf>[:scale]] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]
+  tinymodel train-mtp -m <base.gguf> --data <path> -o <mtp.gguf> [--steps <N>] [--seq-len <T>] [--lr <LR>] [--quant f16|q8_0|q4_0|f32] [-t <threads>] [--max-temp-c <C>] [--json]
+  tinymodel finetune -m <base.gguf> --data <path> -o <adapter.gguf> [--rank <R>] [--alpha <A>] [--targets q,k,v,o,gate,up,down] [--steps <N>] [--seq-len <T>] [--grad-accum <M>] [--lr <LR>] [--lora-plus-ratio <K>] [--save-every <S>] [--ckpt <ckpt.gguf>] [--resume <ckpt.gguf>] [--f16] [-t <threads>] [--max-temp-c <C>] [--json]"
     );
 }
 
@@ -157,9 +163,18 @@ fn cmd_inspect(path: PathBuf) -> Result<()> {
         gguf.version(),
         gguf.alignment()
     );
+    if let Some(gtype) = gguf.get_meta("general.type").and_then(|v| v.as_str()) {
+        println!("Type: {gtype}");
+    }
     println!("Tensors: {}", gguf.tensor_names().len());
     if let Ok(arch) = gguf.req_str("general.architecture") {
         println!("Architecture: {arch}");
+    }
+    if let Some(alpha) = gguf.get_meta("adapter.lora.alpha").and_then(|v| v.as_f32()) {
+        println!("LoRA alpha: {alpha}");
+    }
+    if let Some(d) = gguf.get_meta("mtp.n_embd").and_then(|v| v.as_usize()) {
+        println!("MTP n_embd: {d}");
     }
     if let Some(name) = gguf.get_meta("general.name").and_then(|v| v.as_str()) {
         println!("Name: {name}");
@@ -175,6 +190,86 @@ fn cmd_inspect(path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn load_lora_set(specs: &[(PathBuf, f32)]) -> Result<LoraSet> {
+    let mut set = LoraSet::new();
+    for (p, scale) in specs {
+        let adapter = LoraAdapter::open(p)
+            .with_context(|| format!("failed to load LoRA adapter '{}'", p.display()))?;
+        set.push(adapter, *scale);
+    }
+    Ok(set)
+}
+
+fn cmd_lora_merge(args: &[String]) -> Result<()> {
+    let mut base_path: Option<PathBuf> = None;
+    let mut out_path: Option<PathBuf> = None;
+    let mut lora_specs: Vec<(PathBuf, f32)> = Vec::new();
+    let mut opts = LoraMergeOptions::default();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-m" | "--model" | "-i" | "--input" => {
+                i += 1;
+                base_path = Some(PathBuf::from(
+                    args.get(i).context("missing value for -m/--model")?,
+                ));
+            }
+            "-o" | "--output" => {
+                i += 1;
+                out_path = Some(PathBuf::from(
+                    args.get(i).context("missing value for -o/--output")?,
+                ));
+            }
+            "--lora" => {
+                i += 1;
+                let raw = args.get(i).context("missing value for --lora")?;
+                let (p, sc) = parse_lora_spec(raw).map_err(|e| anyhow::anyhow!(e))?;
+                lora_specs.push((PathBuf::from(p), sc));
+            }
+            "-q" | "--quant" => {
+                i += 1;
+                let raw = args.get(i).context("missing value for --quant")?;
+                opts.quant = Some(parse_convert_dtype("--quant", raw)?);
+            }
+            "--lm-head-quant" => {
+                i += 1;
+                let raw = args.get(i).context("missing value for --lm-head-quant")?;
+                opts.lm_head_quant = Some(parse_convert_dtype("--lm-head-quant", raw)?);
+            }
+            other => bail!("unknown lora-merge argument: {other}"),
+        }
+        i += 1;
+    }
+
+    let base_p = base_path.context("lora-merge requires -m <base.gguf>")?;
+    let out_p = out_path.context("lora-merge requires -o <out.gguf>")?;
+    if lora_specs.is_empty() {
+        bail!("lora-merge requires at least one --lora <adapter.gguf>[:scale]");
+    }
+    let t0 = Instant::now();
+    let base_gguf = GgufFile::open(&base_p)?;
+    let loras = load_lora_set(&lora_specs)?;
+    let rep = merge_lora_gguf(&base_gguf, &loras, &out_p, &opts)?;
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    println!(
+        "lora-merge: {} + {} adapter(s) -> {} | merged {}/{} tensors{} | {:.2} MiB in {:.1} ms",
+        base_p.display(),
+        lora_specs.len(),
+        out_p.display(),
+        rep.merged_tensors,
+        rep.total_tensors,
+        if rep.untied_output {
+            " (untied output.weight)"
+        } else {
+            ""
+        },
+        rep.output_file_bytes as f64 / (1024.0 * 1024.0),
+        ms,
+    );
+    Ok(())
+}
+
 struct RunOpts {
     model: PathBuf,
     prompt: Option<String>,
@@ -187,6 +282,8 @@ struct RunOpts {
     prefix_cache_mib: usize,
     kv_type: KvType,
     spec_mode: SpecMode,
+    mtp_path: Option<PathBuf>,
+    lora_specs: Vec<(PathBuf, f32)>,
     use_metal: bool,
     use_vulkan: bool,
     json: bool,
@@ -205,6 +302,8 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
     let mut prefix_cache_mib = 0usize;
     let mut kv_type = KvType::F16;
     let mut spec_mode = SpecMode::Off;
+    let mut mtp_path: Option<PathBuf> = None;
+    let mut lora_specs: Vec<(PathBuf, f32)> = Vec::new();
     let mut use_metal = false;
     let mut use_vulkan = false;
     let mut json = false;
@@ -356,6 +455,18 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
                 let raw = args.get(i).context("missing value for --spec")?;
                 spec_mode = raw.parse::<SpecMode>().map_err(|e| anyhow::anyhow!(e))?;
             }
+            "--mtp" => {
+                i += 1;
+                mtp_path = Some(PathBuf::from(
+                    args.get(i).context("missing value for --mtp")?,
+                ));
+            }
+            "--lora" => {
+                i += 1;
+                let raw = args.get(i).context("missing value for --lora")?;
+                let (p, sc) = parse_lora_spec(raw).map_err(|e| anyhow::anyhow!(e))?;
+                lora_specs.push((PathBuf::from(p), sc));
+            }
             "--prefix-cache-mib" => {
                 i += 1;
                 prefix_cache_mib = args
@@ -389,6 +500,8 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
         prefix_cache_mib,
         kv_type,
         spec_mode,
+        mtp_path,
+        lora_specs,
         use_metal,
         use_vulkan,
         json,
@@ -1292,7 +1405,17 @@ fn cmd_profile_vulkan(opts: RunOpts) -> Result<()> {
     Ok(())
 }
 
+fn ensure_no_gpu_dynamic_lora(opts: &RunOpts) -> Result<()> {
+    if !opts.lora_specs.is_empty() && (opts.use_metal || opts.use_vulkan) {
+        bail!(
+            "GPU dynamic --lora is scheduled for Phase T4; merge offline first via:\n  tinymodel lora-merge -m <base.gguf> --lora <adapter.gguf> -o <merged.gguf>"
+        );
+    }
+    Ok(())
+}
+
 fn cmd_run(opts: RunOpts) -> Result<()> {
+    ensure_no_gpu_dynamic_lora(&opts)?;
     if opts.use_metal {
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         return cmd_run_metal(opts);
@@ -1312,7 +1435,16 @@ fn cmd_run(opts: RunOpts) -> Result<()> {
     let pool = ThreadPool::new(opts.threads);
     let kt = active_kernels();
 
-    let model = CpuModel::from_gguf(&gguf)?;
+    let mut model = CpuModel::from_gguf(&gguf)?;
+    if !opts.lora_specs.is_empty() {
+        let loras = load_lora_set(&opts.lora_specs)?;
+        model.bind_lora(&gguf, &loras)?;
+    }
+    let mut mtp_head = if let Some(ref mp) = opts.mtp_path {
+        Some(LinearMtpHead::open(mp, model.arch(), model.n_embd())?)
+    } else {
+        None
+    };
     check_linux_dirty_budget(
         model.estimate_dirty_bytes_with_kv(opts.max_ctx, opts.kv_type),
         opts.max_ctx,
@@ -1325,12 +1457,13 @@ fn cmd_run(opts: RunOpts) -> Result<()> {
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
     eprintln!(
-        "[tinymodel] arch={} isa={} threads={} kv={} spec={} load={:.1}ms prompt_tokens={} vocab={} layers={} prefix_cache_mib={}",
+        "[tinymodel] arch={} isa={} threads={} kv={} spec={} loras={} load={:.1}ms prompt_tokens={} vocab={} layers={} prefix_cache_mib={}",
         model.arch(),
         kt.isa.name(),
         pool.num_threads(),
         opts.kv_type.as_str(),
         opts.spec_mode.as_str(),
+        opts.lora_specs.len(),
         load_ms,
         prompt_ids.len(),
         model.vocab_size(),
@@ -1362,7 +1495,7 @@ fn cmd_run(opts: RunOpts) -> Result<()> {
             opts.n_predict,
             opts.spec_mode,
             &mut suffix,
-            None,
+            mtp_head.as_mut().map(|h| h as &mut dyn MtpDrafter),
             &mut ctrl,
             |_, tid| tok.is_stop_token(tid),
         )?;
@@ -1438,6 +1571,7 @@ fn cmd_run(opts: RunOpts) -> Result<()> {
 }
 
 fn cmd_bench(opts: RunOpts) -> Result<()> {
+    ensure_no_gpu_dynamic_lora(&opts)?;
     if opts.use_vulkan {
         #[cfg(feature = "vulkan")]
         return cmd_bench_vulkan(opts);
@@ -1467,7 +1601,16 @@ fn cmd_bench(opts: RunOpts) -> Result<()> {
         .unwrap_or("?")
         .to_string();
 
-    let model = CpuModel::from_gguf(&gguf)?;
+    let mut model = CpuModel::from_gguf(&gguf)?;
+    if !opts.lora_specs.is_empty() {
+        let loras = load_lora_set(&opts.lora_specs)?;
+        model.bind_lora(&gguf, &loras)?;
+    }
+    let mut mtp_head = if let Some(ref mp) = opts.mtp_path {
+        Some(LinearMtpHead::open(mp, model.arch(), model.n_embd())?)
+    } else {
+        None
+    };
     check_linux_dirty_budget(
         model.estimate_dirty_bytes_with_kv(opts.max_ctx, opts.kv_type),
         opts.max_ctx,
@@ -1515,7 +1658,7 @@ fn cmd_bench(opts: RunOpts) -> Result<()> {
             n_gen + 1,
             opts.spec_mode,
             &mut suffix,
-            None,
+            mtp_head.as_mut().map(|h| h as &mut dyn MtpDrafter),
             &mut ctrl,
             |_, _| false,
         )?;
@@ -1859,6 +2002,7 @@ fn write_f32_le(w: &mut BufWriter<File>, slice: &[f32]) -> Result<()> {
 /// Evaluates a multi-token sequence and writes full `[n_steps, vocab_size]` FP32 logits
 /// in `TMLG` v1 binary format for `tools/logits_diff.py` (`AGENTS.md` Rule #7).
 fn cmd_logits(opts: RunOpts) -> Result<()> {
+    ensure_no_gpu_dynamic_lora(&opts)?;
     let out_path = opts
         .out_path
         .clone()
@@ -1958,7 +2102,11 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
 
     let pool = ThreadPool::new(opts.threads);
     let kt = active_kernels();
-    let model = CpuModel::from_gguf(&gguf)?;
+    let mut model = CpuModel::from_gguf(&gguf)?;
+    if !opts.lora_specs.is_empty() {
+        let loras = load_lora_set(&opts.lora_specs)?;
+        model.bind_lora(&gguf, &loras)?;
+    }
     check_linux_dirty_budget(
         model.estimate_dirty_bytes_with_kv(opts.max_ctx, opts.kv_type),
         opts.max_ctx,
@@ -1988,6 +2136,497 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "train")]
+fn enforce_thermal_guard(max_temp_c: Option<f64>) {
+    let Some(limit) = max_temp_c else {
+        return;
+    };
+    if let Some(mut cur) = probe::collect_telemetry().max_temp_c
+        && cur > limit
+    {
+        let target = limit - 3.0;
+        eprintln!(
+            "[tinymodel thermal] SoC temp {:.1}°C > {:.1}°C limit; pausing until <= {:.1}°C...",
+            cur, limit, target
+        );
+        while cur > target {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let Some(next) = probe::collect_telemetry().max_temp_c else {
+                break;
+            };
+            cur = next;
+        }
+    }
+}
+
+#[cfg(feature = "train")]
+fn cmd_train_mtp(args: &[String]) -> Result<()> {
+    let mut model_path: Option<PathBuf> = None;
+    let mut data_path: Option<PathBuf> = None;
+    let mut out_path: Option<PathBuf> = None;
+    let mut threads = tm_cpu::recommended_threads();
+    let mut max_temp_c: Option<f64> = None;
+    let mut json = false;
+    let mut cfg = tm_train::MtpTrainConfig::default();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-m" | "--model" => {
+                i += 1;
+                model_path = Some(PathBuf::from(
+                    args.get(i).context("missing value for -m/--model")?,
+                ));
+            }
+            "--data" | "-d" => {
+                i += 1;
+                data_path = Some(PathBuf::from(
+                    args.get(i).context("missing value for --data")?,
+                ));
+            }
+            "-o" | "--output" => {
+                i += 1;
+                out_path = Some(PathBuf::from(
+                    args.get(i).context("missing value for -o/--output")?,
+                ));
+            }
+            "--steps" => {
+                i += 1;
+                cfg.steps = args
+                    .get(i)
+                    .context("missing --steps")?
+                    .parse()
+                    .context("invalid --steps")?;
+            }
+            "--seq-len" | "-c" => {
+                i += 1;
+                cfg.seq_len = args
+                    .get(i)
+                    .context("missing --seq-len")?
+                    .parse()
+                    .context("invalid --seq-len")?;
+            }
+            "--lr" => {
+                i += 1;
+                cfg.lr = args
+                    .get(i)
+                    .context("missing --lr")?
+                    .parse()
+                    .context("invalid --lr")?;
+            }
+            "--warmup" => {
+                i += 1;
+                cfg.warmup_steps = args
+                    .get(i)
+                    .context("missing --warmup")?
+                    .parse()
+                    .context("invalid --warmup")?;
+            }
+            "-q" | "--quant" => {
+                i += 1;
+                let raw = args.get(i).context("missing --quant")?;
+                cfg.out_dtype = parse_convert_dtype("--quant", raw)?;
+            }
+            "-s" | "--seed" => {
+                i += 1;
+                cfg.seed = args
+                    .get(i)
+                    .context("missing --seed")?
+                    .parse()
+                    .context("invalid --seed")?;
+            }
+            "-t" | "--threads" => {
+                i += 1;
+                threads = args
+                    .get(i)
+                    .context("missing -t")?
+                    .parse()
+                    .context("invalid -t")?;
+            }
+            "--max-temp-c" => {
+                i += 1;
+                max_temp_c = Some(
+                    args.get(i)
+                        .context("missing --max-temp-c")?
+                        .parse()
+                        .context("invalid --max-temp-c")?,
+                );
+            }
+            "--json" => json = true,
+            other => bail!("unknown train-mtp argument: {other}"),
+        }
+        i += 1;
+    }
+
+    let mp = model_path.context("train-mtp requires -m <base.gguf>")?;
+    let dp = data_path.context("train-mtp requires --data <path>")?;
+    let op = out_path.context("train-mtp requires -o <mtp.gguf>")?;
+
+    let gguf = GgufFile::open(&mp)?;
+    let tok = Tokenizer::from_gguf(&gguf).ok();
+    let ds = tm_train::TrainDataset::load(&dp, tok.as_ref(), cfg.seq_len)?;
+    let model = CpuModel::from_gguf(&gguf)?;
+    let pool = ThreadPool::new(threads);
+
+    if !json {
+        eprintln!(
+            "[train-mtp] model={} arch={} n_embd={} samples={} steps={} seq_len={} lr={} out_dtype={:?}",
+            mp.display(),
+            model.arch(),
+            model.n_embd(),
+            ds.samples.len(),
+            cfg.steps,
+            cfg.seq_len,
+            cfg.lr,
+            cfg.out_dtype
+        );
+    }
+
+    let log_every = cfg.log_every.max(1);
+    let (head, rep) =
+        tm_train::train_mtp_head(&model, &pool, &ds, &cfg, |step, loss, acc1, lr| {
+            enforce_thermal_guard(max_temp_c);
+            if !json && (step == 1 || step.is_multiple_of(log_every) || step == cfg.steps) {
+                eprintln!(
+                    "  step {:4}/{} | loss={:.4} | acc@1={:5.1}% | lr={:.2e}",
+                    step,
+                    cfg.steps,
+                    loss,
+                    acc1 * 100.0,
+                    lr
+                );
+            }
+        })?;
+
+    let file_bytes = head.save_gguf(&op, model.arch(), cfg.out_dtype)?;
+    let mstats = probe_process_memory_stats();
+    let tps = (rep.total_mtp_tokens as f64) / rep.elapsed_sec.max(1e-9);
+    if json {
+        println!(
+            "{{\"mode\":\"train-mtp\",\"arch\":\"{}\",\"steps\":{},\"mtp_tokens\":{},\
+            \"initial_loss\":{:.4},\"final_loss\":{:.4},\"initial_acc1\":{:.4},\"final_acc1\":{:.4},\
+            \"elapsed_sec\":{:.3},\"tok_per_sec\":{:.2},\"out_bytes\":{},\
+            \"rss_bytes\":{},\"peak_rss_bytes\":{},\"private_dirty_bytes\":{}}}",
+            probe::json_escape(model.arch()),
+            cfg.steps,
+            rep.total_mtp_tokens,
+            rep.initial_loss,
+            rep.final_loss,
+            rep.initial_acc1,
+            rep.final_acc1,
+            rep.elapsed_sec,
+            tps,
+            file_bytes,
+            probe::opt_u64_json(mstats.rss_bytes),
+            probe::opt_u64_json(mstats.peak_rss_bytes),
+            probe::opt_u64_json(mstats.private_dirty_bytes),
+        );
+    } else {
+        println!(
+            "train-mtp: saved {} ({:.2} MiB) | loss {:.4} -> {:.4} | acc@1 {:.1}% -> {:.1}% | {:.1} tok/s ({:.2}s)",
+            op.display(),
+            file_bytes as f64 / 1048576.0,
+            rep.initial_loss,
+            rep.final_loss,
+            rep.initial_acc1 * 100.0,
+            rep.final_acc1 * 100.0,
+            tps,
+            rep.elapsed_sec,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "train")]
+fn cmd_finetune(args: &[String]) -> Result<()> {
+    let mut model_path: Option<PathBuf> = None;
+    let mut data_path: Option<PathBuf> = None;
+    let mut out_path: Option<PathBuf> = None;
+    let mut threads = tm_cpu::recommended_threads();
+    let mut max_temp_c: Option<f64> = None;
+    let mut json = false;
+    let mut log_every = 5usize;
+    let mut cfg = tm_train::QloraConfig::default();
+    let mut alpha_explicit = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-m" | "--model" => {
+                i += 1;
+                model_path = Some(PathBuf::from(
+                    args.get(i).context("missing value for -m/--model")?,
+                ));
+            }
+            "--data" | "-d" => {
+                i += 1;
+                data_path = Some(PathBuf::from(
+                    args.get(i).context("missing value for --data")?,
+                ));
+            }
+            "-o" | "--output" => {
+                i += 1;
+                out_path = Some(PathBuf::from(
+                    args.get(i).context("missing value for -o/--output")?,
+                ));
+            }
+            "--rank" | "-r" => {
+                i += 1;
+                cfg.rank = args
+                    .get(i)
+                    .context("missing --rank")?
+                    .parse()
+                    .context("invalid --rank")?;
+            }
+            "--alpha" => {
+                i += 1;
+                cfg.alpha = args
+                    .get(i)
+                    .context("missing --alpha")?
+                    .parse()
+                    .context("invalid --alpha")?;
+                alpha_explicit = true;
+            }
+            "--targets" => {
+                i += 1;
+                let raw = args.get(i).context("missing --targets")?;
+                cfg.targets = tm_train::LoraTargets::parse_csv(raw)?;
+            }
+            "--steps" => {
+                i += 1;
+                cfg.steps = args
+                    .get(i)
+                    .context("missing --steps")?
+                    .parse()
+                    .context("invalid --steps")?;
+            }
+            "--seq-len" | "-c" => {
+                i += 1;
+                cfg.seq_len = args
+                    .get(i)
+                    .context("missing --seq-len")?
+                    .parse()
+                    .context("invalid --seq-len")?;
+            }
+            "--grad-accum" => {
+                i += 1;
+                cfg.grad_accum = args
+                    .get(i)
+                    .context("missing --grad-accum")?
+                    .parse()
+                    .context("invalid --grad-accum")?;
+            }
+            "--lr" => {
+                i += 1;
+                cfg.optim.lr = args
+                    .get(i)
+                    .context("missing --lr")?
+                    .parse()
+                    .context("invalid --lr")?;
+            }
+            "--lora-plus-ratio" => {
+                i += 1;
+                cfg.optim.lora_plus_ratio = args
+                    .get(i)
+                    .context("missing --lora-plus-ratio")?
+                    .parse()
+                    .context("invalid --lora-plus-ratio")?;
+            }
+            "--weight-decay" => {
+                i += 1;
+                cfg.optim.weight_decay = args
+                    .get(i)
+                    .context("missing --weight-decay")?
+                    .parse()
+                    .context("invalid --weight-decay")?;
+            }
+            "--max-grad-norm" => {
+                i += 1;
+                cfg.optim.max_grad_norm = args
+                    .get(i)
+                    .context("missing --max-grad-norm")?
+                    .parse()
+                    .context("invalid --max-grad-norm")?;
+            }
+            "--warmup" => {
+                i += 1;
+                cfg.warmup_steps = args
+                    .get(i)
+                    .context("missing --warmup")?
+                    .parse()
+                    .context("invalid --warmup")?;
+            }
+            "--save-every" => {
+                i += 1;
+                cfg.save_every = args
+                    .get(i)
+                    .context("missing --save-every")?
+                    .parse()
+                    .context("invalid --save-every")?;
+            }
+            "--ckpt" => {
+                i += 1;
+                cfg.ckpt_path = Some(PathBuf::from(args.get(i).context("missing --ckpt")?));
+            }
+            "--resume" => {
+                i += 1;
+                cfg.resume_ckpt = Some(PathBuf::from(args.get(i).context("missing --resume")?));
+            }
+            "--f16" => cfg.save_f16_adapter = true,
+            "--fp32-ckpt" => cfg.checkpoint_mode = tm_train::CheckpointMode::Fp32,
+            "--log-every" => {
+                i += 1;
+                log_every = args
+                    .get(i)
+                    .context("missing --log-every")?
+                    .parse()
+                    .context("invalid --log-every")?;
+            }
+            "-s" | "--seed" => {
+                i += 1;
+                cfg.seed = args
+                    .get(i)
+                    .context("missing --seed")?
+                    .parse()
+                    .context("invalid --seed")?;
+            }
+            "-t" | "--threads" => {
+                i += 1;
+                threads = args
+                    .get(i)
+                    .context("missing -t")?
+                    .parse()
+                    .context("invalid -t")?;
+            }
+            "--max-temp-c" => {
+                i += 1;
+                max_temp_c = Some(
+                    args.get(i)
+                        .context("missing --max-temp-c")?
+                        .parse()
+                        .context("invalid --max-temp-c")?,
+                );
+            }
+            "--json" => json = true,
+            other => bail!("unknown finetune argument: {other}"),
+        }
+        i += 1;
+    }
+
+    if !alpha_explicit {
+        cfg.alpha = (2 * cfg.rank) as f32;
+    }
+
+    let mp = model_path.context("finetune requires -m <base.gguf>")?;
+    let dp = data_path.context("finetune requires --data <path>")?;
+    let op = out_path.context("finetune requires -o <adapter.gguf>")?;
+
+    let tel_before = probe::collect_telemetry();
+    let gguf = GgufFile::open(&mp)?;
+    let arch = gguf.req_str("general.architecture")?.to_string();
+    if arch != "llama" && arch != "qwen3" {
+        bail!(
+            "finetune Phase T2b supports 'llama' and 'qwen3' GGUF models (got '{arch}'); use 'train-mtp' or Phase T3 for hybrid architectures"
+        );
+    }
+    let tok = Tokenizer::from_gguf(&gguf).ok();
+    // Load up to `seq_len + 1` tokens per sample (`seq_len` input tokens + 1 shifted label)
+    let ds = tm_train::TrainDataset::load(&dp, tok.as_ref(), cfg.seq_len + 1)?;
+    let model = LlamaModel::from_gguf(&gguf)?;
+    let pool = ThreadPool::new(threads);
+    let kt = active_kernels();
+
+    if !json {
+        eprintln!(
+            "[finetune] model={} arch={} isa={} threads={} rank={} alpha={} steps={} seq_len={} grad_accum={} lr={} lora+={}",
+            mp.display(),
+            arch,
+            kt.isa.name(),
+            pool.num_threads(),
+            cfg.rank,
+            cfg.alpha,
+            cfg.steps,
+            cfg.seq_len,
+            cfg.grad_accum,
+            cfg.optim.lr,
+            cfg.optim.lora_plus_ratio,
+        );
+    }
+
+    let le = log_every.max(1);
+    let (adapter, rep) = tm_train::run_qlora_training(&model, &pool, &ds, &cfg, |m| {
+        enforce_thermal_guard(max_temp_c);
+        if !json && (m.step == 1 || m.step.is_multiple_of(le) || m.step == cfg.steps) {
+            eprintln!(
+                "  step {:4}/{} | loss={:.4} | grad_norm={:.4} | lr={:.2e} | sup_tok={}/{} | {:.1} ms ({:.1} tok/s)",
+                m.step,
+                cfg.steps,
+                m.loss,
+                m.grad_norm,
+                m.lr,
+                m.supervised_tokens,
+                m.total_tokens,
+                m.step_ms,
+                (m.total_tokens as f64) / (m.step_ms * 1e-3).max(1e-9),
+            );
+        }
+        Ok(())
+    })?;
+
+    let adapter_bytes = adapter.save_gguf(&op, cfg.save_f16_adapter)?;
+    let tel_after = probe::collect_telemetry();
+    let mstats = probe_process_memory_stats();
+    let tok_s = (rep.total_tokens as f64) / rep.elapsed_sec.max(1e-9);
+    if json {
+        println!(
+            "{{\"mode\":\"finetune\",\"model\":\"{}\",\"arch\":\"{}\",\"isa\":\"{}\",\"threads\":{},\
+            \"rank\":{},\"alpha\":{},\"trainable_params\":{},\"steps\":{},\"seq_len\":{},\"grad_accum\":{},\
+            \"total_tokens\":{},\"supervised_tokens\":{},\"initial_loss\":{:.5},\"final_loss\":{:.5},\"min_loss\":{:.5},\
+            \"elapsed_sec\":{:.3},\"tok_per_sec\":{:.2},\"adapter_bytes\":{},\"est_dirty_bytes\":{},\
+            \"rss_bytes\":{},\"peak_rss_bytes\":{},\"private_dirty_bytes\":{},\"pss_anon_bytes\":{},\
+            \"telemetry_before\":{},\"telemetry_after\":{}}}",
+            probe::json_escape(mp.file_name().and_then(|s| s.to_str()).unwrap_or("?")),
+            probe::json_escape(&arch),
+            probe::json_escape(kt.isa.name()),
+            pool.num_threads(),
+            cfg.rank,
+            cfg.alpha,
+            rep.trainable_params,
+            rep.total_steps,
+            cfg.seq_len,
+            cfg.grad_accum,
+            rep.total_tokens,
+            rep.supervised_tokens,
+            rep.initial_loss,
+            rep.final_loss,
+            rep.min_loss,
+            rep.elapsed_sec,
+            tok_s,
+            adapter_bytes,
+            rep.estimated_dirty_bytes,
+            probe::opt_u64_json(mstats.rss_bytes),
+            probe::opt_u64_json(mstats.peak_rss_bytes),
+            probe::opt_u64_json(mstats.private_dirty_bytes),
+            probe::opt_u64_json(mstats.pss_anon_bytes),
+            tel_before.to_json(),
+            tel_after.to_json(),
+        );
+    } else {
+        println!(
+            "finetune: saved {} ({:.2} MiB, {} trainable params) | loss {:.4} -> {:.4} (min {:.4}) | {:.1} tok/s ({:.2}s)",
+            op.display(),
+            adapter_bytes as f64 / 1048576.0,
+            rep.trainable_params,
+            rep.initial_loss,
+            rep.final_loss,
+            rep.min_loss,
+            tok_s,
+            rep.elapsed_sec,
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -2002,10 +2641,19 @@ fn main() -> Result<()> {
             cmd_inspect(PathBuf::from(p))
         }
         "convert" => cmd_convert(&args[2..]),
+        "lora-merge" => cmd_lora_merge(&args[2..]),
         "run" => cmd_run(parse_run_opts(&args[2..])?),
         "bench" => cmd_bench(parse_run_opts(&args[2..])?),
         "profile" => cmd_profile(parse_run_opts(&args[2..])?),
         "logits" => cmd_logits(parse_run_opts(&args[2..])?),
+        #[cfg(feature = "train")]
+        "train-mtp" => cmd_train_mtp(&args[2..]),
+        #[cfg(not(feature = "train"))]
+        "train-mtp" => bail!("'train-mtp' requires compiling with feature 'train'"),
+        #[cfg(feature = "train")]
+        "finetune" => cmd_finetune(&args[2..]),
+        #[cfg(not(feature = "train"))]
+        "finetune" => bail!("'finetune' requires compiling with feature 'train'"),
         "-h" | "--help" => {
             print_usage();
             Ok(())

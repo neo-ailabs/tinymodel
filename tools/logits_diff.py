@@ -39,13 +39,14 @@ static void silent_log(enum ggml_log_level level, const char * text, void * user
 
 int main(int argc, char ** argv) {
     if (argc < 5) {
-        fprintf(stderr, "usage: %s <model.gguf> <out.bin> <ngl> <t0,t1,...>\n", argv[0]);
+        fprintf(stderr, "usage: %s <model.gguf> <out.bin> <ngl> <t0,t1,...> [lora_path[:scale] ...]\n", argv[0]);
         return 1;
     }
     const char * model_path = argv[1];
     const char * out_path   = argv[2];
     int ngl                 = atoi(argv[3]);
     char * tok_csv          = argv[4];
+    int n_lora              = argc - 5;
 
     llama_log_set(silent_log, NULL);
     llama_backend_init();
@@ -83,6 +84,39 @@ int main(int argc, char ** argv) {
     if (!ctx) {
         fprintf(stderr, "failed to init llama_context\n");
         return 3;
+    }
+
+    if (n_lora > 0) {
+        struct llama_adapter_lora ** adapters =
+            (struct llama_adapter_lora **)calloc((size_t)n_lora, sizeof(struct llama_adapter_lora *));
+        float * scales = (float *)calloc((size_t)n_lora, sizeof(float));
+        for (int li = 0; li < n_lora; ++li) {
+            char * spec = strdup(argv[5 + li]);
+            float sc = 1.0f;
+            char * colon = strrchr(spec, ':');
+            if (colon != NULL && colon != spec) {
+                char * endp = NULL;
+                float parsed = strtof(colon + 1, &endp);
+                if (endp != colon + 1 && *endp == '\0') {
+                    *colon = '\0';
+                    sc = parsed;
+                }
+            }
+            adapters[li] = llama_adapter_lora_init(model, spec);
+            if (!adapters[li]) {
+                fprintf(stderr, "failed to load LoRA adapter: %s\n", spec);
+                free(spec);
+                return 6;
+            }
+            scales[li] = sc;
+            free(spec);
+        }
+        if (llama_set_adapters_lora(ctx, adapters, (size_t)n_lora, scales) != 0) {
+            fprintf(stderr, "llama_set_adapters_lora failed\n");
+            return 7;
+        }
+        free(adapters);
+        free(scales);
     }
 
     FILE * fp = fopen(out_path, "wb");
@@ -301,6 +335,12 @@ def main() -> int:
         help="Multi-token prompt string",
     )
     ap.add_argument("--tokens", help="Explicit comma-separated token IDs")
+    ap.add_argument(
+        "--lora",
+        action="append",
+        default=[],
+        help="LoRA adapter spec <adapter.gguf>[:scale] (repeatable)",
+    )
     ap.add_argument("--metal", action="store_true", help="Test tinymodel Metal backend")
     ap.add_argument("--vulkan", action="store_true", help="Test tinymodel Vulkan backend")
     ap.add_argument("--both", action="store_true", help="Test BOTH tinymodel CPU and GPU against llama.cpp")
@@ -341,6 +381,8 @@ def main() -> int:
                 cmd += ["--tokens", args.tokens]
             else:
                 cmd += ["-p", args.prompt]
+            for lspec in args.lora:
+                cmd += ["--lora", lspec]
             if bk == "metal":
                 cmd.append("--metal")
             elif bk == "vulkan":
@@ -357,10 +399,10 @@ def main() -> int:
             if ref_ngl not in ref_cache:
                 ref_f = tmp / f"llama_cpp_ngl{ref_ngl}.bin"
                 tok_csv = ",".join(str(x) for x in toks_ref)
-                subprocess.run(
-                    [str(oracle_bin), str(args.model), str(ref_f), str(ref_ngl), tok_csv],
-                    check=True,
+                oracle_cmd = [str(oracle_bin), str(args.model), str(ref_f), str(ref_ngl), tok_csv] + list(
+                    args.lora
                 )
+                subprocess.run(oracle_cmd, check=True)
                 ref_cache[ref_ngl] = read_tmlg(ref_f)
 
             r_toks, _, r_mat = ref_cache[ref_ngl]

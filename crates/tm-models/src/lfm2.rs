@@ -18,6 +18,7 @@ use tm_cpu::{
     rms_norm_batch_parallel, rope_compute_cos_sin, rope_inplace_tables, swiglu_inplace_parallel,
 };
 use tm_gguf::{GgufError, GgufFile};
+use tm_lora::{BoundLora, LoraScratch, LoraSet};
 
 use crate::llama::ModelError;
 use crate::state::{LayerState, MAX_SPEC_WINDOW, SpecVerifyBuf, decode_embedding_row};
@@ -55,10 +56,12 @@ impl Lfm2Config {
 
 #[derive(Clone, Copy)]
 struct MatView<'a> {
+    name: &'a str,
     bytes: &'a [u8],
     dtype: DType,
     rows: usize,
     cols: usize,
+    lora_slot: Option<usize>,
 }
 
 enum Lfm2OpWeights<'a> {
@@ -96,6 +99,7 @@ pub struct Lfm2Model<'a> {
     output_norm: Vec<f32>,
     rope_inv_freqs: Vec<f64>,
     layers: Vec<Lfm2LayerWeights<'a>>,
+    pub lora: BoundLora,
 }
 
 /// Pre-allocated per-session inference state for LFM2 (`LayerState::ShortConv` + `LayerState::Kv`).
@@ -119,6 +123,7 @@ pub struct Lfm2State {
     logits: Vec<f32>,
     pub last_hidden: Vec<f32>,
     mv_scratch: MatvecScratch,
+    pub lora_scratch: LoraScratch,
 }
 
 impl Lfm2State {
@@ -165,6 +170,7 @@ impl Lfm2State {
             logits: vec![0.0; cfg.vocab_size],
             last_hidden: vec![0.0; cfg.n_embd],
             mv_scratch: MatvecScratch::new(max_cols),
+            lora_scratch: LoraScratch::new(64),
         }
     }
 
@@ -201,10 +207,12 @@ fn load_mat<'a>(
 ) -> Result<MatView<'a>, ModelError> {
     let (info, bytes) = gguf.req_tensor(name, layer, &[cols, rows])?;
     Ok(MatView {
+        name: info.name.as_str(),
         bytes,
         dtype: info.dtype,
         rows,
         cols,
+        lora_slot: None,
     })
 }
 
@@ -315,7 +323,10 @@ impl<'a> Lfm2Model<'a> {
         let output = if gguf.tensor_info("output.weight").is_some() {
             load_mat(gguf, "output.weight", "global", n_embd, vocab_size)?
         } else {
-            token_embd
+            MatView {
+                name: "output.weight",
+                ..token_embd
+            }
         };
         // LFM2 stores output RMSNorm under `token_embd_norm.weight` (`llama-arch.cpp:535`)
         let output_norm = if gguf.tensor_info("token_embd_norm.weight").is_some() {
@@ -452,7 +463,34 @@ impl<'a> Lfm2Model<'a> {
             output_norm,
             rope_inv_freqs,
             layers,
+            lora: BoundLora::default(),
         })
+    }
+
+    pub fn bind_lora(&mut self, set: &LoraSet) {
+        let bound = BoundLora::from_lora_set(set);
+        self.token_embd.lora_slot = bound.slot_for(self.token_embd.name);
+        self.output.lora_slot = bound.slot_for(self.output.name);
+        for l in &mut self.layers {
+            match &mut l.op {
+                Lfm2OpWeights::ShortConv {
+                    in_proj, out_proj, ..
+                } => {
+                    in_proj.lora_slot = bound.slot_for(in_proj.name);
+                    out_proj.lora_slot = bound.slot_for(out_proj.name);
+                }
+                Lfm2OpWeights::Gqa { wq, wk, wv, wo, .. } => {
+                    wq.lora_slot = bound.slot_for(wq.name);
+                    wk.lora_slot = bound.slot_for(wk.name);
+                    wv.lora_slot = bound.slot_for(wv.name);
+                    wo.lora_slot = bound.slot_for(wo.name);
+                }
+            }
+            l.w_gate.lora_slot = bound.slot_for(l.w_gate.name);
+            l.w_up.lora_slot = bound.slot_for(l.w_up.name);
+            l.w_down.lora_slot = bound.slot_for(l.w_down.name);
+        }
+        self.lora = bound;
     }
 
     pub fn num_shortconv_layers(&self) -> usize {
@@ -507,6 +545,8 @@ impl<'a> Lfm2Model<'a> {
             tid,
             &mut state.x[..n_embd],
         );
+        self.lora
+            .apply_embed_row(self.token_embd.lora_slot, kt, tid, &mut state.x[..n_embd]);
 
         for (il, layer) in self.layers.iter().enumerate() {
             rms_norm(
@@ -535,6 +575,15 @@ impl<'a> Lfm2Model<'a> {
                         &mut state.bcx_buf[..3 * n_embd],
                         3 * n_embd,
                         n_embd,
+                    );
+                    self.lora.apply_linear(
+                        in_proj.lora_slot,
+                        pool,
+                        kt,
+                        &state.xb[..n_embd],
+                        &mut state.bcx_buf[..3 * n_embd],
+                        1,
+                        &mut state.lora_scratch,
                     );
 
                     // `bcx` layout (`lfm-base.cpp:28-60`): `[b (n_embd), c (n_embd), x (n_embd)]`
@@ -571,6 +620,15 @@ impl<'a> Lfm2Model<'a> {
                         n_embd,
                         n_embd,
                     );
+                    self.lora.apply_linear(
+                        out_proj.lora_slot,
+                        pool,
+                        kt,
+                        &state.conv_y[..n_embd],
+                        &mut state.xb2[..n_embd],
+                        1,
+                        &mut state.lora_scratch,
+                    );
                 }
                 (
                     Lfm2OpWeights::Gqa {
@@ -604,6 +662,35 @@ impl<'a> Lfm2Model<'a> {
                         &mut state.mv_scratch,
                         n_embd,
                     );
+                    if !self.lora.is_empty() {
+                        self.lora.apply_linear(
+                            wq.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.q_buf[..q_dim],
+                            1,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            wk.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.k_buf[..kv_dim],
+                            1,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            wv.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.v_buf[..kv_dim],
+                            1,
+                            &mut state.lora_scratch,
+                        );
+                    }
 
                     for h in 0..self.cfg.n_head {
                         let s = h * hd;
@@ -675,6 +762,15 @@ impl<'a> Lfm2Model<'a> {
                         n_embd,
                         q_dim,
                     );
+                    self.lora.apply_linear(
+                        wo.lora_slot,
+                        pool,
+                        kt,
+                        &state.attn_out[..q_dim],
+                        &mut state.xb2[..n_embd],
+                        1,
+                        &mut state.lora_scratch,
+                    );
                 }
                 _ => unreachable!("LayerState variant always matches Lfm2OpWeights"),
             }
@@ -705,6 +801,26 @@ impl<'a> Lfm2Model<'a> {
                 &mut state.mv_scratch,
                 n_embd,
             );
+            if !self.lora.is_empty() {
+                self.lora.apply_linear(
+                    layer.w_gate.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..n_embd],
+                    &mut state.hb[..n_ff],
+                    1,
+                    &mut state.lora_scratch,
+                );
+                self.lora.apply_linear(
+                    layer.w_up.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..n_embd],
+                    &mut state.hb2[..n_ff],
+                    1,
+                    &mut state.lora_scratch,
+                );
+            }
             swiglu_inplace_parallel(pool, &mut state.hb[..n_ff], &state.hb2[..n_ff]);
             matvec_f32(
                 pool,
@@ -716,6 +832,15 @@ impl<'a> Lfm2Model<'a> {
                 &mut state.xb2[..n_embd],
                 n_embd,
                 n_ff,
+            );
+            self.lora.apply_linear(
+                layer.w_down.lora_slot,
+                pool,
+                kt,
+                &state.hb[..n_ff],
+                &mut state.xb2[..n_embd],
+                1,
+                &mut state.lora_scratch,
             );
             for i in 0..n_embd {
                 state.x[i] += state.xb2[i];
@@ -741,6 +866,15 @@ impl<'a> Lfm2Model<'a> {
                 &mut state.logits,
                 self.output.rows,
                 self.output.cols,
+            );
+            self.lora.apply_linear(
+                self.output.lora_slot,
+                pool,
+                kt,
+                &state.xb[..n_embd],
+                &mut state.logits,
+                1,
+                &mut state.lora_scratch,
             );
         }
 
@@ -830,6 +964,12 @@ impl<'a> Lfm2Model<'a> {
                 tok as usize,
                 &mut state.x[t * n_embd..(t + 1) * n_embd],
             );
+            self.lora.apply_embed_row(
+                self.token_embd.lora_slot,
+                kt,
+                tok as usize,
+                &mut state.x[t * n_embd..(t + 1) * n_embd],
+            );
         }
 
         for (il, layer) in self.layers.iter().enumerate() {
@@ -864,6 +1004,15 @@ impl<'a> Lfm2Model<'a> {
                         3 * n_embd,
                         n_embd,
                         b,
+                    );
+                    self.lora.apply_linear(
+                        in_proj.lora_slot,
+                        pool,
+                        kt,
+                        &state.xb[..b * n_embd],
+                        &mut state.bcx_buf[..b * 3 * n_embd],
+                        b,
+                        &mut state.lora_scratch,
                     );
 
                     for t in 0..b {
@@ -901,6 +1050,15 @@ impl<'a> Lfm2Model<'a> {
                         n_embd,
                         b,
                     );
+                    self.lora.apply_linear(
+                        out_proj.lora_slot,
+                        pool,
+                        kt,
+                        &state.conv_y[..b * n_embd],
+                        &mut state.xb2[..b * n_embd],
+                        b,
+                        &mut state.lora_scratch,
+                    );
                 }
                 (
                     Lfm2OpWeights::Gqa {
@@ -935,6 +1093,35 @@ impl<'a> Lfm2Model<'a> {
                         n_embd,
                         b,
                     );
+                    if !self.lora.is_empty() {
+                        self.lora.apply_linear(
+                            wq.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..b * n_embd],
+                            &mut state.q_buf[..b * q_dim],
+                            b,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            wk.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..b * n_embd],
+                            &mut state.k_buf[..b * kv_dim],
+                            b,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            wv.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..b * n_embd],
+                            &mut state.v_buf[..b * kv_dim],
+                            b,
+                            &mut state.lora_scratch,
+                        );
+                    }
 
                     for t in 0..b {
                         let pos = start_pos + t;
@@ -1016,6 +1203,15 @@ impl<'a> Lfm2Model<'a> {
                         q_dim,
                         b,
                     );
+                    self.lora.apply_linear(
+                        wo.lora_slot,
+                        pool,
+                        kt,
+                        &state.attn_out[..b * q_dim],
+                        &mut state.xb2[..b * n_embd],
+                        b,
+                        &mut state.lora_scratch,
+                    );
                 }
                 _ => unreachable!("LayerState variant always matches Lfm2OpWeights"),
             }
@@ -1050,6 +1246,26 @@ impl<'a> Lfm2Model<'a> {
                 n_embd,
                 b,
             );
+            if !self.lora.is_empty() {
+                self.lora.apply_linear(
+                    layer.w_gate.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..b * n_embd],
+                    &mut state.hb[..b * n_ff],
+                    b,
+                    &mut state.lora_scratch,
+                );
+                self.lora.apply_linear(
+                    layer.w_up.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..b * n_embd],
+                    &mut state.hb2[..b * n_ff],
+                    b,
+                    &mut state.lora_scratch,
+                );
+            }
             swiglu_inplace_parallel(pool, &mut state.hb[..b * n_ff], &state.hb2[..b * n_ff]);
             matmul_f32(
                 pool,
@@ -1062,6 +1278,15 @@ impl<'a> Lfm2Model<'a> {
                 n_embd,
                 n_ff,
                 b,
+            );
+            self.lora.apply_linear(
+                layer.w_down.lora_slot,
+                pool,
+                kt,
+                &state.hb[..b * n_ff],
+                &mut state.xb2[..b * n_embd],
+                b,
+                &mut state.lora_scratch,
             );
             for i in 0..b * n_embd {
                 state.x[i] += state.xb2[i];
@@ -1090,6 +1315,15 @@ impl<'a> Lfm2Model<'a> {
                 &mut state.logits,
                 self.output.rows,
                 self.output.cols,
+            );
+            self.lora.apply_linear(
+                self.output.lora_slot,
+                pool,
+                kt,
+                &state.xb[..n_embd],
+                &mut state.logits,
+                1,
+                &mut state.lora_scratch,
             );
         }
     }
@@ -1140,6 +1374,12 @@ impl<'a> Lfm2Model<'a> {
                 tok as usize,
                 &mut state.x[t * n_embd..(t + 1) * n_embd],
             );
+            self.lora.apply_embed_row(
+                self.token_embd.lora_slot,
+                kt,
+                tok as usize,
+                &mut state.x[t * n_embd..(t + 1) * n_embd],
+            );
         }
 
         let mut sc_idx = 0usize;
@@ -1176,6 +1416,15 @@ impl<'a> Lfm2Model<'a> {
                         3 * n_embd,
                         n_embd,
                         w,
+                    );
+                    self.lora.apply_linear(
+                        in_proj.lora_slot,
+                        pool,
+                        kt,
+                        &state.xb[..w * n_embd],
+                        &mut state.bcx_buf[..w * 3 * n_embd],
+                        w,
+                        &mut state.lora_scratch,
                     );
 
                     let bx_layer_off = sc_idx * MAX_SPEC_WINDOW * n_embd;
@@ -1217,6 +1466,15 @@ impl<'a> Lfm2Model<'a> {
                         n_embd,
                         w,
                     );
+                    self.lora.apply_linear(
+                        out_proj.lora_slot,
+                        pool,
+                        kt,
+                        &state.conv_y[..w * n_embd],
+                        &mut state.xb2[..w * n_embd],
+                        w,
+                        &mut state.lora_scratch,
+                    );
                 }
                 (
                     Lfm2OpWeights::Gqa {
@@ -1251,6 +1509,35 @@ impl<'a> Lfm2Model<'a> {
                         n_embd,
                         w,
                     );
+                    if !self.lora.is_empty() {
+                        self.lora.apply_linear(
+                            wq.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..w * n_embd],
+                            &mut state.q_buf[..w * q_dim],
+                            w,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            wk.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..w * n_embd],
+                            &mut state.k_buf[..w * kv_dim],
+                            w,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            wv.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..w * n_embd],
+                            &mut state.v_buf[..w * kv_dim],
+                            w,
+                            &mut state.lora_scratch,
+                        );
+                    }
 
                     for t in 0..w {
                         let pos = start_pos + t;
@@ -1332,6 +1619,15 @@ impl<'a> Lfm2Model<'a> {
                         q_dim,
                         w,
                     );
+                    self.lora.apply_linear(
+                        wo.lora_slot,
+                        pool,
+                        kt,
+                        &state.attn_out[..w * q_dim],
+                        &mut state.xb2[..w * n_embd],
+                        w,
+                        &mut state.lora_scratch,
+                    );
                 }
                 _ => unreachable!("LayerState variant always matches Lfm2OpWeights"),
             }
@@ -1366,6 +1662,26 @@ impl<'a> Lfm2Model<'a> {
                 n_embd,
                 w,
             );
+            if !self.lora.is_empty() {
+                self.lora.apply_linear(
+                    layer.w_gate.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..w * n_embd],
+                    &mut state.hb[..w * n_ff],
+                    w,
+                    &mut state.lora_scratch,
+                );
+                self.lora.apply_linear(
+                    layer.w_up.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..w * n_embd],
+                    &mut state.hb2[..w * n_ff],
+                    w,
+                    &mut state.lora_scratch,
+                );
+            }
             swiglu_inplace_parallel(pool, &mut state.hb[..w * n_ff], &state.hb2[..w * n_ff]);
             matmul_f32(
                 pool,
@@ -1378,6 +1694,15 @@ impl<'a> Lfm2Model<'a> {
                 n_embd,
                 n_ff,
                 w,
+            );
+            self.lora.apply_linear(
+                layer.w_down.lora_slot,
+                pool,
+                kt,
+                &state.hb[..w * n_ff],
+                &mut state.xb2[..w * n_embd],
+                w,
+                &mut state.lora_scratch,
             );
             for i in 0..w * n_embd {
                 state.x[i] += state.xb2[i];
@@ -1407,6 +1732,15 @@ impl<'a> Lfm2Model<'a> {
             self.output.rows,
             self.output.cols,
             w,
+        );
+        self.lora.apply_linear(
+            self.output.lora_slot,
+            pool,
+            kt,
+            &spec_buf.norm_win[..w * n_embd],
+            &mut spec_buf.logits_win[..w * vocab],
+            w,
+            &mut state.lora_scratch,
         );
         Ok(())
     }
@@ -1476,6 +1810,15 @@ impl<'a> Lfm2Model<'a> {
             self.output.rows,
             self.output.cols,
         );
+        self.lora.apply_linear(
+            self.output.lora_slot,
+            pool,
+            kt,
+            &state.xb[..n_embd],
+            out_logits,
+            1,
+            &mut state.lora_scratch,
+        );
     }
 
     pub fn embed_token(&self, token_id: u32, out_emb: &mut [f32]) {
@@ -1486,5 +1829,20 @@ impl<'a> Lfm2Model<'a> {
             token_id as usize,
             out_emb,
         );
+        if !self.lora.is_empty() {
+            let kt = tm_cpu::active_kernels();
+            self.lora
+                .apply_embed_row(self.token_embd.lora_slot, kt, token_id as usize, out_emb);
+        }
+    }
+
+    pub fn output_head_raw(&self) -> (&[f32], f32, DType, &'a [u8], Option<f32>) {
+        (
+            &self.output_norm,
+            self.cfg.rms_eps,
+            self.output.dtype,
+            self.output.bytes,
+            None,
+        )
     }
 }

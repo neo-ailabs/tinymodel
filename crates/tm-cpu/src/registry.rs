@@ -45,8 +45,11 @@ pub type GemmIQ4NLFn = fn(&[BlockIQ4NL], &[BlockQ8_0], &mut [f32], usize, usize,
 pub type DotF32F16Fn = fn(&[f32], &[u16]) -> f32;
 pub type DotF32Bf16Fn = fn(&[f32], &[u16]) -> f32;
 pub type DotF32Q8_0Fn = fn(&[f32], &[BlockQ8_0]) -> f32;
+pub type AxpyF32Fn = fn(&mut [f32], f32, &[f32]);
 pub type AxpyF32F16Fn = fn(&mut [f32], f32, &[u16]);
 pub type AxpyF32Q8_0Fn = fn(&mut [f32], f32, &[BlockQ8_0]);
+pub type GemmQ4_0TransposedTileFn =
+    fn(&[BlockQ4_0], usize, usize, &[f32], &mut [f32], usize, usize);
 pub type F32ToF16SliceFn = fn(&[f32], &mut [u16]);
 pub type QuantQ8_0Fn = fn(&[f32], &mut [BlockQ8_0]);
 pub type QuantQ8_1Fn = fn(&[f32], &mut [BlockQ8_1]);
@@ -93,8 +96,10 @@ pub struct KernelTable {
     pub dot_f32_f16: DotF32F16Fn,
     pub dot_f32_bf16: DotF32Bf16Fn,
     pub dot_f32_q8_0: DotF32Q8_0Fn,
+    pub axpy_f32: AxpyF32Fn,
     pub axpy_f32_f16: AxpyF32F16Fn,
     pub axpy_f32_q8_0: AxpyF32Q8_0Fn,
+    pub gemm_q4_0_transposed_tile: GemmQ4_0TransposedTileFn,
     pub f32_to_f16_slice: F32ToF16SliceFn,
     pub quantize_q8_0: QuantQ8_0Fn,
     pub quantize_q8_1: QuantQ8_1Fn,
@@ -139,8 +144,10 @@ const GENERIC_TABLE: KernelTable = KernelTable {
     dot_f32_f16: generic::dot_f32_f16,
     dot_f32_bf16: generic::dot_f32_bf16,
     dot_f32_q8_0: generic::dot_f32_q8_0,
+    axpy_f32: generic::axpy_f32,
     axpy_f32_f16: generic::axpy_f32_f16,
     axpy_f32_q8_0: generic::axpy_f32_q8_0,
+    gemm_q4_0_transposed_tile: generic::gemm_q4_0_transposed_tile,
     f32_to_f16_slice: generic::f32_to_f16_slice,
     quantize_q8_0: generic::quantize_q8_0,
     quantize_q8_1: generic::quantize_q8_1,
@@ -316,9 +323,27 @@ mod aarch64_wrappers {
         unsafe { neon_v80::dot_f32_f16(q, k_f16) }
     }
 
+    fn neon_axpy_f32(out: &mut [f32], w: f32, x: &[f32]) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { neon_v80::axpy_f32(out, w, x) }
+    }
+
     fn neon_axpy_f32_f16(out: &mut [f32], w: f32, v_f16: &[u16]) {
         // SAFETY: NEON is always available on aarch64.
         unsafe { neon_v80::axpy_f32_f16(out, w, v_f16) }
+    }
+
+    fn neon_gemm_q4_0_transposed_tile(
+        w: &[BlockQ4_0],
+        cols_blocks: usize,
+        cb: usize,
+        dy: &[f32],
+        dx_tile: &mut [f32],
+        rows: usize,
+        n_tok: usize,
+    ) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe { neon_v80::gemm_q4_0_transposed_tile(w, cols_blocks, cb, dy, dx_tile, rows, n_tok) }
     }
 
     fn neon_f32_to_f16_slice(src: &[f32], dst: &mut [u16]) {
@@ -894,8 +919,10 @@ mod aarch64_wrappers {
         dot_f32_f16: neon_dot_f32_f16,
         dot_f32_bf16: neon_dot_f32_bf16,
         dot_f32_q8_0: neon_dot_f32_q8_0,
+        axpy_f32: neon_axpy_f32,
         axpy_f32_f16: neon_axpy_f32_f16,
         axpy_f32_q8_0: neon_axpy_f32_q8_0,
+        gemm_q4_0_transposed_tile: neon_gemm_q4_0_transposed_tile,
         f32_to_f16_slice: neon_f32_to_f16_slice,
         quantize_q8_0: neon_quant_q8_0,
         quantize_q8_1: neon_quant_q8_1,
@@ -941,8 +968,10 @@ mod aarch64_wrappers {
         dot_f32_f16: neon_dot_f32_f16,
         dot_f32_bf16: neon_dot_f32_bf16,
         dot_f32_q8_0: neon_dot_f32_q8_0,
+        axpy_f32: neon_axpy_f32,
         axpy_f32_f16: neon_axpy_f32_f16,
         axpy_f32_q8_0: neon_axpy_f32_q8_0,
+        gemm_q4_0_transposed_tile: neon_gemm_q4_0_transposed_tile,
         f32_to_f16_slice: neon_f32_to_f16_slice,
         quantize_q8_0: neon_quant_q8_0,
         quantize_q8_1: neon_quant_q8_1,
@@ -988,8 +1017,10 @@ mod aarch64_wrappers {
         dot_f32_f16: neon_dot_f32_f16,
         dot_f32_bf16: neon_dot_f32_bf16,
         dot_f32_q8_0: neon_dot_f32_q8_0,
+        axpy_f32: neon_axpy_f32,
         axpy_f32_f16: neon_axpy_f32_f16,
         axpy_f32_q8_0: neon_axpy_f32_q8_0,
+        gemm_q4_0_transposed_tile: neon_gemm_q4_0_transposed_tile,
         f32_to_f16_slice: neon_f32_to_f16_slice,
         quantize_q8_0: neon_quant_q8_0,
         quantize_q8_1: neon_quant_q8_1,

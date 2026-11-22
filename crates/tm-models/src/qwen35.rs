@@ -26,6 +26,7 @@ use tm_cpu::{
     swiglu_inplace_parallel,
 };
 use tm_gguf::{GgufError, GgufFile};
+use tm_lora::{BoundLora, LoraScratch, LoraSet};
 
 use crate::llama::ModelError;
 pub use crate::state::LayerState;
@@ -79,10 +80,12 @@ impl Qwen35Config {
 
 #[derive(Clone, Copy)]
 struct MatView<'a> {
+    name: &'a str,
     bytes: &'a [u8],
     dtype: DType,
     rows: usize,
     cols: usize,
+    lora_slot: Option<usize>,
 }
 
 enum AttnWeights<'a> {
@@ -128,6 +131,7 @@ pub struct Qwen35Model<'a> {
     output_norm: Vec<f32>,
     rope_inv_freqs: Vec<f64>,
     layers: Vec<Qwen35LayerWeights<'a>>,
+    pub lora: BoundLora,
 }
 
 /// Pre-allocated per-session inference state for Qwen3.5 (`LayerState` + Arena-like scratch).
@@ -161,6 +165,7 @@ pub struct Qwen35State {
     logits: Vec<f32>,
     pub last_hidden: Vec<f32>,
     mv_scratch: MatvecScratch,
+    pub lora_scratch: LoraScratch,
 }
 
 impl Qwen35State {
@@ -219,6 +224,7 @@ impl Qwen35State {
             logits: vec![0.0; cfg.vocab_size],
             last_hidden: vec![0.0; cfg.n_embd],
             mv_scratch: MatvecScratch::new(max_cols),
+            lora_scratch: LoraScratch::new(64),
         }
     }
 
@@ -273,10 +279,12 @@ fn load_mat<'a>(
 ) -> Result<MatView<'a>, ModelError> {
     let (info, bytes) = gguf.req_tensor(name, layer, &[cols, rows])?;
     Ok(MatView {
+        name: info.name.as_str(),
         bytes,
         dtype: info.dtype,
         rows,
         cols,
+        lora_slot: None,
     })
 }
 
@@ -374,7 +382,10 @@ impl<'a> Qwen35Model<'a> {
         let output = if gguf.tensor_info("output.weight").is_some() {
             load_mat(gguf, "output.weight", "global", n_embd, vocab_size)?
         } else {
-            token_embd
+            MatView {
+                name: "output.weight",
+                ..token_embd
+            }
         };
         let output_norm = load_f32_vec(gguf, "output_norm.weight", "global", &[n_embd])?;
 
@@ -541,7 +552,45 @@ impl<'a> Qwen35Model<'a> {
             output_norm,
             rope_inv_freqs,
             layers,
+            lora: BoundLora::default(),
         })
+    }
+
+    /// Binds one or more LoRA adapters to matching Qwen3.5 GDN and Full-Attention projections.
+    pub fn bind_lora(&mut self, set: &LoraSet) {
+        let bound = BoundLora::from_lora_set(set);
+        self.token_embd.lora_slot = bound.slot_for(self.token_embd.name);
+        self.output.lora_slot = bound.slot_for(self.output.name);
+        for l in &mut self.layers {
+            match &mut l.attn {
+                AttnWeights::Gdn {
+                    wqkv,
+                    wz,
+                    w_alpha,
+                    w_beta,
+                    w_out,
+                    ..
+                } => {
+                    wqkv.lora_slot = bound.slot_for(wqkv.name);
+                    wz.lora_slot = bound.slot_for(wz.name);
+                    w_alpha.lora_slot = bound.slot_for(w_alpha.name);
+                    w_beta.lora_slot = bound.slot_for(w_beta.name);
+                    w_out.lora_slot = bound.slot_for(w_out.name);
+                }
+                AttnWeights::FullAttn {
+                    wqg, wk, wv, wo, ..
+                } => {
+                    wqg.lora_slot = bound.slot_for(wqg.name);
+                    wk.lora_slot = bound.slot_for(wk.name);
+                    wv.lora_slot = bound.slot_for(wv.name);
+                    wo.lora_slot = bound.slot_for(wo.name);
+                }
+            }
+            l.w_gate.lora_slot = bound.slot_for(l.w_gate.name);
+            l.w_up.lora_slot = bound.slot_for(l.w_up.name);
+            l.w_down.lora_slot = bound.slot_for(l.w_down.name);
+        }
+        self.lora = bound;
     }
 
     /// Number of GDN linear-attention layers in this model.
@@ -613,6 +662,8 @@ impl<'a> Qwen35Model<'a> {
             tid,
             &mut state.x[..n_embd],
         );
+        self.lora
+            .apply_embed_row(self.token_embd.lora_slot, kt, tid, &mut state.x[..n_embd]);
 
         for (l, layer) in self.layers.iter().enumerate() {
             rms_norm(
@@ -671,6 +722,44 @@ impl<'a> Qwen35Model<'a> {
                         &mut state.mv_scratch,
                         n_embd,
                     );
+                    if !self.lora.is_empty() {
+                        self.lora.apply_linear(
+                            wqkv.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.qkv_buf[..conv_dim],
+                            1,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            wz.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.gate_buf[..v_gdn_dim],
+                            1,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            w_alpha.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.alpha_buf[..hv],
+                            1,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            w_beta.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.beta_buf[..hv],
+                            1,
+                            &mut state.lora_scratch,
+                        );
+                    }
 
                     // 2. Compute GDN scalar gates per value head
                     for vh in 0..hv {
@@ -730,6 +819,15 @@ impl<'a> Qwen35Model<'a> {
                         w_out.rows,
                         w_out.cols,
                     );
+                    self.lora.apply_linear(
+                        w_out.lora_slot,
+                        pool,
+                        kt,
+                        &state.attn_out[..v_gdn_dim],
+                        &mut state.xb2[..n_embd],
+                        1,
+                        &mut state.lora_scratch,
+                    );
                 }
                 (
                     AttnWeights::FullAttn {
@@ -761,6 +859,35 @@ impl<'a> Qwen35Model<'a> {
                         &mut state.mv_scratch,
                         n_embd,
                     );
+                    if !self.lora.is_empty() {
+                        self.lora.apply_linear(
+                            wqg.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.qkv_buf[..qg_dim],
+                            1,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            wk.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.k_buf[..kv_dim],
+                            1,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            wv.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.v_buf[..kv_dim],
+                            1,
+                            &mut state.lora_scratch,
+                        );
+                    }
 
                     // De-interleave `[Q_h (hd), Gate_h (hd)]` per head + apply per-head Q/K RMSNorm
                     let hd = self.cfg.head_dim;
@@ -843,6 +970,15 @@ impl<'a> Qwen35Model<'a> {
                         wo.rows,
                         wo.cols,
                     );
+                    self.lora.apply_linear(
+                        wo.lora_slot,
+                        pool,
+                        kt,
+                        &state.attn_out[..q_dim],
+                        &mut state.xb2[..n_embd],
+                        1,
+                        &mut state.lora_scratch,
+                    );
                 }
                 _ => unreachable!("LayerState variant always matches Qwen35LayerWeights::attn"),
             }
@@ -873,6 +1009,26 @@ impl<'a> Qwen35Model<'a> {
                 &mut state.mv_scratch,
                 n_embd,
             );
+            if !self.lora.is_empty() {
+                self.lora.apply_linear(
+                    layer.w_gate.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..n_embd],
+                    &mut state.hb[..n_ff],
+                    1,
+                    &mut state.lora_scratch,
+                );
+                self.lora.apply_linear(
+                    layer.w_up.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..n_embd],
+                    &mut state.hb2[..n_ff],
+                    1,
+                    &mut state.lora_scratch,
+                );
+            }
             swiglu_inplace_parallel(pool, &mut state.hb[..n_ff], &state.hb2[..n_ff]);
             matvec_f32(
                 pool,
@@ -884,6 +1040,15 @@ impl<'a> Qwen35Model<'a> {
                 &mut state.xb2[..n_embd],
                 layer.w_down.rows,
                 layer.w_down.cols,
+            );
+            self.lora.apply_linear(
+                layer.w_down.lora_slot,
+                pool,
+                kt,
+                &state.hb[..n_ff],
+                &mut state.xb2[..n_embd],
+                1,
+                &mut state.lora_scratch,
             );
             for i in 0..n_embd {
                 state.x[i] += state.xb2[i];
@@ -909,6 +1074,15 @@ impl<'a> Qwen35Model<'a> {
                 &mut state.logits,
                 self.output.rows,
                 self.output.cols,
+            );
+            self.lora.apply_linear(
+                self.output.lora_slot,
+                pool,
+                kt,
+                &state.xb[..n_embd],
+                &mut state.logits,
+                1,
+                &mut state.lora_scratch,
             );
         }
 
@@ -1061,6 +1235,12 @@ impl<'a> Qwen35Model<'a> {
                 tok as usize,
                 &mut state.x[t * n_embd..(t + 1) * n_embd],
             );
+            self.lora.apply_embed_row(
+                self.token_embd.lora_slot,
+                kt,
+                tok as usize,
+                &mut state.x[t * n_embd..(t + 1) * n_embd],
+            );
         }
         if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t_emb) {
             p.embed_ns += ts.elapsed().as_nanos() as u64;
@@ -1133,6 +1313,44 @@ impl<'a> Qwen35Model<'a> {
                         n_embd,
                         b,
                     );
+                    if !self.lora.is_empty() {
+                        self.lora.apply_linear(
+                            wqkv.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..b * n_embd],
+                            &mut state.qkv_buf[..b * conv_dim],
+                            b,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            wz.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..b * n_embd],
+                            &mut state.gate_buf[..b * v_gdn_dim],
+                            b,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            w_alpha.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..b * n_embd],
+                            &mut state.alpha_buf[..b * hv],
+                            b,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            w_beta.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..b * n_embd],
+                            &mut state.beta_buf[..b * hv],
+                            b,
+                            &mut state.lora_scratch,
+                        );
+                    }
                     if let (Some(p), Some(ts)) = (prof.as_deref_mut(), tp) {
                         p.gdn_proj_ns += ts.elapsed().as_nanos() as u64;
                     }
@@ -1203,6 +1421,15 @@ impl<'a> Qwen35Model<'a> {
                         w_out.cols,
                         b,
                     );
+                    self.lora.apply_linear(
+                        w_out.lora_slot,
+                        pool,
+                        kt,
+                        &state.attn_out[..b * v_gdn_dim],
+                        &mut state.xb2[..b * n_embd],
+                        b,
+                        &mut state.lora_scratch,
+                    );
                     if let (Some(p), Some(ts)) = (prof.as_deref_mut(), to) {
                         p.gdn_out_ns += ts.elapsed().as_nanos() as u64;
                     }
@@ -1239,6 +1466,35 @@ impl<'a> Qwen35Model<'a> {
                         n_embd,
                         b,
                     );
+                    if !self.lora.is_empty() {
+                        self.lora.apply_linear(
+                            wqg.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..b * n_embd],
+                            &mut state.qkv_buf[..b * qg_dim],
+                            b,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            wk.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..b * n_embd],
+                            &mut state.k_buf[..b * kv_dim],
+                            b,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            wv.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..b * n_embd],
+                            &mut state.v_buf[..b * kv_dim],
+                            b,
+                            &mut state.lora_scratch,
+                        );
+                    }
                     if let (Some(p), Some(ts)) = (prof.as_deref_mut(), tq) {
                         p.full_qkv_ns += ts.elapsed().as_nanos() as u64;
                     }
@@ -1335,6 +1591,15 @@ impl<'a> Qwen35Model<'a> {
                         wo.cols,
                         b,
                     );
+                    self.lora.apply_linear(
+                        wo.lora_slot,
+                        pool,
+                        kt,
+                        &state.attn_out[..b * q_dim],
+                        &mut state.xb2[..b * n_embd],
+                        b,
+                        &mut state.lora_scratch,
+                    );
                     if let (Some(p), Some(ts)) = (prof.as_deref_mut(), two) {
                         p.full_wo_ns += ts.elapsed().as_nanos() as u64;
                     }
@@ -1377,6 +1642,26 @@ impl<'a> Qwen35Model<'a> {
                 n_embd,
                 b,
             );
+            if !self.lora.is_empty() {
+                self.lora.apply_linear(
+                    layer.w_gate.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..b * n_embd],
+                    &mut state.hb[..b * n_ff],
+                    b,
+                    &mut state.lora_scratch,
+                );
+                self.lora.apply_linear(
+                    layer.w_up.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..b * n_embd],
+                    &mut state.hb2[..b * n_ff],
+                    b,
+                    &mut state.lora_scratch,
+                );
+            }
             swiglu_inplace_parallel(pool, &mut state.hb[..b * n_ff], &state.hb2[..b * n_ff]);
             if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t_gu) {
                 p.ffn_gate_up_ns += ts.elapsed().as_nanos() as u64;
@@ -1393,6 +1678,15 @@ impl<'a> Qwen35Model<'a> {
                 layer.w_down.rows,
                 layer.w_down.cols,
                 b,
+            );
+            self.lora.apply_linear(
+                layer.w_down.lora_slot,
+                pool,
+                kt,
+                &state.hb[..b * n_ff],
+                &mut state.xb2[..b * n_embd],
+                b,
+                &mut state.lora_scratch,
             );
             for i in 0..b * n_embd {
                 state.x[i] += state.xb2[i];
@@ -1430,6 +1724,15 @@ impl<'a> Qwen35Model<'a> {
                 &mut state.logits,
                 self.output.rows,
                 self.output.cols,
+            );
+            self.lora.apply_linear(
+                self.output.lora_slot,
+                pool,
+                kt,
+                &state.xb[..n_embd],
+                &mut state.logits,
+                1,
+                &mut state.lora_scratch,
             );
             if let (Some(p), Some(ts)) = (prof, t_lm) {
                 p.lm_head_ns += ts.elapsed().as_nanos() as u64;
@@ -1489,6 +1792,8 @@ impl<'a> Qwen35Model<'a> {
             tid,
             &mut state.x[..n_embd],
         );
+        self.lora
+            .apply_embed_row(self.token_embd.lora_slot, kt, tid, &mut state.x[..n_embd]);
         prof.embed_ns += t0.elapsed().as_nanos() as u64;
 
         for (l, layer) in self.layers.iter().enumerate() {
@@ -1550,6 +1855,44 @@ impl<'a> Qwen35Model<'a> {
                         &mut state.mv_scratch,
                         n_embd,
                     );
+                    if !self.lora.is_empty() {
+                        self.lora.apply_linear(
+                            wqkv.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.qkv_buf[..conv_dim],
+                            1,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            wz.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.gate_buf[..v_gdn_dim],
+                            1,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            w_alpha.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.alpha_buf[..hv],
+                            1,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            w_beta.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.beta_buf[..hv],
+                            1,
+                            &mut state.lora_scratch,
+                        );
+                    }
                     prof.gdn_proj_ns += tp.elapsed().as_nanos() as u64;
 
                     let tc = Instant::now();
@@ -1609,6 +1952,15 @@ impl<'a> Qwen35Model<'a> {
                         w_out.rows,
                         w_out.cols,
                     );
+                    self.lora.apply_linear(
+                        w_out.lora_slot,
+                        pool,
+                        kt,
+                        &state.attn_out[..v_gdn_dim],
+                        &mut state.xb2[..n_embd],
+                        1,
+                        &mut state.lora_scratch,
+                    );
                     prof.gdn_out_ns += to.elapsed().as_nanos() as u64;
                 }
                 (
@@ -1642,6 +1994,35 @@ impl<'a> Qwen35Model<'a> {
                         &mut state.mv_scratch,
                         n_embd,
                     );
+                    if !self.lora.is_empty() {
+                        self.lora.apply_linear(
+                            wqg.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.qkv_buf[..qg_dim],
+                            1,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            wk.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.k_buf[..kv_dim],
+                            1,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            wv.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.v_buf[..kv_dim],
+                            1,
+                            &mut state.lora_scratch,
+                        );
+                    }
                     prof.full_qkv_ns += tq.elapsed().as_nanos() as u64;
 
                     let ta = Instant::now();
@@ -1719,6 +2100,15 @@ impl<'a> Qwen35Model<'a> {
                         wo.rows,
                         wo.cols,
                     );
+                    self.lora.apply_linear(
+                        wo.lora_slot,
+                        pool,
+                        kt,
+                        &state.attn_out[..q_dim],
+                        &mut state.xb2[..n_embd],
+                        1,
+                        &mut state.lora_scratch,
+                    );
                     prof.full_wo_ns += tw.elapsed().as_nanos() as u64;
                 }
                 _ => unreachable!("LayerState variant always matches Qwen35LayerWeights::attn"),
@@ -1753,6 +2143,26 @@ impl<'a> Qwen35Model<'a> {
                 &mut state.mv_scratch,
                 n_embd,
             );
+            if !self.lora.is_empty() {
+                self.lora.apply_linear(
+                    layer.w_gate.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..n_embd],
+                    &mut state.hb[..n_ff],
+                    1,
+                    &mut state.lora_scratch,
+                );
+                self.lora.apply_linear(
+                    layer.w_up.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..n_embd],
+                    &mut state.hb2[..n_ff],
+                    1,
+                    &mut state.lora_scratch,
+                );
+            }
             swiglu_inplace_parallel(pool, &mut state.hb[..n_ff], &state.hb2[..n_ff]);
             prof.ffn_gate_up_ns += tf1.elapsed().as_nanos() as u64;
 
@@ -1767,6 +2177,15 @@ impl<'a> Qwen35Model<'a> {
                 &mut state.xb2[..n_embd],
                 layer.w_down.rows,
                 layer.w_down.cols,
+            );
+            self.lora.apply_linear(
+                layer.w_down.lora_slot,
+                pool,
+                kt,
+                &state.hb[..n_ff],
+                &mut state.xb2[..n_embd],
+                1,
+                &mut state.lora_scratch,
             );
             for i in 0..n_embd {
                 state.x[i] += state.xb2[i];
@@ -1792,6 +2211,15 @@ impl<'a> Qwen35Model<'a> {
             &mut state.logits,
             self.output.rows,
             self.output.cols,
+        );
+        self.lora.apply_linear(
+            self.output.lora_slot,
+            pool,
+            kt,
+            &state.xb[..n_embd],
+            &mut state.logits,
+            1,
+            &mut state.lora_scratch,
         );
         prof.lm_head_ns += tlm.elapsed().as_nanos() as u64;
         prof.n_steps += 1;
@@ -1848,6 +2276,12 @@ impl<'a> Qwen35Model<'a> {
                 self.token_embd.dtype,
                 self.token_embd.bytes,
                 n_embd,
+                tok as usize,
+                &mut state.x[t * n_embd..(t + 1) * n_embd],
+            );
+            self.lora.apply_embed_row(
+                self.token_embd.lora_slot,
+                kt,
                 tok as usize,
                 &mut state.x[t * n_embd..(t + 1) * n_embd],
             );
@@ -1920,6 +2354,44 @@ impl<'a> Qwen35Model<'a> {
                         n_embd,
                         w,
                     );
+                    if !self.lora.is_empty() {
+                        self.lora.apply_linear(
+                            wqkv.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..w * n_embd],
+                            &mut state.qkv_buf[..w * conv_dim],
+                            w,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            wz.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..w * n_embd],
+                            &mut state.gate_buf[..w * v_gdn_dim],
+                            w,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            w_alpha.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..w * n_embd],
+                            &mut state.alpha_buf[..w * hv],
+                            w,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            w_beta.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..w * n_embd],
+                            &mut state.beta_buf[..w * hv],
+                            w,
+                            &mut state.lora_scratch,
+                        );
+                    }
 
                     for t in 0..w {
                         for vh in 0..hv {
@@ -1989,6 +2461,15 @@ impl<'a> Qwen35Model<'a> {
                         w_out.cols,
                         w,
                     );
+                    self.lora.apply_linear(
+                        w_out.lora_slot,
+                        pool,
+                        kt,
+                        &state.attn_out[..w * v_gdn_dim],
+                        &mut state.xb2[..w * n_embd],
+                        w,
+                        &mut state.lora_scratch,
+                    );
                 }
                 (
                     AttnWeights::FullAttn {
@@ -2021,6 +2502,35 @@ impl<'a> Qwen35Model<'a> {
                         n_embd,
                         w,
                     );
+                    if !self.lora.is_empty() {
+                        self.lora.apply_linear(
+                            wqg.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..w * n_embd],
+                            &mut state.qkv_buf[..w * qg_dim],
+                            w,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            wk.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..w * n_embd],
+                            &mut state.k_buf[..w * kv_dim],
+                            w,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            wv.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..w * n_embd],
+                            &mut state.v_buf[..w * kv_dim],
+                            w,
+                            &mut state.lora_scratch,
+                        );
+                    }
 
                     for t in 0..w {
                         let pos = start_pos + t;
@@ -2106,6 +2616,15 @@ impl<'a> Qwen35Model<'a> {
                         wo.cols,
                         w,
                     );
+                    self.lora.apply_linear(
+                        wo.lora_slot,
+                        pool,
+                        kt,
+                        &state.attn_out[..w * q_dim],
+                        &mut state.xb2[..w * n_embd],
+                        w,
+                        &mut state.lora_scratch,
+                    );
                 }
                 _ => unreachable!("LayerState variant always matches Qwen35LayerWeights::attn"),
             }
@@ -2140,6 +2659,26 @@ impl<'a> Qwen35Model<'a> {
                 n_embd,
                 w,
             );
+            if !self.lora.is_empty() {
+                self.lora.apply_linear(
+                    layer.w_gate.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..w * n_embd],
+                    &mut state.hb[..w * n_ff],
+                    w,
+                    &mut state.lora_scratch,
+                );
+                self.lora.apply_linear(
+                    layer.w_up.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..w * n_embd],
+                    &mut state.hb2[..w * n_ff],
+                    w,
+                    &mut state.lora_scratch,
+                );
+            }
             swiglu_inplace_parallel(pool, &mut state.hb[..w * n_ff], &state.hb2[..w * n_ff]);
             matmul_f32(
                 pool,
@@ -2152,6 +2691,15 @@ impl<'a> Qwen35Model<'a> {
                 layer.w_down.rows,
                 layer.w_down.cols,
                 w,
+            );
+            self.lora.apply_linear(
+                layer.w_down.lora_slot,
+                pool,
+                kt,
+                &state.hb[..w * n_ff],
+                &mut state.xb2[..w * n_embd],
+                w,
+                &mut state.lora_scratch,
             );
             for i in 0..w * n_embd {
                 state.x[i] += state.xb2[i];
@@ -2181,6 +2729,15 @@ impl<'a> Qwen35Model<'a> {
             self.output.rows,
             self.output.cols,
             w,
+        );
+        self.lora.apply_linear(
+            self.output.lora_slot,
+            pool,
+            kt,
+            &spec_buf.norm_win[..w * n_embd],
+            &mut spec_buf.logits_win[..w * vocab],
+            w,
+            &mut state.lora_scratch,
         );
         Ok(())
     }
@@ -2285,6 +2842,15 @@ impl<'a> Qwen35Model<'a> {
             self.output.rows,
             self.output.cols,
         );
+        self.lora.apply_linear(
+            self.output.lora_slot,
+            pool,
+            kt,
+            &state.xb[..n_embd],
+            out_logits,
+            1,
+            &mut state.lora_scratch,
+        );
     }
 
     pub fn embed_token(&self, token_id: u32, out_emb: &mut [f32]) {
@@ -2295,6 +2861,21 @@ impl<'a> Qwen35Model<'a> {
             token_id as usize,
             out_emb,
         );
+        if !self.lora.is_empty() {
+            let kt = tm_cpu::active_kernels();
+            self.lora
+                .apply_embed_row(self.token_embd.lora_slot, kt, token_id as usize, out_emb);
+        }
+    }
+
+    pub fn output_head_raw(&self) -> (&[f32], f32, DType, &'a [u8], Option<f32>) {
+        (
+            &self.output_norm,
+            self.cfg.rms_eps,
+            self.output.dtype,
+            self.output.bytes,
+            None,
+        )
     }
 }
 

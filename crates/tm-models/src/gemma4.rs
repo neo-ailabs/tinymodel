@@ -19,6 +19,7 @@ use tm_cpu::{
     rope_compute_cos_sin, rope_inplace_tables, softcap_inplace_parallel,
 };
 use tm_gguf::{GgufError, GgufFile};
+use tm_lora::{BoundLora, LoraScratch, LoraSet};
 
 use crate::llama::ModelError;
 use crate::state::{LayerState, MAX_SPEC_WINDOW, SpecVerifyBuf, decode_embedding_row};
@@ -86,10 +87,12 @@ impl Gemma4Config {
 
 #[derive(Clone, Copy)]
 struct MatView<'a> {
+    name: &'a str,
     bytes: &'a [u8],
     dtype: DType,
     rows: usize,
     cols: usize,
+    lora_slot: Option<usize>,
 }
 
 struct PleGlobalWeights<'a> {
@@ -137,6 +140,7 @@ pub struct Gemma4Model<'a> {
     rope_inv_freqs_swa: Vec<f64>,
     ple_global: Option<PleGlobalWeights<'a>>,
     layers: Vec<Gemma4LayerWeights<'a>>,
+    pub lora: BoundLora,
 }
 
 /// Pre-allocated inference state for Gemma 4 (`LayerState::Kv` on own-KV layers,
@@ -166,6 +170,7 @@ pub struct Gemma4State {
     logits: Vec<f32>,
     pub last_hidden: Vec<f32>,
     mv_scratch: MatvecScratch,
+    pub lora_scratch: LoraScratch,
 }
 
 impl Gemma4State {
@@ -229,6 +234,7 @@ impl Gemma4State {
             logits: vec![0.0; cfg.vocab_size],
             last_hidden: vec![0.0; cfg.n_embd],
             mv_scratch: MatvecScratch::new(max_cols),
+            lora_scratch: LoraScratch::new(64),
         }
     }
 
@@ -264,10 +270,12 @@ fn load_mat<'a>(
 ) -> Result<MatView<'a>, ModelError> {
     let (info, bytes) = gguf.req_tensor(name, layer, &[cols, rows])?;
     Ok(MatView {
+        name: info.name.as_str(),
         bytes,
         dtype: info.dtype,
         rows,
         cols,
+        lora_slot: None,
     })
 }
 
@@ -410,7 +418,10 @@ impl<'a> Gemma4Model<'a> {
         let output = if gguf.tensor_info("output.weight").is_some() {
             load_mat(gguf, "output.weight", "global", n_embd, vocab_size)?
         } else {
-            token_embd
+            MatView {
+                name: "output.weight",
+                ..token_embd
+            }
         };
         let output_norm = load_f32_vec(gguf, "output_norm.weight", "global", n_embd)?;
 
@@ -627,7 +638,35 @@ impl<'a> Gemma4Model<'a> {
             rope_inv_freqs_swa,
             ple_global,
             layers,
+            lora: BoundLora::default(),
         })
+    }
+
+    pub fn bind_lora(&mut self, set: &LoraSet) {
+        let bound = BoundLora::from_lora_set(set);
+        self.token_embd.lora_slot = bound.slot_for(self.token_embd.name);
+        self.output.lora_slot = bound.slot_for(self.output.name);
+        if let Some(ref mut pg) = self.ple_global {
+            pg.model_proj.lora_slot = bound.slot_for(pg.model_proj.name);
+        }
+        for l in &mut self.layers {
+            l.wq.lora_slot = bound.slot_for(l.wq.name);
+            if let Some(ref mut kv) = l.kv {
+                kv.wk.lora_slot = bound.slot_for(kv.wk.name);
+                if let Some(ref mut wv) = kv.wv {
+                    wv.lora_slot = bound.slot_for(wv.name);
+                }
+            }
+            l.wo.lora_slot = bound.slot_for(l.wo.name);
+            l.w_gate.lora_slot = bound.slot_for(l.w_gate.name);
+            l.w_up.lora_slot = bound.slot_for(l.w_up.name);
+            l.w_down.lora_slot = bound.slot_for(l.w_down.name);
+            if let Some(ref mut ple) = l.ple {
+                ple.inp_gate.lora_slot = bound.slot_for(ple.inp_gate.name);
+                ple.proj.lora_slot = bound.slot_for(ple.proj.name);
+            }
+        }
+        self.lora = bound;
     }
 
     /// Single-token forward pass. Validates bounds BEFORE mutating any `LayerState`.
@@ -666,6 +705,8 @@ impl<'a> Gemma4Model<'a> {
             tid,
             &mut state.x[..n_embd],
         );
+        self.lora
+            .apply_embed_row(self.token_embd.lora_slot, kt, tid, &mut state.x[..n_embd]);
         let emb_scale = (n_embd as f32).sqrt();
         for v in &mut state.x[..n_embd] {
             *v *= emb_scale;
@@ -695,6 +736,15 @@ impl<'a> Gemma4Model<'a> {
                 &mut state.ple_proj_scratch[..ple_total],
                 ple_total,
                 n_embd,
+            );
+            self.lora.apply_linear(
+                ple_g.model_proj.lora_slot,
+                pool,
+                kt,
+                &state.x[..n_embd],
+                &mut state.ple_proj_scratch[..ple_total],
+                1,
+                &mut state.lora_scratch,
             );
 
             let proj_eps = self.cfg.rms_eps * (n_embd as f32);
@@ -767,6 +817,35 @@ impl<'a> Gemma4Model<'a> {
                     &mut state.mv_scratch,
                     n_embd,
                 );
+                if !self.lora.is_empty() {
+                    self.lora.apply_linear(
+                        layer.wq.lora_slot,
+                        pool,
+                        kt,
+                        &state.xb[..n_embd],
+                        &mut state.q_buf[..q_dim],
+                        1,
+                        &mut state.lora_scratch,
+                    );
+                    self.lora.apply_linear(
+                        kv_w.wk.lora_slot,
+                        pool,
+                        kt,
+                        &state.xb[..n_embd],
+                        &mut state.k_buf[..kv_dim],
+                        1,
+                        &mut state.lora_scratch,
+                    );
+                    self.lora.apply_linear(
+                        wv.lora_slot,
+                        pool,
+                        kt,
+                        &state.xb[..n_embd],
+                        &mut state.v_buf[..kv_dim],
+                        1,
+                        &mut state.lora_scratch,
+                    );
+                }
                 did_triple_qkv = true;
             } else {
                 matvec_f32(
@@ -779,6 +858,15 @@ impl<'a> Gemma4Model<'a> {
                     &mut state.q_buf[..q_dim],
                     q_dim,
                     n_embd,
+                );
+                self.lora.apply_linear(
+                    layer.wq.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..n_embd],
+                    &mut state.q_buf[..q_dim],
+                    1,
+                    &mut state.lora_scratch,
                 );
             }
             for h in 0..self.cfg.n_head {
@@ -825,6 +913,26 @@ impl<'a> Gemma4Model<'a> {
                             &mut state.mv_scratch,
                             n_embd,
                         );
+                        if !self.lora.is_empty() {
+                            self.lora.apply_linear(
+                                kv_w.wk.lora_slot,
+                                pool,
+                                kt,
+                                &state.xb[..n_embd],
+                                &mut state.k_buf[..kv_dim],
+                                1,
+                                &mut state.lora_scratch,
+                            );
+                            self.lora.apply_linear(
+                                wv.lora_slot,
+                                pool,
+                                kt,
+                                &state.xb[..n_embd],
+                                &mut state.v_buf[..kv_dim],
+                                1,
+                                &mut state.lora_scratch,
+                            );
+                        }
                     } else {
                         matvec_f32(
                             pool,
@@ -836,6 +944,15 @@ impl<'a> Gemma4Model<'a> {
                             &mut state.k_buf[..kv_dim],
                             kv_dim,
                             n_embd,
+                        );
+                        self.lora.apply_linear(
+                            kv_w.wk.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.k_buf[..kv_dim],
+                            1,
+                            &mut state.lora_scratch,
                         );
                         state.v_buf[..kv_dim].copy_from_slice(&state.k_buf[..kv_dim]);
                     }
@@ -900,6 +1017,15 @@ impl<'a> Gemma4Model<'a> {
                 n_embd,
                 q_dim,
             );
+            self.lora.apply_linear(
+                layer.wo.lora_slot,
+                pool,
+                kt,
+                &state.attn_out[..q_dim],
+                &mut state.xb2[..n_embd],
+                1,
+                &mut state.lora_scratch,
+            );
             rms_norm(
                 &mut state.xb[..n_embd],
                 &state.xb2[..n_embd],
@@ -932,6 +1058,26 @@ impl<'a> Gemma4Model<'a> {
                 &mut state.mv_scratch,
                 n_embd,
             );
+            if !self.lora.is_empty() {
+                self.lora.apply_linear(
+                    layer.w_gate.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..n_embd],
+                    &mut state.hb[..n_ff],
+                    1,
+                    &mut state.lora_scratch,
+                );
+                self.lora.apply_linear(
+                    layer.w_up.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..n_embd],
+                    &mut state.hb2[..n_ff],
+                    1,
+                    &mut state.lora_scratch,
+                );
+            }
             geglu_inplace_parallel(pool, &mut state.hb[..n_ff], &state.hb2[..n_ff]);
             matvec_f32(
                 pool,
@@ -943,6 +1089,15 @@ impl<'a> Gemma4Model<'a> {
                 &mut state.xb2[..n_embd],
                 n_embd,
                 n_ff,
+            );
+            self.lora.apply_linear(
+                layer.w_down.lora_slot,
+                pool,
+                kt,
+                &state.hb[..n_ff],
+                &mut state.xb2[..n_embd],
+                1,
+                &mut state.lora_scratch,
             );
             rms_norm(
                 &mut state.xb[..n_embd],
@@ -967,6 +1122,15 @@ impl<'a> Gemma4Model<'a> {
                     ple_dim,
                     n_embd,
                 );
+                self.lora.apply_linear(
+                    ple_l.inp_gate.lora_slot,
+                    pool,
+                    kt,
+                    &state.x[..n_embd],
+                    &mut state.ple_gate_scratch[..ple_dim],
+                    1,
+                    &mut state.lora_scratch,
+                );
                 let ple_this = &state.ple_inputs[il * ple_dim..(il + 1) * ple_dim];
                 for (g, &p_in) in state.ple_gate_scratch[..ple_dim].iter_mut().zip(ple_this) {
                     *g = gelu_tanh_f32(*g) * p_in;
@@ -981,6 +1145,15 @@ impl<'a> Gemma4Model<'a> {
                     &mut state.xb2[..n_embd],
                     n_embd,
                     ple_dim,
+                );
+                self.lora.apply_linear(
+                    ple_l.proj.lora_slot,
+                    pool,
+                    kt,
+                    &state.ple_gate_scratch[..ple_dim],
+                    &mut state.xb2[..n_embd],
+                    1,
+                    &mut state.lora_scratch,
                 );
                 rms_norm(
                     &mut state.xb[..n_embd],
@@ -1019,6 +1192,15 @@ impl<'a> Gemma4Model<'a> {
                 &mut state.logits,
                 self.output.rows,
                 self.output.cols,
+            );
+            self.lora.apply_linear(
+                self.output.lora_slot,
+                pool,
+                kt,
+                &state.xb[..n_embd],
+                &mut state.logits,
+                1,
+                &mut state.lora_scratch,
             );
             if let Some(cap) = self.cfg.final_logit_softcapping {
                 softcap_inplace_parallel(pool, &mut state.logits, cap);
@@ -1113,6 +1295,8 @@ impl<'a> Gemma4Model<'a> {
                 tok as usize,
                 dst,
             );
+            self.lora
+                .apply_embed_row(self.token_embd.lora_slot, kt, tok as usize, dst);
             for v in dst {
                 *v *= emb_scale;
             }
@@ -1146,6 +1330,15 @@ impl<'a> Gemma4Model<'a> {
                 ple_total,
                 n_embd,
                 b,
+            );
+            self.lora.apply_linear(
+                ple_g.model_proj.lora_slot,
+                pool,
+                kt,
+                &state.x[..b * n_embd],
+                &mut state.ple_proj_scratch[..b * ple_total],
+                b,
+                &mut state.lora_scratch,
             );
 
             let proj_eps = self.cfg.rms_eps * (n_embd as f32);
@@ -1231,6 +1424,35 @@ impl<'a> Gemma4Model<'a> {
                         n_embd,
                         active_rows,
                     );
+                    if !self.lora.is_empty() {
+                        self.lora.apply_linear(
+                            layer.wq.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..active_rows * n_embd],
+                            &mut state.q_buf[..active_rows * q_dim],
+                            active_rows,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            kv_w.wk.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..active_rows * n_embd],
+                            &mut state.k_buf[..active_rows * kv_dim],
+                            active_rows,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            wv.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..active_rows * n_embd],
+                            &mut state.v_buf[..active_rows * kv_dim],
+                            active_rows,
+                            &mut state.lora_scratch,
+                        );
+                    }
                 } else {
                     matmul_pair_f32(
                         pool,
@@ -1248,6 +1470,26 @@ impl<'a> Gemma4Model<'a> {
                         n_embd,
                         active_rows,
                     );
+                    if !self.lora.is_empty() {
+                        self.lora.apply_linear(
+                            layer.wq.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..active_rows * n_embd],
+                            &mut state.q_buf[..active_rows * q_dim],
+                            active_rows,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            kv_w.wk.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..active_rows * n_embd],
+                            &mut state.k_buf[..active_rows * kv_dim],
+                            active_rows,
+                            &mut state.lora_scratch,
+                        );
+                    }
                     state.v_buf[..active_rows * kv_dim]
                         .copy_from_slice(&state.k_buf[..active_rows * kv_dim]);
                 }
@@ -1263,6 +1505,15 @@ impl<'a> Gemma4Model<'a> {
                     q_dim,
                     n_embd,
                     active_rows,
+                );
+                self.lora.apply_linear(
+                    layer.wq.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..active_rows * n_embd],
+                    &mut state.q_buf[..active_rows * q_dim],
+                    active_rows,
+                    &mut state.lora_scratch,
                 );
             }
 
@@ -1379,6 +1630,15 @@ impl<'a> Gemma4Model<'a> {
                 q_dim,
                 active_rows,
             );
+            self.lora.apply_linear(
+                layer.wo.lora_slot,
+                pool,
+                kt,
+                &state.attn_out[..active_rows * q_dim],
+                &mut state.xb2[..active_rows * n_embd],
+                active_rows,
+                &mut state.lora_scratch,
+            );
             rms_norm_batch_parallel(
                 pool,
                 kt,
@@ -1420,6 +1680,26 @@ impl<'a> Gemma4Model<'a> {
                 n_embd,
                 active_rows,
             );
+            if !self.lora.is_empty() {
+                self.lora.apply_linear(
+                    layer.w_gate.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..active_rows * n_embd],
+                    &mut state.hb[..active_rows * n_ff],
+                    active_rows,
+                    &mut state.lora_scratch,
+                );
+                self.lora.apply_linear(
+                    layer.w_up.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..active_rows * n_embd],
+                    &mut state.hb2[..active_rows * n_ff],
+                    active_rows,
+                    &mut state.lora_scratch,
+                );
+            }
             geglu_inplace_parallel(
                 pool,
                 &mut state.hb[..active_rows * n_ff],
@@ -1436,6 +1716,15 @@ impl<'a> Gemma4Model<'a> {
                 n_embd,
                 n_ff,
                 active_rows,
+            );
+            self.lora.apply_linear(
+                layer.w_down.lora_slot,
+                pool,
+                kt,
+                &state.hb[..active_rows * n_ff],
+                &mut state.xb2[..active_rows * n_embd],
+                active_rows,
+                &mut state.lora_scratch,
             );
             rms_norm_batch_parallel(
                 pool,
@@ -1464,6 +1753,15 @@ impl<'a> Gemma4Model<'a> {
                     n_embd,
                     active_rows,
                 );
+                self.lora.apply_linear(
+                    ple_l.inp_gate.lora_slot,
+                    pool,
+                    kt,
+                    &state.x[..active_rows * n_embd],
+                    &mut state.ple_gate_scratch[..active_rows * ple_dim],
+                    active_rows,
+                    &mut state.lora_scratch,
+                );
                 for t in 0..active_rows {
                     let ple_this = &state.ple_inputs
                         [t * ple_total + il * ple_dim..t * ple_total + (il + 1) * ple_dim];
@@ -1483,6 +1781,15 @@ impl<'a> Gemma4Model<'a> {
                     n_embd,
                     ple_dim,
                     active_rows,
+                );
+                self.lora.apply_linear(
+                    ple_l.proj.lora_slot,
+                    pool,
+                    kt,
+                    &state.ple_gate_scratch[..active_rows * ple_dim],
+                    &mut state.xb2[..active_rows * n_embd],
+                    active_rows,
+                    &mut state.lora_scratch,
                 );
                 rms_norm_batch_parallel(
                     pool,
@@ -1528,6 +1835,15 @@ impl<'a> Gemma4Model<'a> {
                 &mut state.logits,
                 self.output.rows,
                 self.output.cols,
+            );
+            self.lora.apply_linear(
+                self.output.lora_slot,
+                pool,
+                kt,
+                &state.xb[..n_embd],
+                &mut state.logits,
+                1,
+                &mut state.lora_scratch,
             );
             if let Some(cap) = self.cfg.final_logit_softcapping {
                 softcap_inplace_parallel(pool, &mut state.logits, cap);
@@ -1591,6 +1907,15 @@ impl<'a> Gemma4Model<'a> {
             self.output.cols,
             w,
         );
+        self.lora.apply_linear(
+            self.output.lora_slot,
+            pool,
+            kt,
+            &spec_buf.norm_win[..w * n_embd],
+            &mut spec_buf.logits_win[..w * vocab],
+            w,
+            &mut state.lora_scratch,
+        );
         if let Some(cap) = self.cfg.final_logit_softcapping {
             softcap_inplace_parallel(pool, &mut spec_buf.logits_win[..w * vocab], cap);
         }
@@ -1639,6 +1964,15 @@ impl<'a> Gemma4Model<'a> {
             self.output.rows,
             self.output.cols,
         );
+        self.lora.apply_linear(
+            self.output.lora_slot,
+            pool,
+            kt,
+            &state.xb[..n_embd],
+            out_logits,
+            1,
+            &mut state.lora_scratch,
+        );
         if let Some(cap) = self.cfg.final_logit_softcapping {
             softcap_inplace_parallel(pool, out_logits, cap);
         }
@@ -1653,9 +1987,24 @@ impl<'a> Gemma4Model<'a> {
             token_id as usize,
             out_emb,
         );
+        if !self.lora.is_empty() {
+            let kt = tm_cpu::active_kernels();
+            self.lora
+                .apply_embed_row(self.token_embd.lora_slot, kt, token_id as usize, out_emb);
+        }
         let emb_scale = (n_embd as f32).sqrt();
         for v in out_emb {
             *v *= emb_scale;
         }
+    }
+
+    pub fn output_head_raw(&self) -> (&[f32], f32, DType, &'a [u8], Option<f32>) {
+        (
+            &self.output_norm,
+            self.cfg.rms_eps,
+            self.output.dtype,
+            self.output.bytes,
+            self.cfg.final_logit_softcapping,
+        )
     }
 }

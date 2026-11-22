@@ -13,6 +13,7 @@ use tm_cpu::{
     rms_norm_batch_parallel, rope_compute_cos_sin, rope_inplace_tables, swiglu_inplace_parallel,
 };
 use tm_gguf::{GgufError, GgufFile};
+use tm_lora::{BoundLora, LoraScratch, LoraSet};
 
 use crate::state::{MAX_SPEC_WINDOW, SpecVerifyBuf, decode_embedding_row};
 
@@ -48,38 +49,47 @@ pub struct LlamaConfig {
     pub rope_type: RopeType,
 }
 
-/// Zero-copy weight matrix view carrying its own `DType` (per `AGENTS.md` rule #5).
+/// Zero-copy weight matrix view carrying its own `DType` (per `AGENTS.md` rule #5)
+/// and optional pre-bound LoRA slot (`ADR-015`).
 #[derive(Clone, Copy)]
-struct MatView<'a> {
-    bytes: &'a [u8],
-    dtype: DType,
-    rows: usize,
-    cols: usize,
+pub struct RawMatView<'a> {
+    pub name: &'a str,
+    pub bytes: &'a [u8],
+    pub dtype: DType,
+    pub rows: usize,
+    pub cols: usize,
+    pub lora_slot: Option<usize>,
 }
 
-struct LayerWeights<'a> {
-    attn_norm: Vec<f32>,
-    ffn_norm: Vec<f32>,
-    q_norm: Option<Vec<f32>>,
-    k_norm: Option<Vec<f32>>,
-    wq: MatView<'a>,
-    wk: MatView<'a>,
-    wv: MatView<'a>,
-    wo: MatView<'a>,
-    w_gate: MatView<'a>,
-    w_up: MatView<'a>,
-    w_down: MatView<'a>,
+type MatView<'a> = RawMatView<'a>;
+
+/// Per-layer weights for `LlamaModel` (`llama` / `qwen3` / `SmolLM2`).
+pub struct LlamaLayerWeights<'a> {
+    pub attn_norm: Vec<f32>,
+    pub ffn_norm: Vec<f32>,
+    pub q_norm: Option<Vec<f32>>,
+    pub k_norm: Option<Vec<f32>>,
+    pub wq: RawMatView<'a>,
+    pub wk: RawMatView<'a>,
+    pub wv: RawMatView<'a>,
+    pub wo: RawMatView<'a>,
+    pub w_gate: RawMatView<'a>,
+    pub w_up: RawMatView<'a>,
+    pub w_down: RawMatView<'a>,
 }
+
+type LayerWeights<'a> = LlamaLayerWeights<'a>;
 
 /// Loaded Llama / Qwen3 model borrowing quantized weight slices directly from `GgufFile`.
 pub struct LlamaModel<'a> {
     pub cfg: LlamaConfig,
-    token_embd: MatView<'a>,
-    output: MatView<'a>,
-    output_norm: Vec<f32>,
+    pub token_embd: RawMatView<'a>,
+    pub output: RawMatView<'a>,
+    pub output_norm: Vec<f32>,
     /// Precomputed `freq_base^(-2i / rope_dim) / rope_freqs[i]` for `i in 0..rope_dim/2`.
-    rope_inv_freqs: Vec<f64>,
-    layers: Vec<LayerWeights<'a>>,
+    pub rope_inv_freqs: Vec<f64>,
+    pub layers: Vec<LlamaLayerWeights<'a>>,
+    pub lora: BoundLora,
 }
 
 /// Pre-allocated per-session inference state (KV cache + scratch buffers).
@@ -110,6 +120,7 @@ pub struct LlamaState {
     logits: Vec<f32>,
     last_hidden: Vec<f32>,
     mv_scratch: MatvecScratch,
+    pub lora_scratch: LoraScratch,
 }
 
 impl LlamaState {
@@ -172,6 +183,7 @@ impl LlamaState {
             logits: vec![0.0; cfg.vocab_size],
             last_hidden: vec![0.0; cfg.n_embd],
             mv_scratch: MatvecScratch::new(max_cols),
+            lora_scratch: LoraScratch::new(64),
         }
     }
 
@@ -221,10 +233,12 @@ fn load_mat<'a>(
     // GGML stores [cols, rows] (ne0 = cols, ne1 = rows).
     let (info, bytes) = gguf.req_tensor(name, layer, &[cols, rows])?;
     Ok(MatView {
+        name: info.name.as_str(),
         bytes,
         dtype: info.dtype,
         rows,
         cols,
+        lora_slot: None,
     })
 }
 
@@ -303,7 +317,10 @@ impl<'a> LlamaModel<'a> {
         let output = if gguf.tensor_info("output.weight").is_some() {
             load_mat(gguf, "output.weight", "global", n_embd, vocab_size)?
         } else {
-            token_embd
+            MatView {
+                name: "output.weight",
+                ..token_embd
+            }
         };
         let output_norm = load_f32_vec(gguf, "output_norm.weight", "global", n_embd)?;
         let rope_freqs = if gguf.tensor_info("rope_freqs.weight").is_some() {
@@ -401,7 +418,25 @@ impl<'a> LlamaModel<'a> {
             output_norm,
             rope_inv_freqs,
             layers,
+            lora: BoundLora::default(),
         })
+    }
+
+    /// Binds one or more LoRA adapters to matching base tensors (`O(1)` slot lookup at runtime).
+    pub fn bind_lora(&mut self, set: &LoraSet) {
+        let bound = BoundLora::from_lora_set(set);
+        self.token_embd.lora_slot = bound.slot_for(self.token_embd.name);
+        self.output.lora_slot = bound.slot_for(self.output.name);
+        for l in &mut self.layers {
+            l.wq.lora_slot = bound.slot_for(l.wq.name);
+            l.wk.lora_slot = bound.slot_for(l.wk.name);
+            l.wv.lora_slot = bound.slot_for(l.wv.name);
+            l.wo.lora_slot = bound.slot_for(l.wo.name);
+            l.w_gate.lora_slot = bound.slot_for(l.w_gate.name);
+            l.w_up.lora_slot = bound.slot_for(l.w_up.name);
+            l.w_down.lora_slot = bound.slot_for(l.w_down.name);
+        }
+        self.lora = bound;
     }
 
     /// Runs a single-token forward pass at sequence position `pos`.
@@ -452,6 +487,8 @@ impl<'a> LlamaModel<'a> {
             tid,
             &mut state.x[..n_embd],
         );
+        self.lora
+            .apply_embed_row(self.token_embd.lora_slot, kt, tid, &mut state.x[..n_embd]);
 
         // 2. Transformer layers
         for (l, layer) in self.layers.iter().enumerate() {
@@ -481,6 +518,35 @@ impl<'a> LlamaModel<'a> {
                 &mut state.mv_scratch,
                 n_embd,
             );
+            if !self.lora.is_empty() {
+                self.lora.apply_linear(
+                    layer.wq.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..n_embd],
+                    &mut state.q[..q_dim],
+                    1,
+                    &mut state.lora_scratch,
+                );
+                self.lora.apply_linear(
+                    layer.wk.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..n_embd],
+                    &mut state.k[..kv_dim],
+                    1,
+                    &mut state.lora_scratch,
+                );
+                self.lora.apply_linear(
+                    layer.wv.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..n_embd],
+                    &mut state.v[..kv_dim],
+                    1,
+                    &mut state.lora_scratch,
+                );
+            }
 
             // Optional per-head QK-Norm (Qwen3) applied before RoPE
             if let Some(ref qn) = layer.q_norm {
@@ -588,6 +654,15 @@ impl<'a> LlamaModel<'a> {
                 layer.wo.rows,
                 layer.wo.cols,
             );
+            self.lora.apply_linear(
+                layer.wo.lora_slot,
+                pool,
+                kt,
+                &state.xb[..q_dim],
+                &mut state.xb2[..n_embd],
+                1,
+                &mut state.lora_scratch,
+            );
             for i in 0..n_embd {
                 state.x[i] += state.xb2[i];
             }
@@ -614,6 +689,26 @@ impl<'a> LlamaModel<'a> {
                 &mut state.mv_scratch,
                 n_embd,
             );
+            if !self.lora.is_empty() {
+                self.lora.apply_linear(
+                    layer.w_gate.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..n_embd],
+                    &mut state.hb[..n_ff],
+                    1,
+                    &mut state.lora_scratch,
+                );
+                self.lora.apply_linear(
+                    layer.w_up.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..n_embd],
+                    &mut state.hb2[..n_ff],
+                    1,
+                    &mut state.lora_scratch,
+                );
+            }
             swiglu_inplace_parallel(pool, &mut state.hb[..n_ff], &state.hb2[..n_ff]);
             matvec_f32(
                 pool,
@@ -625,6 +720,15 @@ impl<'a> LlamaModel<'a> {
                 &mut state.xb2[..n_embd],
                 layer.w_down.rows,
                 layer.w_down.cols,
+            );
+            self.lora.apply_linear(
+                layer.w_down.lora_slot,
+                pool,
+                kt,
+                &state.hb[..n_ff],
+                &mut state.xb2[..n_embd],
+                1,
+                &mut state.lora_scratch,
             );
             for i in 0..n_embd {
                 state.x[i] += state.xb2[i];
@@ -650,6 +754,15 @@ impl<'a> LlamaModel<'a> {
                 &mut state.logits,
                 self.output.rows,
                 self.output.cols,
+            );
+            self.lora.apply_linear(
+                self.output.lora_slot,
+                pool,
+                kt,
+                &state.xb[..n_embd],
+                &mut state.logits,
+                1,
+                &mut state.lora_scratch,
             );
         }
 
@@ -781,6 +894,12 @@ impl<'a> LlamaModel<'a> {
                     tok as usize,
                     &mut state.x[t * n_embd..(t + 1) * n_embd],
                 );
+                self.lora.apply_embed_row(
+                    self.token_embd.lora_slot,
+                    kt,
+                    tok as usize,
+                    &mut state.x[t * n_embd..(t + 1) * n_embd],
+                );
             }
             if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
                 p.embed_ns += ts.elapsed().as_nanos() as u64;
@@ -824,6 +943,35 @@ impl<'a> LlamaModel<'a> {
                     n_embd,
                     b,
                 );
+                if !self.lora.is_empty() {
+                    self.lora.apply_linear(
+                        layer.wq.lora_slot,
+                        pool,
+                        kt,
+                        &state.xb[..b * n_embd],
+                        &mut state.q[..b * q_dim],
+                        b,
+                        &mut state.lora_scratch,
+                    );
+                    self.lora.apply_linear(
+                        layer.wk.lora_slot,
+                        pool,
+                        kt,
+                        &state.xb[..b * n_embd],
+                        &mut state.k[..b * kv_dim],
+                        b,
+                        &mut state.lora_scratch,
+                    );
+                    self.lora.apply_linear(
+                        layer.wv.lora_slot,
+                        pool,
+                        kt,
+                        &state.xb[..b * n_embd],
+                        &mut state.v[..b * kv_dim],
+                        b,
+                        &mut state.lora_scratch,
+                    );
+                }
                 if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
                     p.attn_qkv_ns += ts.elapsed().as_nanos() as u64;
                 }
@@ -960,6 +1108,15 @@ impl<'a> LlamaModel<'a> {
                     q_dim,
                     b,
                 );
+                self.lora.apply_linear(
+                    layer.wo.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..b * q_dim],
+                    &mut state.xb2[..b * n_embd],
+                    b,
+                    &mut state.lora_scratch,
+                );
                 for i in 0..(b * n_embd) {
                     state.x[i] += state.xb2[i];
                 }
@@ -1000,6 +1157,26 @@ impl<'a> LlamaModel<'a> {
                     n_embd,
                     b,
                 );
+                if !self.lora.is_empty() {
+                    self.lora.apply_linear(
+                        layer.w_gate.lora_slot,
+                        pool,
+                        kt,
+                        &state.xb[..b * n_embd],
+                        &mut state.hb[..b * n_ff],
+                        b,
+                        &mut state.lora_scratch,
+                    );
+                    self.lora.apply_linear(
+                        layer.w_up.lora_slot,
+                        pool,
+                        kt,
+                        &state.xb[..b * n_embd],
+                        &mut state.hb2[..b * n_ff],
+                        b,
+                        &mut state.lora_scratch,
+                    );
+                }
                 if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
                     p.ffn_gate_up_ns += ts.elapsed().as_nanos() as u64;
                 }
@@ -1022,6 +1199,15 @@ impl<'a> LlamaModel<'a> {
                     n_embd,
                     n_ff,
                     b,
+                );
+                self.lora.apply_linear(
+                    layer.w_down.lora_slot,
+                    pool,
+                    kt,
+                    &state.hb[..b * n_ff],
+                    &mut state.xb2[..b * n_embd],
+                    b,
+                    &mut state.lora_scratch,
                 );
                 for i in 0..(b * n_embd) {
                     state.x[i] += state.xb2[i];
@@ -1058,6 +1244,15 @@ impl<'a> LlamaModel<'a> {
                     &mut state.logits,
                     self.output.rows,
                     self.output.cols,
+                );
+                self.lora.apply_linear(
+                    self.output.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..n_embd],
+                    &mut state.logits,
+                    1,
+                    &mut state.lora_scratch,
                 );
                 if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
                     p.lm_head_ns += ts.elapsed().as_nanos() as u64;
@@ -1124,6 +1319,8 @@ impl<'a> LlamaModel<'a> {
             tid,
             &mut state.x[..n_embd],
         );
+        self.lora
+            .apply_embed_row(self.token_embd.lora_slot, kt, tid, &mut state.x[..n_embd]);
         prof.embed_ns += t0.elapsed().as_nanos() as u64;
         prof.embed_bytes += (self.token_embd.dtype.row_bytes(n_embd) + n_embd * 4) as u64;
 
@@ -1157,6 +1354,35 @@ impl<'a> LlamaModel<'a> {
                 &mut state.mv_scratch,
                 n_embd,
             );
+            if !self.lora.is_empty() {
+                self.lora.apply_linear(
+                    layer.wq.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..n_embd],
+                    &mut state.q[..q_dim],
+                    1,
+                    &mut state.lora_scratch,
+                );
+                self.lora.apply_linear(
+                    layer.wk.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..n_embd],
+                    &mut state.k[..kv_dim],
+                    1,
+                    &mut state.lora_scratch,
+                );
+                self.lora.apply_linear(
+                    layer.wv.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..n_embd],
+                    &mut state.v[..kv_dim],
+                    1,
+                    &mut state.lora_scratch,
+                );
+            }
             prof.attn_qkv_ns += t0.elapsed().as_nanos() as u64;
             prof.attn_qkv_bytes +=
                 (layer.wq.bytes.len() + layer.wk.bytes.len() + layer.wv.bytes.len()) as u64;
@@ -1281,6 +1507,15 @@ impl<'a> LlamaModel<'a> {
                 layer.wo.rows,
                 layer.wo.cols,
             );
+            self.lora.apply_linear(
+                layer.wo.lora_slot,
+                pool,
+                kt,
+                &state.xb[..q_dim],
+                &mut state.xb2[..n_embd],
+                1,
+                &mut state.lora_scratch,
+            );
             for i in 0..n_embd {
                 state.x[i] += state.xb2[i];
             }
@@ -1312,6 +1547,26 @@ impl<'a> LlamaModel<'a> {
                 &mut state.mv_scratch,
                 n_embd,
             );
+            if !self.lora.is_empty() {
+                self.lora.apply_linear(
+                    layer.w_gate.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..n_embd],
+                    &mut state.hb[..n_ff],
+                    1,
+                    &mut state.lora_scratch,
+                );
+                self.lora.apply_linear(
+                    layer.w_up.lora_slot,
+                    pool,
+                    kt,
+                    &state.xb[..n_embd],
+                    &mut state.hb2[..n_ff],
+                    1,
+                    &mut state.lora_scratch,
+                );
+            }
             prof.ffn_gate_up_ns += t0.elapsed().as_nanos() as u64;
             prof.ffn_gate_up_bytes += (layer.w_gate.bytes.len() + layer.w_up.bytes.len()) as u64;
 
@@ -1330,6 +1585,15 @@ impl<'a> LlamaModel<'a> {
                 &mut state.xb2[..n_embd],
                 layer.w_down.rows,
                 layer.w_down.cols,
+            );
+            self.lora.apply_linear(
+                layer.w_down.lora_slot,
+                pool,
+                kt,
+                &state.hb[..n_ff],
+                &mut state.xb2[..n_embd],
+                1,
+                &mut state.lora_scratch,
             );
             for i in 0..n_embd {
                 state.x[i] += state.xb2[i];
@@ -1361,6 +1625,15 @@ impl<'a> LlamaModel<'a> {
                 &mut state.logits,
                 self.output.rows,
                 self.output.cols,
+            );
+            self.lora.apply_linear(
+                self.output.lora_slot,
+                pool,
+                kt,
+                &state.xb[..n_embd],
+                &mut state.logits,
+                1,
+                &mut state.lora_scratch,
             );
             prof.lm_head_ns += t0.elapsed().as_nanos() as u64;
             prof.lm_head_bytes += self.output.bytes.len() as u64;
@@ -1434,6 +1707,15 @@ impl<'a> LlamaModel<'a> {
             self.output.cols,
             w,
         );
+        self.lora.apply_linear(
+            self.output.lora_slot,
+            pool,
+            kt,
+            &spec_buf.norm_win[..w * n_embd],
+            &mut spec_buf.logits_win[..w * vocab],
+            w,
+            &mut state.lora_scratch,
+        );
         Ok(())
     }
 
@@ -1483,6 +1765,15 @@ impl<'a> LlamaModel<'a> {
             self.output.rows,
             self.output.cols,
         );
+        self.lora.apply_linear(
+            self.output.lora_slot,
+            pool,
+            kt,
+            &state.xb[..n_embd],
+            out_logits,
+            1,
+            &mut state.lora_scratch,
+        );
     }
 
     /// Decodes a single token's input embedding `[n_embd]` (used by MTP cells).
@@ -1494,6 +1785,11 @@ impl<'a> LlamaModel<'a> {
             token_id as usize,
             out_emb,
         );
+        if !self.lora.is_empty() {
+            let kt = tm_cpu::active_kernels();
+            self.lora
+                .apply_embed_row(self.token_embd.lora_slot, kt, token_id as usize, out_emb);
+        }
     }
 }
 

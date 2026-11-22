@@ -7,7 +7,7 @@
 use tm_core::{
     BlockIQ2XXS, BlockIQ3XXS, BlockIQ4NL, BlockQ2_0, BlockQ4_0, BlockQ4_0x4, BlockQ4_1, BlockQ5K,
     BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, BlockTQ2_0, DType, QK_K, QK2_0, QK4_0, QK4_1, QK4_NL,
-    QK8_0,
+    QK8_0, dequantize_q4_0x4_single_row, dequantize_row_bytes, f16_to_f32,
 };
 
 use crate::{KernelTable, ThreadPool, generic};
@@ -2995,4 +2995,469 @@ pub fn softcap_inplace_parallel(pool: &ThreadPool, vec: &mut [f32], cap: f32) {
             *l = (*l * inv_cap).tanh() * cap;
         }
     });
+}
+
+/// Zero-copy transposed quantized matrix multiplication for backward passes (`ADR-015`):
+/// computes `dx[n_tok, cols] = (accum ? dx : 0) + dy[n_tok, rows] * W[rows, cols]`
+/// directly from read-only `mmap` quantized `w_bytes` without materializing or transposing `W`.
+///
+/// Parallelizes across disjoint column blocks (`cb`) so worker threads write to disjoint slices
+/// of `dx` and accumulate `r = 0..rows` in strict sequential order — guaranteeing **0-ULP bit-exact
+/// parity** across `generic` / SIMD ISAs, thread counts (`1..N`), and batch widths (`1..T`).
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_q_transposed_f32(
+    pool: &ThreadPool,
+    kt: &KernelTable,
+    w_dtype: DType,
+    w_bytes: &[u8],
+    dy: &[f32],
+    dx: &mut [f32],
+    rows: usize,
+    cols: usize,
+    n_tok: usize,
+    accum: bool,
+) {
+    assert_eq!(dy.len(), n_tok * rows);
+    assert_eq!(dx.len(), n_tok * cols);
+    if n_tok == 0 || cols == 0 {
+        return;
+    }
+    if !accum {
+        dx.fill(0.0);
+    }
+    if rows == 0 {
+        return;
+    }
+
+    let dx_ptr = dx.as_mut_ptr() as usize;
+
+    match w_dtype {
+        DType::Q4_0 => {
+            assert!(cols.is_multiple_of(QK4_0));
+            let cols_blocks = cols / QK4_0;
+            assert_eq!(
+                w_bytes.len(),
+                rows * cols_blocks * core::mem::size_of::<BlockQ4_0>()
+            );
+            assert!((w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockQ4_0>()));
+            // SAFETY: Alignment and byte length verified; `BlockQ4_0` is `#[repr(C)]` POD.
+            let w: &[BlockQ4_0] = unsafe {
+                core::slice::from_raw_parts(
+                    w_bytes.as_ptr() as *const BlockQ4_0,
+                    rows * cols_blocks,
+                )
+            };
+            let chunk = dynamic_row_chunk(cols_blocks, pool.num_threads());
+            pool.parallel_for(cols_blocks, chunk, |cb0, cb1| {
+                const TILE_TOK: usize = 8;
+                let mut tile = [0.0f32; TILE_TOK * QK4_0];
+                for cb in cb0..cb1 {
+                    let c_off = cb * QK4_0;
+                    let mut t0 = 0usize;
+                    while t0 < n_tok {
+                        let bt = (n_tok - t0).min(TILE_TOK);
+                        let sub = &mut tile[..bt * QK4_0];
+                        for t in 0..bt {
+                            // SAFETY: Disjoint column slice `[c_off .. c_off + 32)` per worker `cb`.
+                            let src = unsafe {
+                                core::slice::from_raw_parts(
+                                    (dx_ptr as *const f32).add((t0 + t) * cols + c_off),
+                                    QK4_0,
+                                )
+                            };
+                            sub[t * QK4_0..(t + 1) * QK4_0].copy_from_slice(src);
+                        }
+                        (kt.gemm_q4_0_transposed_tile)(
+                            w,
+                            cols_blocks,
+                            cb,
+                            &dy[t0 * rows..(t0 + bt) * rows],
+                            sub,
+                            rows,
+                            bt,
+                        );
+                        for t in 0..bt {
+                            // SAFETY: Disjoint column slice `[c_off .. c_off + 32)` per worker `cb`.
+                            let dst = unsafe {
+                                core::slice::from_raw_parts_mut(
+                                    (dx_ptr as *mut f32).add((t0 + t) * cols + c_off),
+                                    QK4_0,
+                                )
+                            };
+                            dst.copy_from_slice(&sub[t * QK4_0..(t + 1) * QK4_0]);
+                        }
+                        t0 += bt;
+                    }
+                }
+            });
+        }
+        DType::Q8_0 => {
+            assert!(cols.is_multiple_of(QK8_0));
+            let cols_blocks = cols / QK8_0;
+            assert_eq!(
+                w_bytes.len(),
+                rows * cols_blocks * core::mem::size_of::<BlockQ8_0>()
+            );
+            assert!((w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockQ8_0>()));
+            // SAFETY: Alignment and byte length verified; `BlockQ8_0` is `#[repr(C)]` POD.
+            let w: &[BlockQ8_0] = unsafe {
+                core::slice::from_raw_parts(
+                    w_bytes.as_ptr() as *const BlockQ8_0,
+                    rows * cols_blocks,
+                )
+            };
+            let chunk = dynamic_row_chunk(cols_blocks, pool.num_threads());
+            pool.parallel_for(cols_blocks, chunk, |cb0, cb1| {
+                for cb in cb0..cb1 {
+                    let c_off = cb * QK8_0;
+                    for r in 0..rows {
+                        let blk = &w[r * cols_blocks + cb..r * cols_blocks + cb + 1];
+                        for t in 0..n_tok {
+                            let scale = dy[t * rows + r];
+                            // SAFETY: Disjoint `[c_off .. c_off + 32)` per worker `cb`.
+                            let dst = unsafe {
+                                core::slice::from_raw_parts_mut(
+                                    (dx_ptr as *mut f32).add(t * cols + c_off),
+                                    QK8_0,
+                                )
+                            };
+                            (kt.axpy_f32_q8_0)(dst, scale, blk);
+                        }
+                    }
+                }
+            });
+        }
+        DType::Q4_0x4 => {
+            assert!(cols.is_multiple_of(QK4_0) && rows.is_multiple_of(4));
+            let cols_blocks = cols / QK4_0;
+            let group_bytes = cols_blocks * 72;
+            assert_eq!(w_bytes.len(), (rows / 4) * group_bytes);
+            let chunk = dynamic_row_chunk(cols_blocks, pool.num_threads());
+            pool.parallel_for(cols_blocks, chunk, |cb0, cb1| {
+                let mut w4 = [[0.0f32; QK4_0]; 4];
+                for cb in cb0..cb1 {
+                    let c_off = cb * QK4_0;
+                    for rg in 0..(rows / 4) {
+                        let sub_bytes =
+                            &w_bytes[rg * group_bytes + cb * 72..rg * group_bytes + (cb + 1) * 72];
+                        for (m, w_row) in w4.iter_mut().enumerate() {
+                            dequantize_q4_0x4_single_row(sub_bytes, QK4_0, m, w_row);
+                        }
+                        for (m, w_row) in w4.iter().enumerate() {
+                            let r = rg * 4 + m;
+                            for t in 0..n_tok {
+                                let scale = dy[t * rows + r];
+                                // SAFETY: Disjoint `[c_off .. c_off + 32)` per worker `cb`.
+                                let dst = unsafe {
+                                    core::slice::from_raw_parts_mut(
+                                        (dx_ptr as *mut f32).add(t * cols + c_off),
+                                        QK4_0,
+                                    )
+                                };
+                                (kt.axpy_f32)(dst, scale, w_row);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        DType::F32 => {
+            assert_eq!(w_bytes.len(), rows * cols * 4);
+            const COL_TILE: usize = 64;
+            let n_tiles = cols.div_ceil(COL_TILE);
+            let chunk = dynamic_row_chunk(n_tiles, pool.num_threads());
+            pool.parallel_for(n_tiles, chunk, |ct0, ct1| {
+                let mut w_buf = [0.0f32; COL_TILE];
+                for ct in ct0..ct1 {
+                    let c0 = ct * COL_TILE;
+                    let c_len = (cols - c0).min(COL_TILE);
+                    for r in 0..rows {
+                        let b_off = (r * cols + c0) * 4;
+                        for (j, slot) in w_buf[..c_len].iter_mut().enumerate() {
+                            let o = b_off + j * 4;
+                            *slot = f32::from_le_bytes([
+                                w_bytes[o],
+                                w_bytes[o + 1],
+                                w_bytes[o + 2],
+                                w_bytes[o + 3],
+                            ]);
+                        }
+                        let w_slice = &w_buf[..c_len];
+                        for t in 0..n_tok {
+                            let scale = dy[t * rows + r];
+                            // SAFETY: Disjoint `[c0 .. c0 + c_len)` per worker `ct`.
+                            let dst = unsafe {
+                                core::slice::from_raw_parts_mut(
+                                    (dx_ptr as *mut f32).add(t * cols + c0),
+                                    c_len,
+                                )
+                            };
+                            (kt.axpy_f32)(dst, scale, w_slice);
+                        }
+                    }
+                }
+            });
+        }
+        other => {
+            // General block-parallel path covering `F16`, `BF16`, `Q4_1`, `Q5_K`, `Q6_K`,
+            // `Q2_0`, `TQ2_0`, `Iq2Xxs`, `Iq3Xxs`, `Iq4Nl` (`block_elements <= 256`).
+            let blk_elems = if matches!(other, DType::F16 | DType::BF16) {
+                cols.min(64)
+            } else {
+                other.block_elements()
+            };
+            let blk_bytes = if matches!(other, DType::F16 | DType::BF16) {
+                blk_elems * 2
+            } else {
+                other.block_bytes()
+            };
+            let row_bytes = other.row_bytes(cols);
+            assert_eq!(w_bytes.len(), rows * row_bytes);
+            let n_tiles = cols.div_ceil(blk_elems);
+            let chunk = dynamic_row_chunk(n_tiles, pool.num_threads());
+            pool.parallel_for(n_tiles, chunk, |ct0, ct1| {
+                let mut w_buf = [0.0f32; QK_K];
+                for ct in ct0..ct1 {
+                    let c0 = ct * blk_elems;
+                    let c_len = (cols - c0).min(blk_elems);
+                    let byte_c0 = if matches!(other, DType::F16 | DType::BF16) {
+                        c0 * 2
+                    } else {
+                        ct * blk_bytes
+                    };
+                    let byte_len = if matches!(other, DType::F16 | DType::BF16) {
+                        c_len * 2
+                    } else {
+                        blk_bytes
+                    };
+                    for r in 0..rows {
+                        let src_b =
+                            &w_bytes[r * row_bytes + byte_c0..r * row_bytes + byte_c0 + byte_len];
+                        dequantize_row_bytes(other, src_b, &mut w_buf[..c_len]);
+                        let w_slice = &w_buf[..c_len];
+                        for t in 0..n_tok {
+                            let scale = dy[t * rows + r];
+                            // SAFETY: Disjoint `[c0 .. c0 + c_len)` per worker `ct`.
+                            let dst = unsafe {
+                                core::slice::from_raw_parts_mut(
+                                    (dx_ptr as *mut f32).add(t * cols + c0),
+                                    c_len,
+                                )
+                            };
+                            (kt.axpy_f32)(dst, scale, w_slice);
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// Exact analytical backward pass for `rms_norm`:
+/// `y_i = x_i * rsqrt(mean(x^2) + eps) * weight_i`.
+/// Accumulates into `dweight` when `Some`.
+pub fn rms_norm_bwd_f32(
+    dx: &mut [f32],
+    mut dweight: Option<&mut [f32]>,
+    x: &[f32],
+    weight: &[f32],
+    dy: &[f32],
+    eps: f32,
+) {
+    let n = x.len();
+    assert_eq!(dx.len(), n);
+    assert_eq!(weight.len(), n);
+    assert_eq!(dy.len(), n);
+    if n == 0 {
+        return;
+    }
+
+    let mut ss = 0.0f64;
+    for &xi in x {
+        let xf = xi as f64;
+        ss += xf * xf;
+    }
+    let inv_rms = 1.0f64 / (ss / (n as f64) + (eps as f64)).sqrt();
+
+    if let Some(ref mut dw) = dweight {
+        assert_eq!(dw.len(), n);
+        for i in 0..n {
+            dw[i] += ((dy[i] as f64) * (x[i] as f64) * inv_rms) as f32;
+        }
+    }
+
+    let mut dot_gx = 0.0f64;
+    for i in 0..n {
+        let gi = (dy[i] as f64) * (weight[i] as f64);
+        dot_gx += gi * (x[i] as f64);
+    }
+    let coeff = (inv_rms * inv_rms) * dot_gx / (n as f64);
+    for i in 0..n {
+        let gi = (dy[i] as f64) * (weight[i] as f64);
+        dx[i] = (inv_rms * (gi - (x[i] as f64) * coeff)) as f32;
+    }
+}
+
+/// Exact analytical backward pass (orthogonal transpose `R(-theta)`) for `rope_inplace_tables`.
+pub fn rope_bwd_inplace_tables(
+    vec: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    cos: &[f32],
+    sin: &[f32],
+    rope_type: RopeType,
+) {
+    debug_assert_eq!(vec.len(), n_heads * head_dim);
+    let half = rope_dim / 2;
+    debug_assert_eq!(cos.len(), half);
+    debug_assert_eq!(sin.len(), half);
+
+    for h in 0..n_heads {
+        let head = &mut vec[h * head_dim..(h + 1) * head_dim];
+        match rope_type {
+            RopeType::Norm => {
+                for i in 0..half {
+                    let c = cos[i];
+                    let s = sin[i];
+                    let dy0 = head[2 * i];
+                    let dy1 = head[2 * i + 1];
+                    head[2 * i] = dy0 * c + dy1 * s;
+                    head[2 * i + 1] = -dy0 * s + dy1 * c;
+                }
+            }
+            RopeType::Neox => {
+                for i in 0..half {
+                    let c = cos[i];
+                    let s = sin[i];
+                    let dy0 = head[i];
+                    let dy1 = head[i + half];
+                    head[i] = dy0 * c + dy1 * s;
+                    head[i + half] = -dy0 * s + dy1 * c;
+                }
+            }
+        }
+    }
+}
+
+/// Exact analytical backward pass for `swiglu` (`out = silu(gate) * up`).
+pub fn swiglu_bwd_f32(
+    d_gate: &mut [f32],
+    d_up: &mut [f32],
+    gate: &[f32],
+    up: &[f32],
+    d_out: &[f32],
+) {
+    let n = d_out.len();
+    assert_eq!(d_gate.len(), n);
+    assert_eq!(d_up.len(), n);
+    assert_eq!(gate.len(), n);
+    assert_eq!(up.len(), n);
+
+    for i in 0..n {
+        let g = gate[i] as f64;
+        let u = up[i] as f64;
+        let dy = d_out[i] as f64;
+        let sig = 1.0 / (1.0 + (-g).exp());
+        let silu = g * sig;
+        let dsilu = sig * (1.0 + g * (1.0 - sig));
+        d_up[i] = (dy * silu) as f32;
+        d_gate[i] = (dy * u * dsilu) as f32;
+    }
+}
+
+/// Causal GQA attention backward pass over an `F16` KV sequence (`k_f16`, `v_f16` of length `n_tok * kv_dim`),
+/// matching `gqa_attention_f16_kv_batch_parallel` forward with straight-through estimator (STE) on `F16` K/V.
+///
+/// Deterministic accumulation order (`t = 0..n_tok, h = 0..n_heads`) guarantees reproducible `dk`/`dv`.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_f16_kv_bwd_f32(
+    kt: &KernelTable,
+    dq: &mut [f32],
+    dk: &mut [f32],
+    dv: &mut [f32],
+    q: &[f32],
+    k_f16: &[u16],
+    v_f16: &[u16],
+    d_out: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    n_tok: usize,
+    window: Option<usize>,
+) {
+    let q_dim = n_heads * head_dim;
+    let kv_dim = n_kv_heads * head_dim;
+    assert_eq!(dq.len(), n_tok * q_dim);
+    assert_eq!(dk.len(), n_tok * kv_dim);
+    assert_eq!(dv.len(), n_tok * kv_dim);
+    assert_eq!(q.len(), n_tok * q_dim);
+    assert_eq!(k_f16.len(), n_tok * kv_dim);
+    assert_eq!(v_f16.len(), n_tok * kv_dim);
+    assert_eq!(d_out.len(), n_tok * q_dim);
+
+    dq.fill(0.0);
+    dk.fill(0.0);
+    dv.fill(0.0);
+    if n_tok == 0 {
+        return;
+    }
+
+    let group = n_heads / n_kv_heads;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let mut probs = vec![0.0f32; n_tok];
+    let mut dp = vec![0.0f32; n_tok];
+
+    for t in 0..n_tok {
+        let end_pos = t + 1;
+        let start_kv = match window {
+            Some(w) if w > 0 => end_pos.saturating_sub(w),
+            _ => 0,
+        };
+        let win_len = end_pos - start_kv;
+        let p = &mut probs[..win_len];
+        let d_prob = &mut dp[..win_len];
+
+        for h in 0..n_heads {
+            let kv_h = h / group;
+            let qh = &q[t * q_dim + h * head_dim..t * q_dim + (h + 1) * head_dim];
+            let doh = &d_out[t * q_dim + h * head_dim..t * q_dim + (h + 1) * head_dim];
+
+            for (w_idx, step) in (start_kv..end_pos).enumerate() {
+                let k_off = step * kv_dim + kv_h * head_dim;
+                p[w_idx] = (kt.dot_f32_f16)(qh, &k_f16[k_off..k_off + head_dim]) * scale;
+            }
+            softmax_inplace(p);
+
+            let mut sum_p_dp = 0.0f64;
+            for (w_idx, step) in (start_kv..end_pos).enumerate() {
+                let pw = p[w_idx];
+                let v_off = step * kv_dim + kv_h * head_dim;
+                let dvh = &mut dv[v_off..v_off + head_dim];
+                let vh_f16 = &v_f16[v_off..v_off + head_dim];
+
+                let mut dot_dov = 0.0f64;
+                for d in 0..head_dim {
+                    dvh[d] = doh[d].mul_add(pw, dvh[d]);
+                    dot_dov += (doh[d] as f64) * (f16_to_f32(vh_f16[d]) as f64);
+                }
+                d_prob[w_idx] = dot_dov as f32;
+                sum_p_dp += (pw as f64) * dot_dov;
+            }
+
+            let dqh = &mut dq[t * q_dim + h * head_dim..t * q_dim + (h + 1) * head_dim];
+            for (w_idx, step) in (start_kv..end_pos).enumerate() {
+                let ds = ((p[w_idx] as f64) * ((d_prob[w_idx] as f64) - sum_p_dp) * (scale as f64))
+                    as f32;
+                if ds == 0.0 {
+                    continue;
+                }
+                let k_off = step * kv_dim + kv_h * head_dim;
+                let kh_f16 = &k_f16[k_off..k_off + head_dim];
+                (kt.axpy_f32_f16)(dqh, ds, kh_f16);
+                let dkh = &mut dk[k_off..k_off + head_dim];
+                (kt.axpy_f32)(dkh, ds, qh);
+            }
+        }
+    }
 }

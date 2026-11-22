@@ -1,0 +1,18 @@
+[package]
+name = "tm-train"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Parameter-efficient QLoRA and MTP draft-head fine-tuning on frozen quantized GGUF models"
+
+[dependencies]
+thiserror = "2"
+tm-core = { path = "../tm-core" }
+tm-cpu = { path = "../tm-cpu" }
+tm-gguf = { path = "../tm-gguf" }
+tm-lora = { path = "../tm-lora" }
+tm-models = { path = "../tm-models" }
+tm-runtime = { path = "../tm-runtime" }
+tm-tokenizer = { path = "../tm-tokenizer" }

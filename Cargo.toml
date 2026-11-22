@@ -7,8 +7,10 @@ members = [
     "crates/tm-metal",
     "crates/tm-vulkan",
     "crates/tm-tokenizer",
+    "crates/tm-lora",
     "crates/tm-models",
     "crates/tm-runtime",
+    "crates/tm-train",
     "crates/tm-cli",
 ]
 

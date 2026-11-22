@@ -183,10 +183,12 @@ dependencies = [
  "tm-core",
  "tm-cpu",
  "tm-gguf",
+ "tm-lora",
  "tm-metal",
  "tm-models",
  "tm-runtime",
  "tm-tokenizer",
+ "tm-train",
  "tm-vulkan",
 ]
 
@@ -211,6 +213,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tm-lora"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "tm-core",
+ "tm-cpu",
+ "tm-gguf",
+]
+
+[[package]]
 name = "tm-metal"
 version = "0.1.0"
 dependencies = [
@@ -230,6 +242,7 @@ dependencies = [
  "tm-core",
  "tm-cpu",
  "tm-gguf",
+ "tm-lora",
 ]
 
 [[package]]
@@ -240,6 +253,7 @@ dependencies = [
  "tm-core",
  "tm-cpu",
  "tm-gguf",
+ "tm-lora",
  "tm-models",
  "tm-tokenizer",
 ]
@@ -250,6 +264,20 @@ version = "0.1.0"
 dependencies = [
  "thiserror",
  "tm-gguf",
+]
+
+[[package]]
+name = "tm-train"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "tm-core",
+ "tm-cpu",
+ "tm-gguf",
+ "tm-lora",
+ "tm-models",
+ "tm-runtime",
+ "tm-tokenizer",
 ]
 
 [[package]]

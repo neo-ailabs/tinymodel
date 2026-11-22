@@ -1,0 +1,14 @@
+[package]
+name = "tm-lora"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "GGUF LoRA adapter loading, multi-adapter scaling, dynamic side-branch execution, and offline merging"
+
+[dependencies]
+thiserror = "2"
+tm-core = { path = "../tm-core" }
+tm-cpu = { path = "../tm-cpu", default-features = false }
+tm-gguf = { path = "../tm-gguf" }
