@@ -36,7 +36,7 @@ fn print_usage() {
   tinymodel profile -m <model.gguf> [-n <tokens>] [-t <threads>] [-c <ctx>] [--lora <adapter.gguf>[:scale]] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]
   tinymodel logits -m <model.gguf> -o <out.bin> [-p <prompt> | --tokens 1,2,3] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--lora <adapter.gguf>[:scale]] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]
   tinymodel train-mtp -m <base.gguf> --data <path> -o <mtp.gguf> [--steps <N>] [--seq-len <T>] [--lr <LR>] [--quant f16|q8_0|q4_0|f32] [-t <threads>] [--max-temp-c <C>] [--json]
-  tinymodel finetune -m <base.gguf> --data <path> -o <adapter.gguf> [--rank <R>] [--alpha <A>] [--targets q,k,v,o,gate,up,down] [--steps <N>] [--seq-len <T>] [--grad-accum <M>] [--lr <LR>] [--lora-plus-ratio <K>] [--save-every <S>] [--ckpt <ckpt.gguf>] [--resume <ckpt.gguf>] [--f16] [-t <threads>] [--max-temp-c <C>] [--json]"
+  tinymodel finetune -m <base.gguf> --data <path> -o <adapter.gguf> [--rank <R>] [--alpha <A>] [--targets q,k,v,o,gate,up,down] [--steps <N>] [--seq-len <T>] [--grad-accum <M>] [--lr <LR>] [--lora-plus-ratio <K>] [--save-every <S>] [--ckpt <ckpt.gguf>] [--resume <ckpt.gguf>] [--f16] [--vulkan | --metal | --gpu <vulkan|metal|cpu>] [--gpu-min-macs <N>] [-t <threads>] [--max-temp-c <C>] [--json]"
     );
 }
 
@@ -632,9 +632,13 @@ fn cmd_run_metal(opts: RunOpts) -> Result<()> {
         opts.sampler.temperature <= 0.0 && (opts.sampler.repeat_penalty - 1.0).abs() < 1e-6;
 
     let mut runner = tm_metal::MetalRunner::from_gguf(gguf, opts.max_ctx)?;
+    if !opts.lora_specs.is_empty() {
+        let loras = load_lora_set(&opts.lora_specs)?;
+        runner.bind_lora(&loras)?;
+    }
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
     eprintln!(
-        "[tinymodel] arch={} backend=metal ({}) weights={} load={:.1}ms prompt_tokens={} vocab={} layers={}",
+        "[tinymodel] arch={} backend=metal ({}) weights={} loras={} load={:.1}ms prompt_tokens={} vocab={} layers={}",
         runner.arch(),
         runner.device_name(),
         if runner.is_zero_copy_weights() {
@@ -642,6 +646,7 @@ fn cmd_run_metal(opts: RunOpts) -> Result<()> {
         } else {
             "copied"
         },
+        opts.lora_specs.len(),
         load_ms,
         prompt_ids.len(),
         runner.vocab_size(),
@@ -846,6 +851,10 @@ fn cmd_bench_metal(opts: RunOpts) -> Result<()> {
         .to_string();
 
     let mut runner = tm_metal::MetalRunner::from_gguf(gguf, opts.max_ctx)?;
+    if !opts.lora_specs.is_empty() {
+        let loras = load_lora_set(&opts.lora_specs)?;
+        runner.bind_lora(&loras)?;
+    }
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
     let _ = runner.forward_token_greedy(1, 0)?;
@@ -1066,14 +1075,24 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
     let is_pure_greedy =
         opts.sampler.temperature <= 0.0 && (opts.sampler.repeat_penalty - 1.0).abs() < 1e-6;
 
+    let loras = if !opts.lora_specs.is_empty() {
+        Some(load_lora_set(&opts.lora_specs)?)
+    } else {
+        None
+    };
+
     if arch == "qwen35" {
         let mut runner = tm_vulkan::Qwen35VkRunner::from_gguf(gguf, opts.max_ctx)?;
+        if let Some(ref ls) = loras {
+            runner.bind_lora(ls)?;
+        }
         let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
         eprintln!(
-            "[tinymodel] arch=qwen35 backend=vulkan ({} · {} · {}) load={:.1}ms prompt_tokens={} vocab={} layers={} (gdn={}, full={})",
+            "[tinymodel] arch=qwen35 backend=vulkan ({} · {} · {}) loras={} load={:.1}ms prompt_tokens={} vocab={} layers={} (gdn={}, full={})",
             runner.device_name(),
             runner.driver_info(),
             runner.weights_mode(),
+            opts.lora_specs.len(),
             load_ms,
             prompt_ids.len(),
             runner.cfg.vocab_size,
@@ -1135,13 +1154,17 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
     }
 
     let mut runner = tm_vulkan::LlamaVkRunner::from_gguf(gguf, opts.max_ctx)?;
+    if let Some(ref ls) = loras {
+        runner.bind_lora(ls)?;
+    }
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
     eprintln!(
-        "[tinymodel] arch={} backend=vulkan ({} · {} · {}) load={:.1}ms prompt_tokens={} vocab={} layers={}",
+        "[tinymodel] arch={} backend=vulkan ({} · {} · {}) loras={} load={:.1}ms prompt_tokens={} vocab={} layers={}",
         runner.cfg.arch,
         runner.device_name(),
         runner.driver_info(),
         runner.weights_mode(),
+        opts.lora_specs.len(),
         load_ms,
         prompt_ids.len(),
         runner.cfg.vocab_size,
@@ -1218,8 +1241,17 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
         .unwrap_or("?")
         .to_string();
 
+    let loras = if !opts.lora_specs.is_empty() {
+        Some(load_lora_set(&opts.lora_specs)?)
+    } else {
+        None
+    };
+
     if arch == "qwen35" {
         let mut runner = tm_vulkan::Qwen35VkRunner::from_gguf(gguf, opts.max_ctx)?;
+        if let Some(ref ls) = loras {
+            runner.bind_lora(ls)?;
+        }
         let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
         let _ = runner.forward_token_greedy(1, 0)?;
@@ -1300,6 +1332,9 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
     }
 
     let mut runner = tm_vulkan::LlamaVkRunner::from_gguf(gguf, opts.max_ctx)?;
+    if let Some(ref ls) = loras {
+        runner.bind_lora(ls)?;
+    }
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
     // Warm up both decode and batched prefill pipelines (>= 2 passes and >= 350 ms, matching
@@ -1388,9 +1423,17 @@ fn cmd_profile_vulkan(opts: RunOpts) -> Result<()> {
         .to_string();
     let gguf = std::sync::Arc::new(GgufFile::open(&opts.model)?);
     let arch = gguf.req_str("general.architecture")?.to_string();
+    let loras = if !opts.lora_specs.is_empty() {
+        Some(load_lora_set(&opts.lora_specs)?)
+    } else {
+        None
+    };
     let n_runs = opts.n_predict.max(16);
     if arch == "qwen35" {
         let mut runner = tm_vulkan::Qwen35VkRunner::from_gguf(gguf, opts.max_ctx)?;
+        if let Some(ref ls) = loras {
+            runner.bind_lora(ls)?;
+        }
         let dev = runner.device_name().to_string();
         let drv = runner.driver_info().to_string();
         let rep = runner.profile(n_runs, 512)?;
@@ -1398,6 +1441,9 @@ fn cmd_profile_vulkan(opts: RunOpts) -> Result<()> {
         return Ok(());
     }
     let mut runner = tm_vulkan::LlamaVkRunner::from_gguf(gguf, opts.max_ctx)?;
+    if let Some(ref ls) = loras {
+        runner.bind_lora(ls)?;
+    }
     let dev = runner.device_name().to_string();
     let drv = runner.driver_info().to_string();
     let rep = runner.profile(n_runs, 512)?;
@@ -1405,17 +1451,7 @@ fn cmd_profile_vulkan(opts: RunOpts) -> Result<()> {
     Ok(())
 }
 
-fn ensure_no_gpu_dynamic_lora(opts: &RunOpts) -> Result<()> {
-    if !opts.lora_specs.is_empty() && (opts.use_metal || opts.use_vulkan) {
-        bail!(
-            "GPU dynamic --lora is scheduled for Phase T4; merge offline first via:\n  tinymodel lora-merge -m <base.gguf> --lora <adapter.gguf> -o <merged.gguf>"
-        );
-    }
-    Ok(())
-}
-
 fn cmd_run(opts: RunOpts) -> Result<()> {
-    ensure_no_gpu_dynamic_lora(&opts)?;
     if opts.use_metal {
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         return cmd_run_metal(opts);
@@ -1571,7 +1607,6 @@ fn cmd_run(opts: RunOpts) -> Result<()> {
 }
 
 fn cmd_bench(opts: RunOpts) -> Result<()> {
-    ensure_no_gpu_dynamic_lora(&opts)?;
     if opts.use_vulkan {
         #[cfg(feature = "vulkan")]
         return cmd_bench_vulkan(opts);
@@ -1758,6 +1793,10 @@ fn cmd_profile_metal(opts: RunOpts) -> Result<()> {
     let gguf = std::sync::Arc::new(GgufFile::open(&opts.model)?);
     let n_runs = opts.n_predict.max(16);
     let mut runner = tm_metal::MetalRunner::from_gguf(gguf, opts.max_ctx)?;
+    if !opts.lora_specs.is_empty() {
+        let loras = load_lora_set(&opts.lora_specs)?;
+        runner.bind_lora(&loras)?;
+    }
     let dev = runner.device_name();
     let rep = runner.profile(n_runs, 512)?;
     print_metal_profile_report(&model_name, &dev, &rep);
@@ -2002,7 +2041,6 @@ fn write_f32_le(w: &mut BufWriter<File>, slice: &[f32]) -> Result<()> {
 /// Evaluates a multi-token sequence and writes full `[n_steps, vocab_size]` FP32 logits
 /// in `TMLG` v1 binary format for `tools/logits_diff.py` (`AGENTS.md` Rule #7).
 fn cmd_logits(opts: RunOpts) -> Result<()> {
-    ensure_no_gpu_dynamic_lora(&opts)?;
     let out_path = opts
         .out_path
         .clone()
@@ -2012,6 +2050,11 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
     let tok = Tokenizer::from_gguf(&gguf)?;
     let input_ids = resolve_prompt_ids(&opts, &tok)?;
     let n_steps = input_ids.len();
+    let loras = if !opts.lora_specs.is_empty() {
+        Some(load_lora_set(&opts.lora_specs)?)
+    } else {
+        None
+    };
 
     let file = File::create(&out_path)
         .with_context(|| format!("failed to create '{}'", out_path.display()))?;
@@ -2022,6 +2065,9 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
         {
             if arch == "qwen35" {
                 let mut runner = tm_vulkan::Qwen35VkRunner::from_gguf(gguf, opts.max_ctx)?;
+                if let Some(ref ls) = loras {
+                    runner.bind_lora(ls)?;
+                }
                 let vocab = runner.cfg.vocab_size as u32;
                 writer.write_all(b"TMLG")?;
                 writer.write_all(&1u32.to_le_bytes())?;
@@ -2036,14 +2082,18 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
                 }
                 writer.flush()?;
                 eprintln!(
-                    "[tinymodel logits] wrote {} steps x {} vocab (vulkan qwen35) -> {}",
+                    "[tinymodel logits] wrote {} steps x {} vocab (vulkan qwen35, loras={}) -> {}",
                     n_steps,
                     vocab,
+                    opts.lora_specs.len(),
                     out_path.display()
                 );
                 return Ok(());
             }
             let mut runner = tm_vulkan::LlamaVkRunner::from_gguf(gguf, opts.max_ctx)?;
+            if let Some(ref ls) = loras {
+                runner.bind_lora(ls)?;
+            }
             let vocab = runner.cfg.vocab_size as u32;
             writer.write_all(b"TMLG")?;
             writer.write_all(&1u32.to_le_bytes())?;
@@ -2058,10 +2108,11 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
             }
             writer.flush()?;
             eprintln!(
-                "[tinymodel logits] wrote {} steps x {} vocab (vulkan {}) -> {}",
+                "[tinymodel logits] wrote {} steps x {} vocab (vulkan {}, loras={}) -> {}",
                 n_steps,
                 vocab,
                 arch,
+                opts.lora_specs.len(),
                 out_path.display()
             );
             return Ok(());
@@ -2074,6 +2125,9 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         {
             let mut runner = tm_metal::MetalRunner::from_gguf(gguf, opts.max_ctx)?;
+            if let Some(ref ls) = loras {
+                runner.bind_lora(ls)?;
+            }
             let vocab = runner.vocab_size() as u32;
             writer.write_all(b"TMLG")?;
             writer.write_all(&1u32.to_le_bytes())?;
@@ -2088,10 +2142,11 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
             }
             writer.flush()?;
             eprintln!(
-                "[tinymodel logits] wrote {} steps x {} vocab (metal {}) -> {}",
+                "[tinymodel logits] wrote {} steps x {} vocab (metal {}, loras={}) -> {}",
                 n_steps,
                 vocab,
                 arch,
+                opts.lora_specs.len(),
                 out_path.display()
             );
             return Ok(());
@@ -2103,9 +2158,8 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
     let pool = ThreadPool::new(opts.threads);
     let kt = active_kernels();
     let mut model = CpuModel::from_gguf(&gguf)?;
-    if !opts.lora_specs.is_empty() {
-        let loras = load_lora_set(&opts.lora_specs)?;
-        model.bind_lora(&gguf, &loras)?;
+    if let Some(ref ls) = loras {
+        model.bind_lora(&gguf, ls)?;
     }
     check_linux_dirty_budget(
         model.estimate_dirty_bytes_with_kv(opts.max_ctx, opts.kv_type),
@@ -2337,6 +2391,102 @@ fn cmd_train_mtp(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(all(feature = "train", feature = "metal", target_vendor = "apple"))]
+struct CliMetalAccel {
+    inner: tm_metal::MetalGpuAccel,
+    dev_name: String,
+}
+
+#[cfg(all(feature = "train", feature = "metal", target_vendor = "apple"))]
+impl tm_train::LinearAccel for CliMetalAccel {
+    fn backend_name(&self) -> &str {
+        "metal"
+    }
+
+    fn device_name(&self) -> &str {
+        &self.dev_name
+    }
+
+    fn matmul_fwd(
+        &mut self,
+        name: &str,
+        _dtype: DType,
+        _w_bytes: &[u8],
+        x: &[f32],
+        out: &mut [f32],
+        rows: usize,
+        cols: usize,
+        n_tok: usize,
+    ) -> Result<bool, String> {
+        Ok(self.inner.matmul_fwd(name, rows, cols, x, out, n_tok))
+    }
+
+    fn matmul_bwd_transposed(
+        &mut self,
+        name: &str,
+        _dtype: DType,
+        _w_bytes: &[u8],
+        dy: &[f32],
+        dx: &mut [f32],
+        rows: usize,
+        cols: usize,
+        n_tok: usize,
+        accum: bool,
+    ) -> Result<bool, String> {
+        Ok(self
+            .inner
+            .matmul_bwd_transposed(name, rows, cols, dy, dx, n_tok, accum))
+    }
+}
+
+#[cfg(all(feature = "train", feature = "vulkan"))]
+struct CliVulkanAccel {
+    inner: tm_vulkan::VulkanGpuAccel,
+    dev_name: String,
+}
+
+#[cfg(all(feature = "train", feature = "vulkan"))]
+impl tm_train::LinearAccel for CliVulkanAccel {
+    fn backend_name(&self) -> &str {
+        "vulkan"
+    }
+
+    fn device_name(&self) -> &str {
+        &self.dev_name
+    }
+
+    fn matmul_fwd(
+        &mut self,
+        name: &str,
+        _dtype: DType,
+        _w_bytes: &[u8],
+        x: &[f32],
+        out: &mut [f32],
+        rows: usize,
+        cols: usize,
+        n_tok: usize,
+    ) -> Result<bool, String> {
+        Ok(self.inner.matmul_fwd(name, rows, cols, x, out, n_tok))
+    }
+
+    fn matmul_bwd_transposed(
+        &mut self,
+        name: &str,
+        _dtype: DType,
+        _w_bytes: &[u8],
+        dy: &[f32],
+        dx: &mut [f32],
+        rows: usize,
+        cols: usize,
+        n_tok: usize,
+        accum: bool,
+    ) -> Result<bool, String> {
+        Ok(self
+            .inner
+            .matmul_bwd_transposed(name, rows, cols, dy, dx, n_tok, accum))
+    }
+}
+
 #[cfg(feature = "train")]
 fn cmd_finetune(args: &[String]) -> Result<()> {
     let mut model_path: Option<PathBuf> = None;
@@ -2348,6 +2498,9 @@ fn cmd_finetune(args: &[String]) -> Result<()> {
     let mut log_every = 5usize;
     let mut cfg = tm_train::QloraConfig::default();
     let mut alpha_explicit = false;
+    let mut use_metal = false;
+    let mut use_vulkan = false;
+    let mut gpu_min_macs: Option<usize> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -2507,12 +2660,51 @@ fn cmd_finetune(args: &[String]) -> Result<()> {
                         .context("invalid --max-temp-c")?,
                 );
             }
+            "--metal" => {
+                use_metal = true;
+                use_vulkan = false;
+            }
+            "--vulkan" => {
+                use_vulkan = true;
+                use_metal = false;
+            }
+            "--gpu" => {
+                i += 1;
+                let bk = args.get(i).context("missing value for --gpu")?;
+                match bk.as_str() {
+                    "vulkan" | "vk" => {
+                        use_vulkan = true;
+                        use_metal = false;
+                    }
+                    "metal" | "mtl" => {
+                        use_metal = true;
+                        use_vulkan = false;
+                    }
+                    "cpu" | "none" => {
+                        use_vulkan = false;
+                        use_metal = false;
+                    }
+                    other => bail!("unknown --gpu backend '{other}' (expected vulkan, metal, cpu)"),
+                }
+            }
+            "--gpu-min-macs" => {
+                i += 1;
+                gpu_min_macs = Some(
+                    args.get(i)
+                        .context("missing --gpu-min-macs")?
+                        .parse()
+                        .context("invalid --gpu-min-macs")?,
+                );
+            }
             "--json" => json = true,
             other => bail!("unknown finetune argument: {other}"),
         }
         i += 1;
     }
 
+    if use_metal && use_vulkan {
+        bail!("cannot specify both --metal and --vulkan");
+    }
     if !alpha_explicit {
         cfg.alpha = (2 * cfg.rank) as f32;
     }
@@ -2522,25 +2714,72 @@ fn cmd_finetune(args: &[String]) -> Result<()> {
     let op = out_path.context("finetune requires -o <adapter.gguf>")?;
 
     let tel_before = probe::collect_telemetry();
-    let gguf = GgufFile::open(&mp)?;
+    let gguf = std::sync::Arc::new(GgufFile::open(&mp)?);
     let arch = gguf.req_str("general.architecture")?.to_string();
-    if arch != "llama" && arch != "qwen3" {
-        bail!(
-            "finetune Phase T2b supports 'llama' and 'qwen3' GGUF models (got '{arch}'); use 'train-mtp' or Phase T3 for hybrid architectures"
-        );
-    }
     let tok = Tokenizer::from_gguf(&gguf).ok();
     // Load up to `seq_len + 1` tokens per sample (`seq_len` input tokens + 1 shifted label)
     let ds = tm_train::TrainDataset::load(&dp, tok.as_ref(), cfg.seq_len + 1)?;
-    let model = LlamaModel::from_gguf(&gguf)?;
+    let model = CpuModel::from_gguf(&gguf)?;
     let pool = ThreadPool::new(threads);
     let kt = active_kernels();
 
+    let mut accel: Option<Box<dyn tm_train::LinearAccel>> = None;
+    if use_metal {
+        #[cfg(all(feature = "metal", target_vendor = "apple"))]
+        {
+            let mut ma = tm_metal::MetalGpuAccel::from_gguf(gguf.clone(), cfg.seq_len.max(2))?;
+            if let Some(mm) = gpu_min_macs {
+                ma = ma.with_min_macs(mm);
+            }
+            let dev_name = ma.device_name();
+            accel = Some(Box::new(CliMetalAccel {
+                inner: ma,
+                dev_name,
+            }));
+        }
+        #[cfg(not(all(feature = "metal", target_vendor = "apple")))]
+        {
+            let _ = gpu_min_macs;
+            bail!("--metal requires compiling with feature 'metal' on Apple Silicon");
+        }
+    } else if use_vulkan {
+        #[cfg(feature = "vulkan")]
+        {
+            let mut va = tm_vulkan::VulkanGpuAccel::from_gguf(gguf.clone(), cfg.seq_len.max(2))?;
+            if let Some(mm) = gpu_min_macs {
+                va = va.with_min_macs(mm);
+            }
+            let dev_name = va.device_name();
+            accel = Some(Box::new(CliVulkanAccel {
+                inner: va,
+                dev_name,
+            }));
+        }
+        #[cfg(not(feature = "vulkan"))]
+        {
+            let _ = gpu_min_macs;
+            bail!("--vulkan requires compiling with feature 'vulkan'");
+        }
+    } else {
+        let _ = gpu_min_macs;
+    }
+
+    let backend_label = accel
+        .as_ref()
+        .map(|a| a.backend_name().to_string())
+        .unwrap_or_else(|| "cpu".to_string());
+    let device_label = accel
+        .as_ref()
+        .map(|a| a.device_name().to_string())
+        .unwrap_or_else(probe::detect_device_model_name);
+
     if !json {
         eprintln!(
-            "[finetune] model={} arch={} isa={} threads={} rank={} alpha={} steps={} seq_len={} grad_accum={} lr={} lora+={}",
+            "[finetune] model={} arch={} backend={} ({}) isa={} threads={} rank={} alpha={} steps={} seq_len={} grad_accum={} lr={} lora+={}",
             mp.display(),
             arch,
+            backend_label,
+            device_label,
             kt.isa.name(),
             pool.num_threads(),
             cfg.rank,
@@ -2554,24 +2793,31 @@ fn cmd_finetune(args: &[String]) -> Result<()> {
     }
 
     let le = log_every.max(1);
-    let (adapter, rep) = tm_train::run_qlora_training(&model, &pool, &ds, &cfg, |m| {
-        enforce_thermal_guard(max_temp_c);
-        if !json && (m.step == 1 || m.step.is_multiple_of(le) || m.step == cfg.steps) {
-            eprintln!(
-                "  step {:4}/{} | loss={:.4} | grad_norm={:.4} | lr={:.2e} | sup_tok={}/{} | {:.1} ms ({:.1} tok/s)",
-                m.step,
-                cfg.steps,
-                m.loss,
-                m.grad_norm,
-                m.lr,
-                m.supervised_tokens,
-                m.total_tokens,
-                m.step_ms,
-                (m.total_tokens as f64) / (m.step_ms * 1e-3).max(1e-9),
-            );
-        }
-        Ok(())
-    })?;
+    let (adapter, rep) = tm_train::run_cpu_qlora_training(
+        &model,
+        &pool,
+        &ds,
+        &cfg,
+        accel.as_deref_mut(),
+        |m| {
+            enforce_thermal_guard(max_temp_c);
+            if !json && (m.step == 1 || m.step.is_multiple_of(le) || m.step == cfg.steps) {
+                eprintln!(
+                    "  step {:4}/{} | loss={:.4} | grad_norm={:.4} | lr={:.2e} | sup_tok={}/{} | {:.1} ms ({:.1} tok/s)",
+                    m.step,
+                    cfg.steps,
+                    m.loss,
+                    m.grad_norm,
+                    m.lr,
+                    m.supervised_tokens,
+                    m.total_tokens,
+                    m.step_ms,
+                    (m.total_tokens as f64) / (m.step_ms * 1e-3).max(1e-9),
+                );
+            }
+            Ok(())
+        },
+    )?;
 
     let adapter_bytes = adapter.save_gguf(&op, cfg.save_f16_adapter)?;
     let tel_after = probe::collect_telemetry();
@@ -2579,7 +2825,7 @@ fn cmd_finetune(args: &[String]) -> Result<()> {
     let tok_s = (rep.total_tokens as f64) / rep.elapsed_sec.max(1e-9);
     if json {
         println!(
-            "{{\"mode\":\"finetune\",\"model\":\"{}\",\"arch\":\"{}\",\"isa\":\"{}\",\"threads\":{},\
+            "{{\"mode\":\"finetune\",\"model\":\"{}\",\"arch\":\"{}\",\"backend\":\"{}\",\"device_name\":\"{}\",\"isa\":\"{}\",\"threads\":{},\
             \"rank\":{},\"alpha\":{},\"trainable_params\":{},\"steps\":{},\"seq_len\":{},\"grad_accum\":{},\
             \"total_tokens\":{},\"supervised_tokens\":{},\"initial_loss\":{:.5},\"final_loss\":{:.5},\"min_loss\":{:.5},\
             \"elapsed_sec\":{:.3},\"tok_per_sec\":{:.2},\"adapter_bytes\":{},\"est_dirty_bytes\":{},\
@@ -2587,6 +2833,8 @@ fn cmd_finetune(args: &[String]) -> Result<()> {
             \"telemetry_before\":{},\"telemetry_after\":{}}}",
             probe::json_escape(mp.file_name().and_then(|s| s.to_str()).unwrap_or("?")),
             probe::json_escape(&arch),
+            probe::json_escape(&backend_label),
+            probe::json_escape(&device_label),
             probe::json_escape(kt.isa.name()),
             pool.num_threads(),
             cfg.rank,
@@ -2613,10 +2861,11 @@ fn cmd_finetune(args: &[String]) -> Result<()> {
         );
     } else {
         println!(
-            "finetune: saved {} ({:.2} MiB, {} trainable params) | loss {:.4} -> {:.4} (min {:.4}) | {:.1} tok/s ({:.2}s)",
+            "finetune: saved {} ({:.2} MiB, {} trainable params, backend={}) | loss {:.4} -> {:.4} (min {:.4}) | {:.1} tok/s ({:.2}s)",
             op.display(),
             adapter_bytes as f64 / 1048576.0,
             rep.trainable_params,
+            backend_label,
             rep.initial_loss,
             rep.final_loss,
             rep.min_loss,

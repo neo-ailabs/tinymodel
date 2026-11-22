@@ -20,7 +20,7 @@ use tm_cpu::{
 use tm_gguf::{GgufError, GgufFile};
 use tm_lora::{BoundLora, LoraScratch, LoraSet};
 
-use crate::llama::ModelError;
+use crate::llama::{ModelError, RawMatView};
 use crate::state::{LayerState, MAX_SPEC_WINDOW, SpecVerifyBuf, decode_embedding_row};
 
 /// Hyperparameters for `general.architecture == "lfm2"`.
@@ -54,51 +54,43 @@ impl Lfm2Config {
     }
 }
 
-#[derive(Clone, Copy)]
-struct MatView<'a> {
-    name: &'a str,
-    bytes: &'a [u8],
-    dtype: DType,
-    rows: usize,
-    cols: usize,
-    lora_slot: Option<usize>,
-}
+type MatView<'a> = RawMatView<'a>;
 
-enum Lfm2OpWeights<'a> {
+pub enum Lfm2OpWeights<'a> {
     ShortConv {
-        in_proj: MatView<'a>,
+        in_proj: RawMatView<'a>,
         /// Depthwise causal conv weights `[n_embd, l_cache]` (`l_cache` contiguous floats per channel).
         conv: Vec<f32>,
-        out_proj: MatView<'a>,
+        out_proj: RawMatView<'a>,
     },
     Gqa {
         n_head_kv: usize,
         q_norm: Vec<f32>,
         k_norm: Vec<f32>,
-        wq: MatView<'a>,
-        wk: MatView<'a>,
-        wv: MatView<'a>,
-        wo: MatView<'a>,
+        wq: RawMatView<'a>,
+        wk: RawMatView<'a>,
+        wv: RawMatView<'a>,
+        wo: RawMatView<'a>,
     },
 }
 
-struct Lfm2LayerWeights<'a> {
-    attn_norm: Vec<f32>,
-    op: Lfm2OpWeights<'a>,
-    ffn_norm: Vec<f32>,
-    w_gate: MatView<'a>,
-    w_up: MatView<'a>,
-    w_down: MatView<'a>,
+pub struct Lfm2LayerWeights<'a> {
+    pub attn_norm: Vec<f32>,
+    pub op: Lfm2OpWeights<'a>,
+    pub ffn_norm: Vec<f32>,
+    pub w_gate: RawMatView<'a>,
+    pub w_up: RawMatView<'a>,
+    pub w_down: RawMatView<'a>,
 }
 
 /// Loaded LFM2 hybrid model borrowing quantized weight slices zero-copy from `GgufFile`.
 pub struct Lfm2Model<'a> {
     pub cfg: Lfm2Config,
-    token_embd: MatView<'a>,
-    output: MatView<'a>,
-    output_norm: Vec<f32>,
-    rope_inv_freqs: Vec<f64>,
-    layers: Vec<Lfm2LayerWeights<'a>>,
+    pub token_embd: RawMatView<'a>,
+    pub output: RawMatView<'a>,
+    pub output_norm: Vec<f32>,
+    pub rope_inv_freqs: Vec<f64>,
+    pub layers: Vec<Lfm2LayerWeights<'a>>,
     pub lora: BoundLora,
 }
 

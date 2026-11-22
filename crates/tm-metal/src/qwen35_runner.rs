@@ -23,6 +23,7 @@ use tm_gguf::{GgufError, GgufFile};
 
 use crate::MetalError;
 use crate::llama_runner::{MetalProfileReport, MetalStageStat};
+use crate::lora_gpu::MetalLoraEngine;
 
 const LLAMA_OPS_MSL: &str = include_str!("shaders/llama_ops.metal");
 const MAX_BATCH: usize = 128;
@@ -188,6 +189,7 @@ impl Qwen35MetalConfig {
 }
 
 struct GpuMat {
+    name: String,
     buf: MtlBuf,
     offset: usize,
     dtype: DType,
@@ -307,6 +309,7 @@ pub struct Qwen35MetalRunner {
     hb: MtlBuf,
     hb2: MtlBuf,
     logits: MtlBuf,
+    lora: MetalLoraEngine,
     zero_copy_weights: bool,
     // IMPORTANT: Must remain LAST so all zero-copy `MTLBuffer`s drop before `_gguf` unmaps.
     _gguf: Arc<GgufFile>,
@@ -449,6 +452,7 @@ fn load_gpu_mat(
         (upload_bytes(device, bytes)?, 0)
     };
     Ok(GpuMat {
+        name: name.to_string(),
         buf,
         offset,
         dtype: info.dtype,
@@ -592,6 +596,7 @@ impl Qwen35MetalRunner {
             silu_mul: build_pipe(&device, &lib, "silu_mul_f32", 256)?,
             argmax: build_pipe(&device, &lib, "argmax_f32", 256)?,
         };
+        let lora = MetalLoraEngine::new(&device, &lib)?;
 
         let shared_weights = try_zero_copy_gguf_buf(&device, gguf_ref);
         let zero_copy_weights = shared_weights.is_some();
@@ -875,6 +880,7 @@ impl Qwen35MetalRunner {
             hb,
             hb2,
             logits,
+            lora,
             zero_copy_weights,
             _gguf: gguf,
         })
@@ -882,6 +888,11 @@ impl Qwen35MetalRunner {
 
     pub fn device_name(&self) -> String {
         self.device.name().to_string()
+    }
+
+    /// Binds dynamic GGUF LoRA adapters onto this Qwen3.5 Metal runner (`Phase T4`).
+    pub fn bind_lora(&mut self, loras: &tm_lora::LoraSet) -> Result<(), MetalError> {
+        self.lora.bind(&self.device, &self._gguf, loras, MAX_BATCH)
     }
 
     pub const fn is_zero_copy_weights(&self) -> bool {
@@ -938,6 +949,18 @@ impl Qwen35MetalRunner {
         y_buf: &ProtocolObject<dyn MTLBuffer>,
         add_residual: bool,
     ) -> Result<(), MetalError> {
+        self.encode_gemv_named(enc, mat, &mat.name, x_buf, y_buf, add_residual)
+    }
+
+    fn encode_gemv_named(
+        &self,
+        enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        mat: &GpuMat,
+        lora_name: &str,
+        x_buf: &ProtocolObject<dyn MTLBuffer>,
+        y_buf: &ProtocolObject<dyn MTLBuffer>,
+        add_residual: bool,
+    ) -> Result<(), MetalError> {
         let (pipe, rows_per_tg): (&MtlPipe, usize) = match mat.dtype {
             DType::Q4_0 => (&self.pipes.gemv_q4_0, 32),
             DType::Q4_1 => (&self.pipes.gemv_q4_1, 32),
@@ -977,6 +1000,8 @@ impl Qwen35MetalRunner {
                 depth: 1,
             },
         );
+        self.lora
+            .encode_linear(enc, lora_name, x_buf, 0, y_buf, 0, 1);
         Ok(())
     }
 
@@ -1029,6 +1054,8 @@ impl Qwen35MetalRunner {
                 depth: 1,
             },
         );
+        self.lora
+            .encode_linear(enc, &mat.name, x_buf, 0, y_buf, 0, n_tok);
         Ok(())
     }
 
@@ -1535,6 +1562,13 @@ impl Qwen35MetalRunner {
                 depth: 1,
             },
         );
+        self.lora.encode_embed_single(
+            enc,
+            "token_embd.weight",
+            &self.token_ids_buf,
+            token_id,
+            &self.x,
+        );
 
         // 2. Hybrid layers
         for layer in &self.layers {
@@ -1592,6 +1626,10 @@ impl Qwen35MetalRunner {
                                 depth: 1,
                             },
                         );
+                        self.lora
+                            .encode_linear(enc, &wqkv.name, &self.xb, 0, &self.qkv_buf, 0, 1);
+                        self.lora
+                            .encode_linear(enc, &wz.name, &self.xb, 0, &self.gate_buf, 0, 1);
                     } else {
                         self.encode_gemv(enc, wqkv, &self.xb, &self.qkv_buf, false)?;
                         self.encode_gemv(enc, wz, &self.xb, &self.gate_buf, false)?;
@@ -1630,6 +1668,24 @@ impl Qwen35MetalRunner {
                                 height: 1,
                                 depth: 1,
                             },
+                        );
+                        self.lora.encode_linear(
+                            enc,
+                            &w_alpha.name,
+                            &self.xb,
+                            0,
+                            &self.alpha_buf,
+                            0,
+                            1,
+                        );
+                        self.lora.encode_linear(
+                            enc,
+                            &w_beta.name,
+                            &self.xb,
+                            0,
+                            &self.beta_buf,
+                            0,
+                            1,
                         );
                     } else {
                         self.encode_gemv(enc, w_alpha, &self.xb, &self.alpha_buf, false)?;
@@ -1699,6 +1755,12 @@ impl Qwen35MetalRunner {
                                 depth: 1,
                             },
                         );
+                        self.lora
+                            .encode_linear(enc, &wqg.name, &self.xb, 0, &self.qkv_buf, 0, 1);
+                        self.lora
+                            .encode_linear(enc, &wk.name, &self.xb, 0, &self.k_buf, 0, 1);
+                        self.lora
+                            .encode_linear(enc, &wv.name, &self.xb, 0, &self.v_buf, 0, 1);
                     } else {
                         self.encode_gemv(enc, wqg, &self.xb, &self.qkv_buf, false)?;
                         self.encode_gemv(enc, wk, &self.xb, &self.k_buf, false)?;
@@ -1712,7 +1774,11 @@ impl Qwen35MetalRunner {
 
             // Post-attention norm + FFN
             self.encode_rms_norm(enc, &self.x, &layer.post_attn_norm, &self.xb, n_embd, 1);
-            if layer.w_gate.dtype == DType::Q4_0 && layer.w_up.dtype == DType::Q4_0 {
+            if layer.w_gate.dtype == DType::Q4_0
+                && layer.w_up.dtype == DType::Q4_0
+                && !self.lora.has(&layer.w_gate.name)
+                && !self.lora.has(&layer.w_up.name)
+            {
                 let gargs = GemvArgs {
                     n_in: layer.w_gate.cols as u32,
                     n_out: layer.w_gate.rows as u32,
@@ -1777,7 +1843,14 @@ impl Qwen35MetalRunner {
 
         if compute_logits {
             self.encode_rms_norm(enc, &self.x, &self.output_norm, &self.xb, n_embd, 1);
-            self.encode_gemv(enc, self.out_mat(), &self.xb, &self.logits, false)?;
+            self.encode_gemv_named(
+                enc,
+                self.out_mat(),
+                "output.weight",
+                &self.xb,
+                &self.logits,
+                false,
+            )?;
             if compute_argmax {
                 let n_vocab = self.cfg.vocab_size as u32;
                 enc.setComputePipelineState(&self.pipes.argmax);
@@ -1971,6 +2044,13 @@ impl Qwen35MetalRunner {
                     depth: 1,
                 },
             );
+            self.lora.encode_embed_batch(
+                &enc,
+                "token_embd.weight",
+                &self.token_ids_buf,
+                &self.x,
+                b,
+            );
 
             for layer in &self.layers {
                 self.encode_rms_norm(&enc, &self.x, &layer.attn_norm, &self.xb, n_embd, b);
@@ -2088,7 +2168,14 @@ impl Qwen35MetalRunner {
                         depth: 1,
                     },
                 );
-                self.encode_gemv(&enc, self.out_mat(), &self.xb, &self.logits, false)?;
+                self.encode_gemv_named(
+                    &enc,
+                    self.out_mat(),
+                    "output.weight",
+                    &self.xb,
+                    &self.logits,
+                    false,
+                )?;
             }
 
             enc.endEncoding();

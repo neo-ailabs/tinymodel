@@ -1,0 +1,33 @@
+#version 450
+// Phase T4: Dynamic GPU token-embedding LoRA (`x[t, col] += sum_r (scale * A[tok[t], r]) * B_T[r, col]`).
+// Works seamlessly in BOTH pre-recorded decode CBs (`tok` bound to `step_buf`, `t = 0` -> `step_buf[0]`)
+// AND batched prefill CBs (`tok` bound to `token_ids_buf`, `t = 0..n_tok-1`)!
+
+layout(constant_id = 0) const uint WG = 256;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer A   { float a[]; };
+layout(std430, binding = 1) readonly buffer BT  { float bt[]; };
+layout(std430, binding = 2) readonly buffer TOK { uint token_ids[]; };
+layout(std430, binding = 3) buffer X            { float x[]; };
+
+layout(push_constant) uniform PC {
+    uint d_out;
+    uint rank;
+    uint n_tok;
+    float scale;
+} pc;
+
+void main() {
+    const uint col = gl_GlobalInvocationID.x;
+    const uint t = gl_WorkGroupID.y;
+    if (col >= pc.d_out || t >= pc.n_tok) return;
+
+    const uint tok = token_ids[t];
+    const uint a_base = tok * pc.rank;
+    float acc = 0.0;
+    for (uint r = 0u; r < pc.rank; ++r) {
+        acc = fma(pc.scale * a[a_base + r], bt[r * pc.d_out + col], acc);
+    }
+    x[t * pc.d_out + col] += acc;
+}

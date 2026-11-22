@@ -3575,3 +3575,392 @@ kernel void lfm2_shortconv_f32(
         h_ptr[k] = hist[k];
     }
 }
+
+// ============================================================================
+// 11. Phase T4: Hardware-Accelerated Transposed Quantized GEMM (`simdgroup_float8x8`)
+//     Computes backward activation gradient:
+//       dx[n_tok, n_in] = (add_residual ? dx : 0) + dy[n_tok, n_out] * W[n_out, n_in]
+//     Grid: `(ceil(n_in / 32), ceil(n_tok / 32))`, 128 threads (4 simdgroups) per TG.
+// ============================================================================
+
+#define TM_METAL_TRANSPOSED_MMA_BODY(...)                                                          \
+    const uint c0 = tg_id.x * 32;                                                                  \
+    const uint t0 = tg_id.y * 32;                                                                  \
+    if (c0 >= a.n_in || t0 >= a.n_tok) return;                                                     \
+                                                                                                   \
+    threadgroup float DY_tile[32][33];                                                             \
+    threadgroup float W_tile[32][33];                                                              \
+                                                                                                   \
+    simdgroup_float8x8 acc00 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);                    \
+    simdgroup_float8x8 acc01 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);                    \
+    simdgroup_float8x8 acc10 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);                    \
+    simdgroup_float8x8 acc11 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);                    \
+                                                                                                   \
+    const uint sg_m = (sg >> 1) * 16;                                                              \
+    const uint sg_n = (sg & 1) * 16;                                                               \
+    const uint loc_row = tid >> 2;      /* 0..31 */                                                \
+    const uint loc_grp = (tid & 3) * 8; /* 0, 8, 16, 24 */                                         \
+    const uint q_grp   = (tid & 3) * 4; /* 0, 4, 8, 12 */                                          \
+    const bool valid_t = (t0 + loc_row) < a.n_tok;                                                 \
+    device const float* dy_row = valid_t ? (dy + ulong(t0 + loc_row) * ulong(a.n_out)) : dy;       \
+                                                                                                   \
+    for (uint r0 = 0; r0 < a.n_out; r0 += 32) {                                                    \
+        if (valid_t) {                                                                             \
+            for (uint j = 0; j < 8; ++j) {                                                         \
+                const uint r = r0 + loc_grp + j;                                                   \
+                DY_tile[loc_row][loc_grp + j] = (r < a.n_out) ? dy_row[r] : 0.0f;                  \
+            }                                                                                      \
+        } else {                                                                                   \
+            for (uint j = 0; j < 8; ++j) {                                                         \
+                DY_tile[loc_row][loc_grp + j] = 0.0f;                                              \
+            }                                                                                      \
+        }                                                                                          \
+                                                                                                   \
+        const bool valid_r = (r0 + loc_row) < a.n_out;                                             \
+        __VA_ARGS__                                                                                \
+                                                                                                   \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                                           \
+                                                                                                   \
+        for (uint kk = 0; kk < 32; kk += 8) {                                                      \
+            simdgroup_float8x8 a0, a1, b0, b1;                                                     \
+            simdgroup_load(a0, &DY_tile[sg_m][kk], 33);                                            \
+            simdgroup_load(a1, &DY_tile[sg_m + 8][kk], 33);                                        \
+            simdgroup_load(b0, &W_tile[kk][sg_n], 33);                                             \
+            simdgroup_load(b1, &W_tile[kk][sg_n + 8], 33);                                         \
+            simdgroup_multiply_accumulate(acc00, a0, b0, acc00);                                   \
+            simdgroup_multiply_accumulate(acc01, a0, b1, acc01);                                   \
+            simdgroup_multiply_accumulate(acc10, a1, b0, acc10);                                   \
+            simdgroup_multiply_accumulate(acc11, a1, b1, acc11);                                   \
+        }                                                                                          \
+                                                                                                   \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                                           \
+    }                                                                                              \
+                                                                                                   \
+    simdgroup_store(acc00, &DY_tile[sg_m][sg_n], 33);                                              \
+    simdgroup_store(acc01, &DY_tile[sg_m][sg_n + 8], 33);                                          \
+    simdgroup_store(acc10, &DY_tile[sg_m + 8][sg_n], 33);                                          \
+    simdgroup_store(acc11, &DY_tile[sg_m + 8][sg_n + 8], 33);                                      \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                               \
+                                                                                                   \
+    if (valid_t) {                                                                                 \
+        const ulong dx_base = ulong(t0 + loc_row) * ulong(a.n_in) + ulong(c0 + loc_grp);           \
+        for (uint j = 0; j < 8; ++j) {                                                             \
+            if (c0 + loc_grp + j < a.n_in) {                                                       \
+                const float out = DY_tile[loc_row][loc_grp + j];                                   \
+                dx[dx_base + j] = (a.add_residual != 0) ? (dx[dx_base + j] + out) : out;           \
+            }                                                                                      \
+        }                                                                                          \
+    }
+
+kernel void gemm_q4_0_transposed(
+    device const uchar* W [[buffer(0)]],
+    device const float* dy [[buffer(1)]],
+    device float* dx [[buffer(2)]],
+    constant GemmArgs& a [[buffer(3)]],
+    uint2 tg_id [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]]
+) {
+    const uint ib = tg_id.x;
+    TM_METAL_TRANSPOSED_MMA_BODY({
+        (void)q_grp;
+        const uint qb = (tid & 3) * 4;
+        if (valid_r) {
+            device const uchar* b = W + ulong(r0 + loc_row) * ulong(a.row_bytes) + ulong(ib) * 18;
+            const float d = read_f16_u(b);
+            device const uchar* qs = b + 2 + qb;
+            for (uint j = 0; j < 4; ++j) {
+                const uchar byte = qs[j];
+                W_tile[loc_row][qb + j]      = (float(byte & 0x0F) - 8.0f) * d;
+                W_tile[loc_row][16 + qb + j] = (float(byte >> 4)   - 8.0f) * d;
+            }
+        } else {
+            for (uint j = 0; j < 4; ++j) {
+                W_tile[loc_row][qb + j]      = 0.0f;
+                W_tile[loc_row][16 + qb + j] = 0.0f;
+            }
+        }
+    })
+}
+
+kernel void gemm_q4_1_transposed(
+    device const uchar* W [[buffer(0)]],
+    device const float* dy [[buffer(1)]],
+    device float* dx [[buffer(2)]],
+    constant GemmArgs& a [[buffer(3)]],
+    uint2 tg_id [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]]
+) {
+    const uint ib = tg_id.x;
+    TM_METAL_TRANSPOSED_MMA_BODY({
+        (void)q_grp;
+        const uint qb = (tid & 3) * 4;
+        if (valid_r) {
+            device const uchar* b = W + ulong(r0 + loc_row) * ulong(a.row_bytes) + ulong(ib) * 20;
+            const float d = read_f16_u(b);
+            const float m = read_f16_u(b + 2);
+            device const uchar* qs = b + 4 + qb;
+            for (uint j = 0; j < 4; ++j) {
+                const uchar byte = qs[j];
+                W_tile[loc_row][qb + j]      = fma(float(byte & 0x0F), d, m);
+                W_tile[loc_row][16 + qb + j] = fma(float(byte >> 4),   d, m);
+            }
+        } else {
+            for (uint j = 0; j < 4; ++j) {
+                W_tile[loc_row][qb + j]      = 0.0f;
+                W_tile[loc_row][16 + qb + j] = 0.0f;
+            }
+        }
+    })
+}
+
+kernel void gemm_q8_0_transposed(
+    device const uchar* W [[buffer(0)]],
+    device const float* dy [[buffer(1)]],
+    device float* dx [[buffer(2)]],
+    constant GemmArgs& a [[buffer(3)]],
+    uint2 tg_id [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]]
+) {
+    const uint ib = tg_id.x;
+    TM_METAL_TRANSPOSED_MMA_BODY({
+        (void)q_grp;
+        if (valid_r) {
+            device const uchar* b = W + ulong(r0 + loc_row) * ulong(a.row_bytes) + ulong(ib) * 34;
+            const float d = read_f16_u(b);
+            device const char* qs = (device const char*)(b + 2) + loc_grp;
+            for (uint j = 0; j < 8; ++j) {
+                W_tile[loc_row][loc_grp + j] = float(qs[j]) * d;
+            }
+        } else {
+            for (uint j = 0; j < 8; ++j) {
+                W_tile[loc_row][loc_grp + j] = 0.0f;
+            }
+        }
+    })
+}
+
+kernel void gemm_q5_k_transposed(
+    device const uchar* W [[buffer(0)]],
+    device const float* dy [[buffer(1)]],
+    device float* dx [[buffer(2)]],
+    constant GemmArgs& a [[buffer(3)]],
+    uint2 tg_id [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]]
+) {
+    const uint ib = tg_id.x >> 3;
+    const uint sub32 = tg_id.x & 7;
+    const uint chunk = sub32 >> 1;
+    const uint hi = sub32 & 1;
+    TM_METAL_TRANSPOSED_MMA_BODY({
+        (void)q_grp;
+        if (valid_r) {
+            device const uchar* b = W + ulong(r0 + loc_row) * ulong(a.row_bytes) + ulong(ib) * 176;
+            const float d    = read_f16_u(b);
+            const float dmin = read_f16_u(b + 2);
+            uchar sc, m;
+            unpack_q5k_sc_m(b + 4, sub32, sc, m);
+            const float d_sc = d * float(sc);
+            const float dm   = -dmin * float(m);
+            for (uint j = 0; j < 8; ++j) {
+                const uint l = loc_grp + j;
+                const uchar ql_b = b[48 + chunk * 32 + l];
+                const uchar qh_b = b[16 + l];
+                const uint nib = (hi == 0) ? uint(ql_b & 0x0F) : uint(ql_b >> 4);
+                const uint hb  = uint((qh_b >> sub32) & 1);
+                W_tile[loc_row][l] = fma(d_sc, float(nib | (hb << 4)), dm);
+            }
+        } else {
+            for (uint j = 0; j < 8; ++j) {
+                W_tile[loc_row][loc_grp + j] = 0.0f;
+            }
+        }
+    })
+}
+
+kernel void gemm_q6_k_transposed(
+    device const uchar* W [[buffer(0)]],
+    device const float* dy [[buffer(1)]],
+    device float* dx [[buffer(2)]],
+    constant GemmArgs& a [[buffer(3)]],
+    uint2 tg_id [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]]
+) {
+    const uint ib = tg_id.x >> 3;
+    const uint sub32 = tg_id.x & 7;
+    const uint half_idx = sub32 >> 2;
+    const uint qtr = sub32 & 3;
+    const uint qh_shift = 2 * qtr;
+    TM_METAL_TRANSPOSED_MMA_BODY({
+        (void)q_grp;
+        if (valid_r) {
+            device const uchar* b = W + ulong(r0 + loc_row) * ulong(a.row_bytes) + ulong(ib) * 210;
+            const float d = read_f16_u(b + 208);
+            device const uchar* ql = b + half_idx * 64 + (qtr & 1) * 32;
+            device const uchar* qh = b + 128 + half_idx * 32;
+            device const char*  sc = (device const char*)(b + 192 + half_idx * 8);
+            for (uint j = 0; j < 8; ++j) {
+                const uint l = loc_grp + j;
+                const uint is = (l >> 4) + 2 * qtr;
+                const uint nib = (qtr < 2) ? uint(ql[l] & 0x0F) : uint(ql[l] >> 4);
+                const uint qhv = uint((qh[l] >> qh_shift) & 3);
+                W_tile[loc_row][l] = d * float(sc[is]) * float(int(nib | (qhv << 4)) - 32);
+            }
+        } else {
+            for (uint j = 0; j < 8; ++j) {
+                W_tile[loc_row][loc_grp + j] = 0.0f;
+            }
+        }
+    })
+}
+
+kernel void gemm_bf16_transposed(
+    device const uchar* W [[buffer(0)]],
+    device const float* dy [[buffer(1)]],
+    device float* dx [[buffer(2)]],
+    constant GemmArgs& a [[buffer(3)]],
+    uint2 tg_id [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]]
+) {
+    TM_METAL_TRANSPOSED_MMA_BODY({
+        (void)q_grp;
+        if (valid_r) {
+            device const ushort* wr = (device const ushort*)(W + ulong(r0 + loc_row) * ulong(a.row_bytes));
+            for (uint j = 0; j < 8; ++j) {
+                const uint c = c0 + loc_grp + j;
+                W_tile[loc_row][loc_grp + j] = (c < a.n_in) ? bf16_to_f32_msl(wr[c]) : 0.0f;
+            }
+        } else {
+            for (uint j = 0; j < 8; ++j) {
+                W_tile[loc_row][loc_grp + j] = 0.0f;
+            }
+        }
+    })
+}
+
+kernel void gemm_f32_transposed(
+    device const uchar* W [[buffer(0)]],
+    device const float* dy [[buffer(1)]],
+    device float* dx [[buffer(2)]],
+    constant GemmArgs& a [[buffer(3)]],
+    uint2 tg_id [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]]
+) {
+    TM_METAL_TRANSPOSED_MMA_BODY({
+        (void)q_grp;
+        if (valid_r) {
+            device const float* wr = (device const float*)(W + ulong(r0 + loc_row) * ulong(a.row_bytes));
+            for (uint j = 0; j < 8; ++j) {
+                const uint c = c0 + loc_grp + j;
+                W_tile[loc_row][loc_grp + j] = (c < a.n_in) ? wr[c] : 0.0f;
+            }
+        } else {
+            for (uint j = 0; j < 8; ++j) {
+                W_tile[loc_row][loc_grp + j] = 0.0f;
+            }
+        }
+    })
+}
+
+#undef TM_METAL_TRANSPOSED_MMA_BODY
+
+// ============================================================================
+// 12. Phase T4: Dynamic GPU LoRA Side-Branch Kernels (1-CB zero-sync)
+// ============================================================================
+
+struct LoraLinearArgs {
+    uint d_in;
+    uint d_out;
+    uint rank;
+    uint n_tok;
+    float scale;
+};
+
+// `h[t, r] = scale * dot(A[r, 0..d_in], x[t, 0..d_in])`
+// 1 simdgroup (32 lanes) per `(t, r)` pair; 4 simdgroups (128 threads) per TG.
+// Identical per-token reduction order for `n_tok == 1` and `n_tok > 1` (`AGENTS.md` §9).
+kernel void lora_down_f32(
+    device const float* A [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* h [[buffer(2)]],
+    constant LoraLinearArgs& a [[buffer(3)]],
+    uint tg_id [[threadgroup_position_in_grid]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    const uint idx = tg_id * 4 + uint(sg);
+    const uint total = a.n_tok * a.rank;
+    if (idx >= total) return;
+
+    const uint t = idx / a.rank;
+    const uint r = idx % a.rank;
+    device const float* ar = A + ulong(r) * ulong(a.d_in);
+    device const float* xt = x + ulong(t) * ulong(a.d_in);
+
+    float acc = 0.0f;
+    for (uint i = lane; i < a.d_in; i += 32) {
+        acc = fma(ar[i], xt[i], acc);
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) {
+        h[idx] = acc * a.scale;
+    }
+}
+
+// `y[t, col] += sum_{r=0..rank-1} h[t, r] * B_T[r, col]`
+// `B_T` is stored transposed `[rank, d_out]` so adjacent threads `col, col+1` coalesce 100%!
+kernel void lora_up_axpy_f32(
+    device const float* B_T [[buffer(0)]],
+    device const float* h [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant LoraLinearArgs& a [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint col = gid.x;
+    const uint t = gid.y;
+    if (col >= a.d_out || t >= a.n_tok) return;
+
+    device const float* ht = h + ulong(t) * ulong(a.rank);
+    float acc = 0.0f;
+    for (uint r = 0; r < a.rank; ++r) {
+        acc = fma(ht[r], B_T[ulong(r) * ulong(a.d_out) + col], acc);
+    }
+    y[ulong(t) * ulong(a.d_out) + col] += acc;
+}
+
+struct LoraEmbedArgs {
+    uint d_out;
+    uint rank;
+    uint n_tok;
+    uint token_id;
+    uint use_tok_buf;
+    float scale;
+};
+
+// `x[t, col] += sum_{r=0..rank-1} (scale * A[tok_t, r]) * B_T[r, col]`
+kernel void lora_embed_f32(
+    device const float* A [[buffer(0)]],
+    device const float* B_T [[buffer(1)]],
+    device const uint* token_ids [[buffer(2)]],
+    device float* x [[buffer(3)]],
+    constant LoraEmbedArgs& a [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint col = gid.x;
+    const uint t = gid.y;
+    if (col >= a.d_out || t >= a.n_tok) return;
+
+    const uint tok = (a.use_tok_buf != 0) ? token_ids[t] : a.token_id;
+    device const float* ar = A + ulong(tok) * ulong(a.rank);
+    float acc = 0.0f;
+    for (uint r = 0; r < a.rank; ++r) {
+        acc = fma(a.scale * ar[r], B_T[ulong(r) * ulong(a.d_out) + col], acc);
+    }
+    x[ulong(t) * ulong(a.d_out) + col] += acc;
+}

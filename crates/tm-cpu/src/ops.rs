@@ -1046,9 +1046,11 @@ pub fn matvec_triple_f32(
         let wa: &[BlockQ4_0x4] = unsafe {
             core::slice::from_raw_parts(wa_bytes.as_ptr() as *const BlockQ4_0x4, ga * cols_blocks)
         };
+        // SAFETY: Lengths and alignment verified; `BlockQ4_0x4` is `#[repr(C)]` POD.
         let wb: &[BlockQ4_0x4] = unsafe {
             core::slice::from_raw_parts(wb_bytes.as_ptr() as *const BlockQ4_0x4, gb * cols_blocks)
         };
+        // SAFETY: Lengths and alignment verified; `BlockQ4_0x4` is `#[repr(C)]` POD.
         let wc: &[BlockQ4_0x4] = unsafe {
             core::slice::from_raw_parts(wc_bytes.as_ptr() as *const BlockQ4_0x4, gc * cols_blocks)
         };
@@ -1127,9 +1129,11 @@ pub fn matvec_triple_f32(
         let wa: &[BlockQ4_0] = unsafe {
             core::slice::from_raw_parts(wa_bytes.as_ptr() as *const BlockQ4_0, rows_a * cols_blocks)
         };
+        // SAFETY: Lengths and alignment verified; `BlockQ4_0` is `#[repr(C)]` POD.
         let wb: &[BlockQ4_0] = unsafe {
             core::slice::from_raw_parts(wb_bytes.as_ptr() as *const BlockQ4_0, rows_b * cols_blocks)
         };
+        // SAFETY: Lengths and alignment verified; `BlockQ4_0` is `#[repr(C)]` POD.
         let wc: &[BlockQ4_0] = unsafe {
             core::slice::from_raw_parts(wc_bytes.as_ptr() as *const BlockQ4_0, rows_c * cols_blocks)
         };
@@ -2633,12 +2637,14 @@ pub fn matmul_triple_f32(
                     ga * cols_blocks,
                 )
             };
+            // SAFETY: Alignment & bounds checked.
             let wb: &[BlockQ4_0x4] = unsafe {
                 core::slice::from_raw_parts(
                     wb_bytes.as_ptr() as *const BlockQ4_0x4,
                     gb * cols_blocks,
                 )
             };
+            // SAFETY: Alignment & bounds checked.
             let wc: &[BlockQ4_0x4] = unsafe {
                 core::slice::from_raw_parts(
                     wc_bytes.as_ptr() as *const BlockQ4_0x4,
@@ -2717,12 +2723,14 @@ pub fn matmul_triple_f32(
                     rows_a * cols_blocks,
                 )
             };
+            // SAFETY: Alignment & bounds checked.
             let wb: &[BlockQ4_0] = unsafe {
                 core::slice::from_raw_parts(
                     wb_bytes.as_ptr() as *const BlockQ4_0,
                     rows_b * cols_blocks,
                 )
             };
+            // SAFETY: Alignment & bounds checked.
             let wc: &[BlockQ4_0] = unsafe {
                 core::slice::from_raw_parts(
                     wc_bytes.as_ptr() as *const BlockQ4_0,
@@ -3340,6 +3348,89 @@ pub fn rope_bwd_inplace_tables(
     }
 }
 
+/// Exact analytical derivative `d(gelu_tanh(x)) / dx` evaluated in `f64` (`ops.rs:627`).
+#[inline]
+pub fn gelu_tanh_bwd_f32(x: f32) -> f32 {
+    const SQRT_2_OVER_PI: f64 = 0.797_884_6_f32 as f64;
+    const GELU_COEF_A: f64 = 0.044_715_f32 as f64;
+    let xf = x as f64;
+    let x2 = xf * xf;
+    let u = SQRT_2_OVER_PI * xf * (1.0 + GELU_COEF_A * x2);
+    let t = u.tanh();
+    let du = SQRT_2_OVER_PI * (1.0 + 3.0 * GELU_COEF_A * x2);
+    (0.5 * (1.0 + t) + 0.5 * xf * (1.0 - t * t) * du) as f32
+}
+
+/// Exact analytical backward pass for `geglu` (`out = gelu_tanh(gate) * up`).
+pub fn geglu_bwd_f32(
+    d_gate: &mut [f32],
+    d_up: &mut [f32],
+    gate: &[f32],
+    up: &[f32],
+    d_out: &[f32],
+) {
+    let n = d_out.len();
+    assert_eq!(d_gate.len(), n);
+    assert_eq!(d_up.len(), n);
+    assert_eq!(gate.len(), n);
+    assert_eq!(up.len(), n);
+
+    for i in 0..n {
+        let g = gate[i];
+        let dy = d_out[i] as f64;
+        let gelu_g = gelu_tanh_f32(g) as f64;
+        let dgelu_g = gelu_tanh_bwd_f32(g) as f64;
+        d_up[i] = (dy * gelu_g) as f32;
+        d_gate[i] = (dy * (up[i] as f64) * dgelu_g) as f32;
+    }
+}
+
+/// Exact analytical backward pass for per-head `L2` normalization (`y = x / sqrt(sum(x^2) + eps)`).
+pub fn l2_norm_bwd_f32(dx: &mut [f32], x: &[f32], dy: &[f32], eps: f32) {
+    let n = x.len();
+    assert_eq!(dx.len(), n);
+    assert_eq!(dy.len(), n);
+    if n == 0 {
+        return;
+    }
+    let mut ss = 0.0f64;
+    let mut dot = 0.0f64;
+    for i in 0..n {
+        let xi = x[i] as f64;
+        ss += xi * xi;
+        dot += (dy[i] as f64) * xi;
+    }
+    let inv_norm2 = 1.0 / (ss + (eps as f64));
+    let inv_norm = inv_norm2.sqrt();
+    let coeff = inv_norm2 * dot;
+    for i in 0..n {
+        dx[i] = (inv_norm * ((dy[i] as f64) - (x[i] as f64) * coeff)) as f32;
+    }
+}
+
+/// Exact analytical backward pass for unit-weight RMS normalization (`y = x / sqrt(mean(x^2) + eps)`).
+pub fn rms_norm_unit_bwd_f32(dx: &mut [f32], x: &[f32], dy: &[f32], eps: f32) {
+    let n = x.len();
+    assert_eq!(dx.len(), n);
+    assert_eq!(dy.len(), n);
+    if n == 0 {
+        return;
+    }
+    let mut ss = 0.0f64;
+    let mut dot = 0.0f64;
+    for i in 0..n {
+        let xi = x[i] as f64;
+        ss += xi * xi;
+        dot += (dy[i] as f64) * xi;
+    }
+    let inv_rms2 = 1.0 / (ss / (n as f64) + (eps as f64));
+    let inv_rms = inv_rms2.sqrt();
+    let coeff = inv_rms2 * dot / (n as f64);
+    for i in 0..n {
+        dx[i] = (inv_rms * ((dy[i] as f64) - (x[i] as f64) * coeff)) as f32;
+    }
+}
+
 /// Exact analytical backward pass for `swiglu` (`out = silu(gate) * up`).
 pub fn swiglu_bwd_f32(
     d_gate: &mut [f32],
@@ -3386,6 +3477,32 @@ pub fn gqa_attention_f16_kv_bwd_f32(
     n_tok: usize,
     window: Option<usize>,
 ) {
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    gqa_attention_f16_kv_bwd_ext_f32(
+        kt, dq, dk, dv, q, k_f16, v_f16, d_out, n_heads, n_kv_heads, head_dim, n_tok, scale, window,
+    );
+}
+
+/// Extended causal GQA attention backward pass supporting custom pre-softmax `attn_scale`
+/// (e.g. `1.0` on Gemma 4) and optional sliding window `window`, with zero heap allocations
+/// for `n_tok <= 2048`.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_f16_kv_bwd_ext_f32(
+    kt: &KernelTable,
+    dq: &mut [f32],
+    dk: &mut [f32],
+    dv: &mut [f32],
+    q: &[f32],
+    k_f16: &[u16],
+    v_f16: &[u16],
+    d_out: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    n_tok: usize,
+    attn_scale: f32,
+    window: Option<usize>,
+) {
     let q_dim = n_heads * head_dim;
     let kv_dim = n_kv_heads * head_dim;
     assert_eq!(dq.len(), n_tok * q_dim);
@@ -3403,10 +3520,21 @@ pub fn gqa_attention_f16_kv_bwd_f32(
         return;
     }
 
+    const STACK_CAP: usize = 2048;
+    let mut stack_probs = [0.0f32; STACK_CAP];
+    let mut stack_dp = [0.0f32; STACK_CAP];
+    let mut heap_probs: Vec<f32>;
+    let mut heap_dp: Vec<f32>;
+    let (probs_all, dp_all): (&mut [f32], &mut [f32]) = if n_tok <= STACK_CAP {
+        (&mut stack_probs[..n_tok], &mut stack_dp[..n_tok])
+    } else {
+        heap_probs = vec![0.0f32; n_tok];
+        heap_dp = vec![0.0f32; n_tok];
+        (&mut heap_probs[..], &mut heap_dp[..])
+    };
+
     let group = n_heads / n_kv_heads;
-    let scale = 1.0f32 / (head_dim as f32).sqrt();
-    let mut probs = vec![0.0f32; n_tok];
-    let mut dp = vec![0.0f32; n_tok];
+    let scale = attn_scale;
 
     for t in 0..n_tok {
         let end_pos = t + 1;
@@ -3415,8 +3543,8 @@ pub fn gqa_attention_f16_kv_bwd_f32(
             _ => 0,
         };
         let win_len = end_pos - start_kv;
-        let p = &mut probs[..win_len];
-        let d_prob = &mut dp[..win_len];
+        let p = &mut probs_all[..win_len];
+        let d_prob = &mut dp_all[..win_len];
 
         for h in 0..n_heads {
             let kv_h = h / group;

@@ -21,6 +21,7 @@ use tm_core::{DType, dequantize_row_bytes};
 use tm_gguf::{GgufError, GgufFile};
 
 use crate::MetalError;
+use crate::lora_gpu::MetalLoraEngine;
 
 const LLAMA_OPS_MSL: &str = include_str!("shaders/llama_ops.metal");
 /// Maximum number of tokens processed per batched prefill command buffer.
@@ -126,6 +127,7 @@ pub struct LlamaMetalConfig {
 }
 
 struct GpuMat {
+    name: String,
     buf: MtlBuf,
     offset: usize,
     dtype: DType,
@@ -167,6 +169,8 @@ struct Pipelines {
     gemv_q8_0: MtlPipe,
     gemv_q5_k: MtlPipe,
     gemv_q6_k: MtlPipe,
+    gemv_bf16: MtlPipe,
+    gemv_f32: MtlPipe,
     argmax: MtlPipe,
     // Batched prefill pipelines
     embed_q4_0_batch: MtlPipe,
@@ -185,6 +189,8 @@ struct Pipelines {
     gemm_q8_0: MtlPipe,
     gemm_q5_k: MtlPipe,
     gemm_q6_k: MtlPipe,
+    gemm_bf16: MtlPipe,
+    gemm_f32: MtlPipe,
 }
 
 /// Complete Apple Metal GPU inference runner for `llama` and `qwen3` models.
@@ -211,6 +217,7 @@ pub struct LlamaMetalRunner {
     hb: MtlBuf,
     hb2: MtlBuf,
     logits: MtlBuf,
+    lora: MetalLoraEngine,
     zero_copy_weights: bool,
     // IMPORTANT: Must remain LAST so all `MTLBuffer` fields (including zero-copy views
     // backed by the GGUF mmap) are dropped BEFORE `_gguf` unmaps the file.
@@ -344,6 +351,7 @@ fn load_gpu_mat(
         (upload_bytes(device, bytes)?, 0)
     };
     Ok(GpuMat {
+        name: name.to_string(),
         buf,
         offset,
         dtype: info.dtype,
@@ -447,6 +455,8 @@ impl LlamaMetalRunner {
             gemv_q8_0: build_pipe(&device, &lib, "gemv_q8_0_res", 128)?,
             gemv_q5_k: build_pipe(&device, &lib, "gemv_q5_k_res", 128)?,
             gemv_q6_k: build_pipe(&device, &lib, "gemv_q6_k_res", 128)?,
+            gemv_bf16: build_pipe(&device, &lib, "gemv_bf16_res", 128)?,
+            gemv_f32: build_pipe(&device, &lib, "gemv_f32_res", 128)?,
             argmax: build_pipe(&device, &lib, "argmax_f32", 256)?,
             embed_q4_0_batch: build_pipe(&device, &lib, "embed_q4_0_batch", 64)?,
             embed_q8_0_batch: build_pipe(&device, &lib, "embed_q8_0_batch", 64)?,
@@ -464,7 +474,10 @@ impl LlamaMetalRunner {
             gemm_q8_0: build_pipe(&device, &lib, "gemm_q8_0_res", 128)?,
             gemm_q5_k: build_pipe(&device, &lib, "gemm_q5_k_res", 128)?,
             gemm_q6_k: build_pipe(&device, &lib, "gemm_q6_k_res", 128)?,
+            gemm_bf16: build_pipe(&device, &lib, "gemm_bf16_res", 128)?,
+            gemm_f32: build_pipe(&device, &lib, "gemm_f32_res", 128)?,
         };
+        let lora = MetalLoraEngine::new(&device, &lib)?;
 
         let shared_weights = try_zero_copy_gguf_buf(&device, gguf_ref);
         let zero_copy_weights = shared_weights.is_some();
@@ -669,6 +682,7 @@ impl LlamaMetalRunner {
             hb,
             hb2,
             logits,
+            lora,
             zero_copy_weights,
             _gguf: gguf,
         })
@@ -676,6 +690,11 @@ impl LlamaMetalRunner {
 
     pub fn device_name(&self) -> String {
         self.device.name().to_string()
+    }
+
+    /// Binds dynamic GGUF LoRA adapters onto this Metal runner (`Phase T4`).
+    pub fn bind_lora(&mut self, loras: &tm_lora::LoraSet) -> Result<(), MetalError> {
+        self.lora.bind(&self.device, &self._gguf, loras, MAX_BATCH)
     }
 
     /// Returns `true` if model weights are bound directly from the GGUF mmap via
@@ -692,12 +711,26 @@ impl LlamaMetalRunner {
         y_buf: &ProtocolObject<dyn MTLBuffer>,
         add_residual: bool,
     ) -> Result<(), MetalError> {
+        self.encode_gemv_named(enc, mat, &mat.name, x_buf, y_buf, add_residual)
+    }
+
+    fn encode_gemv_named(
+        &self,
+        enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        mat: &GpuMat,
+        lora_name: &str,
+        x_buf: &ProtocolObject<dyn MTLBuffer>,
+        y_buf: &ProtocolObject<dyn MTLBuffer>,
+        add_residual: bool,
+    ) -> Result<(), MetalError> {
         let (pipe, rows_per_tg): (&MtlPipe, usize) = match mat.dtype {
             DType::Q4_0 => (&self.pipes.gemv_q4_0, 32),
             DType::Q4_1 => (&self.pipes.gemv_q4_1, 32),
             DType::Q8_0 => (&self.pipes.gemv_q8_0, 16),
             DType::Q5K => (&self.pipes.gemv_q5_k, 8),
             DType::Q6K => (&self.pipes.gemv_q6_k, 16),
+            DType::BF16 => (&self.pipes.gemv_bf16, 16),
+            DType::F32 => (&self.pipes.gemv_f32, 8),
             other => return Err(MetalError::UnsupportedDType(other)),
         };
 
@@ -733,6 +766,8 @@ impl LlamaMetalRunner {
                 depth: 1,
             },
         );
+        self.lora
+            .encode_linear(enc, lora_name, x_buf, 0, y_buf, 0, 1);
         Ok(())
     }
 
@@ -785,6 +820,12 @@ impl LlamaMetalRunner {
                     depth: 1,
                 },
             );
+            self.lora
+                .encode_linear(enc, &layer.wq.name, &self.xb, 0, &self.q, 0, 1);
+            self.lora
+                .encode_linear(enc, &layer.wk.name, &self.xb, 0, &self.k, 0, 1);
+            self.lora
+                .encode_linear(enc, &layer.wv.name, &self.xb, 0, &self.v, 0, 1);
             Ok(())
         } else {
             self.encode_gemv(enc, &layer.wq, &self.xb, &self.q, false)?;
@@ -930,6 +971,8 @@ impl LlamaMetalRunner {
             DType::Q8_0 => (&self.pipes.gemm_q8_0, 4, 8),
             DType::Q5K => (&self.pipes.gemm_q5_k, 4, 8),
             DType::Q6K => (&self.pipes.gemm_q6_k, 4, 8),
+            DType::BF16 => (&self.pipes.gemm_bf16, 32, 32),
+            DType::F32 => (&self.pipes.gemm_f32, 4, 8),
             other => return Err(MetalError::UnsupportedDType(other)),
         };
 
@@ -966,6 +1009,8 @@ impl LlamaMetalRunner {
                 depth: 1,
             },
         );
+        self.lora
+            .encode_linear(enc, &mat.name, x_buf, 0, y_buf, 0, n_tok);
         Ok(())
     }
 
@@ -1090,7 +1135,10 @@ impl LlamaMetalRunner {
             .computeCommandEncoder()
             .ok_or(MetalError::CommandEncodeFailed)?;
 
-        self.encode_single_token_into(&enc, token_id, pos, compute_logits)?;
+        if let Err(e) = self.encode_single_token_into(&enc, token_id, pos, compute_logits) {
+            enc.endEncoding();
+            return Err(e);
+        }
 
         enc.endEncoding();
         cmd.commit();
@@ -1126,7 +1174,10 @@ impl LlamaMetalRunner {
             .computeCommandEncoder()
             .ok_or(MetalError::CommandEncodeFailed)?;
 
-        self.encode_single_token_into(&enc, token_id, pos, true)?;
+        if let Err(e) = self.encode_single_token_into(&enc, token_id, pos, true) {
+            enc.endEncoding();
+            return Err(e);
+        }
 
         let vocab_u32 = self.cfg.vocab_size as u32;
         enc.setComputePipelineState(&self.pipes.argmax);
@@ -1290,6 +1341,13 @@ impl LlamaMetalRunner {
                         height: 1,
                         depth: 1,
                     },
+                );
+                self.lora.encode_embed_batch(
+                    &enc,
+                    "token_embd.weight",
+                    &self.token_ids_buf,
+                    &self.x,
+                    b,
                 );
             }
 
@@ -1479,7 +1537,14 @@ impl LlamaMetalRunner {
                 } else {
                     self.output_separate.as_ref().unwrap_or(&self.token_embd)
                 };
-                self.encode_gemv(&enc, out_mat, &self.xb, &self.logits, false)?;
+                self.encode_gemv_named(
+                    &enc,
+                    out_mat,
+                    "output.weight",
+                    &self.xb,
+                    &self.logits,
+                    false,
+                )?;
             }
 
             enc.endEncoding();
@@ -1562,6 +1627,13 @@ impl LlamaMetalRunner {
                     height: 1,
                     depth: 1,
                 },
+            );
+            self.lora.encode_embed_single(
+                enc,
+                "token_embd.weight",
+                &self.token_ids_buf,
+                token_id,
+                &self.x,
             );
         }
 
@@ -1679,7 +1751,11 @@ impl LlamaMetalRunner {
             self.encode_gemv(enc, &layer.wo, &self.xb, &self.x, true)?;
             self.encode_rms_norm(enc, &self.x, &layer.ffn_norm, &self.xb, self.cfg.n_embd)?;
 
-            if layer.w_gate.dtype == DType::Q4_0 && layer.w_up.dtype == DType::Q4_0 {
+            if layer.w_gate.dtype == DType::Q4_0
+                && layer.w_up.dtype == DType::Q4_0
+                && !self.lora.has(&layer.w_gate.name)
+                && !self.lora.has(&layer.w_up.name)
+            {
                 const THREADS: usize = 128;
                 const ROWS_PER_TG: usize = 16;
                 let gargs = GemvArgs {
@@ -1754,7 +1830,7 @@ impl LlamaMetalRunner {
             } else {
                 self.output_separate.as_ref().unwrap_or(&self.token_embd)
             };
-            self.encode_gemv(enc, out_mat, &self.xb, &self.logits, false)?;
+            self.encode_gemv_named(enc, out_mat, "output.weight", &self.xb, &self.logits, false)?;
         }
         Ok(())
     }
@@ -2181,7 +2257,14 @@ impl LlamaMetalRunner {
                 } else {
                     self.output_separate.as_ref().unwrap_or(&self.token_embd)
                 };
-                self.encode_gemv(&enc, out_mat, &self.xb, &self.logits, false)?;
+                self.encode_gemv_named(
+                    &enc,
+                    out_mat,
+                    "output.weight",
+                    &self.xb,
+                    &self.logits,
+                    false,
+                )?;
                 enc.endEncoding();
                 cb.commit();
                 pending.push((12, cb));

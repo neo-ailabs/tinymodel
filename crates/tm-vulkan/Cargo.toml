@@ -13,6 +13,7 @@ ash = { version = "0.38", default-features = false, features = ["loaded", "debug
 thiserror = "2"
 tm-core = { path = "../tm-core" }
 tm-gguf = { path = "../tm-gguf" }
+tm-lora = { path = "../tm-lora" }
 
 [dev-dependencies]
 tm-cpu = { path = "../tm-cpu" }

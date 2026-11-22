@@ -10,12 +10,15 @@
 mod context;
 mod kernels;
 pub mod llama_runner;
+pub mod lora_gpu;
 pub mod qwen35_runner;
+pub mod train_accel;
 
 pub use context::{DeviceInfo, VkBuffer, VkPrefillMode, VulkanContext};
 pub use kernels::{Q4Layout, VkMatQ4_0};
 pub use llama_runner::{LlamaVkConfig, LlamaVkRunner, VkProfileReport, VkStageStat};
 pub use qwen35_runner::{Qwen35VkConfig, Qwen35VkRunner};
+pub use train_accel::VulkanGpuAccel;
 
 use thiserror::Error;
 
@@ -63,6 +66,8 @@ pub enum VulkanError {
     InvalidDimensions(String),
     #[error("GGUF error: {0}")]
     Gguf(#[from] tm_gguf::GgufError),
+    #[error("LoRA error: {0}")]
+    Lora(#[from] tm_lora::LoraError),
     #[error("unsupported Vulkan weight dtype {0:?}")]
     UnsupportedDType(tm_core::DType),
     #[error("unsupported model architecture '{0}'")]

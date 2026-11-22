@@ -7,7 +7,10 @@ use std::path::Path;
 use tm_core::{DType, dequantize_row_bytes};
 use tm_gguf::{GgufFile, MetadataValue, NewGgufTensor, write_gguf_file_atomic};
 use tm_lora::{LoraAdapter, LoraWeightPair};
-use tm_models::LlamaModel;
+use tm_models::{
+    Gemma4Model, Lfm2Model, Lfm2OpWeights, LlamaModel, Qwen35AttnWeights, Qwen35Model,
+};
+use tm_runtime::CpuModel;
 
 use crate::TrainError;
 
@@ -39,7 +42,7 @@ impl SplitMix64 {
     }
 }
 
-/// Configurable projection targets for LoRA injection (`--targets q,k,v,o,gate,up,down`).
+/// Configurable projection targets for LoRA injection (`--targets q,k,v,o,gate,up,down[,ssm,ple,embed,lm_head]`).
 #[derive(Debug, Clone)]
 pub struct LoraTargets {
     pub q: bool,
@@ -49,6 +52,10 @@ pub struct LoraTargets {
     pub gate: bool,
     pub up: bool,
     pub down: bool,
+    /// Qwen3.5 GDN `attn_gate` (`wz`), `ssm_alpha`, and `ssm_beta` projections (enabled by default).
+    pub ssm_gates: bool,
+    /// Gemma 4 Per-Layer Embedding (`per_layer_model_proj`, `inp_gate`, `proj`) projections.
+    pub ple: bool,
     pub embed: bool,
     pub lm_head: bool,
 }
@@ -63,6 +70,8 @@ impl Default for LoraTargets {
             gate: true,
             up: true,
             down: true,
+            ssm_gates: true,
+            ple: false,
             embed: false,
             lm_head: false,
         }
@@ -80,6 +89,8 @@ impl LoraTargets {
                 gate: true,
                 up: true,
                 down: true,
+                ssm_gates: true,
+                ple: true,
                 embed: true,
                 lm_head: true,
             });
@@ -92,6 +103,8 @@ impl LoraTargets {
             gate: false,
             up: false,
             down: false,
+            ssm_gates: false,
+            ple: false,
             embed: false,
             lm_head: false,
         };
@@ -106,15 +119,22 @@ impl LoraTargets {
                 "q" | "attn_q" => t.q = true,
                 "k" | "attn_k" => t.k = true,
                 "v" | "attn_v" => t.v = true,
-                "o" | "wo" | "attn_output" => t.o = true,
+                "qkv" | "attn_qkv" | "shortconv" => {
+                    t.q = true;
+                    t.k = true;
+                    t.v = true;
+                }
+                "o" | "wo" | "attn_output" | "ssm_out" | "out_proj" => t.o = true,
                 "gate" | "ffn_gate" => t.gate = true,
                 "up" | "ffn_up" => t.up = true,
                 "down" | "ffn_down" => t.down = true,
+                "ssm" | "ssm_gates" | "attn_gate" | "z" => t.ssm_gates = true,
+                "ple" => t.ple = true,
                 "embed" | "token_embd" => t.embed = true,
                 "lm_head" | "output" => t.lm_head = true,
                 other => {
                     return Err(TrainError::InvalidConfig(format!(
-                        "unknown --targets module '{other}' (expected q,k,v,o,gate,up,down,embed,lm_head or 'all')"
+                        "unknown --targets module '{other}' (expected q,k,v,o,gate,up,down,ssm,ple,embed,lm_head or 'all')"
                     )));
                 }
             }
@@ -126,6 +146,512 @@ impl LoraTargets {
         }
         Ok(t)
     }
+}
+
+fn push_embed_pair(
+    rng: &mut SplitMix64,
+    pairs: &mut HashMap<String, LoraWeightPair>,
+    order: &mut Vec<String>,
+    vocab: usize,
+    d_out: usize,
+    rank: usize,
+) {
+    let bound = 1.0f32 / (rank as f32).sqrt();
+    let a: Vec<f32> = (0..vocab * rank).map(|_| rng.uniform_sym(bound)).collect();
+    let b = vec![0.0f32; d_out * rank];
+    let name = "token_embd.weight".to_string();
+    order.push(name.clone());
+    pairs.insert(
+        name.clone(),
+        LoraWeightPair {
+            base_name: name,
+            is_token_embd: true,
+            rank,
+            d_in: vocab,
+            d_out,
+            a,
+            b,
+        },
+    );
+}
+
+fn push_linear_pair(
+    rng: &mut SplitMix64,
+    pairs: &mut HashMap<String, LoraWeightPair>,
+    order: &mut Vec<String>,
+    base_name: &str,
+    d_in: usize,
+    d_out: usize,
+    rank: usize,
+) {
+    let bound = 1.0f32 / (d_in as f32).sqrt();
+    let a: Vec<f32> = (0..rank * d_in).map(|_| rng.uniform_sym(bound)).collect();
+    let b = vec![0.0f32; d_out * rank];
+    order.push(base_name.to_string());
+    pairs.insert(
+        base_name.to_string(),
+        LoraWeightPair {
+            base_name: base_name.to_string(),
+            is_token_embd: false,
+            rank,
+            d_in,
+            d_out,
+            a,
+            b,
+        },
+    );
+}
+
+/// Initializes a new [`LoraAdapter`] for any supported [`CpuModel`] (`llama`, `qwen3`, `qwen35`,
+/// `gemma4`, `lfm2`) using Kaiming-uniform `A` and exact zero `B`.
+pub fn init_lora_adapter_for_cpu_model(
+    model: &CpuModel<'_>,
+    rank: usize,
+    alpha: f32,
+    targets: &LoraTargets,
+    seed: u64,
+) -> Result<LoraAdapter, TrainError> {
+    match model {
+        CpuModel::Llama(m) => init_lora_adapter(m, rank, alpha, targets, seed),
+        CpuModel::Qwen35(m) => init_lora_adapter_qwen35(m, rank, alpha, targets, seed),
+        CpuModel::Gemma4(m) => init_lora_adapter_gemma4(m, rank, alpha, targets, seed),
+        CpuModel::Lfm2(m) => init_lora_adapter_lfm2(m, rank, alpha, targets, seed),
+    }
+}
+
+/// Initializes a [`LoraAdapter`] for hybrid `Qwen35Model` (GDN + FullAttn + SwiGLU).
+pub fn init_lora_adapter_qwen35(
+    model: &Qwen35Model<'_>,
+    rank: usize,
+    alpha: f32,
+    targets: &LoraTargets,
+    seed: u64,
+) -> Result<LoraAdapter, TrainError> {
+    if rank == 0 {
+        return Err(TrainError::InvalidConfig(
+            "LoRA rank must be >= 1".to_string(),
+        ));
+    }
+    let mut rng = SplitMix64::new(seed);
+    let mut pairs = HashMap::new();
+    let mut order = Vec::new();
+
+    if targets.embed {
+        push_embed_pair(
+            &mut rng,
+            &mut pairs,
+            &mut order,
+            model.cfg.vocab_size,
+            model.cfg.n_embd,
+            rank,
+        );
+    }
+
+    for lw in &model.layers {
+        match &lw.attn {
+            Qwen35AttnWeights::Gdn {
+                wqkv,
+                wz,
+                w_alpha,
+                w_beta,
+                w_out,
+                ..
+            } => {
+                if targets.q || targets.k || targets.v {
+                    push_linear_pair(
+                        &mut rng, &mut pairs, &mut order, wqkv.name, wqkv.cols, wqkv.rows, rank,
+                    );
+                }
+                if targets.ssm_gates {
+                    push_linear_pair(
+                        &mut rng, &mut pairs, &mut order, wz.name, wz.cols, wz.rows, rank,
+                    );
+                    let r_small = rank.min(w_alpha.rows).max(1);
+                    push_linear_pair(
+                        &mut rng,
+                        &mut pairs,
+                        &mut order,
+                        w_alpha.name,
+                        w_alpha.cols,
+                        w_alpha.rows,
+                        r_small,
+                    );
+                    push_linear_pair(
+                        &mut rng,
+                        &mut pairs,
+                        &mut order,
+                        w_beta.name,
+                        w_beta.cols,
+                        w_beta.rows,
+                        r_small,
+                    );
+                }
+                if targets.o {
+                    push_linear_pair(
+                        &mut rng, &mut pairs, &mut order, w_out.name, w_out.cols, w_out.rows, rank,
+                    );
+                }
+            }
+            Qwen35AttnWeights::FullAttn {
+                wqg, wk, wv, wo, ..
+            } => {
+                if targets.q {
+                    push_linear_pair(
+                        &mut rng, &mut pairs, &mut order, wqg.name, wqg.cols, wqg.rows, rank,
+                    );
+                }
+                if targets.k {
+                    push_linear_pair(
+                        &mut rng, &mut pairs, &mut order, wk.name, wk.cols, wk.rows, rank,
+                    );
+                }
+                if targets.v {
+                    push_linear_pair(
+                        &mut rng, &mut pairs, &mut order, wv.name, wv.cols, wv.rows, rank,
+                    );
+                }
+                if targets.o {
+                    push_linear_pair(
+                        &mut rng, &mut pairs, &mut order, wo.name, wo.cols, wo.rows, rank,
+                    );
+                }
+            }
+        }
+        if targets.gate {
+            push_linear_pair(
+                &mut rng,
+                &mut pairs,
+                &mut order,
+                lw.w_gate.name,
+                lw.w_gate.cols,
+                lw.w_gate.rows,
+                rank,
+            );
+        }
+        if targets.up {
+            push_linear_pair(
+                &mut rng,
+                &mut pairs,
+                &mut order,
+                lw.w_up.name,
+                lw.w_up.cols,
+                lw.w_up.rows,
+                rank,
+            );
+        }
+        if targets.down {
+            push_linear_pair(
+                &mut rng,
+                &mut pairs,
+                &mut order,
+                lw.w_down.name,
+                lw.w_down.cols,
+                lw.w_down.rows,
+                rank,
+            );
+        }
+    }
+
+    if targets.lm_head {
+        push_linear_pair(
+            &mut rng,
+            &mut pairs,
+            &mut order,
+            model.output.name,
+            model.output.cols,
+            model.output.rows,
+            rank,
+        );
+    }
+
+    Ok(LoraAdapter {
+        arch: model.cfg.arch.clone(),
+        alpha,
+        name: Some("tinymodel-qlora".to_string()),
+        pairs,
+        pair_order: order,
+    })
+}
+
+/// Initializes a [`LoraAdapter`] for `Gemma4Model` (SWA + KV-sharing + GeGLU + PLE).
+pub fn init_lora_adapter_gemma4(
+    model: &Gemma4Model<'_>,
+    rank: usize,
+    alpha: f32,
+    targets: &LoraTargets,
+    seed: u64,
+) -> Result<LoraAdapter, TrainError> {
+    if rank == 0 {
+        return Err(TrainError::InvalidConfig(
+            "LoRA rank must be >= 1".to_string(),
+        ));
+    }
+    let mut rng = SplitMix64::new(seed);
+    let mut pairs = HashMap::new();
+    let mut order = Vec::new();
+
+    if targets.embed {
+        push_embed_pair(
+            &mut rng,
+            &mut pairs,
+            &mut order,
+            model.cfg.vocab_size,
+            model.cfg.n_embd,
+            rank,
+        );
+    }
+
+    if targets.ple
+        && let Some(ref pg) = model.ple_global
+    {
+        push_linear_pair(
+            &mut rng,
+            &mut pairs,
+            &mut order,
+            pg.model_proj.name,
+            pg.model_proj.cols,
+            pg.model_proj.rows,
+            rank,
+        );
+    }
+
+    for lw in &model.layers {
+        if targets.q {
+            push_linear_pair(
+                &mut rng, &mut pairs, &mut order, lw.wq.name, lw.wq.cols, lw.wq.rows, rank,
+            );
+        }
+        if let Some(ref kv) = lw.kv {
+            if targets.k {
+                push_linear_pair(
+                    &mut rng, &mut pairs, &mut order, kv.wk.name, kv.wk.cols, kv.wk.rows, rank,
+                );
+            }
+            if targets.v
+                && let Some(ref wv) = kv.wv
+            {
+                push_linear_pair(
+                    &mut rng, &mut pairs, &mut order, wv.name, wv.cols, wv.rows, rank,
+                );
+            }
+        }
+        if targets.o {
+            push_linear_pair(
+                &mut rng, &mut pairs, &mut order, lw.wo.name, lw.wo.cols, lw.wo.rows, rank,
+            );
+        }
+        if targets.gate {
+            push_linear_pair(
+                &mut rng,
+                &mut pairs,
+                &mut order,
+                lw.w_gate.name,
+                lw.w_gate.cols,
+                lw.w_gate.rows,
+                rank,
+            );
+        }
+        if targets.up {
+            push_linear_pair(
+                &mut rng,
+                &mut pairs,
+                &mut order,
+                lw.w_up.name,
+                lw.w_up.cols,
+                lw.w_up.rows,
+                rank,
+            );
+        }
+        if targets.down {
+            push_linear_pair(
+                &mut rng,
+                &mut pairs,
+                &mut order,
+                lw.w_down.name,
+                lw.w_down.cols,
+                lw.w_down.rows,
+                rank,
+            );
+        }
+        if targets.ple
+            && let Some(ref ple) = lw.ple
+        {
+            let r_ple = rank.min(ple.inp_gate.rows).max(1);
+            push_linear_pair(
+                &mut rng,
+                &mut pairs,
+                &mut order,
+                ple.inp_gate.name,
+                ple.inp_gate.cols,
+                ple.inp_gate.rows,
+                r_ple,
+            );
+            push_linear_pair(
+                &mut rng,
+                &mut pairs,
+                &mut order,
+                ple.proj.name,
+                ple.proj.cols,
+                ple.proj.rows,
+                r_ple,
+            );
+        }
+    }
+
+    if targets.lm_head {
+        push_linear_pair(
+            &mut rng,
+            &mut pairs,
+            &mut order,
+            model.output.name,
+            model.output.cols,
+            model.output.rows,
+            rank,
+        );
+    }
+
+    Ok(LoraAdapter {
+        arch: model.cfg.arch.clone(),
+        alpha,
+        name: Some("tinymodel-qlora".to_string()),
+        pairs,
+        pair_order: order,
+    })
+}
+
+/// Initializes a [`LoraAdapter`] for `Lfm2Model` (`ShortConv` + `GQA` + SwiGLU).
+pub fn init_lora_adapter_lfm2(
+    model: &Lfm2Model<'_>,
+    rank: usize,
+    alpha: f32,
+    targets: &LoraTargets,
+    seed: u64,
+) -> Result<LoraAdapter, TrainError> {
+    if rank == 0 {
+        return Err(TrainError::InvalidConfig(
+            "LoRA rank must be >= 1".to_string(),
+        ));
+    }
+    let mut rng = SplitMix64::new(seed);
+    let mut pairs = HashMap::new();
+    let mut order = Vec::new();
+
+    if targets.embed {
+        push_embed_pair(
+            &mut rng,
+            &mut pairs,
+            &mut order,
+            model.cfg.vocab_size,
+            model.cfg.n_embd,
+            rank,
+        );
+    }
+
+    for lw in &model.layers {
+        match &lw.op {
+            Lfm2OpWeights::ShortConv {
+                in_proj, out_proj, ..
+            } => {
+                if targets.q || targets.k || targets.v {
+                    push_linear_pair(
+                        &mut rng,
+                        &mut pairs,
+                        &mut order,
+                        in_proj.name,
+                        in_proj.cols,
+                        in_proj.rows,
+                        rank,
+                    );
+                }
+                if targets.o {
+                    push_linear_pair(
+                        &mut rng,
+                        &mut pairs,
+                        &mut order,
+                        out_proj.name,
+                        out_proj.cols,
+                        out_proj.rows,
+                        rank,
+                    );
+                }
+            }
+            Lfm2OpWeights::Gqa { wq, wk, wv, wo, .. } => {
+                if targets.q {
+                    push_linear_pair(
+                        &mut rng, &mut pairs, &mut order, wq.name, wq.cols, wq.rows, rank,
+                    );
+                }
+                if targets.k {
+                    push_linear_pair(
+                        &mut rng, &mut pairs, &mut order, wk.name, wk.cols, wk.rows, rank,
+                    );
+                }
+                if targets.v {
+                    push_linear_pair(
+                        &mut rng, &mut pairs, &mut order, wv.name, wv.cols, wv.rows, rank,
+                    );
+                }
+                if targets.o {
+                    push_linear_pair(
+                        &mut rng, &mut pairs, &mut order, wo.name, wo.cols, wo.rows, rank,
+                    );
+                }
+            }
+        }
+        if targets.gate {
+            push_linear_pair(
+                &mut rng,
+                &mut pairs,
+                &mut order,
+                lw.w_gate.name,
+                lw.w_gate.cols,
+                lw.w_gate.rows,
+                rank,
+            );
+        }
+        if targets.up {
+            push_linear_pair(
+                &mut rng,
+                &mut pairs,
+                &mut order,
+                lw.w_up.name,
+                lw.w_up.cols,
+                lw.w_up.rows,
+                rank,
+            );
+        }
+        if targets.down {
+            push_linear_pair(
+                &mut rng,
+                &mut pairs,
+                &mut order,
+                lw.w_down.name,
+                lw.w_down.cols,
+                lw.w_down.rows,
+                rank,
+            );
+        }
+    }
+
+    if targets.lm_head {
+        push_linear_pair(
+            &mut rng,
+            &mut pairs,
+            &mut order,
+            model.output.name,
+            model.output.cols,
+            model.output.rows,
+            rank,
+        );
+    }
+
+    Ok(LoraAdapter {
+        arch: model.cfg.arch.clone(),
+        alpha,
+        name: Some("tinymodel-qlora".to_string()),
+        pairs,
+        pair_order: order,
+    })
 }
 
 /// Initializes a new [`LoraAdapter`] for `LlamaModel` using Kaiming-uniform `A` and exact zero `B`

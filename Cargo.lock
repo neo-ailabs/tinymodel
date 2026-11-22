@@ -231,7 +231,11 @@ dependencies = [
  "objc2-metal",
  "thiserror",
  "tm-core",
+ "tm-cpu",
  "tm-gguf",
+ "tm-lora",
+ "tm-models",
+ "tm-runtime",
 ]
 
 [[package]]
@@ -289,6 +293,7 @@ dependencies = [
  "tm-core",
  "tm-cpu",
  "tm-gguf",
+ "tm-lora",
  "tm-models",
 ]
 

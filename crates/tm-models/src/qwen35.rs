@@ -28,7 +28,7 @@ use tm_cpu::{
 use tm_gguf::{GgufError, GgufFile};
 use tm_lora::{BoundLora, LoraScratch, LoraSet};
 
-use crate::llama::ModelError;
+use crate::llama::{ModelError, RawMatView};
 pub use crate::state::LayerState;
 use crate::state::{MAX_SPEC_WINDOW, SpecVerifyBuf, decode_embedding_row};
 
@@ -78,59 +78,53 @@ impl Qwen35Config {
     }
 }
 
-#[derive(Clone, Copy)]
-struct MatView<'a> {
-    name: &'a str,
-    bytes: &'a [u8],
-    dtype: DType,
-    rows: usize,
-    cols: usize,
-    lora_slot: Option<usize>,
-}
+type MatView<'a> = RawMatView<'a>;
 
-enum AttnWeights<'a> {
+pub enum Qwen35AttnWeights<'a> {
     FullAttn {
         q_norm: Vec<f32>,
         k_norm: Vec<f32>,
         /// Joint Q+Gate projection `[n_embd -> n_head * head_dim * 2]`.
-        wqg: MatView<'a>,
-        wk: MatView<'a>,
-        wv: MatView<'a>,
-        wo: MatView<'a>,
+        wqg: RawMatView<'a>,
+        wk: RawMatView<'a>,
+        wv: RawMatView<'a>,
+        wo: RawMatView<'a>,
     },
     Gdn {
         /// Joint QKV projection `[n_embd -> conv_dim]`.
-        wqkv: MatView<'a>,
+        wqkv: RawMatView<'a>,
         /// Output gate `z` projection `[n_embd -> ssm_d_inner]`.
-        wz: MatView<'a>,
-        w_alpha: MatView<'a>,
-        w_beta: MatView<'a>,
+        wz: RawMatView<'a>,
+        w_alpha: RawMatView<'a>,
+        w_beta: RawMatView<'a>,
         /// Depthwise causal conv weights `[conv_dim, conv_kernel]` (`conv_kernel` contiguous floats per channel).
         conv1d: Vec<f32>,
         ssm_a: Vec<f32>,
         ssm_dt_bias: Vec<f32>,
         ssm_norm: Vec<f32>,
-        w_out: MatView<'a>,
+        w_out: RawMatView<'a>,
     },
 }
 
-struct Qwen35LayerWeights<'a> {
-    attn_norm: Vec<f32>,
-    post_attn_norm: Vec<f32>,
-    attn: AttnWeights<'a>,
-    w_gate: MatView<'a>,
-    w_up: MatView<'a>,
-    w_down: MatView<'a>,
+type AttnWeights<'a> = Qwen35AttnWeights<'a>;
+
+pub struct Qwen35LayerWeights<'a> {
+    pub attn_norm: Vec<f32>,
+    pub post_attn_norm: Vec<f32>,
+    pub attn: Qwen35AttnWeights<'a>,
+    pub w_gate: RawMatView<'a>,
+    pub w_up: RawMatView<'a>,
+    pub w_down: RawMatView<'a>,
 }
 
 /// Loaded Qwen3.5 hybrid model borrowing quantized weight slices directly from `GgufFile`.
 pub struct Qwen35Model<'a> {
     pub cfg: Qwen35Config,
-    token_embd: MatView<'a>,
-    output: MatView<'a>,
-    output_norm: Vec<f32>,
-    rope_inv_freqs: Vec<f64>,
-    layers: Vec<Qwen35LayerWeights<'a>>,
+    pub token_embd: RawMatView<'a>,
+    pub output: RawMatView<'a>,
+    pub output_norm: Vec<f32>,
+    pub rope_inv_freqs: Vec<f64>,
+    pub layers: Vec<Qwen35LayerWeights<'a>>,
     pub lora: BoundLora,
 }
 

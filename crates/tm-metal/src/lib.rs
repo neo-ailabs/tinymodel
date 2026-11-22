@@ -37,6 +37,8 @@ pub enum MetalError {
     InvalidDimensions(String),
     #[error("GGUF error: {0}")]
     Gguf(#[from] tm_gguf::GgufError),
+    #[error("LoRA error: {0}")]
+    Lora(#[from] tm_lora::LoraError),
     #[error("unsupported Metal weight dtype {0:?}")]
     UnsupportedDType(tm_core::DType),
     #[error("unsupported model architecture '{0}'")]
@@ -52,7 +54,11 @@ pub mod lfm2_runner;
 #[cfg(target_vendor = "apple")]
 pub mod llama_runner;
 #[cfg(target_vendor = "apple")]
+pub mod lora_gpu;
+#[cfg(target_vendor = "apple")]
 pub mod qwen35_runner;
+#[cfg(target_vendor = "apple")]
+pub mod train_accel;
 
 #[cfg(target_vendor = "apple")]
 pub use apple::{MetalBuffer, MetalContext};
@@ -64,10 +70,13 @@ pub use lfm2_runner::{Lfm2MetalConfig, Lfm2MetalRunner};
 pub use llama_runner::{LlamaMetalConfig, LlamaMetalRunner, MetalProfileReport, MetalStageStat};
 #[cfg(target_vendor = "apple")]
 pub use qwen35_runner::{Qwen35MetalConfig, Qwen35MetalRunner};
+#[cfg(target_vendor = "apple")]
+pub use train_accel::MetalGpuAccel;
 
 /// Unified Apple Metal GPU runner dispatching across all supported M2 architectures
 /// (`llama`, `qwen3`, `qwen35`, `gemma4`, `lfm2`).
 #[cfg(target_vendor = "apple")]
+#[allow(clippy::large_enum_variant)]
 pub enum MetalRunner {
     Llama(LlamaMetalRunner),
     Qwen35(Qwen35MetalRunner),
@@ -150,6 +159,16 @@ impl MetalRunner {
             MetalRunner::Qwen35(r) => r.reset_state(),
             MetalRunner::Gemma4(r) => r.reset_state(),
             MetalRunner::Lfm2(r) => r.reset_state(),
+        }
+    }
+
+    /// Binds a set of dynamic GGUF LoRA adapters onto the active Metal GPU runner.
+    pub fn bind_lora(&mut self, loras: &tm_lora::LoraSet) -> Result<(), MetalError> {
+        match self {
+            MetalRunner::Llama(r) => r.bind_lora(loras),
+            MetalRunner::Qwen35(r) => r.bind_lora(loras),
+            MetalRunner::Gemma4(r) => r.bind_lora(loras),
+            MetalRunner::Lfm2(r) => r.bind_lora(loras),
         }
     }
 

@@ -25,6 +25,7 @@ use tm_gguf::{GgufError, GgufFile};
 
 use crate::context::{Pipeline, VkBuffer, VkPrefillMode, VulkanContext};
 use crate::kernels::{dtype_code, normalize_vk_mat_bytes};
+use crate::lora_gpu::{VkEmbedSlot, VkLinearSlot, VkLoraEngine};
 use crate::{VkResultExt, VulkanError};
 
 const SPV_EMBED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/embed.spv"));
@@ -285,6 +286,7 @@ enum DecodeFfnSets {
 }
 
 struct LayerPlan {
+    idx: usize,
     attn_norm_set: vk::DescriptorSet,
     qkv_dec: DecodeQkvSets,
     wq_batch: BatchGemmEntry,
@@ -300,7 +302,14 @@ struct LayerPlan {
     wo_batch: BatchGemmEntry,
     ffn_norm_set: vk::DescriptorSet,
     ffn_dec: DecodeFfnSets,
+    #[allow(clippy::type_complexity)]
+    ffn_dec_sep: (
+        (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
+        (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
+        vk::DescriptorSet,
+    ),
     ffn_batch: BatchFfnPlan,
+    ffn_batch_sep: (BatchGemmEntry, BatchGemmEntry, vk::DescriptorSet),
     down_dec: (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
     down_batch: BatchGemmEntry,
     // Byte sizes for stage bandwidth accounting in `profile`
@@ -356,6 +365,9 @@ pub struct LlamaVkRunner {
     cb_decode_greedy: vk::CommandBuffer,
     cb_batch: vk::CommandBuffer,
     fence: vk::Fence,
+    lora: VkLoraEngine,
+    linear_slots: Vec<VkLinearSlot>,
+    embed_slots: Vec<VkEmbedSlot>,
     zero_copy_weights: bool,
     // Kept AFTER `slabs` so the GGUF `mmap` outlives any imported `VK_EXT_external_memory_host` buffer.
     _gguf: Arc<GgufFile>,
@@ -923,7 +935,7 @@ impl LlamaVkRunner {
         };
 
         // 4. Allocate static descriptor pool, command pool, pre-bound descriptor sets.
-        let max_sets = (n_layers as u32) * 26 + 24;
+        let max_sets = (n_layers as u32) * 34 + 32;
         let max_desc = max_sets * 8;
         let d = &ctx.inner.device;
         // SAFETY: `d` is a valid logical device and `ctx.inner.queue_family` is its compute queue family.
@@ -1175,8 +1187,38 @@ impl LlamaVkRunner {
             &[Binding::Arena(logits_dev), Binding::Raw(&argmax_buf)],
         )?;
 
+        let mk_lin_slot = |name: String, xs: VkSlice, ys: VkSlice| VkLinearSlot {
+            name,
+            x_buf: slabs[xs.slab].buf,
+            x_off: xs.offset,
+            x_len: xs.len,
+            y_buf: slabs[ys.slab].buf,
+            y_off: ys.offset,
+            y_len: ys.len,
+        };
+        let embed_slots = vec![VkEmbedSlot {
+            name: "token_embd.weight".to_string(),
+            dec_tok_buf: step_buf.buf,
+            dec_tok_len: step_buf.byte_len(),
+            batch_tok_buf: token_ids_buf.buf,
+            batch_tok_len: token_ids_buf.byte_len(),
+            x_buf: slabs[s_x.slab].buf,
+            x_off: s_x.offset,
+            x_len: s_x.len,
+        }];
+        let mut linear_slots = Vec::with_capacity(n_layers * 7 + 1);
+        linear_slots.push(mk_lin_slot("output.weight".to_string(), s_xb, logits_dev));
+
         let mut layers = Vec::with_capacity(n_layers);
-        for pl in &p_layers {
+        for (il, pl) in p_layers.iter().enumerate() {
+            let ltag = format!("blk.{il}");
+            linear_slots.push(mk_lin_slot(format!("{ltag}.attn_q.weight"), s_xb, s_q));
+            linear_slots.push(mk_lin_slot(format!("{ltag}.attn_k.weight"), s_xb, s_k));
+            linear_slots.push(mk_lin_slot(format!("{ltag}.attn_v.weight"), s_xb, s_v));
+            linear_slots.push(mk_lin_slot(format!("{ltag}.attn_output.weight"), s_xb, s_x));
+            linear_slots.push(mk_lin_slot(format!("{ltag}.ffn_gate.weight"), s_xb, s_hb));
+            linear_slots.push(mk_lin_slot(format!("{ltag}.ffn_up.weight"), s_xb, s_hb2));
+            linear_slots.push(mk_lin_slot(format!("{ltag}.ffn_down.weight"), s_hb, s_x));
             let attn_norm_set = alloc_set(
                 &pipes.rms_norm,
                 &[
@@ -1340,6 +1382,32 @@ impl LlamaVkRunner {
                 ],
             )?;
 
+            let ffn_dec_sep = {
+                let (pg, gg, push_g) = gemv_pipe_for(&pl.w_gate.mat)?;
+                let sg_set = alloc_set(
+                    &pg,
+                    &[
+                        Binding::Arena(pl.w_gate.slice),
+                        Binding::Arena(s_xb),
+                        Binding::Arena(s_hb),
+                    ],
+                )?;
+                let (pu, gu, push_u) = gemv_pipe_for(&pl.w_up.mat)?;
+                let su_set = alloc_set(
+                    &pu,
+                    &[
+                        Binding::Arena(pl.w_up.slice),
+                        Binding::Arena(s_xb),
+                        Binding::Arena(s_hb2),
+                    ],
+                )?;
+                let silu_set = alloc_set(
+                    &pipes.silu_mul,
+                    &[Binding::Arena(s_hb), Binding::Arena(s_hb2)],
+                )?;
+                ((pg, sg_set, gg, push_g), (pu, su_set, gu, push_u), silu_set)
+            };
+
             let ffn_dec = if pl.w_gate.mat.dtype == DType::Q4_0 && pl.w_up.mat.dtype == DType::Q4_0
             {
                 let wg = 128u32;
@@ -1368,33 +1436,21 @@ impl LlamaVkRunner {
                     push: [pl.w_gate.mat.cols as u32, pl.w_gate.mat.rows as u32],
                 }
             } else {
-                let (pg, gg, push_g) = gemv_pipe_for(&pl.w_gate.mat)?;
-                let sg_set = alloc_set(
-                    &pg,
-                    &[
-                        Binding::Arena(pl.w_gate.slice),
-                        Binding::Arena(s_xb),
-                        Binding::Arena(s_hb),
-                    ],
-                )?;
-                let (pu, gu, push_u) = gemv_pipe_for(&pl.w_up.mat)?;
-                let su_set = alloc_set(
-                    &pu,
-                    &[
-                        Binding::Arena(pl.w_up.slice),
-                        Binding::Arena(s_xb),
-                        Binding::Arena(s_hb2),
-                    ],
-                )?;
+                DecodeFfnSets::Separate {
+                    gate: ffn_dec_sep.0.clone(),
+                    up: ffn_dec_sep.1.clone(),
+                    silu_set: ffn_dec_sep.2,
+                }
+            };
+
+            let ffn_batch_sep = {
+                let gate = make_batch_gemm(pl.w_gate.mat, s_xb, s_hb)?;
+                let up = make_batch_gemm(pl.w_up.mat, s_xb, s_hb2)?;
                 let silu_set = alloc_set(
                     &pipes.silu_mul,
                     &[Binding::Arena(s_hb), Binding::Arena(s_hb2)],
                 )?;
-                DecodeFfnSets::Separate {
-                    gate: (pg, sg_set, gg, push_g),
-                    up: (pu, su_set, gu, push_u),
-                    silu_set,
-                }
+                (gate, up, silu_set)
             };
 
             let ffn_batch = if prefill_kind == ResolvedPrefill::CoopMatF16
@@ -1431,11 +1487,11 @@ impl LlamaVkRunner {
             } else {
                 let gate = make_batch_gemm(pl.w_gate.mat, s_xb, s_hb)?;
                 let up = make_batch_gemm(pl.w_up.mat, s_xb, s_hb2)?;
-                let silu_set = alloc_set(
-                    &pipes.silu_mul,
-                    &[Binding::Arena(s_hb), Binding::Arena(s_hb2)],
-                )?;
-                BatchFfnPlan::Separate { gate, up, silu_set }
+                BatchFfnPlan::Separate {
+                    gate,
+                    up,
+                    silu_set: ffn_batch_sep.2,
+                }
             };
 
             let (p_dn, g_dn, mut push_dn) = gemv_pipe_for(&pl.w_down.mat)?;
@@ -1451,6 +1507,7 @@ impl LlamaVkRunner {
             let down_batch = make_batch_gemm(pl.w_down.mat, s_hb, s_x)?;
 
             layers.push(LayerPlan {
+                idx: il,
                 attn_norm_set,
                 qkv_dec,
                 wq_batch,
@@ -1466,7 +1523,9 @@ impl LlamaVkRunner {
                 wo_batch,
                 ffn_norm_set,
                 ffn_dec,
+                ffn_dec_sep,
                 ffn_batch,
+                ffn_batch_sep,
                 down_dec: (p_dn, s_dn, g_dn, push_dn),
                 down_batch,
                 qkv_weight_bytes: pl.wq.slice.len + pl.wk.slice.len + pl.wv.slice.len,
@@ -1475,6 +1534,8 @@ impl LlamaVkRunner {
                 down_weight_bytes: pl.w_down.slice.len,
             });
         }
+
+        let lora = VkLoraEngine::new(&ctx)?;
 
         let mut runner = Self {
             cfg: LlamaVkConfig {
@@ -1520,11 +1581,27 @@ impl LlamaVkRunner {
             cb_decode_greedy: cbs[2],
             cb_batch: cbs[3],
             fence,
+            lora,
+            linear_slots,
+            embed_slots,
             zero_copy_weights,
             _gguf: gguf.clone(),
         };
         runner.prerecord_decode_command_buffers()?;
         Ok(runner)
+    }
+
+    /// Binds dynamic GGUF LoRA adapters onto this Vulkan runner and re-records static decode CBs (`Phase T4`).
+    pub fn bind_lora(&mut self, loras: &tm_lora::LoraSet) -> Result<(), VulkanError> {
+        self.lora.bind(
+            &self.ctx,
+            &self._gguf,
+            loras,
+            self.max_batch,
+            &self.linear_slots,
+            &self.embed_slots,
+        )?;
+        self.prerecord_decode_command_buffers()
     }
 
     pub fn device_name(&self) -> &str {
@@ -1645,6 +1722,8 @@ impl LlamaVkRunner {
         let d = &self.ctx.inner.device;
         // SAFETY: `cb` is idle and owned by `self.cmd_pool`.
         unsafe {
+            d.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
+                .ctx("vkResetCommandBuffer")?;
             d.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default())
                 .ctx("vkBeginCommandBuffer")?;
         }
@@ -1662,6 +1741,8 @@ impl LlamaVkRunner {
             1,
             true,
         )?;
+        self.lora
+            .cmd_record_embed(&self.ctx, cb, "token_embd.weight", 1, false)?;
 
         let eps_bits = self.cfg.rms_eps.to_bits();
         let norm_push = [self.cfg.n_embd as u32, 0, eps_bits];
@@ -1688,6 +1769,15 @@ impl LlamaVkRunner {
         ];
 
         for layer in &self.layers {
+            let ltag = format!("blk.{}", layer.idx);
+            let wq_n = format!("{ltag}.attn_q.weight");
+            let wk_n = format!("{ltag}.attn_k.weight");
+            let wv_n = format!("{ltag}.attn_v.weight");
+            let wo_n = format!("{ltag}.attn_output.weight");
+            let wg_n = format!("{ltag}.ffn_gate.weight");
+            let wu_n = format!("{ltag}.ffn_up.weight");
+            let wd_n = format!("{ltag}.ffn_down.weight");
+
             self.cmd_dispatch_set(
                 cb,
                 &self.pipes.rms_norm,
@@ -1713,6 +1803,9 @@ impl LlamaVkRunner {
                     self.cmd_dispatch_set(cb, &wv.0, wv.1, &wv.3, wv.2, 1, true)?;
                 }
             }
+            self.lora.cmd_record_linear(&self.ctx, cb, &wq_n, 1)?;
+            self.lora.cmd_record_linear(&self.ctx, cb, &wk_n, 1)?;
+            self.lora.cmd_record_linear(&self.ctx, cb, &wv_n, 1)?;
 
             if layer.q_norm_set.is_some() || layer.k_norm_set.is_some() {
                 if let Some(qns) = layer.q_norm_set {
@@ -1769,6 +1862,7 @@ impl LlamaVkRunner {
                 1,
                 true,
             )?;
+            self.lora.cmd_record_linear(&self.ctx, cb, &wo_n, 1)?;
 
             self.cmd_dispatch_set(
                 cb,
@@ -1780,28 +1874,47 @@ impl LlamaVkRunner {
                 true,
             )?;
 
-            match &layer.ffn_dec {
-                DecodeFfnSets::FusedPairSilu {
-                    pipe,
-                    set,
-                    groups_x,
-                    push,
-                } => {
-                    self.cmd_dispatch_set(cb, pipe, *set, push, *groups_x, 1, true)?;
-                }
-                DecodeFfnSets::Separate { gate, up, silu_set } => {
-                    self.cmd_dispatch_set(cb, &gate.0, gate.1, &gate.3, gate.2, 1, false)?;
-                    self.cmd_dispatch_set(cb, &up.0, up.1, &up.3, up.2, 1, true)?;
-                    let gx = (self.cfg.n_ff as u32).div_ceil(256).min(65535);
-                    self.cmd_dispatch_set(
-                        cb,
-                        &self.pipes.silu_mul,
-                        *silu_set,
-                        &[self.cfg.n_ff as u32],
-                        gx,
-                        1,
-                        true,
-                    )?;
+            let force_sep = self.lora.has_linear(&wg_n) || self.lora.has_linear(&wu_n);
+            if force_sep {
+                let (ref gate, ref up, silu_set) = layer.ffn_dec_sep;
+                self.cmd_dispatch_set(cb, &gate.0, gate.1, &gate.3, gate.2, 1, false)?;
+                self.cmd_dispatch_set(cb, &up.0, up.1, &up.3, up.2, 1, true)?;
+                self.lora.cmd_record_linear(&self.ctx, cb, &wg_n, 1)?;
+                self.lora.cmd_record_linear(&self.ctx, cb, &wu_n, 1)?;
+                let gx = (self.cfg.n_ff as u32).div_ceil(256).min(65535);
+                self.cmd_dispatch_set(
+                    cb,
+                    &self.pipes.silu_mul,
+                    silu_set,
+                    &[self.cfg.n_ff as u32],
+                    gx,
+                    1,
+                    true,
+                )?;
+            } else {
+                match &layer.ffn_dec {
+                    DecodeFfnSets::FusedPairSilu {
+                        pipe,
+                        set,
+                        groups_x,
+                        push,
+                    } => {
+                        self.cmd_dispatch_set(cb, pipe, *set, push, *groups_x, 1, true)?;
+                    }
+                    DecodeFfnSets::Separate { gate, up, silu_set } => {
+                        self.cmd_dispatch_set(cb, &gate.0, gate.1, &gate.3, gate.2, 1, false)?;
+                        self.cmd_dispatch_set(cb, &up.0, up.1, &up.3, up.2, 1, true)?;
+                        let gx = (self.cfg.n_ff as u32).div_ceil(256).min(65535);
+                        self.cmd_dispatch_set(
+                            cb,
+                            &self.pipes.silu_mul,
+                            *silu_set,
+                            &[self.cfg.n_ff as u32],
+                            gx,
+                            1,
+                            true,
+                        )?;
+                    }
                 }
             }
 
@@ -1814,6 +1927,7 @@ impl LlamaVkRunner {
                 1,
                 true,
             )?;
+            self.lora.cmd_record_linear(&self.ctx, cb, &wd_n, 1)?;
         }
 
         if compute_logits {
@@ -1829,6 +1943,8 @@ impl LlamaVkRunner {
             let lm = &self.lm_head_dec;
             if greedy_argmax {
                 self.cmd_dispatch_set(cb, &lm.0, lm.1, &lm.3, lm.2, 1, true)?;
+                self.lora
+                    .cmd_record_linear(&self.ctx, cb, "output.weight", 1)?;
                 self.cmd_dispatch_set(
                     cb,
                     &self.pipes.argmax,
@@ -1855,6 +1971,8 @@ impl LlamaVkRunner {
                 }
             } else {
                 self.cmd_dispatch_set(cb, &lm.0, lm.1, &lm.3, lm.2, 1, false)?;
+                self.lora
+                    .cmd_record_linear(&self.ctx, cb, "output.weight", 1)?;
                 let to_xfer = vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
@@ -2185,6 +2303,8 @@ impl LlamaVkRunner {
                 b_u32,
                 true,
             )?;
+            self.lora
+                .cmd_record_embed(&self.ctx, cb, "token_embd.weight", b_u32, true)?;
 
             let rope_push = [
                 self.cfg.n_head as u32,
@@ -2198,6 +2318,15 @@ impl LlamaVkRunner {
             ];
 
             for layer in &self.layers {
+                let ltag = format!("blk.{}", layer.idx);
+                let wq_n = format!("{ltag}.attn_q.weight");
+                let wk_n = format!("{ltag}.attn_k.weight");
+                let wv_n = format!("{ltag}.attn_v.weight");
+                let wo_n = format!("{ltag}.attn_output.weight");
+                let wg_n = format!("{ltag}.ffn_gate.weight");
+                let wu_n = format!("{ltag}.ffn_up.weight");
+                let wd_n = format!("{ltag}.ffn_down.weight");
+
                 self.cmd_dispatch_set(
                     cb,
                     &self.pipes.rms_norm,
@@ -2222,6 +2351,9 @@ impl LlamaVkRunner {
                 self.cmd_gemm(cb, &layer.wq_batch, b_u32, false, false)?;
                 self.cmd_gemm(cb, &layer.wk_batch, b_u32, false, false)?;
                 self.cmd_gemm(cb, &layer.wv_batch, b_u32, false, true)?;
+                self.lora.cmd_record_linear(&self.ctx, cb, &wq_n, b_u32)?;
+                self.lora.cmd_record_linear(&self.ctx, cb, &wk_n, b_u32)?;
+                self.lora.cmd_record_linear(&self.ctx, cb, &wv_n, b_u32)?;
 
                 if layer.q_norm_set.is_some() || layer.k_norm_set.is_some() {
                     if let Some(qns) = layer.q_norm_set {
@@ -2269,6 +2401,7 @@ impl LlamaVkRunner {
                     matches!(layer.wo_batch.flavor, GemmFlavor::CoopMatI8),
                 )?;
                 self.cmd_gemm(cb, &layer.wo_batch, b_u32, true, true)?;
+                self.lora.cmd_record_linear(&self.ctx, cb, &wo_n, b_u32)?;
 
                 self.cmd_dispatch_set(
                     cb,
@@ -2280,48 +2413,71 @@ impl LlamaVkRunner {
                     true,
                 )?;
 
-                match &layer.ffn_batch {
-                    BatchFfnPlan::FusedPairSiluCoopMat {
-                        pipe,
-                        set,
-                        cols,
-                        rows,
-                        row_bytes,
-                    } => {
-                        let push = [*cols as u32, *rows as u32, b_u32, (*row_bytes / 2) as u32];
-                        self.cmd_dispatch_set(
-                            cb,
+                let force_sep = self.lora.has_linear(&wg_n) || self.lora.has_linear(&wu_n);
+                if force_sep {
+                    let (ref gate, ref up, silu_set) = layer.ffn_batch_sep;
+                    let gu_i8 = matches!(gate.flavor, GemmFlavor::CoopMatI8)
+                        || matches!(up.flavor, GemmFlavor::CoopMatI8);
+                    self.cmd_quant_if_needed(cb, self.quant_xb_set, b_u32, self.cfg.n_embd, gu_i8)?;
+                    self.cmd_gemm(cb, gate, b_u32, false, false)?;
+                    self.cmd_gemm(cb, up, b_u32, false, true)?;
+                    self.lora.cmd_record_linear(&self.ctx, cb, &wg_n, b_u32)?;
+                    self.lora.cmd_record_linear(&self.ctx, cb, &wu_n, b_u32)?;
+                    let total_ff = (b * self.cfg.n_ff) as u32;
+                    let gx = total_ff.div_ceil(256).min(65535);
+                    self.cmd_dispatch_set(
+                        cb,
+                        &self.pipes.silu_mul,
+                        silu_set,
+                        &[total_ff],
+                        gx,
+                        1,
+                        true,
+                    )?;
+                } else {
+                    match &layer.ffn_batch {
+                        BatchFfnPlan::FusedPairSiluCoopMat {
                             pipe,
-                            *set,
-                            &push,
-                            (*rows as u32).div_ceil(64),
-                            b_u32.div_ceil(128),
-                            true,
-                        )?;
-                    }
-                    BatchFfnPlan::Separate { gate, up, silu_set } => {
-                        let gu_i8 = matches!(gate.flavor, GemmFlavor::CoopMatI8)
-                            || matches!(up.flavor, GemmFlavor::CoopMatI8);
-                        self.cmd_quant_if_needed(
-                            cb,
-                            self.quant_xb_set,
-                            b_u32,
-                            self.cfg.n_embd,
-                            gu_i8,
-                        )?;
-                        self.cmd_gemm(cb, gate, b_u32, false, false)?;
-                        self.cmd_gemm(cb, up, b_u32, false, true)?;
-                        let total_ff = (b * self.cfg.n_ff) as u32;
-                        let gx = total_ff.div_ceil(256).min(65535);
-                        self.cmd_dispatch_set(
-                            cb,
-                            &self.pipes.silu_mul,
-                            *silu_set,
-                            &[total_ff],
-                            gx,
-                            1,
-                            true,
-                        )?;
+                            set,
+                            cols,
+                            rows,
+                            row_bytes,
+                        } => {
+                            let push = [*cols as u32, *rows as u32, b_u32, (*row_bytes / 2) as u32];
+                            self.cmd_dispatch_set(
+                                cb,
+                                pipe,
+                                *set,
+                                &push,
+                                (*rows as u32).div_ceil(64),
+                                b_u32.div_ceil(128),
+                                true,
+                            )?;
+                        }
+                        BatchFfnPlan::Separate { gate, up, silu_set } => {
+                            let gu_i8 = matches!(gate.flavor, GemmFlavor::CoopMatI8)
+                                || matches!(up.flavor, GemmFlavor::CoopMatI8);
+                            self.cmd_quant_if_needed(
+                                cb,
+                                self.quant_xb_set,
+                                b_u32,
+                                self.cfg.n_embd,
+                                gu_i8,
+                            )?;
+                            self.cmd_gemm(cb, gate, b_u32, false, false)?;
+                            self.cmd_gemm(cb, up, b_u32, false, true)?;
+                            let total_ff = (b * self.cfg.n_ff) as u32;
+                            let gx = total_ff.div_ceil(256).min(65535);
+                            self.cmd_dispatch_set(
+                                cb,
+                                &self.pipes.silu_mul,
+                                *silu_set,
+                                &[total_ff],
+                                gx,
+                                1,
+                                true,
+                            )?;
+                        }
                     }
                 }
 
@@ -2333,6 +2489,7 @@ impl LlamaVkRunner {
                     matches!(layer.down_batch.flavor, GemmFlavor::CoopMatI8),
                 )?;
                 self.cmd_gemm(cb, &layer.down_batch, b_u32, true, true)?;
+                self.lora.cmd_record_linear(&self.ctx, cb, &wd_n, b_u32)?;
             }
 
             if is_last_chunk && compute_last_logits {
@@ -2348,6 +2505,8 @@ impl LlamaVkRunner {
                 )?;
                 let lm = &self.lm_head_dec;
                 self.cmd_dispatch_set(cb, &lm.0, lm.1, &lm.3, lm.2, 1, false)?;
+                self.lora
+                    .cmd_record_linear(&self.ctx, cb, "output.weight", 1)?;
 
                 let to_xfer = vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)

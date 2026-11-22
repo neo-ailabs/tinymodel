@@ -17,6 +17,13 @@ const SPV_QUANTIZE_Q8_1: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quant
 const SPV_GEMM_COOPMAT_I8: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_i8.spv"));
 const SPV_FA_COOPMAT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_coopmat.spv"));
 const SPV_FA_GQA_TILED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_gqa_tiled.spv"));
+pub(crate) const SPV_GEMM_TRANSPOSED: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_transposed.spv"));
+pub(crate) const SPV_LORA_DOWN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/lora_down.spv"));
+pub(crate) const SPV_LORA_UP_AXPY: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/lora_up_axpy.spv"));
+pub(crate) const SPV_LORA_EMBED: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/lora_embed.spv"));
 
 /// Maximum tokens per shared-weight GEMV dispatch (matches the Metal backend).
 pub const MAX_NTOK: usize = 8;
@@ -533,5 +540,121 @@ impl VulkanContext {
             }
             Ok(())
         })
+    }
+
+    /// Phase T4: LDS-tiled `32x64x32` register-blocked transposed quantized GEMM:
+    /// `dx[n_tok, cols] = (accum ? dx : 0) + dy[n_tok, rows] * W[rows, cols]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_transposed_raw(
+        &self,
+        dtype: DType,
+        w: &VkBuffer,
+        dy: &VkBuffer,
+        dx: &VkBuffer,
+        rows: usize,
+        cols: usize,
+        n_tok: usize,
+        accum: bool,
+        repeat: usize,
+    ) -> Result<(), VulkanError> {
+        if rows == 0 || cols == 0 || n_tok == 0 {
+            return Err(VulkanError::InvalidDimensions(format!(
+                "gemm_transposed_raw rows={rows}, cols={cols}, n_tok={n_tok} must be non-zero"
+            )));
+        }
+        let dt = dtype_code(dtype)?;
+        let align_req = match dtype {
+            DType::Q4_0 | DType::Q4_1 | DType::Q8_0 => 32usize,
+            DType::Q5K | DType::Q6K => 256usize,
+            DType::F32 => 1usize,
+            other => return Err(VulkanError::UnsupportedDType(other)),
+        };
+        if !cols.is_multiple_of(align_req) {
+            return Err(VulkanError::InvalidDimensions(format!(
+                "cols={cols} must be a multiple of {align_req} for {dtype:?}"
+            )));
+        }
+        let row_bytes = dtype.row_bytes(cols);
+        let pipe = self.pipeline(
+            "gemm_transposed",
+            dt,
+            SPV_GEMM_TRANSPOSED,
+            3,
+            20,
+            &[128, dt],
+        )?;
+        let push = [
+            cols as u32,
+            rows as u32,
+            n_tok as u32,
+            u32::from(accum),
+            (row_bytes / 2) as u32,
+        ];
+        let gx = (cols as u32).div_ceil(64);
+        let gy = (n_tok as u32).div_ceil(32);
+        self.run(|rec| {
+            for _ in 0..repeat.max(1) {
+                rec.dispatch_xy(&pipe, &[w, dy, dx], &push, gx, gy)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Phase T4: Dynamic GPU linear LoRA `y += scale * (x @ A^T) @ B_T` (`B_T` has layout `[rank, d_out]`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn lora_linear_raw(
+        &self,
+        a: &VkBuffer,
+        b_t: &VkBuffer,
+        x: &VkBuffer,
+        h_scratch: &VkBuffer,
+        y: &VkBuffer,
+        d_in: usize,
+        d_out: usize,
+        rank: usize,
+        n_tok: usize,
+        scale: f32,
+    ) -> Result<(), VulkanError> {
+        let sg = self.info().subgroup_size;
+        let wg_down = 128u32.max(sg);
+        let wg_up = 256u32.max(sg).min(self.info().max_workgroup_invocations);
+        let p_down = self.pipeline("lora_down", wg_down, SPV_LORA_DOWN, 3, 20, &[wg_down])?;
+        let p_up = self.pipeline("lora_up_axpy", wg_up, SPV_LORA_UP_AXPY, 3, 20, &[wg_up])?;
+        let push = [
+            d_in as u32,
+            d_out as u32,
+            rank as u32,
+            n_tok as u32,
+            scale.to_bits(),
+        ];
+        let sgs_per_wg = (wg_down / sg).max(1);
+        let gx_down = ((n_tok * rank) as u32).div_ceil(sgs_per_wg);
+        let gx_up = (d_out as u32).div_ceil(wg_up);
+        self.run(|rec| {
+            rec.dispatch(&p_down, &[a, x, h_scratch], &push, gx_down)?;
+            rec.dispatch_xy(&p_up, &[b_t, h_scratch, y], &push, gx_up, n_tok as u32)?;
+            Ok(())
+        })
+    }
+
+    /// Phase T4: Dynamic GPU embedding LoRA `x[t] += scale * A[tok[t]] @ B_T`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lora_embed_raw(
+        &self,
+        a: &VkBuffer,
+        b_t: &VkBuffer,
+        token_ids: &VkBuffer,
+        x: &VkBuffer,
+        d_out: usize,
+        rank: usize,
+        n_tok: usize,
+        scale: f32,
+    ) -> Result<(), VulkanError> {
+        let sg = self.info().subgroup_size;
+        let wg = 256u32.max(sg).min(self.info().max_workgroup_invocations);
+        let pipe = self.pipeline("lora_embed", wg, SPV_LORA_EMBED, 4, 16, &[wg])?;
+        let push = [d_out as u32, rank as u32, n_tok as u32, scale.to_bits()];
+        let gx = (d_out as u32).div_ceil(wg);
+        self.run(|rec| rec.dispatch_xy(&pipe, &[a, b_t, token_ids, x], &push, gx, n_tok as u32))
     }
 }

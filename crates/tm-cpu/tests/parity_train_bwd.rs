@@ -6,10 +6,12 @@ use tm_core::{
     quantize_row_to_bytes, repack_q4_0_bytes_to_q4_0x4,
 };
 use tm_cpu::{
-    Isa, RopeType, ThreadPool, detect_caps, generic, gqa_attention_f16_kv_batch_parallel,
-    gqa_attention_f16_kv_bwd_f32, matmul_q_transposed_f32, rms_norm_bwd_f32,
-    rope_bwd_inplace_tables, rope_compute_cos_sin, rope_inplace_tables, select_kernels,
-    swiglu_bwd_f32, swiglu_inplace,
+    Isa, RopeType, ThreadPool, detect_caps, geglu_bwd_f32, geglu_inplace, generic,
+    gqa_attention_f16_kv_batch_parallel, gqa_attention_f16_kv_bwd_ext_f32,
+    gqa_attention_f16_kv_bwd_f32, gqa_attention_f16_kv_ext_batch_parallel, l2_norm_bwd_f32,
+    l2_norm_inplace, matmul_q_transposed_f32, rms_norm_bwd_f32, rms_norm_unit_bwd_f32,
+    rms_norm_unit_inplace, rope_bwd_inplace_tables, rope_compute_cos_sin, rope_inplace_tables,
+    select_kernels, swiglu_bwd_f32, swiglu_inplace,
 };
 
 struct Rng(u64);
@@ -479,6 +481,206 @@ fn l1_backward_ops_match_fp64_central_finite_differences() {
             err_v < 1e-5,
             "gqa dv[{i}] got={} num={num_v} err={err_v:e}",
             dv[i]
+        );
+    }
+}
+
+#[test]
+fn l1_hybrid_backward_ops_finite_diff_geglu_l2_unit_rms_and_swa_attn() {
+    let mut rng = Rng(0x2026_1122_CAFE_0003);
+    let eps_fd = 1e-4f64;
+
+    // 1. GeGLU backward (`gelu_tanh(gate) * up`)
+    let n = 48usize;
+    let gate: Vec<f32> = (0..n).map(|_| rng.f32(1.6)).collect();
+    let up: Vec<f32> = (0..n).map(|_| rng.f32(1.3)).collect();
+    let dy: Vec<f32> = (0..n).map(|_| rng.f32(0.9)).collect();
+    let mut dg = vec![0.0f32; n];
+    let mut du = vec![0.0f32; n];
+    geglu_bwd_f32(&mut dg, &mut du, &gate, &up, &dy);
+
+    let geglu_loss = |g_idx: Option<(usize, f64)>, u_idx: Option<(usize, f64)>| -> f64 {
+        let mut g_v: Vec<f32> = gate.clone();
+        let mut u_v: Vec<f32> = up.clone();
+        if let Some((i, delta)) = g_idx {
+            g_v[i] = ((gate[i] as f64) + delta) as f32;
+        }
+        if let Some((i, delta)) = u_idx {
+            u_v[i] = ((up[i] as f64) + delta) as f32;
+        }
+        geglu_inplace(&mut g_v, &u_v);
+        g_v.iter()
+            .zip(dy.iter())
+            .map(|(&o, &d)| (o as f64) * (d as f64))
+            .sum()
+    };
+    for i in 0..n {
+        let num_g = (geglu_loss(Some((i, 1e-3)), None) - geglu_loss(Some((i, -1e-3)), None)) / 2e-3;
+        let err_g = ((dg[i] as f64) - num_g).abs() / num_g.abs().max(1.0);
+        assert!(
+            err_g < 2e-4,
+            "geglu dg[{i}] got={} num={num_g} err={err_g:e}",
+            dg[i]
+        );
+        let num_u = (geglu_loss(None, Some((i, 1e-3))) - geglu_loss(None, Some((i, -1e-3)))) / 2e-3;
+        let err_u = ((du[i] as f64) - num_u).abs() / num_u.abs().max(1.0);
+        assert!(
+            err_u < 2e-4,
+            "geglu du[{i}] got={} num={num_u} err={err_u:e}",
+            du[i]
+        );
+    }
+
+    // 2. L2-norm backward (Qwen3.5 GDN q/k L2 norm) & unit-weight RMSNorm backward (Gemma 4 V norm)
+    let x_vec: Vec<f32> = (0..32).map(|_| rng.f32(1.2)).collect();
+    let dy_vec: Vec<f32> = (0..32).map(|_| rng.f32(0.8)).collect();
+    let norm_eps = 1e-6f32;
+    let mut dx_l2 = vec![0.0f32; 32];
+    let mut dx_urms = vec![0.0f32; 32];
+    l2_norm_bwd_f32(&mut dx_l2, &x_vec, &dy_vec, norm_eps);
+    rms_norm_unit_bwd_f32(&mut dx_urms, &x_vec, &dy_vec, norm_eps);
+
+    // Check forward helper consistency too
+    let mut tmp_l2 = x_vec.clone();
+    l2_norm_inplace(&mut tmp_l2, norm_eps);
+    let mut tmp_ur = x_vec.clone();
+    rms_norm_unit_inplace(&mut tmp_ur, norm_eps);
+
+    let l2_loss64 = |xv: &[f64]| -> f64 {
+        let ss: f64 = xv.iter().map(|v| v * v).sum();
+        let inv = 1.0 / (ss + norm_eps as f64).sqrt();
+        xv.iter()
+            .zip(dy_vec.iter())
+            .map(|(&xi, &di)| xi * inv * (di as f64))
+            .sum()
+    };
+    let urms_loss64 = |xv: &[f64]| -> f64 {
+        let ss: f64 = xv.iter().map(|v| v * v).sum();
+        let inv = 1.0 / (ss / (xv.len() as f64) + norm_eps as f64).sqrt();
+        xv.iter()
+            .zip(dy_vec.iter())
+            .map(|(&xi, &di)| xi * inv * (di as f64))
+            .sum()
+    };
+    let x64: Vec<f64> = x_vec.iter().map(|&v| v as f64).collect();
+    for i in 0..32 {
+        let mut xp = x64.clone();
+        let mut xm = x64.clone();
+        xp[i] += eps_fd;
+        xm[i] -= eps_fd;
+        let num_l2 = (l2_loss64(&xp) - l2_loss64(&xm)) / (2.0 * eps_fd);
+        assert!(
+            ((dx_l2[i] as f64) - num_l2).abs() / num_l2.abs().max(1.0) < 1e-5,
+            "l2_norm dx[{i}] mismatch"
+        );
+        let num_ur = (urms_loss64(&xp) - urms_loss64(&xm)) / (2.0 * eps_fd);
+        assert!(
+            ((dx_urms[i] as f64) - num_ur).abs() / num_ur.abs().max(1.0) < 1e-5,
+            "rms_norm_unit dx[{i}] mismatch"
+        );
+    }
+
+    // 3. Extended GQA attention backward with custom `attn_scale = 1.0` and SWA `window = Some(3)`
+    let kt = select_kernels(Isa::Generic);
+    let pool = ThreadPool::new(2);
+    let n_tok = 6usize;
+    let nh = 4usize;
+    let nkv = 2usize;
+    let hd = 8usize;
+    let q_dim = nh * hd;
+    let kv_dim = nkv * hd;
+    let window = Some(3usize);
+    let attn_scale = 1.0f32;
+
+    let q_in: Vec<f32> = (0..n_tok * q_dim).map(|_| rng.f32(0.5)).collect();
+    let k_f16: Vec<u16> = (0..n_tok * kv_dim)
+        .map(|_| f32_to_f16(rng.f32(0.5)))
+        .collect();
+    let v_f16: Vec<u16> = (0..n_tok * kv_dim)
+        .map(|_| f32_to_f16(rng.f32(0.5)))
+        .collect();
+    let do_in: Vec<f32> = (0..n_tok * q_dim).map(|_| rng.f32(0.7)).collect();
+    let mut fwd_out = vec![0.0f32; n_tok * q_dim];
+    let mut scores = vec![0.0f32; nh * n_tok];
+    gqa_attention_f16_kv_ext_batch_parallel(
+        &pool,
+        kt,
+        &mut fwd_out,
+        &q_in,
+        &k_f16,
+        &v_f16,
+        nh,
+        nkv,
+        hd,
+        0,
+        n_tok,
+        attn_scale,
+        window,
+        n_tok,
+        &mut scores,
+    );
+
+    let mut dq = vec![0.0f32; n_tok * q_dim];
+    let mut dk = vec![0.0f32; n_tok * kv_dim];
+    let mut dv = vec![0.0f32; n_tok * kv_dim];
+    gqa_attention_f16_kv_bwd_ext_f32(
+        kt, &mut dq, &mut dk, &mut dv, &q_in, &k_f16, &v_f16, &do_in, nh, nkv, hd, n_tok,
+        attn_scale, window,
+    );
+
+    let swa_loss64 = |qv: &[f64], kv: &[f64], vv: &[f64]| -> f64 {
+        let group = nh / nkv;
+        let mut loss = 0.0f64;
+        for t in 0..n_tok {
+            let end_pos = t + 1;
+            let start_kv = end_pos.saturating_sub(3);
+            for h in 0..nh {
+                let kvh = h / group;
+                let mut sc = Vec::with_capacity(end_pos - start_kv);
+                for s in start_kv..end_pos {
+                    let mut dot = 0.0f64;
+                    for d in 0..hd {
+                        dot += qv[t * q_dim + h * hd + d] * kv[s * kv_dim + kvh * hd + d];
+                    }
+                    sc.push(dot * (attn_scale as f64));
+                }
+                let mx = sc.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let exps: Vec<f64> = sc.iter().map(|&v| (v - mx).exp()).collect();
+                let z: f64 = exps.iter().sum();
+                for d in 0..hd {
+                    let mut o = 0.0f64;
+                    for (wi, s) in (start_kv..end_pos).enumerate() {
+                        o += (exps[wi] / z) * vv[s * kv_dim + kvh * hd + d];
+                    }
+                    loss += o * (do_in[t * q_dim + h * hd + d] as f64);
+                }
+            }
+        }
+        loss
+    };
+    let q64: Vec<f64> = q_in.iter().map(|&v| v as f64).collect();
+    let k64: Vec<f64> = k_f16.iter().map(|&v| f16_to_f32(v) as f64).collect();
+    let v64: Vec<f64> = v_f16.iter().map(|&v| f16_to_f32(v) as f64).collect();
+    for i in 0..q64.len() {
+        let mut qp = q64.clone();
+        let mut qm = q64.clone();
+        qp[i] += eps_fd;
+        qm[i] -= eps_fd;
+        let num = (swa_loss64(&qp, &k64, &v64) - swa_loss64(&qm, &k64, &v64)) / (2.0 * eps_fd);
+        assert!(
+            ((dq[i] as f64) - num).abs() / num.abs().max(1.0) < 1e-5,
+            "swa dq[{i}] mismatch"
+        );
+    }
+    for i in 0..k64.len() {
+        let mut kp = k64.clone();
+        let mut km = k64.clone();
+        kp[i] += eps_fd;
+        km[i] -= eps_fd;
+        let num = (swa_loss64(&q64, &kp, &v64) - swa_loss64(&q64, &km, &v64)) / (2.0 * eps_fd);
+        assert!(
+            ((dk[i] as f64) - num).abs() / num.abs().max(1.0) < 1e-5,
+            "swa dk[{i}] mismatch"
         );
     }
 }

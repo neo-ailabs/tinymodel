@@ -25,6 +25,7 @@ use tm_gguf::{GgufError, GgufFile};
 
 use crate::MetalError;
 use crate::llama_runner::{MetalProfileReport, MetalStageStat};
+use crate::lora_gpu::MetalLoraEngine;
 
 const LLAMA_OPS_MSL: &str = include_str!("shaders/llama_ops.metal");
 const MAX_BATCH: usize = 128;
@@ -189,6 +190,7 @@ impl Gemma4MetalConfig {
 }
 
 struct GpuMat {
+    name: String,
     buf: MtlBuf,
     offset: usize,
     dtype: DType,
@@ -308,6 +310,7 @@ pub struct Gemma4MetalRunner {
     ple_proj_scratch: MtlBuf,
     ple_gate_scratch: MtlBuf,
     logits: MtlBuf,
+    lora: MetalLoraEngine,
     zero_copy_weights: bool,
     // IMPORTANT: Must remain LAST so all zero-copy `MTLBuffer`s drop before `_gguf` unmaps.
     _gguf: Arc<GgufFile>,
@@ -455,6 +458,7 @@ fn load_gpu_mat(
         (upload_bytes(device, bytes)?, 0)
     };
     Ok(GpuMat {
+        name: name.to_string(),
         buf,
         offset,
         dtype: info.dtype,
@@ -524,6 +528,7 @@ impl Gemma4MetalRunner {
             geglu_mul: build_pipe(&device, &lib, "geglu_mul_f32", 256)?,
             argmax: build_pipe(&device, &lib, "argmax_f32", 256)?,
         };
+        let lora = MetalLoraEngine::new(&device, &lib)?;
 
         let n_layers = gguf.req_usize("gemma4.block_count")?;
         let n_embd = gguf.req_usize("gemma4.embedding_length")?;
@@ -979,6 +984,7 @@ impl Gemma4MetalRunner {
             ple_proj_scratch,
             ple_gate_scratch,
             logits,
+            lora,
             zero_copy_weights,
             _gguf: gguf,
         })
@@ -986,6 +992,11 @@ impl Gemma4MetalRunner {
 
     pub fn device_name(&self) -> String {
         self.device.name().to_string()
+    }
+
+    /// Binds dynamic GGUF LoRA adapters onto this Gemma 4 Metal runner (`Phase T4`).
+    pub fn bind_lora(&mut self, loras: &tm_lora::LoraSet) -> Result<(), MetalError> {
+        self.lora.bind(&self.device, &self._gguf, loras, MAX_BATCH)
     }
 
     pub fn is_zero_copy_weights(&self) -> bool {
@@ -1034,6 +1045,21 @@ impl Gemma4MetalRunner {
         y_off: usize,
         add_residual: bool,
     ) {
+        self.enc_gemv_named(enc, w, &w.name, x, x_off, y, y_off, add_residual);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enc_gemv_named(
+        &self,
+        enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        w: &GpuMat,
+        lora_name: &str,
+        x: &MtlBuf,
+        x_off: usize,
+        y: &MtlBuf,
+        y_off: usize,
+        add_residual: bool,
+    ) {
         let (pipe, rows_per_tg): (&MtlPipe, usize) = match w.dtype {
             DType::Q4_0 => (&self.pipes.gemv_q4_0, 32),
             DType::Q4_1 => (&self.pipes.gemv_q4_1, 32),
@@ -1074,6 +1100,8 @@ impl Gemma4MetalRunner {
                 depth: 1,
             },
         );
+        self.lora
+            .encode_linear(enc, lora_name, x, x_off, y, y_off, 1);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1133,6 +1161,8 @@ impl Gemma4MetalRunner {
                 depth: 1,
             },
         );
+        self.lora
+            .encode_linear(enc, &w.name, x, x_off, y, y_off, n_tok);
     }
 
     fn enc_embed_row(
@@ -1178,6 +1208,8 @@ impl Gemma4MetalRunner {
                 depth: 1,
             },
         );
+        self.lora
+            .encode_embed_single(enc, &mat.name, &self.token_ids_buf, token_id, dst);
     }
 
     fn enc_embed_batch(
@@ -1224,6 +1256,8 @@ impl Gemma4MetalRunner {
                 depth: 1,
             },
         );
+        self.lora
+            .encode_embed_batch(enc, &mat.name, &self.token_ids_buf, dst, n_tok);
     }
 
     fn enc_scale(
@@ -1515,6 +1549,12 @@ impl Gemma4MetalRunner {
                         depth: 1,
                     },
                 );
+                self.lora
+                    .encode_linear(enc, &layer.wq.name, &self.xb, 0, &self.q_buf, 0, 1);
+                self.lora
+                    .encode_linear(enc, &kv_own.wk.name, &self.xb, 0, &self.k_buf, 0, 1);
+                self.lora
+                    .encode_linear(enc, &wv.name, &self.xb, 0, &self.v_buf, 0, 1);
                 did_fused_qkv = true;
             }
             if !did_fused_qkv {
@@ -1854,6 +1894,8 @@ impl Gemma4MetalRunner {
             if active_rows == 1
                 && layer.w_gate.dtype == DType::Q4_0
                 && layer.w_up.dtype == DType::Q4_0
+                && !self.lora.has(&layer.w_gate.name)
+                && !self.lora.has(&layer.w_up.name)
             {
                 let g_args = GemvArgs {
                     n_in: n_embd as u32,
@@ -2055,7 +2097,16 @@ impl Gemma4MetalRunner {
                 },
             );
 
-            self.enc_gemv(enc, self.output_mat(), &self.xb, 0, &self.logits, 0, false);
+            self.enc_gemv_named(
+                enc,
+                self.output_mat(),
+                "output.weight",
+                &self.xb,
+                0,
+                &self.logits,
+                0,
+                false,
+            );
 
             if let Some(cap) = self.cfg.final_logit_softcapping {
                 let sc_args = ScaleArgs {

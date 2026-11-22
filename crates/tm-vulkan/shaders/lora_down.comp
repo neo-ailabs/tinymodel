@@ -1,0 +1,41 @@
+#version 450
+// Phase T4: Dynamic GPU LoRA down-projection (`h[t, r] = scale * dot(A[r, :], x[t, :])`).
+// 1 subgroup per `(t, r)` pair -> identical per-token reduction order for `n_tok == 1` and `n_tok > 1`.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(constant_id = 0) const uint WG = 128;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) buffer H          { float h[]; };
+
+layout(push_constant) uniform PC {
+    uint d_in;
+    uint d_out;
+    uint rank;
+    uint n_tok;
+    float scale;
+} pc;
+
+void main() {
+    const uint idx = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+    const uint total = pc.n_tok * pc.rank;
+    if (idx >= total) return;
+
+    const uint t = idx / pc.rank;
+    const uint r = idx % pc.rank;
+    const uint a_base = r * pc.d_in;
+    const uint x_base = t * pc.d_in;
+
+    float acc = 0.0;
+    for (uint i = gl_SubgroupInvocationID; i < pc.d_in; i += gl_SubgroupSize) {
+        acc = fma(a[a_base + i], x[x_base + i], acc);
+    }
+    const float out_v = subgroupAdd(acc);
+    if (subgroupElect()) {
+        h[idx] = out_v * pc.scale;
+    }
+}

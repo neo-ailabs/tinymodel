@@ -1,0 +1,31 @@
+#version 450
+// Phase T4: Coalesced dynamic GPU LoRA up-projection (`y[t, col] += sum_r h[t, r] * B_T[r, col]`).
+// `B_T` has layout `[rank, d_out]` so adjacent threads `col, col+1` coalesce 100%.
+
+layout(constant_id = 0) const uint WG = 256;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer BT { float bt[]; };
+layout(std430, binding = 1) readonly buffer H  { float h[]; };
+layout(std430, binding = 2) buffer Y           { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint d_in;
+    uint d_out;
+    uint rank;
+    uint n_tok;
+    float scale;
+} pc;
+
+void main() {
+    const uint col = gl_GlobalInvocationID.x;
+    const uint t = gl_WorkGroupID.y;
+    if (col >= pc.d_out || t >= pc.n_tok) return;
+
+    const uint h_base = t * pc.rank;
+    float acc = 0.0;
+    for (uint r = 0u; r < pc.rank; ++r) {
+        acc = fma(h[h_base + r], bt[r * pc.d_out + col], acc);
+    }
+    y[t * pc.d_out + col] += acc;
+}

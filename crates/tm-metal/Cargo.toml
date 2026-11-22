@@ -11,6 +11,12 @@ description = "Apple Metal GPU backend for tinymodel (objc2-metal + MSL kernels)
 thiserror = "2"
 tm-core = { path = "../tm-core" }
 tm-gguf = { path = "../tm-gguf" }
+tm-lora = { path = "../tm-lora" }
+
+[dev-dependencies]
+tm-cpu = { path = "../tm-cpu" }
+tm-models = { path = "../tm-models" }
+tm-runtime = { path = "../tm-runtime" }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2 = "0.6"

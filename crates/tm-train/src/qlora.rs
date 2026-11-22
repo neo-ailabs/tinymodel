@@ -18,15 +18,16 @@ use tm_core::{f16_to_f32, probe_system_memory};
 use tm_cpu::{
     KernelTable, MAX_CPU_BATCH, MatvecScratch, ThreadPool, active_kernels,
     gqa_attention_f16_kv_batch_parallel, gqa_attention_f16_kv_bwd_f32,
-    gqa_attention_f16_kv_parallel, matmul_f32, matmul_pair_f32, matmul_q_transposed_f32,
-    matmul_triple_f32, matvec_f32, matvec_pair_f32, matvec_triple_f32, rms_norm,
-    rms_norm_batch_parallel, rms_norm_bwd_f32, rope_bwd_inplace_tables, rope_compute_cos_sin,
-    rope_inplace_tables, swiglu_bwd_f32, swiglu_inplace_parallel,
+    gqa_attention_f16_kv_parallel, matmul_f32, matmul_pair_f32, matmul_triple_f32, matvec_f32,
+    matvec_pair_f32, matvec_triple_f32, rms_norm, rms_norm_batch_parallel, rms_norm_bwd_f32,
+    rope_bwd_inplace_tables, rope_compute_cos_sin, rope_inplace_tables, swiglu_bwd_f32,
+    swiglu_inplace_parallel,
 };
 use tm_lora::{BoundLora, LoraAdapter, LoraScratch, LoraSet};
-use tm_models::{LlamaModel, RawMatView, decode_embedding_row};
+use tm_models::{LlamaModel, decode_embedding_row};
 
 use crate::TrainError;
+use crate::accel::{LinearAccel, linear_bwd_with_accel, linear_fwd_with_accel};
 use crate::dataset::TrainDataset;
 use crate::optim::{
     AdamW, AdamWConfig, LoraGradStore, LoraTargets, init_lora_adapter, load_train_checkpoint,
@@ -406,6 +407,7 @@ impl<'a> LlamaTrainer<'a> {
         model: &LlamaModel<'_>,
         bound: &BoundLora,
         arena: &mut TrainArena,
+        mut accel: Option<&mut (dyn LinearAccel + '_)>,
         pool: &ThreadPool,
         kt: &KernelTable,
         layer_idx: usize,
@@ -462,76 +464,121 @@ impl<'a> LlamaTrainer<'a> {
 
             // 2. QKV projections + LoRA
             let xn_chunk = &arena.x_attn_norm[offset * d..(offset + b) * d];
-            if single_tok_mode {
-                matvec_triple_f32(
+            if accel.is_some() {
+                linear_fwd_with_accel(
+                    accel.as_deref_mut(),
                     pool,
                     kt,
-                    lw.wq.dtype,
-                    lw.wq.bytes,
-                    q_dim,
-                    &mut arena.q_rope[..q_dim],
-                    lw.wk.dtype,
-                    lw.wk.bytes,
-                    kv_dim,
-                    &mut arena.k_rope_f32[..kv_dim],
-                    lw.wv.dtype,
-                    lw.wv.bytes,
-                    kv_dim,
-                    &mut arena.v_full_f32[..kv_dim],
+                    &lw.wq,
+                    bound,
+                    slot_wq,
                     xn_chunk,
+                    &mut arena.q_rope[offset * q_dim..(offset + b) * q_dim],
+                    b,
+                    single_tok_mode,
                     &mut arena.mv_scratch,
-                    d,
+                    &mut arena.lora_scratch,
+                );
+                linear_fwd_with_accel(
+                    accel.as_deref_mut(),
+                    pool,
+                    kt,
+                    &lw.wk,
+                    bound,
+                    slot_wk,
+                    xn_chunk,
+                    &mut arena.k_rope_f32[offset * kv_dim..(offset + b) * kv_dim],
+                    b,
+                    single_tok_mode,
+                    &mut arena.mv_scratch,
+                    &mut arena.lora_scratch,
+                );
+                linear_fwd_with_accel(
+                    accel.as_deref_mut(),
+                    pool,
+                    kt,
+                    &lw.wv,
+                    bound,
+                    slot_wv,
+                    xn_chunk,
+                    &mut arena.v_full_f32[offset * kv_dim..(offset + b) * kv_dim],
+                    b,
+                    single_tok_mode,
+                    &mut arena.mv_scratch,
+                    &mut arena.lora_scratch,
                 );
             } else {
-                matmul_triple_f32(
-                    pool,
-                    kt,
-                    lw.wq.dtype,
-                    lw.wq.bytes,
-                    q_dim,
-                    &mut arena.q_rope[offset * q_dim..(offset + b) * q_dim],
-                    lw.wk.dtype,
-                    lw.wk.bytes,
-                    kv_dim,
-                    &mut arena.k_rope_f32[offset * kv_dim..(offset + b) * kv_dim],
-                    lw.wv.dtype,
-                    lw.wv.bytes,
-                    kv_dim,
-                    &mut arena.v_full_f32[offset * kv_dim..(offset + b) * kv_dim],
-                    xn_chunk,
-                    &mut arena.mv_scratch,
-                    d,
-                    b,
-                );
-            }
-            if !bound.is_empty() {
-                bound.apply_linear(
-                    slot_wq,
-                    pool,
-                    kt,
-                    xn_chunk,
-                    &mut arena.q_rope[offset * q_dim..(offset + b) * q_dim],
-                    b,
-                    &mut arena.lora_scratch,
-                );
-                bound.apply_linear(
-                    slot_wk,
-                    pool,
-                    kt,
-                    xn_chunk,
-                    &mut arena.k_rope_f32[offset * kv_dim..(offset + b) * kv_dim],
-                    b,
-                    &mut arena.lora_scratch,
-                );
-                bound.apply_linear(
-                    slot_wv,
-                    pool,
-                    kt,
-                    xn_chunk,
-                    &mut arena.v_full_f32[offset * kv_dim..(offset + b) * kv_dim],
-                    b,
-                    &mut arena.lora_scratch,
-                );
+                if single_tok_mode {
+                    matvec_triple_f32(
+                        pool,
+                        kt,
+                        lw.wq.dtype,
+                        lw.wq.bytes,
+                        q_dim,
+                        &mut arena.q_rope[..q_dim],
+                        lw.wk.dtype,
+                        lw.wk.bytes,
+                        kv_dim,
+                        &mut arena.k_rope_f32[..kv_dim],
+                        lw.wv.dtype,
+                        lw.wv.bytes,
+                        kv_dim,
+                        &mut arena.v_full_f32[..kv_dim],
+                        xn_chunk,
+                        &mut arena.mv_scratch,
+                        d,
+                    );
+                } else {
+                    matmul_triple_f32(
+                        pool,
+                        kt,
+                        lw.wq.dtype,
+                        lw.wq.bytes,
+                        q_dim,
+                        &mut arena.q_rope[offset * q_dim..(offset + b) * q_dim],
+                        lw.wk.dtype,
+                        lw.wk.bytes,
+                        kv_dim,
+                        &mut arena.k_rope_f32[offset * kv_dim..(offset + b) * kv_dim],
+                        lw.wv.dtype,
+                        lw.wv.bytes,
+                        kv_dim,
+                        &mut arena.v_full_f32[offset * kv_dim..(offset + b) * kv_dim],
+                        xn_chunk,
+                        &mut arena.mv_scratch,
+                        d,
+                        b,
+                    );
+                }
+                if !bound.is_empty() {
+                    bound.apply_linear(
+                        slot_wq,
+                        pool,
+                        kt,
+                        xn_chunk,
+                        &mut arena.q_rope[offset * q_dim..(offset + b) * q_dim],
+                        b,
+                        &mut arena.lora_scratch,
+                    );
+                    bound.apply_linear(
+                        slot_wk,
+                        pool,
+                        kt,
+                        xn_chunk,
+                        &mut arena.k_rope_f32[offset * kv_dim..(offset + b) * kv_dim],
+                        b,
+                        &mut arena.lora_scratch,
+                    );
+                    bound.apply_linear(
+                        slot_wv,
+                        pool,
+                        kt,
+                        xn_chunk,
+                        &mut arena.v_full_f32[offset * kv_dim..(offset + b) * kv_dim],
+                        b,
+                        &mut arena.lora_scratch,
+                    );
+                }
             }
 
             if save_recompute {
@@ -649,39 +696,18 @@ impl<'a> LlamaTrainer<'a> {
 
             // 5. Output projection (`wo`) + residual -> `x_mid`
             let ao_chunk = &arena.attn_out[offset * q_dim..(offset + b) * q_dim];
-            if single_tok_mode {
-                matvec_f32(
-                    pool,
-                    kt,
-                    lw.wo.dtype,
-                    lw.wo.bytes,
-                    ao_chunk,
-                    &mut arena.mv_scratch,
-                    &mut arena.xb2_chunk[..d],
-                    d,
-                    q_dim,
-                );
-            } else {
-                matmul_f32(
-                    pool,
-                    kt,
-                    lw.wo.dtype,
-                    lw.wo.bytes,
-                    ao_chunk,
-                    &mut arena.mv_scratch,
-                    &mut arena.xb2_chunk[..b * d],
-                    d,
-                    q_dim,
-                    b,
-                );
-            }
-            bound.apply_linear(
-                slot_wo,
+            linear_fwd_with_accel(
+                accel.as_deref_mut(),
                 pool,
                 kt,
+                &lw.wo,
+                bound,
+                slot_wo,
                 ao_chunk,
                 &mut arena.xb2_chunk[..b * d],
                 b,
+                single_tok_mode,
+                &mut arena.mv_scratch,
                 &mut arena.lora_scratch,
             );
             for i in 0..(b * d) {
@@ -716,59 +742,90 @@ impl<'a> LlamaTrainer<'a> {
             }
 
             let xfn_chunk = &arena.x_ffn_norm[offset * d..(offset + b) * d];
-            if single_tok_mode {
-                matvec_pair_f32(
+            if accel.is_some() {
+                linear_fwd_with_accel(
+                    accel.as_deref_mut(),
                     pool,
                     kt,
-                    lw.w_gate.dtype,
-                    lw.w_gate.bytes,
-                    ff,
-                    &mut arena.gate_pre[..ff],
-                    lw.w_up.dtype,
-                    lw.w_up.bytes,
-                    ff,
-                    &mut arena.up_pre[..ff],
+                    &lw.w_gate,
+                    bound,
+                    slot_wg,
                     xfn_chunk,
+                    &mut arena.gate_pre[offset * ff..(offset + b) * ff],
+                    b,
+                    single_tok_mode,
                     &mut arena.mv_scratch,
-                    d,
+                    &mut arena.lora_scratch,
+                );
+                linear_fwd_with_accel(
+                    accel.as_deref_mut(),
+                    pool,
+                    kt,
+                    &lw.w_up,
+                    bound,
+                    slot_wu,
+                    xfn_chunk,
+                    &mut arena.up_pre[offset * ff..(offset + b) * ff],
+                    b,
+                    single_tok_mode,
+                    &mut arena.mv_scratch,
+                    &mut arena.lora_scratch,
                 );
             } else {
-                matmul_pair_f32(
-                    pool,
-                    kt,
-                    lw.w_gate.dtype,
-                    lw.w_gate.bytes,
-                    ff,
-                    &mut arena.gate_pre[offset * ff..(offset + b) * ff],
-                    lw.w_up.dtype,
-                    lw.w_up.bytes,
-                    ff,
-                    &mut arena.up_pre[offset * ff..(offset + b) * ff],
-                    xfn_chunk,
-                    &mut arena.mv_scratch,
-                    d,
-                    b,
-                );
-            }
-            if !bound.is_empty() {
-                bound.apply_linear(
-                    slot_wg,
-                    pool,
-                    kt,
-                    xfn_chunk,
-                    &mut arena.gate_pre[offset * ff..(offset + b) * ff],
-                    b,
-                    &mut arena.lora_scratch,
-                );
-                bound.apply_linear(
-                    slot_wu,
-                    pool,
-                    kt,
-                    xfn_chunk,
-                    &mut arena.up_pre[offset * ff..(offset + b) * ff],
-                    b,
-                    &mut arena.lora_scratch,
-                );
+                if single_tok_mode {
+                    matvec_pair_f32(
+                        pool,
+                        kt,
+                        lw.w_gate.dtype,
+                        lw.w_gate.bytes,
+                        ff,
+                        &mut arena.gate_pre[..ff],
+                        lw.w_up.dtype,
+                        lw.w_up.bytes,
+                        ff,
+                        &mut arena.up_pre[..ff],
+                        xfn_chunk,
+                        &mut arena.mv_scratch,
+                        d,
+                    );
+                } else {
+                    matmul_pair_f32(
+                        pool,
+                        kt,
+                        lw.w_gate.dtype,
+                        lw.w_gate.bytes,
+                        ff,
+                        &mut arena.gate_pre[offset * ff..(offset + b) * ff],
+                        lw.w_up.dtype,
+                        lw.w_up.bytes,
+                        ff,
+                        &mut arena.up_pre[offset * ff..(offset + b) * ff],
+                        xfn_chunk,
+                        &mut arena.mv_scratch,
+                        d,
+                        b,
+                    );
+                }
+                if !bound.is_empty() {
+                    bound.apply_linear(
+                        slot_wg,
+                        pool,
+                        kt,
+                        xfn_chunk,
+                        &mut arena.gate_pre[offset * ff..(offset + b) * ff],
+                        b,
+                        &mut arena.lora_scratch,
+                    );
+                    bound.apply_linear(
+                        slot_wu,
+                        pool,
+                        kt,
+                        xfn_chunk,
+                        &mut arena.up_pre[offset * ff..(offset + b) * ff],
+                        b,
+                        &mut arena.lora_scratch,
+                    );
+                }
             }
 
             arena.swiglu_out[offset * ff..(offset + b) * ff]
@@ -780,39 +837,18 @@ impl<'a> LlamaTrainer<'a> {
             );
 
             let sw_chunk = &arena.swiglu_out[offset * ff..(offset + b) * ff];
-            if single_tok_mode {
-                matvec_f32(
-                    pool,
-                    kt,
-                    lw.w_down.dtype,
-                    lw.w_down.bytes,
-                    sw_chunk,
-                    &mut arena.mv_scratch,
-                    &mut arena.xb2_chunk[..d],
-                    d,
-                    ff,
-                );
-            } else {
-                matmul_f32(
-                    pool,
-                    kt,
-                    lw.w_down.dtype,
-                    lw.w_down.bytes,
-                    sw_chunk,
-                    &mut arena.mv_scratch,
-                    &mut arena.xb2_chunk[..b * d],
-                    d,
-                    ff,
-                    b,
-                );
-            }
-            bound.apply_linear(
-                slot_wd,
+            linear_fwd_with_accel(
+                accel.as_deref_mut(),
                 pool,
                 kt,
+                &lw.w_down,
+                bound,
+                slot_wd,
                 sw_chunk,
                 &mut arena.xb2_chunk[..b * d],
                 b,
+                single_tok_mode,
+                &mut arena.mv_scratch,
                 &mut arena.lora_scratch,
             );
 
@@ -872,6 +908,7 @@ impl<'a> LlamaTrainer<'a> {
                 self.model,
                 &self.bound_lora,
                 &mut self.arena,
+                None,
                 pool,
                 kt,
                 l,
@@ -925,6 +962,22 @@ impl<'a> LlamaTrainer<'a> {
         loss_mask: &[u8],
         grad_scale: f32,
     ) -> (f32, usize) {
+        self.forward_backward_microbatch_with_accel(
+            None, pool, adapter, grads, tokens, loss_mask, grad_scale,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_backward_microbatch_with_accel(
+        &mut self,
+        mut accel: Option<&mut (dyn LinearAccel + '_)>,
+        pool: &ThreadPool,
+        adapter: &LoraAdapter,
+        grads: &mut LoraGradStore,
+        tokens: &[u32],
+        loss_mask: &[u8],
+        grad_scale: f32,
+    ) -> (f32, usize) {
         assert_eq!(tokens.len(), loss_mask.len());
         assert!(tokens.len() >= 2);
         let seq_len = (tokens.len() - 1).min(self.arena.max_seq);
@@ -971,6 +1024,7 @@ impl<'a> LlamaTrainer<'a> {
                 self.model,
                 &self.bound_lora,
                 &mut self.arena,
+                accel.as_deref_mut(),
                 pool,
                 kt,
                 l,
@@ -1002,25 +1056,18 @@ impl<'a> LlamaTrainer<'a> {
                 );
             }
 
-            matmul_f32(
+            linear_fwd_with_accel(
+                accel.as_deref_mut(),
                 pool,
                 kt,
-                self.model.output.dtype,
-                self.model.output.bytes,
-                &self.arena.ce_x_norm[..b * d],
-                &mut self.arena.mv_scratch,
-                &mut self.arena.ce_logits[..b * vocab],
-                vocab,
-                d,
-                b,
-            );
-            self.bound_lora.apply_linear(
+                &self.model.output,
+                &self.bound_lora,
                 slot_out,
-                pool,
-                kt,
                 &self.arena.ce_x_norm[..b * d],
                 &mut self.arena.ce_logits[..b * vocab],
                 b,
+                false,
+                &mut self.arena.mv_scratch,
                 &mut self.arena.lora_scratch,
             );
 
@@ -1047,7 +1094,8 @@ impl<'a> LlamaTrainer<'a> {
                 }
             }
 
-            linear_backward(
+            linear_bwd_with_accel(
+                accel.as_deref_mut(),
                 pool,
                 kt,
                 &self.model.output,
@@ -1085,6 +1133,7 @@ impl<'a> LlamaTrainer<'a> {
                 self.model,
                 &self.bound_lora,
                 &mut self.arena,
+                accel.as_deref_mut(),
                 pool,
                 kt,
                 l,
@@ -1097,7 +1146,8 @@ impl<'a> LlamaTrainer<'a> {
             let lw = &self.model.layers[l];
 
             // 3a. FFN backward (`w_down` -> `swiglu` -> `w_gate`/`w_up` -> `ffn_norm` + residual)
-            linear_backward(
+            linear_bwd_with_accel(
+                accel.as_deref_mut(),
                 pool,
                 kt,
                 &lw.w_down,
@@ -1119,7 +1169,8 @@ impl<'a> LlamaTrainer<'a> {
                 &self.arena.up_pre[..seq_len * ff],
                 &self.arena.d_swiglu[..seq_len * ff],
             );
-            linear_backward(
+            linear_bwd_with_accel(
+                accel.as_deref_mut(),
                 pool,
                 kt,
                 &lw.w_gate,
@@ -1134,7 +1185,8 @@ impl<'a> LlamaTrainer<'a> {
                 &mut self.arena.lora_dh,
                 &mut self.arena.lora_bt,
             );
-            linear_backward(
+            linear_bwd_with_accel(
+                accel.as_deref_mut(),
                 pool,
                 kt,
                 &lw.w_up,
@@ -1166,7 +1218,8 @@ impl<'a> LlamaTrainer<'a> {
             }
 
             // 3b. GQA Attention backward (`wo` -> `gqa_attn` -> `RoPE` -> `QK-Norm` -> `wq`/`wk`/`wv` -> `attn_norm` + residual)
-            linear_backward(
+            linear_bwd_with_accel(
+                accel.as_deref_mut(),
                 pool,
                 kt,
                 &lw.wo,
@@ -1279,7 +1332,8 @@ impl<'a> LlamaTrainer<'a> {
                 }
             }
 
-            linear_backward(
+            linear_bwd_with_accel(
+                accel.as_deref_mut(),
                 pool,
                 kt,
                 &lw.wq,
@@ -1294,7 +1348,8 @@ impl<'a> LlamaTrainer<'a> {
                 &mut self.arena.lora_dh,
                 &mut self.arena.lora_bt,
             );
-            linear_backward(
+            linear_bwd_with_accel(
+                accel.as_deref_mut(),
                 pool,
                 kt,
                 &lw.wk,
@@ -1309,7 +1364,8 @@ impl<'a> LlamaTrainer<'a> {
                 &mut self.arena.lora_dh,
                 &mut self.arena.lora_bt,
             );
-            linear_backward(
+            linear_bwd_with_accel(
+                accel.as_deref_mut(),
                 pool,
                 kt,
                 &lw.wv,
@@ -1420,6 +1476,7 @@ impl<'a> LlamaTrainer<'a> {
                 self.model,
                 &self.bound_lora,
                 &mut self.arena,
+                None,
                 pool,
                 kt,
                 l,
@@ -1476,103 +1533,6 @@ impl<'a> LlamaTrainer<'a> {
             c0 += b;
         }
         loss_sum / (n_valid as f64)
-    }
-}
-
-/// Symmetric backward for `y = W_base * x + scale * (x * A^T) * B^T` (`AGENTS.md` Rule #5):
-/// 1. Accumulates `(dA, dB)` in deterministic token order (`t = 0..n_tok`).
-/// 2. Computes `dx = (accum ? dx : 0) + dy * W_base + scale * (dy * B) * A`.
-#[allow(clippy::too_many_arguments)]
-fn linear_backward(
-    pool: &ThreadPool,
-    kt: &KernelTable,
-    w: &RawMatView<'_>,
-    adapter: &LoraAdapter,
-    grads: &mut LoraGradStore,
-    x: &[f32],
-    dy: &[f32],
-    out_dx: &mut [f32],
-    n_tok: usize,
-    accum: bool,
-    lora_h: &mut [f32],
-    lora_dh: &mut [f32],
-    lora_bt: &mut [f32],
-) {
-    matmul_q_transposed_f32(
-        pool, kt, w.dtype, w.bytes, dy, out_dx, w.rows, w.cols, n_tok, accum,
-    );
-
-    let Some(pair) = adapter.pairs.get(w.name) else {
-        return;
-    };
-    if pair.is_token_embd {
-        return;
-    }
-    let scale = pair.effective_scale(adapter.alpha, 1.0);
-    if scale == 0.0 {
-        return;
-    }
-
-    let r = pair.rank;
-    let d_in = pair.d_in;
-    let d_out = pair.d_out;
-    let h = &mut lora_h[..n_tok * r];
-    let dh = &mut lora_dh[..n_tok * r];
-    let b_t = &mut lora_bt[..r * d_out];
-
-    for o in 0..d_out {
-        let src = &pair.b[o * r..(o + 1) * r];
-        for (r_idx, &val) in src.iter().enumerate() {
-            b_t[r_idx * d_out + o] = val;
-        }
-    }
-
-    let g = grads.grads.get_mut(w.name).expect("lora grad slot");
-
-    for t in 0..n_tok {
-        let xt = &x[t * d_in..(t + 1) * d_in];
-        let dyt = &dy[t * d_out..(t + 1) * d_out];
-        let ht = &mut h[t * r..(t + 1) * r];
-        let dht = &mut dh[t * r..(t + 1) * r];
-
-        for r_idx in 0..r {
-            let ar = &pair.a[r_idx * d_in..(r_idx + 1) * d_in];
-            let mut sum_ax = 0.0f64;
-            for (&ai, &xi) in ar.iter().zip(xt.iter()) {
-                sum_ax += (ai as f64) * (xi as f64);
-            }
-            ht[r_idx] = sum_ax as f32;
-
-            let bt_r = &b_t[r_idx * d_out..(r_idx + 1) * d_out];
-            let mut sum_dyb = 0.0f64;
-            for (&dyo, &bo) in dyt.iter().zip(bt_r.iter()) {
-                sum_dyb += (dyo as f64) * (bo as f64);
-            }
-            dht[r_idx] = (sum_dyb * (scale as f64)) as f32;
-        }
-
-        // `dB[o, r_idx] += scale * dy[t, o] * h[t, r_idx]`
-        for (o, &dyo) in dyt.iter().enumerate() {
-            if dyo == 0.0 {
-                continue;
-            }
-            let s_dyo = dyo * scale;
-            let db_row = &mut g.db[o * r..(o + 1) * r];
-            for (db_v, &h_v) in db_row.iter_mut().zip(ht.iter()) {
-                *db_v = s_dyo.mul_add(h_v, *db_v);
-            }
-        }
-
-        // `dA[r_idx, :] += dh[t, r_idx] * x[t, :]` and `out_dx[t, :] += dh[t, r_idx] * A[r_idx, :]`
-        let dxt = &mut out_dx[t * d_in..(t + 1) * d_in];
-        for (r_idx, &dhr) in dht.iter().enumerate() {
-            if dhr == 0.0 {
-                continue;
-            }
-            let ar = &pair.a[r_idx * d_in..(r_idx + 1) * d_in];
-            (kt.axpy_f32)(&mut g.da[r_idx * d_in..(r_idx + 1) * d_in], dhr, xt);
-            (kt.axpy_f32)(dxt, dhr, ar);
-        }
     }
 }
 

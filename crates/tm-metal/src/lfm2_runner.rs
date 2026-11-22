@@ -22,6 +22,7 @@ use tm_gguf::{GgufError, GgufFile};
 
 use crate::MetalError;
 use crate::llama_runner::{MetalProfileReport, MetalStageStat};
+use crate::lora_gpu::MetalLoraEngine;
 
 const LLAMA_OPS_MSL: &str = include_str!("shaders/llama_ops.metal");
 const MAX_BATCH: usize = 128;
@@ -119,6 +120,7 @@ pub struct Lfm2MetalConfig {
 }
 
 struct GpuMat {
+    name: String,
     buf: MtlBuf,
     offset: usize,
     dtype: DType,
@@ -217,6 +219,7 @@ pub struct Lfm2MetalRunner {
     hb: MtlBuf,
     hb2: MtlBuf,
     logits: MtlBuf,
+    lora: MetalLoraEngine,
     zero_copy_weights: bool,
     // IMPORTANT: Must remain LAST so all zero-copy `MTLBuffer`s drop before `_gguf` unmaps.
     _gguf: Arc<GgufFile>,
@@ -364,6 +367,7 @@ fn load_gpu_mat(
         (upload_bytes(device, bytes)?, 0)
     };
     Ok(GpuMat {
+        name: name.to_string(),
         buf,
         offset,
         dtype: info.dtype,
@@ -424,6 +428,7 @@ impl Lfm2MetalRunner {
             silu_mul: build_pipe(&device, &lib, "silu_mul_f32", 256)?,
             argmax: build_pipe(&device, &lib, "argmax_f32", 256)?,
         };
+        let lora = MetalLoraEngine::new(&device, &lib)?;
 
         let n_layers = gguf.req_usize("lfm2.block_count")?;
         let n_embd = gguf.req_usize("lfm2.embedding_length")?;
@@ -758,6 +763,7 @@ impl Lfm2MetalRunner {
             hb,
             hb2,
             logits,
+            lora,
             zero_copy_weights,
             _gguf: gguf,
         })
@@ -765,6 +771,11 @@ impl Lfm2MetalRunner {
 
     pub fn device_name(&self) -> String {
         self.device.name().to_string()
+    }
+
+    /// Binds dynamic GGUF LoRA adapters onto this LFM2 Metal runner (`Phase T4`).
+    pub fn bind_lora(&mut self, loras: &tm_lora::LoraSet) -> Result<(), MetalError> {
+        self.lora.bind(&self.device, &self._gguf, loras, MAX_BATCH)
     }
 
     pub fn is_zero_copy_weights(&self) -> bool {
@@ -833,6 +844,18 @@ impl Lfm2MetalRunner {
         y: &MtlBuf,
         add_residual: bool,
     ) {
+        self.enc_gemv_named(enc, w, &w.name, x, y, add_residual);
+    }
+
+    fn enc_gemv_named(
+        &self,
+        enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        w: &GpuMat,
+        lora_name: &str,
+        x: &MtlBuf,
+        y: &MtlBuf,
+        add_residual: bool,
+    ) {
         let (pipe, rows_per_tg): (&MtlPipe, usize) = match w.dtype {
             DType::Q4_0 => (&self.pipes.gemv_q4_0, 32),
             DType::Q4_1 => (&self.pipes.gemv_q4_1, 32),
@@ -873,6 +896,7 @@ impl Lfm2MetalRunner {
                 depth: 1,
             },
         );
+        self.lora.encode_linear(enc, lora_name, x, 0, y, 0, 1);
     }
 
     fn enc_gemm(
@@ -929,6 +953,7 @@ impl Lfm2MetalRunner {
                 depth: 1,
             },
         );
+        self.lora.encode_linear(enc, &w.name, x, 0, y, 0, n_tok);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1023,6 +1048,13 @@ impl Lfm2MetalRunner {
                     depth: 1,
                 },
             );
+            self.lora.encode_embed_single(
+                enc,
+                "token_embd.weight",
+                &self.token_ids_buf,
+                tid,
+                &self.x,
+            );
         } else {
             let args = EmbedArgs {
                 token_id: 0,
@@ -1060,6 +1092,13 @@ impl Lfm2MetalRunner {
                     height: 1,
                     depth: 1,
                 },
+            );
+            self.lora.encode_embed_batch(
+                enc,
+                "token_embd.weight",
+                &self.token_ids_buf,
+                &self.x,
+                n_tok,
             );
         }
 
@@ -1307,7 +1346,12 @@ impl Lfm2MetalRunner {
                 self.cfg.rms_eps,
                 n_tok,
             );
-            if n_tok == 1 && layer.w_gate.dtype == DType::Q4_0 && layer.w_up.dtype == DType::Q4_0 {
+            if n_tok == 1
+                && layer.w_gate.dtype == DType::Q4_0
+                && layer.w_up.dtype == DType::Q4_0
+                && !self.lora.has(&layer.w_gate.name)
+                && !self.lora.has(&layer.w_up.name)
+            {
                 let g_args = GemvArgs {
                     n_in: n_embd as u32,
                     n_out: n_ff as u32,
@@ -1402,7 +1446,14 @@ impl Lfm2MetalRunner {
                 },
             );
 
-            self.enc_gemv(enc, self.output_mat(), &self.xb, &self.logits, false);
+            self.enc_gemv_named(
+                enc,
+                self.output_mat(),
+                "output.weight",
+                &self.xb,
+                &self.logits,
+                false,
+            );
 
             if greedy_argmax {
                 let n_vocab = self.cfg.vocab_size as u32;

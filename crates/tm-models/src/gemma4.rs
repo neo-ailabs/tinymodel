@@ -21,7 +21,7 @@ use tm_cpu::{
 use tm_gguf::{GgufError, GgufFile};
 use tm_lora::{BoundLora, LoraScratch, LoraSet};
 
-use crate::llama::ModelError;
+use crate::llama::{ModelError, RawMatView};
 use crate::state::{LayerState, MAX_SPEC_WINDOW, SpecVerifyBuf, decode_embedding_row};
 
 /// Hyperparameters for `general.architecture == "gemma4"`.
@@ -85,61 +85,53 @@ impl Gemma4Config {
     }
 }
 
-#[derive(Clone, Copy)]
-struct MatView<'a> {
-    name: &'a str,
-    bytes: &'a [u8],
-    dtype: DType,
-    rows: usize,
-    cols: usize,
-    lora_slot: Option<usize>,
-}
+type MatView<'a> = RawMatView<'a>;
 
-struct PleGlobalWeights<'a> {
-    tok_embd: MatView<'a>,
-    model_proj: MatView<'a>,
+pub struct PleGlobalWeights<'a> {
+    pub tok_embd: RawMatView<'a>,
+    pub model_proj: RawMatView<'a>,
     /// Pre-scaled by `1 / sqrt(2)` at load time (`gemma4.cpp:543`).
-    proj_norm_scaled: Vec<f32>,
+    pub proj_norm_scaled: Vec<f32>,
 }
 
-struct PleLayerWeights<'a> {
-    inp_gate: MatView<'a>,
-    proj: MatView<'a>,
-    post_norm: Vec<f32>,
+pub struct PleLayerWeights<'a> {
+    pub inp_gate: RawMatView<'a>,
+    pub proj: RawMatView<'a>,
+    pub post_norm: Vec<f32>,
 }
 
-struct KvLayerWeights<'a> {
-    wk: MatView<'a>,
-    wv: Option<MatView<'a>>,
-    k_norm: Vec<f32>,
+pub struct KvLayerWeights<'a> {
+    pub wk: RawMatView<'a>,
+    pub wv: Option<RawMatView<'a>>,
+    pub k_norm: Vec<f32>,
 }
 
-struct Gemma4LayerWeights<'a> {
-    attn_norm: Vec<f32>,
-    wq: MatView<'a>,
-    q_norm: Vec<f32>,
-    kv: Option<KvLayerWeights<'a>>,
-    wo: MatView<'a>,
-    post_attn_norm: Vec<f32>,
-    ffn_norm: Vec<f32>,
-    w_gate: MatView<'a>,
-    w_up: MatView<'a>,
-    w_down: MatView<'a>,
-    post_ffw_norm: Vec<f32>,
-    ple: Option<PleLayerWeights<'a>>,
-    out_scale: Option<f32>,
+pub struct Gemma4LayerWeights<'a> {
+    pub attn_norm: Vec<f32>,
+    pub wq: RawMatView<'a>,
+    pub q_norm: Vec<f32>,
+    pub kv: Option<KvLayerWeights<'a>>,
+    pub wo: RawMatView<'a>,
+    pub post_attn_norm: Vec<f32>,
+    pub ffn_norm: Vec<f32>,
+    pub w_gate: RawMatView<'a>,
+    pub w_up: RawMatView<'a>,
+    pub w_down: RawMatView<'a>,
+    pub post_ffw_norm: Vec<f32>,
+    pub ple: Option<PleLayerWeights<'a>>,
+    pub out_scale: Option<f32>,
 }
 
 /// Loaded Gemma 4 model borrowing quantized weight slices zero-copy from `GgufFile`.
 pub struct Gemma4Model<'a> {
     pub cfg: Gemma4Config,
-    token_embd: MatView<'a>,
-    output: MatView<'a>,
-    output_norm: Vec<f32>,
-    rope_inv_freqs_full: Vec<f64>,
-    rope_inv_freqs_swa: Vec<f64>,
-    ple_global: Option<PleGlobalWeights<'a>>,
-    layers: Vec<Gemma4LayerWeights<'a>>,
+    pub token_embd: RawMatView<'a>,
+    pub output: RawMatView<'a>,
+    pub output_norm: Vec<f32>,
+    pub rope_inv_freqs_full: Vec<f64>,
+    pub rope_inv_freqs_swa: Vec<f64>,
+    pub ple_global: Option<PleGlobalWeights<'a>>,
+    pub layers: Vec<Gemma4LayerWeights<'a>>,
     pub lora: BoundLora,
 }
 
