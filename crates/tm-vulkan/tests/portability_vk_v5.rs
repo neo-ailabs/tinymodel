@@ -546,8 +546,25 @@ fn max_rel_err(got: &[f32], r: &[f32]) -> (f32, f32) {
     (max_abs / norm, max_abs)
 }
 
+fn ctx() -> Option<VulkanContext> {
+    match VulkanContext::new() {
+        Ok(c) => Some(c),
+        Err(VulkanError::DeviceNotFound(sel)) => {
+            panic!("TM_VK_DEVICE='{sel}' did not match any Vulkan device");
+        }
+        Err(e) => {
+            eprintln!("[tm-vulkan] skipping: no usable Vulkan device ({e})");
+            None
+        }
+    }
+}
+
 #[test]
 fn vk_v5_trap_checks_never_silently_drop_work() {
+    let Some(ctx) = ctx() else {
+        return;
+    };
+
     // 1. Bogus device selector must return `DeviceNotFound`.
     let bad = VulkanContext::with_selector(Some("nonexistent-vulkan-device-xyz-999"));
     assert!(
@@ -565,7 +582,6 @@ fn vk_v5_trap_checks_never_silently_drop_work() {
         bad_sg.err()
     );
 
-    let ctx = VulkanContext::new().expect("VulkanContext");
     let max_wg = ctx.info().max_workgroup_invocations;
     let sg = ctx.info().subgroup_size;
 
@@ -626,7 +642,9 @@ fn vk_v5_trap_checks_never_silently_drop_work() {
 #[test]
 fn vk_v5_subgroup_width_matrix_and_zero_copy_parity() {
     let sel = std::env::var("TM_VK_DEVICE").ok();
-    let base_ctx = VulkanContext::with_selector(sel.as_deref()).expect("base VulkanContext");
+    let Some(base_ctx) = ctx() else {
+        return;
+    };
     let info = base_ctx.info().clone();
 
     let mut supported_sgs = Vec::new();

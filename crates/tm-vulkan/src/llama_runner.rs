@@ -926,6 +926,7 @@ impl LlamaVkRunner {
         let max_sets = (n_layers as u32) * 26 + 24;
         let max_desc = max_sets * 8;
         let d = &ctx.inner.device;
+        // SAFETY: `d` is a valid logical device and `ctx.inner.queue_family` is its compute queue family.
         let (desc_pool, cmd_pool, cbs, fence) = unsafe {
             let pool_sizes = [vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,

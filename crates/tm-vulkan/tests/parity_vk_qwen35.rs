@@ -16,7 +16,20 @@ use tm_core::{BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ6K, BlockQ8_0, f32_to_f16};
 use tm_cpu::{ThreadPool, active_kernels};
 use tm_gguf::GgufFile;
 use tm_models::{Qwen35Model, Qwen35State, argmax};
-use tm_vulkan::{Qwen35VkRunner, VkPrefillMode, VulkanContext};
+use tm_vulkan::{Qwen35VkRunner, VkPrefillMode, VulkanContext, VulkanError};
+
+fn ctx() -> Option<VulkanContext> {
+    match VulkanContext::new() {
+        Ok(c) => Some(c),
+        Err(VulkanError::DeviceNotFound(sel)) => {
+            panic!("TM_VK_DEVICE='{sel}' did not match any Vulkan device");
+        }
+        Err(e) => {
+            eprintln!("[tm-vulkan] skipping: no usable Vulkan device ({e})");
+            None
+        }
+    }
+}
 
 struct Rng(u64);
 impl Rng {
@@ -449,7 +462,9 @@ fn vk_qwen35_f32_exact_parity_and_hk_grouping() {
     let pool = ThreadPool::new(2);
     let kt = active_kernels();
 
-    let ctx = VulkanContext::new().expect("vulkan context");
+    let Some(ctx) = ctx() else {
+        return;
+    };
     ctx.set_prefill_mode(VkPrefillMode::Fallback);
     let mut vk = Qwen35VkRunner::from_gguf_with_context(ctx, gguf.clone(), 64).expect("vk qwen35");
 
@@ -656,7 +671,9 @@ fn vk_qwen35_mixed_quant_coopmat_fallback_and_reset_parity() {
         .forward_batch(&mut cpu_state, &pool, kt, &prompt, 0, true)
         .expect("cpu batch");
 
-    let base_ctx = VulkanContext::new().expect("vulkan context");
+    let Some(base_ctx) = ctx() else {
+        return;
+    };
     let info = base_ctx.info().clone();
 
     // 1. Sequential pre-recorded decode + Fallback batch invariance
@@ -880,7 +897,9 @@ fn vk_qwen35_gdn_layer_vs_fp64_oracle() {
         1, n_embd, n_ff, 2, 2, 32, 16, d_conv, s_dim, hk, hv, vocab, ts,
     );
     let gguf = open_temp_gguf("fp64_oracle", &bytes);
-    let ctx = VulkanContext::new().expect("vk ctx");
+    let Some(ctx) = ctx() else {
+        return;
+    };
     ctx.set_prefill_mode(VkPrefillMode::Fallback);
     let mut vk = Qwen35VkRunner::from_gguf_with_context(ctx, gguf, 32).expect("vk runner");
 
