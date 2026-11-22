@@ -10,7 +10,10 @@
 | `ldraw.py` | 标准 LDraw (`.ldr`) 与模型友好的 **Compact Grid DSL**（Y 轴朝上、整数凸点/薄板栅格、`rot ∈ {0,1,2,3}`）双向无损编解码与原点归一化 |
 | `validator.py` | 乐高版 **DRC 物理校验器**：三维体素穿模检测、凸点-管孔咬合连通图、悬空/接地与重心稳定性检查、分步可拼搭性校验、BOM 零件预算约束 |
 | `dataset.py` | 6 类通过 DRC 校验的多步拼搭模板（金字塔、小屋、拱桥、小卡车、瞭望塔、楼梯）+ 自动生成穿模/悬空/孤岛负样本，导出 `sft_messages.jsonl`、`sft_prompt_completion.jsonl`、`dpo_pairs.jsonl` |
-| `cli.py` | 命令行工具（`convert` / `validate` / `generate` / `repair-demo`） |
+| `importer.py` | 真实数据批量导入器：支持 `.ldr` / `.mpd` / BrickLink `.io` / HuggingFace OMR JSONL，自动过滤零件子集与 DRC 校验并切分 `train.jsonl` / `val.jsonl` |
+| `train_qwen25_coder_7b.py` | `Qwen2.5-Coder-7B-Instruct` 单卡 24GB 显存 QLoRA 微调脚本（4-bit NF4 + 全线性层 LoRA `r=32` + Assistant-only Loss Masking + 可选合并导出） |
+| `eval_drc.py` | 盲测评测与多轮 DRC 自修复闭环脚本（统计语法解析率、0 穿模率、100% 连通率、BOM 合规率与全项 DRC 通过率） |
+| `cli.py` | 命令行工具（`convert` / `validate` / `generate` / `import` / `repair-demo`） |
 | `test_lego.py` | `pytest` 单元测试与端到端回归测试 |
 
 ## 快速使用
@@ -32,6 +35,31 @@ python3 -m tools.lego.cli convert /tmp/lego_data/dsl/mini_house.dsl --to-ldraw -
 
 # 5. 查看 DRC 报错与修复闭环演示
 python3 -m tools.lego.cli repair-demo
+
+# 6. 导入真实 LDraw / .io / HuggingFace OMR JSONL 数据集
+python3 -m tools.lego.cli import /path/to/omr_or_ldr_dir --out-dir /tmp/lego_sft
+```
+
+## Qwen2.5-Coder-7B-Instruct QLoRA 微调与盲测（单卡 24GB GPU）
+
+```bash
+# 1. 在 GPU 机器上安装依赖
+pip install torch transformers peft datasets bitsandbytes accelerate
+
+# 2. 启动 4-bit NF4 QLoRA 微调（支持多轮 DRC 自修复样本，仅对 assistant 回复计算 loss）
+python3 tools/lego/train_qwen25_coder_7b.py \
+    --model-id Qwen/Qwen2.5-Coder-7B-Instruct \
+    --train-jsonl /tmp/lego_sft/train.jsonl \
+    --val-jsonl /tmp/lego_sft/val.jsonl \
+    --output-dir runs/qwen25-coder-7b-lego-lora \
+    --epochs 4 --max-seq-len 2048 --merge-and-save
+
+# 3. 对接 OpenAI 兼容服务（vLLM / llama-server）跑盲测 + 2 轮 DRC 自修复闭环评测
+python3 tools/lego/eval_drc.py \
+    --val-jsonl /tmp/lego_sft/val.jsonl \
+    --base-url http://127.0.0.1:8000/v1 \
+    --model qwen25-coder-7b-lego \
+    --repair-rounds 2
 ```
 
 ## 对接 `tinymodel` QLoRA 微调

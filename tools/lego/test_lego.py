@@ -134,3 +134,47 @@ def test_dataset_generation_outputs_valid_jsonl(tmp_path: Path) -> None:
     for lf in ldr_files:
         m = parse_ldraw(lf.read_text(encoding="utf-8"), default_name=lf.stem)
         assert validate_model(m).passed
+
+
+def test_importer_and_eval_drc_pipeline(tmp_path: Path) -> None:
+    import zipfile
+    from tools.lego.eval_drc import evaluate_predictions_file
+    from tools.lego.importer import import_to_sft
+
+    src_dir = tmp_path / "raw"
+    src_dir.mkdir()
+    templates = default_templates()
+    for m in templates:
+        (src_dir / f"{m.name}.ldr").write_text(to_ldraw(m), encoding="utf-8")
+
+    # Also pack one as BrickLink Studio .io (zip)
+    with zipfile.ZipFile(src_dir / "house_studio.io", "w") as zf:
+        zf.writestr("model.ldr", to_ldraw(build_mini_house()))
+
+    out_sft = tmp_path / "sft"
+    stats = import_to_sft(src_dir, out_sft, val_ratio=0.2, seed=42)
+    assert stats.total_seen == len(templates) + 1
+    assert stats.accepted == len(templates) + 1
+    assert (out_sft / "train.jsonl").exists()
+    assert (out_sft / "val.jsonl").exists()
+
+    # Score offline predictions (1 good wrapped in markdown fence + 1 broken collision)
+    good = build_mini_house()
+    broken = make_corrupted_variant(good, "collision")
+    pred_path = tmp_path / "preds.jsonl"
+    pred_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"name": "good", "completion": f"```dsl\n{to_dsl(good)}```", "bom": good.bom()}),
+                json.dumps({"name": "bad", "completion": to_dsl(broken), "bom": good.bom()}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    summary = evaluate_predictions_file(pred_path)
+    assert summary["total"] == 2
+    assert summary["parse_rate"] == 1.0
+    assert summary["drc_pass_rate"] == 0.5
+    assert summary["zero_collision_rate"] == 0.5
+

@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from .dataset import build_mini_house, generate_dataset, make_corrupted_variant
+from .importer import import_to_sft
 from .ldraw import load_model, to_dsl, to_ldraw
 from .validator import validate_model
 
@@ -57,6 +58,25 @@ def cmd_generate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_import(args: argparse.Namespace) -> int:
+    stats = import_to_sft(
+        input_path=args.input,
+        out_dir=args.out_dir,
+        min_bricks=args.min_bricks,
+        max_bricks=args.max_bricks,
+        require_drc_pass=not args.allow_drc_fail,
+        val_ratio=args.val_ratio,
+        include_repair_turns=not args.no_repair_turns,
+        seed=args.seed,
+    )
+    print(
+        f"[lego-import] seen={stats.total_seen} parsed={stats.parsed_ok} "
+        f"accepted={stats.accepted} skipped_parts={stats.skipped_unsupported_parts} "
+        f"skipped_drc={stats.skipped_drc_failed} -> {args.out_dir}"
+    )
+    return 0
+
+
 def cmd_repair_demo(_args: argparse.Namespace) -> int:
     good = build_mini_house()
     broken = make_corrupted_variant(good, "collision")
@@ -92,6 +112,17 @@ def main(argv: list[str] | None = None) -> int:
     p_gen.add_argument("--seed", type=int, default=42, help="Random seed")
     p_gen.add_argument("--variants", type=int, default=12, help="Number of extra color-swapped variants")
     p_gen.set_defaults(func=cmd_generate)
+
+    p_imp = sub.add_parser("import", help="Import real .ldr/.mpd/.io/OMR JSONL into Qwen2.5-Coder SFT splits")
+    p_imp.add_argument("input", type=Path, help="Input file or directory (.ldr/.mpd/.io/.jsonl)")
+    p_imp.add_argument("--out-dir", type=Path, required=True, help="Output directory for train.jsonl / val.jsonl")
+    p_imp.add_argument("--min-bricks", type=int, default=4)
+    p_imp.add_argument("--max-bricks", type=int, default=250)
+    p_imp.add_argument("--val-ratio", type=float, default=0.1)
+    p_imp.add_argument("--allow-drc-fail", action="store_true", help="Do not filter out models that fail DRC")
+    p_imp.add_argument("--no-repair-turns", action="store_true", help="Disable multi-turn DRC repair samples")
+    p_imp.add_argument("--seed", type=int, default=42)
+    p_imp.set_defaults(func=cmd_import)
 
     p_demo = sub.add_parser("repair-demo", help="Run a quick DRC error-feedback and repair demo")
     p_demo.set_defaults(func=cmd_repair_demo)
