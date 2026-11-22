@@ -74,6 +74,61 @@ fn dynamic_row_chunk(total_rows: usize, n_thr: usize) -> usize {
     }
 }
 
+/// Computes `y = W * x` without quantizing `x` when `dtype == DType::Q8_0` (evaluates exact
+/// `Q8_0 × F32` dequantized dot products via `kt.dot_f32_q8_0`, matching GPU float-activation
+/// shaders across hybrid VRAM + Host RAM + NVMe MoE execution). Falls back to `matvec_f32`
+/// for other `DType`s.
+#[allow(clippy::too_many_arguments)]
+pub fn matvec_f32_unquant_act(
+    pool: &ThreadPool,
+    kt: &KernelTable,
+    dtype: DType,
+    w_bytes: &[u8],
+    x: &[f32],
+    scratch: &mut MatvecScratch,
+    out: &mut [f32],
+    rows: usize,
+    cols: usize,
+) {
+    if dtype == DType::Q8_0 {
+        assert_eq!(x.len(), cols);
+        assert_eq!(out.len(), rows);
+        assert_eq!(w_bytes.len(), rows * dtype.row_bytes(cols));
+        let cols_blocks = cols / QK8_0;
+        assert!(
+            (w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockQ8_0>()),
+            "Q8_0 tensor pointer misaligned"
+        );
+        // SAFETY: Length and alignment of `w_bytes` verified above; `BlockQ8_0` is `#[repr(C)]` POD.
+        let w: &[BlockQ8_0] = unsafe {
+            core::slice::from_raw_parts(w_bytes.as_ptr() as *const BlockQ8_0, rows * cols_blocks)
+        };
+        let n_thr = pool.num_threads();
+        if n_thr <= 1 {
+            for (r, dst) in out.iter_mut().enumerate() {
+                let row = &w[r * cols_blocks..(r + 1) * cols_blocks];
+                *dst = (kt.dot_f32_q8_0)(x, row);
+            }
+        } else {
+            let chunk = dynamic_row_chunk(rows, n_thr);
+            let out_ptr = out.as_mut_ptr() as usize;
+            pool.parallel_for(rows, chunk, |r0, r1| {
+                let len = r1 - r0;
+                // SAFETY: Disjoint `[r0..r1)` output ranges per parallel chunk.
+                let o =
+                    unsafe { core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(r0), len) };
+                for (i, dst) in o.iter_mut().enumerate() {
+                    let r = r0 + i;
+                    let row = &w[r * cols_blocks..(r + 1) * cols_blocks];
+                    *dst = (kt.dot_f32_q8_0)(x, row);
+                }
+            });
+        }
+        return;
+    }
+    matvec_f32(pool, kt, dtype, w_bytes, x, scratch, out, rows, cols);
+}
+
 /// Dispatches quantized `y = W * x` across `pool` strictly by `dtype` of tensor `W`.
 ///
 /// Zero heap allocations: activation quantization uses `scratch`.

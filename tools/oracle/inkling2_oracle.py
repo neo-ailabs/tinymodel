@@ -318,10 +318,12 @@ def generate_synthetic_inkling2_loop_gguf(out_path: Path, seed: int = 20261122) 
                 w.add_tensor_f32(f"blk.{i}.attn_res_query.weight", rand_w((3, n_embd), 0.2), (n_embd, 3))
         w.add_tensor_f32(f"blk.{i}.ffn_res_query.weight", rand_w((n_embd,), 0.2), (n_embd,))
 
-        # MoE
+        # MoE (router scale 0.4 + structured load-balance bias ensures min top-2 margin > 5e-3 across 42 distinct expert pairs)
         w.add_tensor_f32(f"blk.{i}.ffn_norm.weight", rand_norm(n_embd), (n_embd,))
-        w.add_tensor_f32(f"blk.{i}.ffn_gate_inp.weight", rand_w((n_expert, n_embd), 0.3), (n_embd, n_expert))
-        w.add_tensor_f32(f"blk.{i}.exp_probs_b.bias", rand_w((n_expert,), 0.15), (n_expert,))
+        w.add_tensor_f32(f"blk.{i}.ffn_gate_inp.weight", rand_w((n_expert, n_embd), 0.4), (n_embd, n_expert))
+        base_b = rand_w((n_expert,), 0.05)
+        perm_b = np.array([(e * 5 + i * 3) % n_expert for e in range(n_expert)], dtype=np.float32)
+        w.add_tensor_f32(f"blk.{i}.exp_probs_b.bias", base_b + 0.12 * perm_b, (n_expert,))
         w.add_tensor_q8_0(
             f"blk.{i}.ffn_gate_up_exps.weight",
             rand_w((n_expert, 2 * n_ff_exp, n_embd), 0.10),
@@ -488,9 +490,15 @@ def mix_depth(blocks: list[np.ndarray], cur: np.ndarray, query: np.ndarray) -> n
 class Inkling2Oracle:
     """Exact token-by-token FP64 reference implementation of `inkling2` & `inkling2_loop`."""
 
-    def __init__(self, gguf: GgufReader, quantize_q8_act: bool = True) -> None:
+    def __init__(
+        self,
+        gguf: GgufReader,
+        quantize_q8_act: bool = True,
+        hybrid_vram_exps: set[int] | None = None,
+    ) -> None:
         self.g = gguf
-        self.quantize_q8_act = quantize_q8_act
+        self.quantize_q8_act = False if hybrid_vram_exps is not None else quantize_q8_act
+        self.hybrid_vram_exps = hybrid_vram_exps
         kv = gguf.kv
         arch = kv["general.architecture"]
         assert arch in ("inkling2", "inkling2_loop")
@@ -738,9 +746,14 @@ class Inkling2Oracle:
 
         gate_up_exps = self.g.tensor_f64(f"blk.{ip}.ffn_gate_up_exps.weight")  # [E, 2*n_ff, n_embd]
         down_exps = self.g.tensor_f64(f"blk.{ip}.ffn_down_exps.weight")  # [E, n_embd, n_ff]
+        moe_q8_act = (
+            (ip not in self.hybrid_vram_exps)
+            if self.hybrid_vram_exps is not None
+            else self.quantize_q8_act
+        )
         cur_in = (
             dequantize_q8_0_bytes(quantize_q8_0_rows(cur.astype(np.float32)), cur.shape)
-            if self.quantize_q8_act
+            if moe_q8_act
             else cur
         )
         moe_out = np.zeros((self.n_embd,), dtype=np.float64)
@@ -753,7 +766,7 @@ class Inkling2Oracle:
             hidden = act_g * act_u
             hid_in = (
                 dequantize_q8_0_bytes(quantize_q8_0_rows(hidden.astype(np.float32)), hidden.shape)
-                if self.quantize_q8_act
+                if moe_q8_act
                 else hidden
             )
             moe_out += w_e * (down_exps[e_id] @ hid_in)
@@ -826,6 +839,12 @@ def main() -> None:
     ap.add_argument("--out", type=Path, required=True, help="Output TMLG v1 reference file")
     ap.add_argument("--seed", type=int, default=20261122)
     ap.add_argument("--float-act", action="store_true", help="Keep activations in float64 instead of Q8_0 (matches GPU float-activation GEMV)")
+    ap.add_argument(
+        "--hybrid-vram-exps",
+        type=str,
+        default=None,
+        help="Comma-separated physical layer IDs whose MoE runs on GPU float-act (or 'none' when all MoE layers run on Host Q8_0)",
+    )
     args = ap.parse_args()
 
     if args.gen_gguf is not None:
@@ -840,8 +859,17 @@ def main() -> None:
     if len(toks) < 2:
         raise SystemExit("AGENTS.md Rule #7 requires >= 2 tokens")
 
+    hybrid_vram: set[int] | None = None
+    if args.hybrid_vram_exps is not None:
+        s = args.hybrid_vram_exps.strip()
+        hybrid_vram = set() if s in ("", "none") else {int(x) for x in s.split(",") if x.strip()}
+
     reader = GgufReader(gguf_path)
-    oracle = Inkling2Oracle(reader, quantize_q8_act=not args.float_act)
+    oracle = Inkling2Oracle(
+        reader,
+        quantize_q8_act=not args.float_act,
+        hybrid_vram_exps=hybrid_vram,
+    )
     logits_steps: list[np.ndarray] = []
     for step, tid in enumerate(toks):
         lg = oracle.forward_token(tid, step)

@@ -1,0 +1,178 @@
+//! Multi-token Vulkan parity tests for `Inkling-2-Mini` (`inkling2_loop`) across:
+//! 1. 100% pure-GPU execution (`vram-full`), AND
+//! 2. Loop-aware 3-Tier `GPU VRAM + Host RAM + NVMe O_DIRECT` hybrid execution!
+
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::Arc;
+
+use tm_cpu::{ThreadPool, active_kernels};
+use tm_gguf::GgufFile;
+use tm_models::{Inkling2LoadOptions, Inkling2Model, Inkling2State, argmax};
+use tm_vulkan::{Inkling2VkRunner, VulkanError};
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap()
+}
+
+fn read_tmlg_f32(path: &std::path::Path) -> (Vec<u32>, usize, Vec<Vec<f32>>) {
+    let raw = std::fs::read(path).unwrap();
+    assert_eq!(&raw[0..4], b"TMLG");
+    let ver = u32::from_le_bytes(raw[4..8].try_into().unwrap());
+    assert_eq!(ver, 1);
+    let n_steps = u32::from_le_bytes(raw[8..12].try_into().unwrap()) as usize;
+    let n_vocab = u32::from_le_bytes(raw[12..16].try_into().unwrap()) as usize;
+    let mut off = 16;
+    let mut toks = Vec::with_capacity(n_steps);
+    for _ in 0..n_steps {
+        toks.push(u32::from_le_bytes(raw[off..off + 4].try_into().unwrap()));
+        off += 4;
+    }
+    let mut mat = Vec::with_capacity(n_steps);
+    for _ in 0..n_steps {
+        let mut row = Vec::with_capacity(n_vocab);
+        for _ in 0..n_vocab {
+            row.push(f32::from_le_bytes(raw[off..off + 4].try_into().unwrap()));
+            off += 4;
+        }
+        mat.push(row);
+    }
+    assert_eq!(off, raw.len());
+    (toks, n_vocab, mat)
+}
+
+#[test]
+fn parity_vk_inkling2_pure_gpu_and_3tier_hybrid() {
+    let root = repo_root();
+    let tmp_dir = std::env::temp_dir().join(format!("tm_vk_inkling2_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let gguf_path = tmp_dir.join("synthetic_inkling2_loop_q8_0.gguf");
+    let ref_path = tmp_dir.join("ref_float_act.tmlg");
+
+    let status = Command::new("python3")
+        .arg(root.join("tools/oracle/inkling2_oracle.py"))
+        .arg("--gen-gguf")
+        .arg(&gguf_path)
+        .arg("--tokens")
+        .arg("5,12,29,41,7,63,18")
+        .arg("--float-act")
+        .arg("--out")
+        .arg(&ref_path)
+        .status()
+        .expect("failed to invoke inkling2_oracle.py");
+    assert!(status.success());
+
+    let (toks, _, ref_logits) = read_tmlg_f32(&ref_path);
+    let gguf = Arc::new(GgufFile::open(&gguf_path).unwrap());
+
+    // 1. 100% pure-GPU mode (`vram-full`) vs FP64 float-activation oracle
+    let mut runner = match Inkling2VkRunner::from_gguf(gguf.clone(), 64) {
+        Ok(r) => r,
+        Err(VulkanError::Loader(_) | VulkanError::NoDevice) => {
+            eprintln!("skipping parity_vk_inkling2: no Vulkan loader/device in environment");
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return;
+        }
+        Err(e) => panic!("Inkling2VkRunner::from_gguf failed: {e}"),
+    };
+    assert!(!runner.has_host_offload_layers());
+    assert_eq!(runner.weights_mode(), "vram-full");
+
+    for (step, &tid) in toks.iter().enumerate() {
+        let got = runner.forward_token(tid, step, true).unwrap();
+        let want = &ref_logits[step];
+        assert_eq!(
+            argmax(got),
+            argmax(want),
+            "pure-GPU Top-1 mismatch at step {step} on {}",
+            runner.device_name()
+        );
+        let mut max_diff = 0.0f32;
+        for (&a, &b) in got.iter().zip(want.iter()) {
+            max_diff = max_diff.max((a - b).abs());
+        }
+        assert!(
+            max_diff < 5e-3,
+            "pure-GPU step {step} max_diff {max_diff} >= 5e-3 on {}",
+            runner.device_name()
+        );
+    }
+
+    // Verify reset_state() + forward_token_greedy() matches step 0 argmax!
+    runner.reset_state().unwrap();
+    let greedy0 = runner.forward_token_greedy(toks[0], 0).unwrap();
+    assert_eq!(greedy0, argmax(&ref_logits[0]));
+
+    // 2. Forced 3-Tier Hybrid (`GPU VRAM + Host Anonymous RAM + NVMe O_DIRECT`)!
+    //    Give VRAM enough budget for dense + state + 2 of the 4 core layers (`ip=2,3`),
+    //    Host RAM enough for the other 2 core layers (`ip=4,5`), and stream the 4 outer layers
+    //    (`ip=0,1,6,7`) via parallel `O_DIRECT` NVMe!
+    let one_layer_exp_bytes = 52_224u64;
+    let two_core_bytes = 2 * one_layer_exp_bytes;
+    let scratch_est = ((24 * 64 + 4 * 2 * 32 + 2 * 96 + 65536) * 4) as u64;
+    let base_plus_2core = runner.vram_total_bytes() + scratch_est - 6 * one_layer_exp_bytes + 8192;
+    let mut hybrid_runner =
+        Inkling2VkRunner::from_gguf_with_vram_budget(gguf.clone(), 64, Some(base_plus_2core))
+            .unwrap();
+    assert!(hybrid_runner.has_host_offload_layers());
+
+    let host_model = Inkling2Model::from_gguf_with_options(
+        &gguf,
+        &Inkling2LoadOptions {
+            vram_expert_layers: hybrid_runner.vram_expert_mask().to_vec(),
+            ram_expert_budget_bytes: Some(two_core_bytes),
+        },
+    )
+    .unwrap();
+    assert!(host_model.stats.nvme_direct_expert_layers >= 4);
+    let mut host_state = Inkling2State::new(&host_model, 64);
+    let pool = ThreadPool::new(4);
+    let kt = active_kernels();
+
+    for (step, &tid) in toks.iter().enumerate() {
+        let mut cb = |ip: usize,
+                      cur_normed: &[f32],
+                      top_ids: &[usize],
+                      top_weights: &[f32],
+                      moe_out: &mut [f32]| {
+            let (serial_pool, expert_slots, mv_scratch) = host_state.host_moe_parts_mut();
+            host_model.eval_moe_experts_f32(
+                ip,
+                cur_normed,
+                top_ids,
+                top_weights,
+                &pool,
+                serial_pool,
+                kt,
+                expert_slots,
+                mv_scratch,
+                moe_out,
+            );
+        };
+        let got = hybrid_runner
+            .forward_token_hybrid(tid, step, true, Some(&mut cb))
+            .unwrap();
+        let top_got = argmax(got);
+        let want = &ref_logits[step];
+        let mut max_diff_h = 0.0f32;
+        for (&a, &b) in got.iter().zip(want.iter()) {
+            max_diff_h = max_diff_h.max((a - b).abs());
+        }
+        assert_eq!(
+            top_got,
+            argmax(want),
+            "3-tier hybrid Top-1 mismatch at step {step} ({})",
+            hybrid_runner.weights_mode()
+        );
+        assert!(
+            max_diff_h < 5e-3,
+            "3-tier hybrid step {step} max_diff_h {max_diff_h} >= 5e-3 ({})",
+            hybrid_runner.weights_mode()
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}

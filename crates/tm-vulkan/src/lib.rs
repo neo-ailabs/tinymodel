@@ -8,11 +8,13 @@
 //! instead of silently dropping work.
 
 mod context;
+pub mod inkling2_runner;
 mod kernels;
 pub mod llama_runner;
 pub mod qwen35_runner;
 
 pub use context::{DeviceInfo, VkBuffer, VkPrefillMode, VulkanContext};
+pub use inkling2_runner::{HostMoeFn, Inkling2VkConfig, Inkling2VkRunner};
 pub use kernels::{Q4Layout, VkMatQ4_0};
 pub use llama_runner::{LlamaVkConfig, LlamaVkRunner, VkProfileReport, VkStageStat};
 pub use qwen35_runner::{Qwen35VkConfig, Qwen35VkRunner};

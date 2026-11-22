@@ -19,8 +19,8 @@
 
 use tm_core::{DType, KvType, QK8_0, dequantize_row_bytes, probe_system_memory};
 use tm_cpu::{
-    KernelTable, MAX_CPU_BATCH, MatvecScratch, ThreadPool, matmul_f32, matvec_f32, rms_norm,
-    rms_norm_unit_inplace, softcap_inplace_parallel,
+    KernelTable, MAX_CPU_BATCH, MatvecScratch, ThreadPool, matmul_f32, matvec_f32,
+    matvec_f32_unquant_act, rms_norm, rms_norm_unit_inplace, softcap_inplace_parallel,
 };
 use tm_gguf::{DirectTensorReader, GgufError, GgufFile, PageAlignedSlot};
 
@@ -1223,9 +1223,7 @@ impl<'a> Inkling2Model<'a> {
     }
 
     /// Evaluates selected MoE experts `(top_ids, top_weights)` on a single normed input vector `cur_normed`
-    /// (`[n_embd]`) for physical layer `ip`, writing the combined `[n_embd]` output into `moe_out`.
-    ///
-    /// Shared by `Inkling2Model::forward_token` AND `Inkling2VkHybridRunner` (for host RAM + NVMe layers!).
+    /// (`[n_embd]`) for physical layer `ip` using `Q8_0 × Q8_0` CPU kernels.
     #[allow(clippy::too_many_arguments)]
     pub fn eval_moe_experts_single(
         &self,
@@ -1240,6 +1238,73 @@ impl<'a> Inkling2Model<'a> {
         mv_scratch: &mut MatvecScratch,
         moe_out: &mut [f32],
     ) {
+        self.eval_moe_experts_inner(
+            ip,
+            cur_normed,
+            top_ids,
+            top_weights,
+            pool,
+            serial_pool,
+            kt,
+            expert_slots,
+            mv_scratch,
+            moe_out,
+            false,
+        );
+    }
+
+    /// Evaluates selected MoE experts `(top_ids, top_weights)` using exact `Q8_0 × F32` float
+    /// activations (`kt.dot_f32_q8_0`), matching GPU `moe_gemv_q8_0_id` shaders across 3-tier
+    /// `VRAM + Host RAM + NVMe O_DIRECT` hybrid inference with zero activation-quantization loss.
+    #[allow(clippy::too_many_arguments)]
+    pub fn eval_moe_experts_f32(
+        &self,
+        ip: usize,
+        cur_normed: &[f32],
+        top_ids: &[usize],
+        top_weights: &[f32],
+        pool: &ThreadPool,
+        serial_pool: &ThreadPool,
+        kt: &KernelTable,
+        expert_slots: &mut [ExpertWorkSlot],
+        mv_scratch: &mut MatvecScratch,
+        moe_out: &mut [f32],
+    ) {
+        self.eval_moe_experts_inner(
+            ip,
+            cur_normed,
+            top_ids,
+            top_weights,
+            pool,
+            serial_pool,
+            kt,
+            expert_slots,
+            mv_scratch,
+            moe_out,
+            true,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn eval_moe_experts_inner(
+        &self,
+        ip: usize,
+        cur_normed: &[f32],
+        top_ids: &[usize],
+        top_weights: &[f32],
+        pool: &ThreadPool,
+        serial_pool: &ThreadPool,
+        kt: &KernelTable,
+        expert_slots: &mut [ExpertWorkSlot],
+        mv_scratch: &mut MatvecScratch,
+        moe_out: &mut [f32],
+        float_act: bool,
+    ) {
+        let mv_fn = if float_act {
+            matvec_f32_unquant_act
+        } else {
+            matvec_f32
+        };
         let n_embd = self.cfg.n_embd;
         let n_ff = self.cfg.n_ff_exp;
         let top_k = top_ids.len();
@@ -1258,17 +1323,13 @@ impl<'a> Inkling2Model<'a> {
             } => {
                 let gu_all = gate_up.as_slice();
                 let dn_all = down.as_slice();
-                // For `InMemory`, evaluate each selected expert across all threads in `pool`
-                // (`matvec_f32` shards the 2304 rows across all workers with zero stragglers)
-                // OR parallelize across experts; row-sharding each expert's 2304 rows uses `mv_scratch`
-                // and matches single-thread / multi-thread bit-for-bit (`0-ULP`).
                 let ws = &mut expert_slots[0];
                 for j in 0..top_k {
                     let e_id = top_ids[j];
                     let w_e = top_weights[j];
                     let gu_slice =
                         &gu_all[e_id * gate_up_expert_bytes..(e_id + 1) * gate_up_expert_bytes];
-                    matvec_f32(
+                    mv_fn(
                         pool,
                         kt,
                         *gate_up_dtype,
@@ -1288,7 +1349,7 @@ impl<'a> Inkling2Model<'a> {
                     );
                     let dn_slice =
                         &dn_all[e_id * down_expert_bytes..(e_id + 1) * down_expert_bytes];
-                    matvec_f32(
+                    mv_fn(
                         pool,
                         kt,
                         *down_dtype,
@@ -1324,7 +1385,7 @@ impl<'a> Inkling2Model<'a> {
                     let gu_bytes = rdr
                         .read_into_slot(gu_off, *gate_up_expert_bytes, &mut ws.slot)
                         .expect("O_DIRECT gate_up expert read failed");
-                    matvec_f32(
+                    mv_fn(
                         serial_pool,
                         kt,
                         *gate_up_dtype,
@@ -1346,7 +1407,7 @@ impl<'a> Inkling2Model<'a> {
                     let dn_bytes = rdr
                         .read_into_slot(dn_off, *down_expert_bytes, &mut ws.slot)
                         .expect("O_DIRECT down expert read failed");
-                    matvec_f32(
+                    mv_fn(
                         serial_pool,
                         kt,
                         *down_dtype,
@@ -2366,6 +2427,20 @@ impl Inkling2State {
 
     pub fn logits(&self) -> &[f32] {
         &self.logits
+    }
+
+    pub fn mv_scratch_mut(&mut self) -> &mut MatvecScratch {
+        &mut self.mv_scratch
+    }
+
+    pub fn host_moe_parts_mut(
+        &mut self,
+    ) -> (&ThreadPool, &mut [ExpertWorkSlot], &mut MatvecScratch) {
+        (
+            &self.serial_pool,
+            &mut self.expert_slots,
+            &mut self.mv_scratch,
+        )
     }
 
     fn pack_shortconv_into(&self, dst: &mut [f32]) {

@@ -1378,6 +1378,20 @@ impl VulkanContext {
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )
             .ctx("vkBeginCommandBuffer")?;
+            // Ensure prior host writes to persistently mapped `HOST_VISIBLE | HOST_COHERENT`
+            // buffers invalidate any stale GPU L2/Mall cache lines before shaders/transfers read.
+            let host_in = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_READ)];
+            d.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &host_in,
+                &[],
+                &[],
+            );
         }
         let mut rec = Recorder {
             ctx: self,
@@ -1387,6 +1401,20 @@ impl VulkanContext {
         let r = f(&mut rec);
         // SAFETY: as above; the fence is unsignaled (reset after every wait).
         unsafe {
+            // Vulkan 1.2 §7.9: `vkWaitForFences` alone does not flush discrete GPU L2/Mall caches
+            // (`SHADER_WRITE | TRANSFER_WRITE`) to `HOST_READ`; record an explicit epilogue barrier.
+            let host_out = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)];
+            d.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &host_out,
+                &[],
+                &[],
+            );
             d.end_command_buffer(cb).ctx("vkEndCommandBuffer")?;
             r?;
             let cbs = [cb];

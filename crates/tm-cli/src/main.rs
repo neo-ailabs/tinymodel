@@ -1009,6 +1009,108 @@ fn print_vulkan_profile_report(
 }
 
 #[cfg(feature = "vulkan")]
+fn eval_inkling2_vk_batch<'a>(
+    runner: &'a mut tm_vulkan::Inkling2VkRunner,
+    host_helper: &mut Option<(tm_models::Inkling2Model<'_>, tm_models::Inkling2State)>,
+    pool: &ThreadPool,
+    kt: &tm_cpu::KernelTable,
+    token_ids: &[u32],
+    start_pos: usize,
+    compute_last_logits: bool,
+) -> Result<&'a [f32]> {
+    if let Some((hm, hs)) = host_helper {
+        let mut cb = |ip: usize, cur_n: &[f32], t_ids: &[usize], t_w: &[f32], m_out: &mut [f32]| {
+            let (serial_pool, expert_slots, mv_scratch) = hs.host_moe_parts_mut();
+            hm.eval_moe_experts_f32(
+                ip,
+                cur_n,
+                t_ids,
+                t_w,
+                pool,
+                serial_pool,
+                kt,
+                expert_slots,
+                mv_scratch,
+                m_out,
+            );
+        };
+        Ok(
+            runner.forward_batch_hybrid(
+                token_ids,
+                start_pos,
+                compute_last_logits,
+                Some(&mut cb),
+            )?,
+        )
+    } else {
+        Ok(runner.forward_batch_hybrid(token_ids, start_pos, compute_last_logits, None)?)
+    }
+}
+
+#[cfg(feature = "vulkan")]
+fn eval_inkling2_vk_token<'a>(
+    runner: &'a mut tm_vulkan::Inkling2VkRunner,
+    host_helper: &mut Option<(tm_models::Inkling2Model<'_>, tm_models::Inkling2State)>,
+    pool: &ThreadPool,
+    kt: &tm_cpu::KernelTable,
+    token_id: u32,
+    pos: usize,
+    compute_logits: bool,
+) -> Result<&'a [f32]> {
+    if let Some((hm, hs)) = host_helper {
+        let mut cb = |ip: usize, cur_n: &[f32], t_ids: &[usize], t_w: &[f32], m_out: &mut [f32]| {
+            let (serial_pool, expert_slots, mv_scratch) = hs.host_moe_parts_mut();
+            hm.eval_moe_experts_f32(
+                ip,
+                cur_n,
+                t_ids,
+                t_w,
+                pool,
+                serial_pool,
+                kt,
+                expert_slots,
+                mv_scratch,
+                m_out,
+            );
+        };
+        Ok(runner.forward_token_hybrid(token_id, pos, compute_logits, Some(&mut cb))?)
+    } else {
+        Ok(runner.forward_token(token_id, pos, compute_logits)?)
+    }
+}
+
+#[cfg(feature = "vulkan")]
+fn eval_inkling2_vk_greedy(
+    runner: &mut tm_vulkan::Inkling2VkRunner,
+    host_helper: &mut Option<(tm_models::Inkling2Model<'_>, tm_models::Inkling2State)>,
+    pool: &ThreadPool,
+    kt: &tm_cpu::KernelTable,
+    token_id: u32,
+    pos: usize,
+) -> Result<u32> {
+    if let Some((hm, hs)) = host_helper {
+        let mut cb = |ip: usize, cur_n: &[f32], t_ids: &[usize], t_w: &[f32], m_out: &mut [f32]| {
+            let (serial_pool, expert_slots, mv_scratch) = hs.host_moe_parts_mut();
+            hm.eval_moe_experts_f32(
+                ip,
+                cur_n,
+                t_ids,
+                t_w,
+                pool,
+                serial_pool,
+                kt,
+                expert_slots,
+                mv_scratch,
+                m_out,
+            );
+        };
+        Ok(runner.forward_token_greedy_hybrid(token_id, pos, Some(&mut cb))?)
+    } else {
+        Ok(runner.forward_token_greedy(token_id, pos)?)
+    }
+}
+
+#[cfg(feature = "vulkan")]
 fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
     let t_load = Instant::now();
     let gguf = std::sync::Arc::new(GgufFile::open(&opts.model)?);
@@ -1017,6 +1119,125 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
     let prompt_ids = resolve_prompt_ids(&opts, &tok)?;
     let is_pure_greedy =
         opts.sampler.temperature <= 0.0 && (opts.sampler.repeat_penalty - 1.0).abs() < 1e-6;
+
+    if arch == "inkling2" || arch == "inkling2_loop" {
+        let pool = ThreadPool::new(opts.threads);
+        let kt = active_kernels();
+        let mut runner = tm_vulkan::Inkling2VkRunner::from_gguf(gguf.clone(), opts.max_ctx)?;
+        let mut host_helper = if runner.has_host_offload_layers() {
+            let hm = tm_models::Inkling2Model::from_gguf_with_options(
+                &gguf,
+                &tm_models::Inkling2LoadOptions {
+                    vram_expert_layers: runner.vram_expert_mask().to_vec(),
+                    ram_expert_budget_bytes: None,
+                },
+            )?;
+            let hs = tm_models::Inkling2State::new(&hm, opts.max_ctx);
+            Some((hm, hs))
+        } else {
+            None
+        };
+        let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
+        let tier_info = if let Some((ref hm, _)) = host_helper {
+            format!(
+                "vram_exps={} ram_exps={} nvme_exps={} ({:.1} MiB/tok direct_io={})",
+                hm.stats.vram_expert_layers,
+                hm.stats.ram_owned_expert_layers + hm.stats.ram_mmap_expert_layers,
+                hm.stats.nvme_direct_expert_layers,
+                hm.stats.nvme_bytes_per_decode_tok as f64 / 1048576.0,
+                hm.stats.direct_io_active
+            )
+        } else {
+            "all-vram".to_string()
+        };
+        eprintln!(
+            "[tinymodel] arch={} backend=vulkan ({} · {} · {} · {}) cpu_threads={} load={:.1}ms prompt_tokens={} vocab={} slots={}",
+            arch,
+            runner.device_name(),
+            runner.driver_info(),
+            runner.weights_mode(),
+            tier_info,
+            pool.num_threads(),
+            load_ms,
+            prompt_ids.len(),
+            runner.cfg.vocab_size,
+            runner.cfg.n_layers,
+        );
+
+        let mut sampler = Sampler::new(opts.sampler, runner.cfg.vocab_size);
+        let mut history = prompt_ids.clone();
+
+        let t_pp = Instant::now();
+        let logits = eval_inkling2_vk_batch(
+            &mut runner,
+            &mut host_helper,
+            &pool,
+            kt,
+            &prompt_ids,
+            0,
+            true,
+        )?;
+        let mut next_id = sampler.sample(logits, &history);
+        let pp_sec = t_pp.elapsed().as_secs_f64();
+
+        let mut stdout = io::stdout().lock();
+        let mut pos = prompt_ids.len();
+        let mut generated = 0usize;
+        let t_gen = Instant::now();
+        while generated < opts.n_predict {
+            if tok.is_stop_token(next_id) {
+                break;
+            }
+            stdout.write_all(&tok.decode_token_bytes(next_id))?;
+            stdout.flush()?;
+            history.push(next_id);
+            generated += 1;
+            if generated >= opts.n_predict {
+                break;
+            }
+            if is_pure_greedy {
+                next_id = eval_inkling2_vk_greedy(
+                    &mut runner,
+                    &mut host_helper,
+                    &pool,
+                    kt,
+                    next_id,
+                    pos,
+                )?;
+            } else {
+                let lg = eval_inkling2_vk_token(
+                    &mut runner,
+                    &mut host_helper,
+                    &pool,
+                    kt,
+                    next_id,
+                    pos,
+                    true,
+                )?;
+                next_id = sampler.sample(lg, &history);
+            }
+            pos += 1;
+        }
+        let gen_sec = t_gen.elapsed().as_secs_f64();
+        writeln!(stdout)?;
+        let pp_tps = (prompt_ids.len() as f64) / pp_sec.max(1e-9);
+        let tg_runs = generated.saturating_sub(1);
+        let tg_tps = if tg_runs > 0 {
+            (tg_runs as f64) / gen_sec.max(1e-9)
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[tinymodel] prompt: {:.2} ms / {} tok ({:.2} tok/s) | eval: {:.2} ms / {} runs ({:.2} tok/s)",
+            pp_sec * 1e3,
+            prompt_ids.len(),
+            pp_tps,
+            gen_sec * 1e3,
+            tg_runs,
+            tg_tps
+        );
+        return Ok(());
+    }
 
     if arch == "qwen35" {
         let mut runner = tm_vulkan::Qwen35VkRunner::from_gguf(gguf, opts.max_ctx)?;
@@ -1169,6 +1390,120 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
         .and_then(|s| s.to_str())
         .unwrap_or("?")
         .to_string();
+
+    if arch == "inkling2" || arch == "inkling2_loop" {
+        let pool = ThreadPool::new(opts.threads);
+        let kt = active_kernels();
+        let mut runner = tm_vulkan::Inkling2VkRunner::from_gguf(gguf.clone(), opts.max_ctx)?;
+        let mut host_helper = if runner.has_host_offload_layers() {
+            let hm = tm_models::Inkling2Model::from_gguf_with_options(
+                &gguf,
+                &tm_models::Inkling2LoadOptions {
+                    vram_expert_layers: runner.vram_expert_mask().to_vec(),
+                    ram_expert_budget_bytes: None,
+                },
+            )?;
+            let hs = tm_models::Inkling2State::new(&hm, opts.max_ctx);
+            Some((hm, hs))
+        } else {
+            None
+        };
+        let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
+
+        let _ = eval_inkling2_vk_greedy(&mut runner, &mut host_helper, &pool, kt, 1, 0)?;
+        runner.reset_state()?;
+        if let Some((_, ref mut hs)) = host_helper {
+            hs.reset();
+        }
+
+        let t_pp = Instant::now();
+        let pp_logits = eval_inkling2_vk_batch(
+            &mut runner,
+            &mut host_helper,
+            &pool,
+            kt,
+            &pp_ids,
+            0,
+            corpus_mode,
+        )?;
+        let first_tok = if corpus_mode { argmax(pp_logits) } else { 0 };
+        let pp_sec = t_pp.elapsed().as_secs_f64();
+        let pp_tps = (n_pp as f64) / pp_sec.max(1e-9);
+
+        let n_gen = opts.n_predict;
+        let mut gen_tokens = Vec::with_capacity(n_gen + 1);
+        let (mut tok, base_pos) = if corpus_mode {
+            (first_tok, n_pp)
+        } else {
+            runner.reset_state()?;
+            if let Some((_, ref mut hs)) = host_helper {
+                hs.reset();
+            }
+            (
+                eval_inkling2_vk_greedy(&mut runner, &mut host_helper, &pool, kt, 1, 0)?,
+                1,
+            )
+        };
+        gen_tokens.push(tok);
+        let t0 = Instant::now();
+        for step in 0..n_gen {
+            tok = eval_inkling2_vk_greedy(
+                &mut runner,
+                &mut host_helper,
+                &pool,
+                kt,
+                tok,
+                base_pos + step,
+            )?;
+            gen_tokens.push(tok);
+        }
+        let sec = t0.elapsed().as_secs_f64();
+        let tps = (n_gen as f64) / sec.max(1e-9);
+        let tel_after = probe::collect_telemetry();
+        let dev_name = runner.device_name().to_string();
+        let wmode = runner.weights_mode().to_string();
+        if opts.json {
+            BenchMetrics {
+                model_name: &model_name,
+                arch: &arch,
+                backend: "vulkan",
+                isa: kt.isa.name(),
+                device_name: &dev_name,
+                weights_mode: &wmode,
+                threads: pool.num_threads(),
+                max_ctx: opts.max_ctx,
+                corpus_mode,
+                active_decode_bytes,
+                load_ms,
+                ttft_ms: pp_sec * 1e3,
+                n_pp,
+                pp_ms: pp_sec * 1e3,
+                n_gen,
+                tg_ms: sec * 1e3,
+                last_tok: tok,
+                greedy_hash: probe::hash_token_sequence(&gen_tokens),
+                tel_before,
+                tel_after,
+            }
+            .print_json();
+        } else {
+            println!(
+                "bench: model={} backend=vulkan ({}) weights={} threads={} load={:.1}ms pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, last_tok={})",
+                model_name,
+                dev_name,
+                wmode,
+                pool.num_threads(),
+                load_ms,
+                n_pp,
+                pp_tps,
+                n_gen,
+                tps,
+                (sec * 1e3) / (n_gen as f64),
+                tok
+            );
+        }
+        return Ok(());
+    }
 
     if arch == "qwen35" {
         let mut runner = tm_vulkan::Qwen35VkRunner::from_gguf(gguf, opts.max_ctx)?;
@@ -1941,6 +2276,55 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
     if opts.use_vulkan {
         #[cfg(feature = "vulkan")]
         {
+            if arch == "inkling2" || arch == "inkling2_loop" {
+                let pool = ThreadPool::new(opts.threads);
+                let kt = active_kernels();
+                let mut runner =
+                    tm_vulkan::Inkling2VkRunner::from_gguf(gguf.clone(), opts.max_ctx)?;
+                let mut host_helper = if runner.has_host_offload_layers() {
+                    let hm = tm_models::Inkling2Model::from_gguf_with_options(
+                        &gguf,
+                        &tm_models::Inkling2LoadOptions {
+                            vram_expert_layers: runner.vram_expert_mask().to_vec(),
+                            ram_expert_budget_bytes: None,
+                        },
+                    )?;
+                    let hs = tm_models::Inkling2State::new(&hm, opts.max_ctx);
+                    Some((hm, hs))
+                } else {
+                    None
+                };
+                let vocab = runner.cfg.vocab_size as u32;
+                writer.write_all(b"TMLG")?;
+                writer.write_all(&1u32.to_le_bytes())?;
+                writer.write_all(&(n_steps as u32).to_le_bytes())?;
+                writer.write_all(&vocab.to_le_bytes())?;
+                for &id in &input_ids {
+                    writer.write_all(&id.to_le_bytes())?;
+                }
+                for (pos, &id) in input_ids.iter().enumerate() {
+                    let logits = eval_inkling2_vk_token(
+                        &mut runner,
+                        &mut host_helper,
+                        &pool,
+                        kt,
+                        id,
+                        pos,
+                        true,
+                    )?;
+                    write_f32_le(&mut writer, logits)?;
+                }
+                writer.flush()?;
+                eprintln!(
+                    "[tinymodel logits] wrote {} steps x {} vocab (vulkan {} {}) -> {}",
+                    n_steps,
+                    vocab,
+                    arch,
+                    runner.weights_mode(),
+                    out_path.display()
+                );
+                return Ok(());
+            }
             if arch == "qwen35" {
                 let mut runner = tm_vulkan::Qwen35VkRunner::from_gguf(gguf, opts.max_ctx)?;
                 let vocab = runner.cfg.vocab_size as u32;
