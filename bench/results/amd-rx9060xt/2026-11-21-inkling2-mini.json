@@ -1,0 +1,635 @@
+{
+  "timestamp": "2026-11-21T23:09:40+0800",
+  "model": "Inkling-2-Mini-UD-IQ1_S.gguf",
+  "part_a": [
+    {
+      "name": "vulkan_radv_full_vram",
+      "ok": true,
+      "wall_s": 58.67,
+      "rows": [
+        {
+          "n_prompt": 512,
+          "n_gen": 0,
+          "avg_ts": 226.73,
+          "median_ts": 225.24,
+          "stddev_ts": 10.94,
+          "samples_ts": [
+            215.69,
+            216.75,
+            225.24,
+            237.08,
+            238.9
+          ]
+        },
+        {
+          "n_prompt": 0,
+          "n_gen": 128,
+          "avg_ts": 17.25,
+          "median_ts": 17.27,
+          "stddev_ts": 0.12,
+          "samples_ts": [
+            17.22,
+            17.34,
+            17.34,
+            17.27,
+            17.06
+          ]
+        }
+      ],
+      "telemetry": {
+        "vram_peak_mib": 8123.6,
+        "peak_rss_mib": 7625.5,
+        "gpu_power_mean_w": 42.67,
+        "gpu_power_max_w": 69.0,
+        "gpu_temp_edge_c": 43.0,
+        "gpu_temp_junc_c": 48.0,
+        "gpu_temp_vram_c": 67.0
+      }
+    },
+    {
+      "name": "rocm_hip_opt_vram",
+      "ok": true,
+      "wall_s": 36.77,
+      "rows": [
+        {
+          "n_prompt": 512,
+          "n_gen": 0,
+          "avg_ts": 547.18,
+          "median_ts": 547.95,
+          "stddev_ts": 3.72,
+          "samples_ts": [
+            541.04,
+            549.21,
+            550.77,
+            546.93,
+            547.95
+          ]
+        },
+        {
+          "n_prompt": 0,
+          "n_gen": 128,
+          "avg_ts": 24.89,
+          "median_ts": 24.96,
+          "stddev_ts": 0.18,
+          "samples_ts": [
+            24.57,
+            24.96,
+            24.96,
+            24.99,
+            24.97
+          ]
+        }
+      ],
+      "telemetry": {
+        "vram_peak_mib": 8013.1,
+        "peak_rss_mib": 8330.9,
+        "gpu_power_mean_w": 89.84,
+        "gpu_power_max_w": 158.0,
+        "gpu_temp_edge_c": 52.0,
+        "gpu_temp_junc_c": 78.0,
+        "gpu_temp_vram_c": 72.0
+      }
+    },
+    {
+      "name": "rocm_hip_loop_aware_hybrid",
+      "ok": true,
+      "wall_s": 45.29,
+      "rows": [
+        {
+          "n_prompt": 512,
+          "n_gen": 0,
+          "avg_ts": 443.5,
+          "median_ts": 449.04,
+          "stddev_ts": 11.52,
+          "samples_ts": [
+            423.44,
+            450.73,
+            450.21,
+            444.06,
+            449.04
+          ]
+        },
+        {
+          "n_prompt": 0,
+          "n_gen": 128,
+          "avg_ts": 19.36,
+          "median_ts": 19.43,
+          "stddev_ts": 0.15,
+          "samples_ts": [
+            19.09,
+            19.43,
+            19.45,
+            19.39,
+            19.44
+          ]
+        }
+      ],
+      "telemetry": {
+        "vram_peak_mib": 5528.2,
+        "peak_rss_mib": 8359.5,
+        "gpu_power_mean_w": 66.52,
+        "gpu_power_max_w": 158.0,
+        "gpu_temp_edge_c": 54.0,
+        "gpu_temp_junc_c": 80.0,
+        "gpu_temp_vram_c": 74.0
+      }
+    },
+    {
+      "name": "rocm_hip_naive_ngl15",
+      "ok": true,
+      "wall_s": 74.13,
+      "rows": [
+        {
+          "n_prompt": 512,
+          "n_gen": 0,
+          "avg_ts": 289.6,
+          "median_ts": 298.88,
+          "stddev_ts": 25.79,
+          "samples_ts": [
+            243.83,
+            304.5,
+            298.88,
+            303.79,
+            297.02
+          ]
+        },
+        {
+          "n_prompt": 0,
+          "n_gen": 128,
+          "avg_ts": 11.14,
+          "median_ts": 11.13,
+          "stddev_ts": 0.02,
+          "samples_ts": [
+            11.16,
+            11.11,
+            11.13,
+            11.16,
+            11.12
+          ]
+        }
+      ],
+      "telemetry": {
+        "vram_peak_mib": 5709.8,
+        "peak_rss_mib": 7714.4,
+        "gpu_power_mean_w": 43.91,
+        "gpu_power_max_w": 150.0,
+        "gpu_temp_edge_c": 55.0,
+        "gpu_temp_junc_c": 79.0,
+        "gpu_temp_vram_c": 74.0
+      }
+    },
+    {
+      "name": "cpu_alderlake_12t",
+      "ok": true,
+      "wall_s": 116.82,
+      "rows": [
+        {
+          "n_prompt": 512,
+          "n_gen": 0,
+          "avg_ts": 39.1,
+          "median_ts": 38.98,
+          "stddev_ts": 0.31,
+          "samples_ts": [
+            38.87,
+            39.45,
+            38.98
+          ]
+        },
+        {
+          "n_prompt": 0,
+          "n_gen": 128,
+          "avg_ts": 6.41,
+          "median_ts": 6.41,
+          "stddev_ts": 0.01,
+          "samples_ts": [
+            6.39,
+            6.41,
+            6.41
+          ]
+        }
+      ],
+      "telemetry": {
+        "vram_peak_mib": 57.1,
+        "peak_rss_mib": 7879.5,
+        "gpu_power_mean_w": 8.51,
+        "gpu_power_max_w": 10.0,
+        "gpu_temp_edge_c": 48.0,
+        "gpu_temp_junc_c": 52.0,
+        "gpu_temp_vram_c": 70.0
+      }
+    },
+    {
+      "name": "vulkan_uhd770_attn_gpu_moe_cpu",
+      "ok": false,
+      "returncode": 1,
+      "stderr_tail": "d from /tmp/inkling2-bin/libggml-rpc.so\nWARNING: radv is not a conformant Vulkan implementation, testing use only.\nggml_vulkan: Found 1 Vulkan devices:\nggml_vulkan: 0 = Intel(R) UHD Graphics 770 (ADL-S GT1) (Intel open-source Mesa driver) | uma: 1 | rebar: 1 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 32 | shared memory: 65536 | int dot: 1 | matrix cores: none\nload_backend: loaded Vulkan backend from /tmp/inkling2-bin/libggml-vulkan.so\nload_backend: loaded CPU backend from /tmp/inkling2-bin/libggml-cpu-alderlake.so\nggml_vulkan: Device memory allocation of size 415427584 failed.\nggml_vulkan: vk::Device::allocateMemory: ErrorOutOfDeviceMemory\nggml_gallocr_reserve_n_impl: failed to allocate Vulkan0 buffer of size 415427584\ngraph_reserve: failed to allocate compute buffers\nllama_init_from_model: failed to initialize the context: failed to allocate compute pp buffers\nllama_bench: error: failed to create context with model '/home/zhangpf/tinymodel/models/inkling2/Inkling-2-Mini-UD-IQ1_S.gguf'\n",
+      "telemetry": {
+        "vram_peak_mib": 57.1,
+        "peak_rss_mib": 222.2,
+        "gpu_power_mean_w": 8.03,
+        "gpu_power_max_w": 9.0,
+        "gpu_temp_edge_c": 40.0,
+        "gpu_temp_junc_c": 45.0,
+        "gpu_temp_vram_c": 62.0
+      }
+    }
+  ],
+  "part_b": [
+    {
+      "suite": "baseline_no_spec",
+      "ok": true,
+      "load_s": 8.56,
+      "vram_loaded_mib": 7669.1,
+      "rss_loaded_mib": 7904.5,
+      "results": [
+        {
+          "id": "zh_moe_loop",
+          "effort": "low",
+          "wall_s": 20.73,
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 51,
+            "prompt_ms": 3298.945,
+            "prompt_per_token_ms": 64.68519607843137,
+            "prompt_per_second": 15.459487805950085,
+            "predicted_n": 384,
+            "predicted_ms": 17421.669,
+            "predicted_per_token_ms": 45.487386422976506,
+            "predicted_per_second": 21.98411644716703
+          },
+          "draft_accept_pct": null,
+          "telemetry": {
+            "vram_peak_mib": 7764.5,
+            "peak_rss_mib": 8463.9,
+            "gpu_power_mean_w": 74.89,
+            "gpu_power_max_w": 89.0,
+            "gpu_temp_edge_c": 50.0,
+            "gpu_temp_junc_c": 60.0,
+            "gpu_temp_vram_c": 71.0
+          },
+          "reasoning_content": "The user asks in Chinese: \"用三句话简要介绍什么是 Mixture-of-Experts (MoE) 架构以及循环 Transformer（Looped Transformer）的优势。\" Need answer in Chinese, exactly three sentences? They ask \"用三句话简要介绍什么是 MoE 架构以及循环 Transformer 的优势。\" Need provide concise three sentences. Need ensure accuracy.\n\nMoE: sparse mixture of experts, routes tokens to subset of expert networks via gating, increases capacity/compute efficiency. Looped Transformer: reuses same transformer block/weights across multiple iterations/steps, enabling iterative refinement, deeper effective computation with fewer parameters, potentially better generalization/reasoning. Need three sentences total. Could be:\n1. MoE 是把输入 token 通过门控路由到少数专家网络，而不是所有专家，从而在不显著增加每个 token 计算量的情况下扩大模型容量。\n2. 循环 Transformer 让同一组参数在多个迭代/步数中重复应用，相当于用更少参数实现更深的有效计算。\n3. 优势在于 MoE 提升稀疏计算与容量效率，循环 Transformer 提升参数效率、迭代推理与泛化/适应能力。\n\nNeed exactly three sentences. Good. Ensure no extra.",
+          "content": "MoE 是通过门控路由把每个 token 分配到少数专家网络，而不是全部专家，从而在不显著增加单 token 计算量的情况下扩大模型容量。循环 Transformer 让同一组参数在多个迭代中重复应用，相当于用更少参数实现更深的有效计算"
+        },
+        {
+          "id": "rust_ringbuf",
+          "effort": "low",
+          "wall_s": 25.07,
+          "timings": {
+            "cache_n": 12,
+            "prompt_n": 55,
+            "prompt_ms": 1753.778,
+            "prompt_per_token_ms": 31.886872727272728,
+            "prompt_per_second": 31.36086779512572,
+            "predicted_n": 512,
+            "predicted_ms": 23253.421,
+            "predicted_per_token_ms": 45.50571624266144,
+            "predicted_per_second": 21.97526118845051
+          },
+          "draft_accept_pct": null,
+          "telemetry": {
+            "vram_peak_mib": 7766.9,
+            "peak_rss_mib": 8536.8,
+            "gpu_power_mean_w": 83.24,
+            "gpu_power_max_w": 90.0,
+            "gpu_temp_edge_c": 52.0,
+            "gpu_temp_junc_c": 63.0,
+            "gpu_temp_vram_c": 74.0
+          },
+          "reasoning_content": "The user wants a concise zero-allocation ring buffer in Rust no_std using const generics. Need provide code. Need think through implementation.\n\nRequirements: no_std, const generics RingBuf<T: Copy, const N: usize>, new, push, pop, len. Zero allocation. Need concise.\n\nDesign: struct RingBuf<T, const N: usize> { data: [T; N], head: usize, len: usize }. But T: Copy and N maybe zero? If N=0, data [T;0], head/len 0. new() requires T: Copy? Need initialize [T; N]. Since T: Copy, can do [T::?] no Default. Need a value. new() cannot create T without value. Options: new(value: T) or new() where T: Copy + Default? User specifically RingBuf<T: Copy, const N: usize> with new. Could make new(value: T) -> Self, filling all slots with value. That's zero-allocation and uses Copy. Or new() -> Self with MaybeUninit? But T: Copy no Default, cannot zero-init. Could use MaybeUninit<T> and track len, but then pop returns T and push overwrites; new() can create uninit buffer. That's more general and zero-allocation. But pop must return Option<T>, push returns bool maybe. Need ensure safety. Using MaybeUninit is fine in no_std. But concise? Could avoid unsafe by requiring T: Copy and new(value: T). But user asked new no args likely. Need satisfy.\n\nAlternative: new() -> Self where data: [T; N] initialized by copying a provided value? Not possible. Could use `new()` with `T: Copy` and `N` const by `[T; N]` from `core::array::from_fn`? from_fn needs closure returning T, still needs a T. Could use `core::array::from_fn(|_| unsafe { core::mem::MaybeUninit::<T>.assume_init() })` unsafe bad.\n\nUse MaybeUninit:\n```\n#[derive(Clone)]\npub struct RingBuf<T, const N: usize> {\n    data: [core::mem::MaybeUninit",
+          "content": ""
+        },
+        {
+          "id": "math_diophantine",
+          "effort": "medium",
+          "wall_s": 22.12,
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 45,
+            "prompt_ms": 2292.204,
+            "prompt_per_token_ms": 50.93786666666667,
+            "prompt_per_second": 19.63176052393242,
+            "predicted_n": 435,
+            "predicted_ms": 19754.549,
+            "predicted_per_token_ms": 45.51739400921659,
+            "predicted_per_second": 21.969623300435764
+          },
+          "draft_accept_pct": null,
+          "telemetry": {
+            "vram_peak_mib": 7767.1,
+            "peak_rss_mib": 8706.1,
+            "gpu_power_mean_w": 80.85,
+            "gpu_power_max_w": 90.0,
+            "gpu_temp_edge_c": 54.0,
+            "gpu_temp_junc_c": 65.0,
+            "gpu_temp_vram_c": 75.0
+          },
+          "reasoning_content": "We need answer math. Need find all pairs positive integers (a,b) with a^2 - b^2 =105. Factor: (a-b)(a+b)=105. Let x=a-b, y=a+b. Positive integers, x<y, same parity (since a=(x+y)/2, b=(y-x)/2 integers; x,y same parity). Product 105 odd, so x,y odd automatically. Positive divisors of 105: 1,3,5,7,15,21,35,105. Pairs (x,y) with x<y and xy=105: (1,105),(3,35),(5,21),(7,15). Also (15,7) no x<y. Compute a=(x+y)/2, b=(y-x)/2:\n(1,105): a=53, b=52.\n(3,35): a=19, b=16.\n(5,21): a=13, b=8.\n(7,15): a=11, b=4.\nCheck: 53^2-52^2=(1)(105)=105 yes; 19^2-16^2=(3)(35)=105; 13^2-8^2=(5)(21)=105; 11^2-4^2=(7)(15)=105. Need final list clearly. Could mention all pairs. Ensure positive b yes. Final concise.",
+          "content": "The pairs are:\n\n\\[\n(a,b)=(53,52),\\ (19,16),\\ (13,8),\\ (11,4)\n\\]\n\nUsing \\(a^2-b^2=(a-b)(a+b)=105\\)."
+        }
+      ]
+    },
+    {
+      "suite": "dspark_nmax3",
+      "ok": false,
+      "logs_tail": "0.00.021.048 I srv  llama_server: initializing ...\n0.00.021.057 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)\n0.00.072.454 I spec common_specu: auto-detected speculative type 'draft-dflash' from the draft model metadata\n0.00.076.857 W srv  server_setup: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)\n0.00.078.460 I srv    load_model: loading model '/home/zhangpf/tinymodel/models/inkling2/Inkling-2-Mini-UD-IQ1_S.gguf'\n0.00.239.111 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance\n0.01.642.090 I cmn          init: llama threadpool init, n_threads = 12\n0.01.936.929 I common_speculative_init_result: loading draft model '/home/zhangpf/tinymodel/models/inkling2/dspark-Inkling-2-Mini-Q8_0.gguf'\n0.02.453.976 W resolve_fused_ops: layer 0 is assigned to device ROCm0 but Flash Attention over K/V rows is assigned to device CPU (usually due to missing support)\n0.02.453.978 W resolve_fused_ops: Flash Attention over K/V rows not supported, set to disabled\n0.02.458.484 E ggml_backend_cuda_buffer_type_alloc_buffer: allocating 810.89 MiB on device 0: cudaMalloc failed: out of memory\n0.02.458.486 E ggml_gallocr_reserve_n_impl: failed to allocate ROCm0 buffer of size 850279424\n0.02.458.486 E graph_reserve: failed to allocate compute buffers\n0.02.465.036 E llama_init_from_model: failed to initialize the context: failed to allocate compute pp buffers\n0.02.465.040 E common_speculative_init_result: failed to create MTP context\n0.02.465.045 E srv    load_model: failed to create MTP context\n0.02.465.064 I srv    operator(): operator(): cleaning up before exit...\n0.02.465.573 E srv  server_run_i: exiting due to model loading error\n"
+    },
+    {
+      "suite": "dspark_nmax5",
+      "ok": false,
+      "logs_tail": "0.00.022.954 I srv  llama_server: initializing ...\n0.00.022.966 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)\n0.00.069.253 I spec common_specu: auto-detected speculative type 'draft-dflash' from the draft model metadata\n0.00.073.520 W srv  server_setup: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)\n0.00.075.122 I srv    load_model: loading model '/home/zhangpf/tinymodel/models/inkling2/Inkling-2-Mini-UD-IQ1_S.gguf'\n0.00.233.153 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance\n0.01.564.854 I cmn          init: llama threadpool init, n_threads = 12\n0.01.859.957 I common_speculative_init_result: loading draft model '/home/zhangpf/tinymodel/models/inkling2/dspark-Inkling-2-Mini-Q8_0.gguf'\n0.02.176.558 W resolve_fused_ops: layer 0 is assigned to device ROCm0 but Flash Attention over K/V rows is assigned to device CPU (usually due to missing support)\n0.02.176.560 W resolve_fused_ops: Flash Attention over K/V rows not supported, set to disabled\n0.02.181.935 E ggml_backend_cuda_buffer_type_alloc_buffer: allocating 810.89 MiB on device 0: cudaMalloc failed: out of memory\n0.02.181.937 E ggml_gallocr_reserve_n_impl: failed to allocate ROCm0 buffer of size 850279424\n0.02.181.938 E graph_reserve: failed to allocate compute buffers\n0.02.188.362 E llama_init_from_model: failed to initialize the context: failed to allocate compute pp buffers\n0.02.188.365 E common_speculative_init_result: failed to create MTP context\n0.02.188.371 E srv    load_model: failed to create MTP context\n0.02.188.375 I srv    operator(): operator(): cleaning up before exit...\n0.02.188.963 E srv  server_run_i: exiting due to model loading error\n"
+    }
+  ],
+  "dspark_ablation": [
+    {
+      "suite": "loop_hybrid_no_spec",
+      "ok": true,
+      "load_s": 8.65,
+      "vram_loaded_mib": 5675.5,
+      "rss_loaded_mib": 3955.5,
+      "results": [
+        {
+          "id": "zh_moe_loop",
+          "effort": "minimal",
+          "wall_s": 25.71,
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 51,
+            "prompt_ms": 3403.132,
+            "prompt_per_token_ms": 66.72807843137255,
+            "prompt_per_second": 14.98619506971813,
+            "predicted_n": 427,
+            "predicted_ms": 22296.894,
+            "predicted_per_token_ms": 52.34012676056338,
+            "predicted_per_second": 19.10580011727194
+          },
+          "draft_accept_pct": null,
+          "telemetry": {
+            "vram_peak_mib": 5769.4,
+            "peak_rss_mib": 4515.1,
+            "gpu_power_mean_w": 54.77,
+            "gpu_power_max_w": 64.0,
+            "gpu_temp_edge_c": 46.0,
+            "gpu_temp_junc_c": 52.0,
+            "gpu_temp_vram_c": 69.0
+          },
+          "reasoning_content": "The user asks in Chinese: \"用三句话简要介绍什么是 Mixture-of-Experts (MoE) 架构以及循环 Transformer（Looped Transformer）的优势。\" Need answer in Chinese, exactly three sentences? They ask \"用三句话简要介绍什么是 MoE 架构以及循环 Transformer 的优势。\" Need provide concise three sentences. Need ensure accuracy.\n\nMoE: sparse mixture of experts, routes tokens to subset of expert networks via gating, increases capacity/compute efficiency. Looped Transformer: reuses same transformer block/weights across multiple iterations/steps, enabling iterative refinement, deeper effective computation with fewer parameters, potentially better generalization/reasoning. Need three sentences total. Could be:\n1. MoE 是把输入 token 通过门控路由到少数专家网络，而不是所有专家，从而在不显著增加每个 token 计算量的情况下扩大模型容量。\n2. 循环 Transformer 让同一组参数在多个迭代/步数中重复应用，相当于用更少参数实现更深的有效计算。\n3. 两者优势在于提升效率与表达能力：MoE 提高稀疏计算下的容量，循环 Transformer 通过迭代精炼增强推理/泛化，并降低参数规模。\n\nNeed exactly three sentences. Good. Ensure no extra.",
+          "content": "MoE 是通过门控路由把每个 token 分配到少数专家网络，而不是全部专家，从而在稀疏计算下扩大模型容量。循环 Transformer 让同一组参数在多个迭代中重复应用，相当于用更少参数实现更深的有效计算。两者优势在于提升效率与表达能力：MoE 提高容量效率，循环 Transformer 通过迭代精炼增强推理与泛化。"
+        },
+        {
+          "id": "rust_ringbuf",
+          "effort": "none",
+          "wall_s": 35.93,
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 71,
+            "prompt_ms": 2480.018,
+            "prompt_per_token_ms": 34.929830985915494,
+            "prompt_per_second": 28.628824468209505,
+            "predicted_n": 640,
+            "predicted_ms": 33400.912,
+            "predicted_per_token_ms": 52.270597809076676,
+            "predicted_per_second": 19.13121414169769
+          },
+          "draft_accept_pct": null,
+          "telemetry": {
+            "vram_peak_mib": 5771.9,
+            "peak_rss_mib": 4631.4,
+            "gpu_power_mean_w": 58.72,
+            "gpu_power_max_w": 65.0,
+            "gpu_temp_edge_c": 52.0,
+            "gpu_temp_junc_c": 59.0,
+            "gpu_temp_vram_c": 74.0
+          },
+          "reasoning_content": "The user wants a concise zero-allocation ring buffer in Rust no_std using const generics RingBuf<T: Copy, const N: usize> with new, push, pop, len, plus a short unit test.\n\nNeed produce code. Need think through implementation carefully.\n\nRequirements: no_std, const generics, T: Copy, zero allocation. Ring buffer fixed capacity N. Methods: new, push, pop, len. Need maybe also is_empty? Keep concise. Need unit test. Since no_std, unit test can be in same file with #[cfg(test)] extern crate std? In no_std crate, tests need std for assert? Actually unit tests can use std via #[cfg(test)] extern crate std; but assert! macro is core? assert! is in core? In Rust, assert! is in core? Yes assert! macro is available in core (since Rust 1.?). Actually assert! is in core::assert? Let's recall: core has assert!, assert_eq!, assert_ne! macros? Yes core::assert! exists? In Rust, `assert!` is in `core` since 1.? I think `core::assert!` exists. `panic!` is in core. So tests can use core::assert_eq!. But unit test in no_std crate: test harness requires std? The test crate links std for test harness even if no_std? In a no_std library, `cargo test` compiles with test harness which requires std? Actually `#[cfg(test)]` can use std if the crate has std available? For no_std, you can still run tests on host by enabling std in test cfg: `#[cfg(test)] extern crate std;` and use std::println etc. But assert_eq! from core works. The test harness itself (libtest) requires std, but cargo test on a no_std lib still builds with std for tests? I believe yes: tests are compiled with `--test` and link std even if crate is no_std? Hmm. In no_std embedded, cargo test not possible. But for host target, a no_std library can have tests; the test harness uses std. Common pattern: `#[cfg(test)] extern crate std;` then use std::assert? But assert_eq! is core macro, no need.\n\nNeed implement.\n\nDesign:\n```\n#[cfg(not(test))]\n#[no_std]\n```\nNo, no_std attribute at crate root. But user asked write concise zero-allocation ring buffer in Rust no_std. We can provide a snippet with `#![no_std]`? If we include `#![no_std]` in snippet, unit test may fail? Better provide module snippet and mention crate root has `#![no_std]`.",
+          "content": ""
+        },
+        {
+          "id": "math_diophantine",
+          "effort": "low",
+          "wall_s": 30.01,
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 45,
+            "prompt_ms": 2480.477,
+            "prompt_per_token_ms": 55.12171111111111,
+            "prompt_per_second": 18.141671944549376,
+            "predicted_n": 525,
+            "predicted_ms": 27462.996,
+            "predicted_per_token_ms": 52.41029770992366,
+            "predicted_per_second": 19.080219798306057
+          },
+          "draft_accept_pct": null,
+          "telemetry": {
+            "vram_peak_mib": 5772.2,
+            "peak_rss_mib": 4824.2,
+            "gpu_power_mean_w": 58.41,
+            "gpu_power_max_w": 65.0,
+            "gpu_temp_edge_c": 53.0,
+            "gpu_temp_junc_c": 59.0,
+            "gpu_temp_vram_c": 74.0
+          },
+          "reasoning_content": "We need answer math. Need find all pairs positive integers (a,b) with a^2-b^2=105. Factor (a-b)(a+b)=105. Let x=a-b, y=a+b. Positive integers, x<y, same parity (since a=(x+y)/2, b=(y-x)/2 integers; x,y same parity). Product 105 odd, so x,y odd automatically. Factor pairs of 105: (1,105),(3,35),(5,21),(7,15). Also (15,7) etc but x<y. Compute a=(x+y)/2, b=(y-x)/2.\n(1,105): a=53, b=52.\n(3,35): a=19, b=16.\n(5,21): a=13, b=8.\n(7,15): a=11, b=4.\nCheck: 53^2-52^2=(1)(105)=105 yes; 19^2-16^2=(3)(35)=105; 13^2-8^2=(5)(21)=105; 11^2-4^2=(7)(15)=105. Need final list clearly. Ensure positive b yes. Provide concise explanation.",
+          "content": "Factor:\n\\[\na^2-b^2=(a-b)(a+b)=105.\n\\]\nSince 105 is odd, both factors are odd. The factor pairs \\((a-b,a+b)\\) are:\n\n- \\((1,105)\\Rightarrow (a,b)=(53,52)\\)\n- \\((3,35)\\Rightarrow (a,b)=(19,16)\\)\n- \\((5,21)\\Rightarrow (a,b)=(13,8)\\)\n- \\((7,15)\\Rightarrow (a,b)=(11,4)\\)\n\nFinal list:\n\\[\n\\boxed{(53,52),\\ (19,16),\\ (13,8),\\ (11,4)}\n\\]"
+        }
+      ]
+    },
+    {
+      "suite": "loop_hybrid_dspark_nmax3",
+      "ok": true,
+      "load_s": 4.03,
+      "vram_loaded_mib": 6360.1,
+      "rss_loaded_mib": 3897.9,
+      "results": [
+        {
+          "id": "zh_moe_loop",
+          "effort": "minimal",
+          "wall_s": 25.32,
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 51,
+            "prompt_ms": 4032.759,
+            "prompt_per_token_ms": 79.07370588235294,
+            "prompt_per_second": 12.646428908843795,
+            "predicted_n": 374,
+            "predicted_ms": 21277.183,
+            "predicted_per_token_ms": 57.043386058981234,
+            "predicted_per_second": 17.530516140224012,
+            "draft_n": 618,
+            "draft_n_accepted": 167
+          },
+          "draft_accept_pct": 27.0,
+          "telemetry": {
+            "vram_peak_mib": 6509.0,
+            "peak_rss_mib": 4719.6,
+            "gpu_power_mean_w": 87.66,
+            "gpu_power_max_w": 102.0,
+            "gpu_temp_edge_c": 55.0,
+            "gpu_temp_junc_c": 68.0,
+            "gpu_temp_vram_c": 76.0
+          },
+          "reasoning_content": "The user asks in Chinese: \"用三句话简要介绍什么是 Mixture-of-Experts (MoE) 架构以及循环 Transformer（Looped Transformer）的优势。\" Need answer in Chinese, exactly three sentences? They ask \"用三句话简要介绍什么是 MoE 架构以及循环 Transformer 的优势。\" Need concise. Need ensure three sentences total. Could say: MoE 是用门控路由把每个 token 分配到少数专家子网络，从而在不显著增加推理计算的同时扩大模型容量；Looped Transformer 通过重复共享同一套 Transformer 块来迭代 refine 表示，能在参数量不变的情况下提升深度/推理时计算与泛化。它们的共同优势是提高效率与表达能力：MoE 按需激活专家，Looped Transformer 用循环复用参数实现更深的推理。 Need exactly three sentences. That's three? Sentence1 MoE definition. Sentence2 Looped definition/advantages. Sentence3 common advantages. Good. Ensure no extra.",
+          "content": "Mixture-of-Experts（MoE）是用门控路由把每个 token 分配到少数专家子网络，从而在推理时只激活部分参数、扩大模型容量；Looped Transformer 通过重复共享同一套 Transformer 块来迭代 refine 表示，能在参数量不变的情况下增加有效深度与推理时计算；两者的共同优势是提高效率与表达能力，分别通过按需激活与参数复用提升性能。"
+        },
+        {
+          "id": "rust_ringbuf",
+          "effort": "none",
+          "wall_s": 30.85,
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 71,
+            "prompt_ms": 2423.227,
+            "prompt_per_token_ms": 34.12995774647887,
+            "prompt_per_second": 29.299772575990612,
+            "predicted_n": 640,
+            "predicted_ms": 28382.474,
+            "predicted_per_token_ms": 44.4170172143975,
+            "predicted_per_second": 22.513893609133582,
+            "draft_n": 779,
+            "draft_n_accepted": 378
+          },
+          "draft_accept_pct": 48.5,
+          "telemetry": {
+            "vram_peak_mib": 6511.4,
+            "peak_rss_mib": 4812.8,
+            "gpu_power_mean_w": 90.05,
+            "gpu_power_max_w": 100.0,
+            "gpu_temp_edge_c": 54.0,
+            "gpu_temp_junc_c": 66.0,
+            "gpu_temp_vram_c": 76.0
+          },
+          "reasoning_content": "The user wants a concise zero-allocation ring buffer in Rust `no_std` using const generics `RingBuf<T: Copy, const N: usize>` with `new`, `push`, `pop`, and `len`, plus a short unit test.\n\nNeed produce code. Need think through implementation carefully.\n\nRequirements:\n- no_std: use core::mem::MaybeUninit? But T: Copy. Ring buffer can store T in array [MaybeUninit<T>; N] or [T; N]? If T: Copy, we can use [T; N] but initialization of all elements requires T: Copy? We can't initialize [T; N] without a value. Use MaybeUninit array and track len/head/tail. Zero allocation.\n- const generics: RingBuf<T: Copy, const N: usize>.\n- new: const fn? In Rust, const fn with const generics possible. Need ensure no allocation. Use const fn new() -> Self { Self { data: [MaybeUninit::uninit(); N], head: 0, len: 0 } }. Is [MaybeUninit::uninit(); N] valid const? Yes MaybeUninit::uninit is const fn? In core, MaybeUninit::uninit is const stable? I think `MaybeUninit::uninit()` is const since 1.? It is const fn. Array repeat with const N works.\n- push: fn push(&mut self, value: T) -> bool? Need decide semantics. Ring buffer push when full: either overwrite oldest or return false. User didn't specify. Concise: push returns bool false if full (no overwrite). pop returns Option<T>. len returns usize.\n- Need maintain head index of oldest element, len. push: if len == N return false; idx = (head + len) % N; data[idx].write(value); len +=1; true. pop: if len ==0 return None; idx=head; value=data[idx].read(); head=(head+1)%N; len-=1; Some(value). Since T: Copy, read is fine (MaybeUninit::read copies? Actually read moves out; for Copy T, okay but leaves uninit? read on MaybeUninit<T> where T: Copy returns T and leaves? It reads value and marks? For Copy, no drop. Fine. Could use read_unaligned? no.\n- Need ensure head only valid when len>0. When len=0, head can be 0 or stale; okay.\n- len: fn len(&self) -> usize { self.len }. Maybe also is_empty? Not requested.\n- Unit test: #[cfg(test)] mod tests { use super::*; #[test] fn push_pop() { let mut r =",
+          "content": ""
+        },
+        {
+          "id": "math_diophantine",
+          "effort": "low",
+          "wall_s": 20.15,
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 45,
+            "prompt_ms": 2402.081,
+            "prompt_per_token_ms": 53.37957777777778,
+            "prompt_per_second": 18.733756272165675,
+            "predicted_n": 508,
+            "predicted_ms": 17682.944,
+            "predicted_per_token_ms": 34.87760157790927,
+            "predicted_per_second": 28.67169629672525,
+            "draft_n": 489,
+            "draft_n_accepted": 344
+          },
+          "draft_accept_pct": 70.3,
+          "telemetry": {
+            "vram_peak_mib": 6511.7,
+            "peak_rss_mib": 5046.9,
+            "gpu_power_mean_w": 88.62,
+            "gpu_power_max_w": 100.0,
+            "gpu_temp_edge_c": 53.0,
+            "gpu_temp_junc_c": 65.0,
+            "gpu_temp_vram_c": 76.0
+          },
+          "reasoning_content": "We need answer math. Need find all pairs positive integers (a,b) with a^2-b^2=105. Factor (a-b)(a+b)=105. Let x=a-b, y=a+b. Positive integers, x<y, same parity (since a=(x+y)/2, b=(y-x)/2 integers; x,y same parity). Product 105 odd, so x,y odd. Factor pairs of 105: (1,105),(3,35),(5,21),(7,15). Also (15,7) etc but x<y. Compute a,b:\n(1,105): a=53, b=52.\n(3,35): a=19, b=16.\n(5,21): a=13, b=8.\n(7,15): a=11, b=4.\nCheck: 53^2-52^2=(1)(105)=105 yes; 19^2-16^2=(3)(35)=105; 13^2-8^2=(5)(21)=105; 11^2-4^2=(7)(15)=105. Need final list clearly. Ensure positive b yes. Provide concise explanation.",
+          "content": "Factor:\n\\[\na^2-b^2=(a-b)(a+b)=105.\n\\]\nSince 105 is odd, both factors are odd. The factor pairs \\((a-b,a+b)\\) are:\n\n- \\((1,105)\\Rightarrow (a,b)=(53,52)\\)\n- \\((3,35)\\Rightarrow (a,b)=(19,16)\\)\n- \\((5,21)\\Rightarrow (a,b)=(13,8)\\)\n- \\((7,15)\\Rightarrow (a,b)=(11,4)\\)\n\nFinal list:\n\\[\n\\boxed{(53,52),\\ (19,16),\\ (13,8),\\ (11,4)}\n\\]"
+        }
+      ]
+    },
+    {
+      "suite": "loop_hybrid_dspark_nmax5",
+      "ok": true,
+      "load_s": 5.01,
+      "vram_loaded_mib": 6388.1,
+      "rss_loaded_mib": 3899.2,
+      "results": [
+        {
+          "id": "zh_moe_loop",
+          "effort": "minimal",
+          "wall_s": 30.67,
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 51,
+            "prompt_ms": 3980.998,
+            "prompt_per_token_ms": 78.0587843137255,
+            "prompt_per_second": 12.810857980837971,
+            "predicted_n": 442,
+            "predicted_ms": 26681.333,
+            "predicted_per_token_ms": 60.501888888888885,
+            "predicted_per_second": 16.528409581335385,
+            "draft_n": 1065,
+            "draft_n_accepted": 228
+          },
+          "draft_accept_pct": 21.4,
+          "telemetry": {
+            "vram_peak_mib": 6537.4,
+            "peak_rss_mib": 4720.7,
+            "gpu_power_mean_w": 87.31,
+            "gpu_power_max_w": 104.0,
+            "gpu_temp_edge_c": 54.0,
+            "gpu_temp_junc_c": 67.0,
+            "gpu_temp_vram_c": 76.0
+          },
+          "reasoning_content": "The user asks in Chinese: \"用三句话简要介绍什么是 Mixture-of-Experts (MoE) 架构以及循环 Transformer（Looped Transformer）的优势。\" Need answer in Chinese, exactly three sentences? They ask \"用三句话简要介绍什么是 MoE 架构以及循环 Transformer 的优势。\" Need provide concise three sentences. Need ensure accuracy.\n\nMoE: sparse mixture of experts, routes tokens to subset of expert networks via gating, increases capacity/computation efficiency. Looped Transformer: reuses same transformer block/weights across multiple iterations/steps, enabling iterative refinement, deeper effective computation with fewer parameters, potentially better generalization/reasoning. Need three sentences total. Could be:\n1. MoE 是把输入 token 通过门控路由到少数专家网络，而不是所有专家，从而在不显著增加每 token 计算量的情况下扩大模型容量。\n2. 循环 Transformer 让同一组参数在多个迭代/步数中重复应用，相当于用更少参数获得更深的有效计算。\n3. 两者优势在于提升效率与表达能力：MoE 提高稀疏条件下的容量，循环 Transformer 增强迭代推理与参数效率，常可与 MoE 结合。\n\nNeed exactly three sentences. Good. Ensure no extra.",
+          "content": "MoE 是通过门控路由把每个 token 送到少数专家网络，而不是全部专家，从而在不显著增加每 token 计算量的情况下扩大模型容量。循环 Transformer 让同一组参数在多个迭代中重复应用，相当于用更少参数获得更深的有效计算。两者的优势都在于提升效率与表达能力：MoE 提高稀疏条件下的容量，循环 Transformer 增强迭代推理与参数效率，并可相互结合。"
+        },
+        {
+          "id": "rust_ringbuf",
+          "effort": "none",
+          "wall_s": 27.16,
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 71,
+            "prompt_ms": 2384.798,
+            "prompt_per_token_ms": 33.58870422535211,
+            "prompt_per_second": 29.77191359603623,
+            "predicted_n": 640,
+            "predicted_ms": 24716.142,
+            "predicted_per_token_ms": 38.67940845070422,
+            "predicted_per_second": 25.85354947386206,
+            "draft_n": 940,
+            "draft_n_accepted": 450
+          },
+          "draft_accept_pct": 47.9,
+          "telemetry": {
+            "vram_peak_mib": 6539.8,
+            "peak_rss_mib": 4842.7,
+            "gpu_power_mean_w": 88.27,
+            "gpu_power_max_w": 106.0,
+            "gpu_temp_edge_c": 54.0,
+            "gpu_temp_junc_c": 66.0,
+            "gpu_temp_vram_c": 76.0
+          },
+          "reasoning_content": "The user wants a concise zero-allocation ring buffer in Rust `no_std` using const generics `RingBuf<T: Copy, const N: usize>` with `new`, `push`, `pop`, and `len`, plus a short unit test.\n\nNeed produce code. Need think through implementation carefully.\n\nRequirements:\n- no_std: likely use core::mem::MaybeUninit? But T: Copy, so can use [MaybeUninit<T>; N] or [T; N]? For zero allocation and Copy, simplest: store [T; N] with a bool/len? But T may not be initialized; using [T; N] requires T: Copy but not Default. Could use MaybeUninit array and track head/tail/len. Zero allocation means no heap; stack array. Need ensure safety.\n\nDesign:\n```\n#[derive(Clone, Copy)]\npub struct RingBuf<T: Copy, const N: usize> {\n    data: [core::mem::MaybeUninit<T>; N],\n    head: usize, // index of next write? or oldest?\n    len: usize,\n}\n```\nNeed new, push, pop, len.\n\nSemantics: push adds to back, pop removes from front. Ring buffer with head = index of oldest element, tail = index of next write. len = number elements.\n\nImplementation:\n```\nimpl<T: Copy, const N: usize> RingBuf<T, N> {\n    pub const fn new() -> Self {\n        Self { data: [core::mem::MaybeUninit::uninit(); N], head: 0, len: 0 }\n    }\n    pub fn push(&mut self, value: T) -> Option<T> { // maybe returns Option<T> if full? \n        if self.len == N { return None; }\n        let idx = (self.head + self.len) % N;\n        self.data[idx].write(value);\n        self.len += 1;\n        Some(value)\n    }\n    pub fn pop(&mut self) -> Option<T> {\n        if self.len == 0 { return None; }\n        let idx = self.head;\n        let value = unsafe { self.data[idx].assume_init() };\n        self.head = (self.head + 1) % N;\n        self.len -= 1;\n        Some(value)\n    }\n    pub fn len(&self) -> usize { self.len }\n}\n```\nNeed const fn new: `[MaybeUninit::uninit(); N]` is const? In recent Rust, `MaybeUninit::uninit()` is const fn? Yes `const",
+          "content": ""
+        },
+        {
+          "id": "math_diophantine",
+          "effort": "low",
+          "wall_s": 20.3,
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 45,
+            "prompt_ms": 2385.469,
+            "prompt_per_token_ms": 53.010422222222225,
+            "prompt_per_second": 18.86421496150233,
+            "predicted_n": 493,
+            "predicted_ms": 17840.938,
+            "predicted_per_token_ms": 36.262069105691054,
+            "predicted_per_second": 27.577025378374167,
+            "draft_n": 675,
+            "draft_n_accepted": 357
+          },
+          "draft_accept_pct": 52.9,
+          "telemetry": {
+            "vram_peak_mib": 6540.2,
+            "peak_rss_mib": 5038.1,
+            "gpu_power_mean_w": 86.16,
+            "gpu_power_max_w": 102.0,
+            "gpu_temp_edge_c": 53.0,
+            "gpu_temp_junc_c": 65.0,
+            "gpu_temp_vram_c": 75.0
+          },
+          "reasoning_content": "We need answer math. Need find all pairs positive integers (a,b) with a^2-b^2=105. Factor (a-b)(a+b)=105. Let x=a-b, y=a+b. Positive integers, x<y, same parity (since a=(x+y)/2, b=(y-x)/2 integers; x,y same parity). Product 105 odd, so x,y odd. Factor pairs of 105: (1,105),(3,35),(5,21),(7,15). Also (15,7) etc but x<y. Compute a,b:\n(1,105): a=53, b=52.\n(3,35): a=19, b=16.\n(5,21): a=13, b=8.\n(7,15): a=11, b=4.\nCheck: 53^2-52^2=(1)(105)=105 yes; 19^2-16^2=(3)(35)=105; 13^2-8^2=(5)(21)=105; 11^2-4^2=(7)(15)=105. Need final list clearly. Ensure positive b yes. Provide concise explanation.",
+          "content": "Factor:\n\\[\na^2-b^2=(a-b)(a+b)=105.\n\\]\nSince 105 is odd, both factors are odd. The factor pairs \\((a-b,a+b)\\) are:\n\n\\[\n(1,105),\\ (3,35),\\ (5,21),\\ (7,15).\n\\]\n\nSolving for \\((a,b)\\):\n\n\\[\n(53,52),\\ (19,16),\\ (13,8),\\ (11,4).\n\\]\n\nFinal list:\n\\[\n\\boxed{(53,52),\\ (19,16),\\ (13,8),\\ (11,4)}\n\\]"
+        }
+      ]
+    }
+  ]
+}

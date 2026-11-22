@@ -10,6 +10,8 @@ pub mod registry;
 
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
+#[cfg(target_arch = "x86_64")]
+pub mod x86_64;
 
 pub use affinity::{CpuTopology, detected_topology, recommended_threads};
 pub use isa::{Caps, Isa, best_isa, detect_caps, effective_isa};

@@ -96,3 +96,12 @@
   3. **单后端跨厂商复用**：同一套 `tm-vulkan` 在 **Intel UHD 770** 核显上 Decode 超越 `llama.cpp` Vulkan **`18.2%–50.0%`**，且通过 `aarch64-linux-android` 与 `aarch64-unknown-linux-gnu` 交叉编译检查。
 - **决策**：**不单独提前开辟 HIP 后端**，`tm-vulkan` 作为 AMD、Intel 及 Arm 端侧 GPU 的正式主力后端；待 M5 建设 `tm-cuda` 时，再按需评估 `.cu` 内核对 `hipcc` 的共源复用。
 - **后果**：省去维护第三套 GPU 后端及 `~2 GiB` ROCm 运行时依赖，直接衔接 M5 服务层与 `tm-cuda`。
+
+### ADR-015 `host` 档支持 `Inkling-2-Mini` (`inkling2_loop`) 全量 `Q8_0` 三层循环感知存储与 `DSpark` (`dflash`) 分块投机
+- **状态**：Accepted（2026-11-22，用户确认在新分支 `feat/inkling2-q8` 实施）
+- **背景**：用户希望利用 `tinymodel` 在本机（i7-12700 `15.4 GiB` DDR4 + RX 9060 XT `8 GiB` GDDR6 + Predator GM7000 PCIe 4.0 NVMe）及 32GB+ 主机上全量运行 26.07B 物理参数的循环稀疏 MoE 模型 `Inkling-2-Mini-Q8_0.gguf`（`25.91 GiB`）及原生草稿器 `dspark-Inkling-2-Mini-Q8_0.gguf`（`383.6 MiB`）。全量 `Q8_0` 仅含 `Q8_0`/`BF16`/`F32` 三种已有 `DType`，且单 token 实际读取仅 `5.15 GiB`（其中 85.3% 流量集中在 `14.13 GiB` 的稠密层与 `3×` 循环核专家上），但 `26.3 GiB` 总权重超出本机 `21 GiB` 易失存储上限，常规 `mmap` 会触发全层 LRU 随机缺页风暴并造成页缓存双份驻留。
+- **决策**：
+  1. **三层循环感知存储规划（Tier 0 VRAM + Tier 1 匿名 RAM + Tier 2 `O_DIRECT` NVMe 双缓冲槽）**：加载期按“每 token 逻辑访问频次 ÷ 字节体积”静态划分权重驻留层级——优先将全部 24 层稠密注意力/卷积/Loop 控制器、LM Head、`DSpark` 及高频 `blk.6..17`（`3×` 循环核）专家锁入 VRAM 与主机匿名 RAM（通过不触碰 `mmap` 页的无缓存 `DirectTensorReader` 加载，彻底杜绝 Linux 页缓存双份占用）；当 `VRAM + 可用 RAM < 总权重` 时，仅将单遍外层专家留在 NVMe，运行期通过预分配的 4096 字节对齐槽位并发 `O_DIRECT` 直读 Top-8 激活专家（生成路径零堆分配、零 `unsafe` 越界）。
+  2. **严格遵守 48 逻辑层独立状态与填充词表截断契约**：24 层物理权重展开为 48 个独立逻辑层状态槽（40 层 `SWA=1024` 环形 KV + 8 层全局 KV + 48 份 4 路 `ShortConv` 历史）；采样前严格将 `201,024` 行填充 logits 截断至 `vocab_size_unpadded = 200,058`。
+  3. **补齐 `tm-cpu::x86_64::avx2` 0-ULP 内核并隔离 `micro` 边界**：在 `tm-cpu` 实装 `x86_64` `AVX2+FMA` 向量化内核（与 `generic` 逐位一致），同时保持 `micro` 档 `aarch64-musl` 静态构建零体积膨胀。
+- **后果**：在不破坏 `micro`/`edge` 零拷贝精简架构的前提下，使 `tinymodel` 能够在 16GB RAM + 8GB VRAM 主机上无 OOM、无 Swap 抖动地全量运行 `25.91 GiB` `Inkling-2-Mini-Q8_0` + `DSpark`，并在 32GB+ 主机上自动退化为纯内存+显存零读盘运行。
