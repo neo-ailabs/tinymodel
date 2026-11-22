@@ -48,17 +48,19 @@ LOOP_CTRL_NAMES = ["q", "k", "v", "ffn"]
 
 
 def quantize_q8_0_rows(mat_f32: np.ndarray) -> bytes:
-    """Quantize a 2D/3D array `[..., cols]` (`cols % 32 == 0`) to GGML `Q8_0` bytes."""
+    """Quantize a 2D/3D array `[..., cols]` (`cols % 32 == 0`) to GGML `Q8_0` bytes (`ggml` `quantize_row_q8_0` exact)."""
     arr = np.asarray(mat_f32, dtype=np.float32)
     cols = arr.shape[-1]
     assert cols % 32 == 0, f"Q8_0 requires cols % 32 == 0, got {cols}"
     flat = arr.reshape(-1, 32)
-    amax = np.max(np.abs(flat), axis=1)
-    d_f32 = amax / 127.0
+    amax = np.max(np.abs(flat), axis=1).astype(np.float32)
+    d_f32 = (amax / np.float32(127.0)).astype(np.float32)
+    inv_d = np.where(d_f32 != 0.0, np.float32(1.0) / d_f32, np.float32(0.0)).astype(np.float32)
+    scaled = (flat * inv_d[:, None]).astype(np.float32)
+    # C/Rust `roundf`: round half away from zero
+    rounded = np.copysign(np.floor(np.abs(scaled) + np.float32(0.5)), scaled)
+    qs = np.clip(rounded, -127.0, 127.0).astype(np.int8)
     d_f16 = d_f32.astype(np.float16)
-    d_back = d_f16.astype(np.float32)
-    inv_d = np.where(d_back != 0.0, 1.0 / d_back, 0.0)
-    qs = np.rint(flat * inv_d[:, None]).clip(-128, 127).astype(np.int8)
     out = bytearray(flat.shape[0] * 34)
     for i in range(flat.shape[0]):
         off = i * 34
@@ -439,6 +441,15 @@ class GgufReader:
             return dequantize_q8_0_bytes(self.raw[abs_off : abs_off + byte_len], rm_shape)
         raise ValueError(f"{name}: unsupported ttype={ttype}")
 
+    def matvec(self, name: str, x: np.ndarray, quantize_q8_act: bool = True) -> np.ndarray:
+        """Matrix-vector product matching `ggml` / `tinymodel` (`Q8_0 x Q8_0` when `quantize_q8_act=True`)."""
+        _, ttype, _ = self.tensor_meta[name]
+        w = self.tensor_f64(name)
+        if quantize_q8_act and ttype == GGML_TYPE_Q8_0:
+            x_q8 = dequantize_q8_0_bytes(quantize_q8_0_rows(x.astype(np.float32)), x.shape)
+            return w @ x_q8
+        return w @ x
+
 
 def rms_norm_unit(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     ms = np.mean(x * x, axis=-1, keepdims=True)
@@ -477,8 +488,9 @@ def mix_depth(blocks: list[np.ndarray], cur: np.ndarray, query: np.ndarray) -> n
 class Inkling2Oracle:
     """Exact token-by-token FP64 reference implementation of `inkling2` & `inkling2_loop`."""
 
-    def __init__(self, gguf: GgufReader) -> None:
+    def __init__(self, gguf: GgufReader, quantize_q8_act: bool = True) -> None:
         self.g = gguf
+        self.quantize_q8_act = quantize_q8_act
         kv = gguf.kv
         arch = kv["general.architecture"]
         assert arch in ("inkling2", "inkling2_loop")
@@ -637,14 +649,14 @@ class Inkling2Oracle:
             inputs[2] = rms_norm_weighted(inputs[2], self.g.tensor_f64(f"blk.{ip}.attn_v_inp_norm.weight"), self.rms_eps)
 
         # Self-attention
-        q_raw = self.g.tensor_f64(f"blk.{ip}.attn_q.weight") @ inputs[0]
-        k_mm = self.g.tensor_f64(f"blk.{ip}.attn_k.weight") @ inputs[1]
-        v_mm = self.g.tensor_f64(f"blk.{ip}.attn_v.weight") @ inputs[2]
-        k_dyn = None if swa else (self.g.tensor_f64(f"blk.{ip}.attn_k_conv_proj.weight") @ inputs[1])
-        v_dyn = None if swa else (self.g.tensor_f64(f"blk.{ip}.attn_v_conv_proj.weight") @ inputs[2])
+        q_raw = self.g.matvec(f"blk.{ip}.attn_q.weight", inputs[0], self.quantize_q8_act)
+        k_mm = self.g.matvec(f"blk.{ip}.attn_k.weight", inputs[1], self.quantize_q8_act)
+        v_mm = self.g.matvec(f"blk.{ip}.attn_v.weight", inputs[2], self.quantize_q8_act)
+        k_dyn = None if swa else self.g.matvec(f"blk.{ip}.attn_k_conv_proj.weight", inputs[1], self.quantize_q8_act)
+        v_dyn = None if swa else self.g.matvec(f"blk.{ip}.attn_v_conv_proj.weight", inputs[2], self.quantize_q8_act)
         k_conv = self._convolve(il, "k", k_mm, self.g.tensor_f64(f"blk.{ip}.attn_k_conv.weight"), k_dyn)
         v_conv = self._convolve(il, "v", v_mm, self.g.tensor_f64(f"blk.{ip}.attn_v_conv.weight"), v_dyn)
-        r_raw = self.g.tensor_f64(f"blk.{ip}.attn_rel.weight") @ inputs[0]
+        r_raw = self.g.matvec(f"blk.{ip}.attn_rel.weight", inputs[0], self.quantize_q8_act)
 
         q_cur = clip_rows(
             q_raw.reshape(nh, hd),
@@ -671,7 +683,7 @@ class Inkling2Oracle:
         self.v_cache[il].append(v_f16)
         assert len(self.k_cache[il]) == pos + 1
 
-        sinks = self.g.tensor_f64(f"blk.{ip}.attn_sink_proj.weight") @ inputs[0]  # [nh]
+        sinks = self.g.matvec(f"blk.{ip}.attn_sink_proj.weight", inputs[0], self.quantize_q8_act)  # [nh]
         rel_bias_w = self.g.tensor_f64(f"blk.{ip}.attn_rel_bias.weight")  # [extent, n_rel]
         extent = rel_bias_w.shape[0]
         # `table`: `[nh, extent + 1]`, last column is 0 for `distance >= extent`
@@ -700,9 +712,9 @@ class Inkling2Oracle:
             attn_heads[h] = probs @ v_stack[:, kvh, :]
 
         attn_vec = attn_heads.reshape(-1)
-        gate = 1.0 / (1.0 + np.exp(-(self.g.tensor_f64(f"blk.{ip}.attn_gate.weight") @ inputs[0])))
+        gate = 1.0 / (1.0 + np.exp(-self.g.matvec(f"blk.{ip}.attn_gate.weight", inputs[0], self.quantize_q8_act)))
         attn_vec = attn_vec * gate
-        wo_out = self.g.tensor_f64(f"blk.{ip}.attn_output.weight") @ attn_vec
+        wo_out = self.g.matvec(f"blk.{ip}.attn_output.weight", attn_vec, self.quantize_q8_act)
         cur = self._convolve(il, "attn", wo_out, self.g.tensor_f64(f"blk.{ip}.attn_post_conv.weight"), None)
 
         if ip % self.block_size == 0:
@@ -726,15 +738,25 @@ class Inkling2Oracle:
 
         gate_up_exps = self.g.tensor_f64(f"blk.{ip}.ffn_gate_up_exps.weight")  # [E, 2*n_ff, n_embd]
         down_exps = self.g.tensor_f64(f"blk.{ip}.ffn_down_exps.weight")  # [E, n_embd, n_ff]
+        cur_in = (
+            dequantize_q8_0_bytes(quantize_q8_0_rows(cur.astype(np.float32)), cur.shape)
+            if self.quantize_q8_act
+            else cur
+        )
         moe_out = np.zeros((self.n_embd,), dtype=np.float64)
         for e_id, w_e in zip(top_idx, top_w):
-            gu = gate_up_exps[e_id] @ cur
+            gu = gate_up_exps[e_id] @ cur_in
             gate_v = gu[: self.n_ff_exp]
             up_v = gu[self.n_ff_exp :]
             act_g = self.situ_beta * np.tanh(gate_v / self.situ_beta) * (1.0 / (1.0 + np.exp(-gate_v)))
             act_u = self.situ_lb * np.tanh(up_v / self.situ_lb) if self.situ_lb > 0.0 else up_v
             hidden = act_g * act_u
-            moe_out += w_e * (down_exps[e_id] @ hidden)
+            hid_in = (
+                dequantize_q8_0_bytes(quantize_q8_0_rows(hidden.astype(np.float32)), hidden.shape)
+                if self.quantize_q8_act
+                else hidden
+            )
+            moe_out += w_e * (down_exps[e_id] @ hid_in)
 
         cur = self._convolve(il, "ffn", moe_out, self.g.tensor_f64(f"blk.{ip}.ffn_post_conv.weight"), None)
         return ffn_inp + cur
@@ -778,7 +800,7 @@ class Inkling2Oracle:
 
         cur = mix_depth(blocks, cur, self.out_res_q)
         cur = rms_norm_weighted(cur, self.out_norm, self.rms_eps)
-        logits = (self.out_w @ cur)[: self.vocab_unpadded]
+        logits = self.g.matvec("output.weight", cur, self.quantize_q8_act)[: self.vocab_unpadded]
         if self.softcap != 0.0:
             logits = self.softcap * np.tanh(logits / self.softcap)
         return logits.astype(np.float32)
@@ -803,6 +825,7 @@ def main() -> None:
     ap.add_argument("--tokens", type=str, default="5,12,29,41,7,63,18", help="Comma-separated token IDs (>=2)")
     ap.add_argument("--out", type=Path, required=True, help="Output TMLG v1 reference file")
     ap.add_argument("--seed", type=int, default=20261122)
+    ap.add_argument("--float-act", action="store_true", help="Keep activations in float64 instead of Q8_0 (matches GPU float-activation GEMV)")
     args = ap.parse_args()
 
     if args.gen_gguf is not None:
@@ -818,7 +841,7 @@ def main() -> None:
         raise SystemExit("AGENTS.md Rule #7 requires >= 2 tokens")
 
     reader = GgufReader(gguf_path)
-    oracle = Inkling2Oracle(reader)
+    oracle = Inkling2Oracle(reader, quantize_q8_act=not args.float_act)
     logits_steps: list[np.ndarray] = []
     for step, tid in enumerate(toks):
         lg = oracle.forward_token(tid, step)

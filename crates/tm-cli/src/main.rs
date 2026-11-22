@@ -591,6 +591,38 @@ fn cmd_run_metal(opts: RunOpts) -> Result<()> {
 }
 
 fn compute_active_decode_bytes(gguf: &GgufFile) -> u64 {
+    let arch = gguf.req_str("general.architecture").unwrap_or("");
+    let is_inkling2 = arch == "inkling2" || arch == "inkling2_loop";
+    let (core_start, core_end, n_passes, n_exp, n_exp_used) = if is_inkling2 {
+        let cs = gguf
+            .get_meta(&format!("{arch}.loop.start"))
+            .and_then(|v| v.as_usize())
+            .unwrap_or(0);
+        let ce = gguf
+            .get_meta(&format!("{arch}.loop.end"))
+            .and_then(|v| v.as_usize())
+            .unwrap_or(0);
+        let np = gguf
+            .get_meta(&format!("{arch}.loop.count"))
+            .and_then(|v| v.as_usize())
+            .unwrap_or(1);
+        let ne = gguf
+            .get_meta(&format!("{arch}.expert_count"))
+            .and_then(|v| v.as_usize())
+            .unwrap_or(1)
+            .max(1);
+        let eu = gguf
+            .get_meta(&format!("{arch}.expert_used_count"))
+            .and_then(|v| {
+                v.as_usize()
+                    .or_else(|| v.as_usize_array().and_then(|a| a.first().copied()))
+            })
+            .unwrap_or(ne);
+        (cs, ce, np, ne, eu)
+    } else {
+        (0, 0, 1, 1, 1)
+    };
+
     let mut total = 0u64;
     let has_separate_output = gguf.tensor_info("output.weight").is_some();
     for name in gguf.tensor_names() {
@@ -606,6 +638,27 @@ fn compute_active_decode_bytes(gguf: &GgufFile) -> u64 {
                 // Gemma 4 PLE lookup table only reads 1 row per token (`ARCHITECTURE.md` §1)!
                 if let Some(&cols) = info.dims.first() {
                     total += info.dtype.row_bytes(cols) as u64;
+                }
+                continue;
+            }
+            if is_inkling2
+                && let Some(rest) = name.strip_prefix("blk.")
+                && let Some((idx_str, suffix)) = rest.split_once('.')
+                && let Ok(ip) = idx_str.parse::<usize>()
+            {
+                let in_core = (core_start..core_end).contains(&ip) && n_passes > 1;
+                let mult = if suffix.starts_with("loop_") {
+                    n_passes.saturating_sub(1) as u64
+                } else if in_core {
+                    n_passes as u64
+                } else {
+                    1
+                };
+                if suffix.ends_with("_exps.weight") {
+                    let per_exp = (info.byte_len / n_exp) as u64;
+                    total += mult * (n_exp_used as u64) * per_exp;
+                } else {
+                    total += mult * (info.byte_len as u64);
                 }
                 continue;
             }
@@ -631,8 +684,20 @@ fn resolve_bench_pp_ids(opts: &RunOpts, gguf: &GgufFile) -> Result<(Vec<u32>, bo
         }
         Ok((ids, true))
     } else {
+        let arch = gguf.req_str("general.architecture").unwrap_or("");
+        let vocab_cap = gguf
+            .get_meta(&format!("{arch}.vocab_size_unpadded"))
+            .or_else(|| gguf.get_meta(&format!("{arch}.vocab_size")))
+            .and_then(|v| v.as_usize())
+            .or_else(|| {
+                gguf.tensor_info("token_embd.weight")
+                    .and_then(|t| t.dims.get(1).copied())
+            })
+            .unwrap_or(1001)
+            .saturating_sub(1)
+            .clamp(1, 1000);
         let n_pp = 512usize.min(opts.max_ctx.saturating_sub(opts.n_predict + 2));
-        let ids: Vec<u32> = (0..n_pp).map(|i| ((i % 1000) + 1) as u32).collect();
+        let ids: Vec<u32> = (0..n_pp).map(|i| ((i % vocab_cap) + 1) as u32).collect();
         Ok((ids, false))
     }
 }

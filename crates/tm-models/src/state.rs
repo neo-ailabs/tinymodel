@@ -128,6 +128,25 @@ impl SpecVerifyBuf {
         }
     }
 
+    pub fn new_inkling2(vocab_size: usize, n_embd: usize, total_conv_floats: usize) -> Self {
+        Self {
+            logits_win: vec![0.0; MAX_SPEC_WINDOW * vocab_size],
+            hidden_win: vec![0.0; MAX_SPEC_WINDOW * n_embd],
+            norm_win: Vec::new(),
+            gdn_qkv_win: Vec::new(),
+            gdn_g_win: Vec::new(),
+            gdn_beta_win: Vec::new(),
+            sc_bx_win: vec![0.0; MAX_SPEC_WINDOW * total_conv_floats],
+            tmp_ssm_state: Vec::new(),
+            tmp_conv_hist: vec![0.0; total_conv_floats],
+            replay_q: Vec::new(),
+            replay_k: Vec::new(),
+            replay_v: Vec::new(),
+            replay_out: Vec::new(),
+            last_window_len: 0,
+        }
+    }
+
     #[inline]
     pub fn logits_at(&self, step: usize, vocab_size: usize) -> &[f32] {
         &self.logits_win[step * vocab_size..(step + 1) * vocab_size]
