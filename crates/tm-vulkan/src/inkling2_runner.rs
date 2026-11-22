@@ -178,9 +178,19 @@ struct VkInklingLayer {
     vram_experts: Option<VkVramExperts>,
 }
 
+/// Maximum number of tokens evaluated in lockstep per `forward_window_hybrid` pass
+/// (covers `32`-token prompt prefill chunks and `DSpark` `block_size == 8` verification windows!).
+pub const MAX_INKLING2_VK_WINDOW: usize = 32;
+/// Maximum speculative rollback window with `save_conv_snapshots == true` (`DSpark` `block_size == 8`).
+pub const MAX_INKLING2_SPEC_WINDOW: usize = 8;
+
 /// Callback signature invoked for MoE layers offloaded to Host RAM / NVMe `O_DIRECT`:
 /// `(ip, cur_normed, top_ids, top_weights, moe_out)`.
 pub type HostMoeFn<'a> = dyn FnMut(usize, &[f32], &[usize], &[f32], &mut [f32]) + 'a;
+
+/// Windowed callback invoked for MoE layers offloaded to Host RAM / NVMe `O_DIRECT` across `1..=8` tokens:
+/// `(ip, window_len, cur_normed_win, top_ids_win, top_weights_win, moe_out_win)`.
+pub type HostMoeWindowFn<'a> = dyn FnMut(usize, usize, &[f32], &[usize], &[f32], &mut [f32]) + 'a;
 
 /// End-to-end / Hybrid Vulkan runner for `inkling2` & `inkling2_loop`.
 pub struct Inkling2VkRunner {
@@ -204,6 +214,17 @@ pub struct Inkling2VkRunner {
     slot_kv_u32_bases: Vec<u32>,
     conv_hist: VkBuffer,
     slot_conv_bases: Vec<u32>,
+    total_conv_f32s: usize,
+    last_window_len: usize,
+    // Multi-token window state & `O(1)` speculative `ShortConv` snapshot buffers
+    win_state_buf: VkBuffer,
+    per_tok_state_f32s: usize,
+    conv_snapshots_buf: VkBuffer,
+    dspark_taps_buf: VkBuffer,
+    win_argmax_buf: VkBuffer,
+    step_tok0_buf: VkBuffer,
+    top_ids_tmp_buf: VkBuffer,
+    top_weights_tmp_buf: VkBuffer,
     // Working device buffers
     step_buf: VkBuffer,
     cur_buf: VkBuffer,
@@ -1105,8 +1126,19 @@ impl Inkling2VkRunner {
         let max_q_dim = max_nh * cfg.head_dim;
         let max_kv_dim = max_nh_kv * cfg.head_dim;
         let max_blocks = cfg.max_depth_blocks();
+        let per_tok_state_f32s = (4 + 3 * max_blocks) * n_embd;
 
-        let step_buf = ctx.create_host_buffer(16)?;
+        let step_buf = ctx.create_host_buffer((MAX_INKLING2_VK_WINDOW * 4).max(16) as u64)?;
+        let step_tok0_buf = ctx.alloc_buffer(16)?;
+        let win_state_buf =
+            ctx.alloc_buffer((MAX_INKLING2_VK_WINDOW * per_tok_state_f32s * 4).max(16) as u64)?;
+        let conv_snapshots_buf =
+            ctx.alloc_buffer((MAX_INKLING2_SPEC_WINDOW * conv_f32_cursor * 4).max(16) as u64)?;
+        let dspark_taps_buf =
+            ctx.create_host_buffer((MAX_INKLING2_VK_WINDOW * 8 * n_embd * 4).max(16) as u64)?;
+        let win_argmax_buf = ctx.create_host_buffer((MAX_INKLING2_VK_WINDOW * 4).max(16) as u64)?;
+        let top_ids_tmp_buf = ctx.alloc_buffer((cfg.n_expert_used * 4).max(16) as u64)?;
+        let top_weights_tmp_buf = ctx.alloc_buffer((cfg.n_expert_used * 4).max(16) as u64)?;
         let cur_buf = ctx.alloc_buffer((n_embd * 4) as u64)?;
         let inp_sa_buf = ctx.alloc_buffer((n_embd * 4) as u64)?;
         let ffn_inp_buf = ctx.alloc_buffer((n_embd * 4) as u64)?;
@@ -1143,10 +1175,14 @@ impl Inkling2VkRunner {
         let argmax_buf = ctx.create_host_buffer(16)?;
         let dummy_buf = ctx.alloc_buffer(64)?;
 
-        let ffn_normed_bridge = ctx.create_host_buffer((n_embd * 4) as u64)?;
-        let top_ids_bridge = ctx.create_host_buffer((cfg.n_expert_used * 4).max(16) as u64)?;
-        let top_weights_bridge = ctx.create_host_buffer((cfg.n_expert_used * 4).max(16) as u64)?;
-        let moe_out_bridge = ctx.create_host_buffer((n_embd * 4) as u64)?;
+        let ffn_normed_bridge =
+            ctx.create_host_buffer((MAX_INKLING2_VK_WINDOW * n_embd * 4) as u64)?;
+        let top_ids_bridge = ctx
+            .create_host_buffer((MAX_INKLING2_VK_WINDOW * cfg.n_expert_used * 4).max(16) as u64)?;
+        let top_weights_bridge = ctx
+            .create_host_buffer((MAX_INKLING2_VK_WINDOW * cfg.n_expert_used * 4).max(16) as u64)?;
+        let moe_out_bridge =
+            ctx.create_host_buffer((MAX_INKLING2_VK_WINDOW * n_embd * 4) as u64)?;
 
         // Build compute pipelines
         let sg = info.subgroup_size;
@@ -1227,6 +1263,16 @@ impl Inkling2VkRunner {
             slot_kv_u32_bases,
             conv_hist,
             slot_conv_bases,
+            total_conv_f32s: conv_f32_cursor,
+            last_window_len: 0,
+            win_state_buf,
+            per_tok_state_f32s,
+            conv_snapshots_buf,
+            dspark_taps_buf,
+            win_argmax_buf,
+            step_tok0_buf,
+            top_ids_tmp_buf,
+            top_weights_tmp_buf,
             step_buf,
             cur_buf,
             inp_sa_buf,
@@ -1268,10 +1314,10 @@ impl Inkling2VkRunner {
             top_weights_bridge,
             moe_out_bridge,
             logits_host: vec![0.0; cfg.vocab_size],
-            host_cur_scratch: vec![0.0; n_embd],
-            host_ids_scratch: vec![0; cfg.n_expert_used],
-            host_weights_scratch: vec![0.0; cfg.n_expert_used],
-            host_moe_out_scratch: vec![0.0; n_embd],
+            host_cur_scratch: vec![0.0; MAX_INKLING2_VK_WINDOW * n_embd],
+            host_ids_scratch: vec![0; MAX_INKLING2_VK_WINDOW * cfg.n_expert_used],
+            host_weights_scratch: vec![0.0; MAX_INKLING2_VK_WINDOW * cfg.n_expert_used],
+            host_moe_out_scratch: vec![0.0; MAX_INKLING2_VK_WINDOW * n_embd],
             pipe_embed,
             pipe_ops,
             pipe_rel_attn,
@@ -1391,6 +1437,211 @@ impl Inkling2VkRunner {
             read_mapped_f32(&self.ctx, &self.logits_buf, &mut self.logits_host)?;
         }
         Ok(&self.logits_host)
+    }
+
+    /// Evaluates a window of `1 <= W <= MAX_INKLING2_VK_WINDOW` tokens in lockstep across all
+    /// 48 visits (sharing GPU submissions and grouping unique Host RAM + NVMe `O_DIRECT` experts!),
+    /// optionally snapshotting `ShortConv` states for `O(1)` speculative rollback and capturing
+    /// `dspark_target_visits` (`e.g. &[5, 23, 41, 48]`).
+    ///
+    /// If `compute_last_logits` is true, populates `self.logits_host` with token `W - 1`'s logits.
+    /// If `out_argmax` is `Some`, populates `out_argmax[0..W]` with GPU `argmax` token IDs for ALL `W` tokens.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_window_hybrid(
+        &mut self,
+        window_tokens: &[u32],
+        start_pos: usize,
+        compute_last_logits: bool,
+        save_conv_snapshots: bool,
+        dspark_target_visits: &[usize],
+        mut host_moe_win: Option<&mut HostMoeWindowFn<'_>>,
+        out_argmax: Option<&mut [u32]>,
+    ) -> Result<&[f32], VulkanError> {
+        let w = window_tokens.len();
+        if w == 0 || w > MAX_INKLING2_VK_WINDOW {
+            return Err(VulkanError::InvalidDimensions(format!(
+                "window length {w} outside 1..={MAX_INKLING2_VK_WINDOW}"
+            )));
+        }
+        if save_conv_snapshots && w > MAX_INKLING2_SPEC_WINDOW {
+            return Err(VulkanError::InvalidDimensions(format!(
+                "speculative snapshot window {w} exceeds MAX_INKLING2_SPEC_WINDOW={MAX_INKLING2_SPEC_WINDOW}"
+            )));
+        }
+        if dspark_target_visits.len() > 8 {
+            return Err(VulkanError::InvalidDimensions(format!(
+                "dspark_target_visits len {} exceeds cap 8",
+                dspark_target_visits.len()
+            )));
+        }
+        let end_pos = start_pos.saturating_add(w);
+        if end_pos > self.cfg.max_ctx {
+            return Err(VulkanError::InvalidDimensions(format!(
+                "window end position {} exceeds max_ctx {}",
+                end_pos - 1,
+                self.cfg.max_ctx
+            )));
+        }
+        for &tid in window_tokens {
+            if (tid as usize) >= self.cfg.vocab_size {
+                return Err(VulkanError::InvalidDimensions(format!(
+                    "token_id {tid} exceeds vocab_size {}",
+                    self.cfg.vocab_size
+                )));
+            }
+        }
+        let want_all_argmax = out_argmax.is_some();
+        if let Some(ref slice) = out_argmax
+            && slice.len() < w
+        {
+            return Err(VulkanError::InvalidDimensions(
+                "out_argmax slice shorter than window_tokens".to_string(),
+            ));
+        }
+
+        self.run_window_internal(
+            window_tokens,
+            start_pos,
+            compute_last_logits,
+            want_all_argmax,
+            save_conv_snapshots,
+            dspark_target_visits,
+            &mut host_moe_win,
+        )?;
+        self.last_window_len = w;
+
+        if let Some(dst_argmax) = out_argmax {
+            read_mapped_u32(&self.win_argmax_buf, &mut dst_argmax[..w])?;
+        }
+        if compute_last_logits {
+            read_mapped_f32(&self.ctx, &self.logits_buf, &mut self.logits_host)?;
+        }
+        Ok(&self.logits_host)
+    }
+
+    /// Commits `1 <= committed <= last_window_len` accepted tokens from the preceding
+    /// `forward_window_hybrid(..., save_conv_snapshots = true, ...)` call in `O(1)` (`~0.015 ms`).
+    pub fn commit_speculative_window(&mut self, committed: usize) -> Result<(), VulkanError> {
+        if committed == 0 || committed > self.last_window_len {
+            return Err(VulkanError::InvalidDimensions(format!(
+                "commit_speculative_window({committed}) outside 1..={}",
+                self.last_window_len
+            )));
+        }
+        if committed < self.last_window_len && self.total_conv_f32s > 0 {
+            let bytes = (self.total_conv_f32s * 4) as u64;
+            let src_off = ((committed - 1) * self.total_conv_f32s * 4) as u64;
+            let src_buf = self.conv_snapshots_buf.buf;
+            let dst_buf = self.conv_hist.buf;
+            self.ctx.run(|rec| {
+                // SAFETY: Valid device buffers of sufficient size; `ctx.run` waits on fence.
+                unsafe {
+                    rec.ctx.inner.device.cmd_copy_buffer(
+                        rec.cb,
+                        src_buf,
+                        dst_buf,
+                        &[ash::vk::BufferCopy {
+                            src_offset: src_off,
+                            dst_offset: 0,
+                            size: bytes,
+                        }],
+                    );
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Reads captured `DSpark` target visit taps (`count_tokens * n_taps * n_embd` floats)
+    /// from the coherent host-visible tap buffer.
+    pub fn read_dspark_taps(
+        &self,
+        count_tokens: usize,
+        n_taps: usize,
+        dst: &mut [f32],
+    ) -> Result<(), VulkanError> {
+        let need = count_tokens * n_taps * self.cfg.n_embd;
+        if dst.len() < need {
+            return Err(VulkanError::InvalidDimensions(
+                "read_dspark_taps destination slice too small".to_string(),
+            ));
+        }
+        read_mapped_f32(&self.ctx, &self.dspark_taps_buf, &mut dst[..need])
+    }
+
+    /// Computes `rms_norm(tok_embd[token_id], tok_norm, rms_eps)` on GPU VRAM (`9 KiB` readback)
+    /// so `DFlashModel` (`DSpark`) borrows `tok_embd` directly from VRAM with 0 duplicate host RAM.
+    pub fn embed_token_normed(
+        &mut self,
+        token_id: u32,
+        out_normed: &mut [f32],
+    ) -> Result<(), VulkanError> {
+        let n_embd = self.cfg.n_embd;
+        if out_normed.len() < n_embd {
+            return Err(VulkanError::InvalidDimensions(
+                "embed_token_normed slice shorter than n_embd".to_string(),
+            ));
+        }
+        write_mapped_u32(&self.ctx, &self.step_buf, &[token_id])?;
+        self.ctx.run(|rec| {
+            self.record_embed_and_norm(rec)?;
+            self.record_vec_copy(rec, &self.moe_out_bridge, 0, &self.cur_buf, 0, n_embd)
+        })?;
+        read_mapped_f32(&self.ctx, &self.moe_out_bridge, &mut out_normed[..n_embd])
+    }
+
+    /// Evaluates `(output * corr_hidden)[..vocab_size] -> softcap -> argmax` on GPU VRAM and
+    /// returns the 4-byte greedy token ID (`< 1.5 ms` per draft token on RX 9060 XT!).
+    pub fn project_dspark_greedy(
+        &mut self,
+        corr_hidden: &[f32],
+        softcap: f32,
+    ) -> Result<u32, VulkanError> {
+        let n_embd = self.cfg.n_embd;
+        if corr_hidden.len() != n_embd {
+            return Err(VulkanError::InvalidDimensions(
+                "project_dspark_greedy input length != n_embd".to_string(),
+            ));
+        }
+        write_mapped_f32(&self.ctx, &self.moe_out_bridge, corr_hidden)?;
+        self.ctx.run(|rec| {
+            // Copy 9 KiB `corr_hidden` from host-coherent GTT bridge into `DEVICE_LOCAL` VRAM
+            // (`wo_out_buf`) first so 201k LM-head subgroups hit RDNA4 Infinity Cache instead of PCIe!
+            self.record_vec_copy(rec, &self.wo_out_buf, 0, &self.moe_out_bridge, 0, n_embd)?;
+            self.dispatch_gemv(rec, &self.output, &self.wo_out_buf, &self.logits_padded_buf)?;
+            rec.dispatch(
+                &self.pipe_ops,
+                &[
+                    &self.logits_buf,
+                    &self.logits_padded_buf,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                ],
+                &[
+                    6,
+                    self.cfg.vocab_size as u32,
+                    2,
+                    0,
+                    0,
+                    softcap.to_bits(),
+                    0,
+                    0,
+                ],
+                self.elem_groups(self.cfg.vocab_size),
+            )?;
+            rec.dispatch(
+                &self.pipe_argmax,
+                &[&self.logits_buf, &self.argmax_buf],
+                &[self.cfg.vocab_size as u32],
+                1,
+            )
+        })?;
+        let mut id = [0u32; 1];
+        read_mapped_u32(&self.argmax_buf, &mut id)?;
+        Ok(id[0])
     }
 
     fn gemv_pipe(&self, dt_code: u32) -> Result<Arc<Pipeline>, VulkanError> {
@@ -1630,13 +1881,13 @@ impl Inkling2VkRunner {
                 read_mapped_f32(
                     &self.ctx,
                     &self.ffn_normed_bridge,
-                    &mut self.host_cur_scratch,
+                    &mut self.host_cur_scratch[..n_embd],
                 )?;
                 read_mapped_u32(&self.top_ids_bridge, &mut raw_ids[..top_k])?;
                 read_mapped_f32(
                     &self.ctx,
                     &self.top_weights_bridge,
-                    &mut self.host_weights_scratch,
+                    &mut self.host_weights_scratch[..top_k],
                 )?;
                 for (dst_id, &raw_id) in self.host_ids_scratch[..top_k]
                     .iter_mut()
@@ -1651,7 +1902,11 @@ impl Inkling2VkRunner {
                     &self.host_weights_scratch[..top_k],
                     &mut self.host_moe_out_scratch[..n_embd],
                 );
-                write_mapped_f32(&self.ctx, &self.moe_out_bridge, &self.host_moe_out_scratch)?;
+                write_mapped_f32(
+                    &self.ctx,
+                    &self.moe_out_bridge,
+                    &self.host_moe_out_scratch[..n_embd],
+                )?;
                 pending_post_moe = Some((h_il, h_ip));
             }
         }
@@ -1875,6 +2130,36 @@ impl Inkling2VkRunner {
         has_messages: bool,
         blocks_len: &mut usize,
         bank_len: usize,
+    ) -> Result<(), VulkanError> {
+        self.record_layer_pre_moe_into(
+            rec,
+            il,
+            ip,
+            pos,
+            tau,
+            has_messages,
+            blocks_len,
+            bank_len,
+            &self.ffn_normed_bridge,
+            &self.top_ids_bridge,
+            &self.top_weights_bridge,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_layer_pre_moe_into(
+        &self,
+        rec: &mut Recorder<'_>,
+        il: usize,
+        ip: usize,
+        pos: usize,
+        tau: f32,
+        has_messages: bool,
+        blocks_len: &mut usize,
+        bank_len: usize,
+        ffn_norm_dst: &VkBuffer,
+        top_ids_dst: &VkBuffer,
+        top_w_dst: &VkBuffer,
     ) -> Result<(), VulkanError> {
         let n_embd = self.cfg.n_embd;
         let swa = self.cfg.is_swa[ip];
@@ -2361,7 +2646,7 @@ impl Inkling2VkRunner {
             &self.pipe_ops,
             &[
                 &self.inp_sa_buf,
-                &self.ffn_normed_bridge,
+                ffn_norm_dst,
                 &self.f32_params,
                 &self.dummy_buf,
                 &self.dummy_buf,
@@ -2380,11 +2665,11 @@ impl Inkling2VkRunner {
             1,
         )?;
 
-        // Router GEMV + GPU top-k selection (writes `top_ids_bridge` & `top_weights_bridge`)
+        // Router GEMV + GPU top-k selection
         self.dispatch_gemv(
             rec,
             &layer.ffn_gate_inp,
-            &self.ffn_normed_bridge,
+            ffn_norm_dst,
             &self.router_logits_buf,
         )?;
         let (has_b, b_off) = match layer.exp_probs_b_off {
@@ -2397,8 +2682,8 @@ impl Inkling2VkRunner {
                 &self.dummy_buf,
                 &self.router_logits_buf,
                 &self.f32_params,
-                &self.top_ids_bridge,
-                &self.top_weights_bridge,
+                top_ids_dst,
+                top_w_dst,
                 &self.dummy_buf,
             ],
             &[
@@ -2642,6 +2927,714 @@ impl Inkling2VkRunner {
             }
         }
         Ok(())
+    }
+
+    fn record_buf_copy_bytes(
+        &self,
+        rec: &mut Recorder<'_>,
+        dst: &VkBuffer,
+        dst_byte_off: u64,
+        src: &VkBuffer,
+        src_byte_off: u64,
+        byte_len: u64,
+    ) {
+        if byte_len == 0 {
+            return;
+        }
+        let d = &rec.ctx.inner.device;
+        // SAFETY: Valid buffers and ranges owned by `self`; explicit transfer->compute/transfer barrier follows.
+        unsafe {
+            d.cmd_copy_buffer(
+                rec.cb,
+                src.buf,
+                dst.buf,
+                &[ash::vk::BufferCopy {
+                    src_offset: src_byte_off,
+                    dst_offset: dst_byte_off,
+                    size: byte_len,
+                }],
+            );
+            let barrier = [ash::vk::MemoryBarrier::default()
+                .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(
+                    ash::vk::AccessFlags::SHADER_READ
+                        | ash::vk::AccessFlags::SHADER_WRITE
+                        | ash::vk::AccessFlags::TRANSFER_READ,
+                )];
+            d.cmd_pipeline_barrier(
+                rec.cb,
+                ash::vk::PipelineStageFlags::TRANSFER,
+                ash::vk::PipelineStageFlags::COMPUTE_SHADER | ash::vk::PipelineStageFlags::TRANSFER,
+                ash::vk::DependencyFlags::empty(),
+                &barrier,
+                &[],
+                &[],
+            );
+        }
+    }
+
+    fn record_load_tok_state(
+        &self,
+        rec: &mut Recorder<'_>,
+        tok_i: usize,
+        blocks_len: usize,
+        prelude_blocks_len: usize,
+        bank_len: usize,
+    ) -> Result<(), VulkanError> {
+        let n_embd = self.cfg.n_embd;
+        let max_b = self.cfg.max_depth_blocks();
+        let base = (tok_i * self.per_tok_state_f32s) as u32;
+        self.record_vec_copy(rec, &self.cur_buf, 0, &self.win_state_buf, base, n_embd)?;
+        self.record_vec_copy(
+            rec,
+            &self.ffn_inp_buf,
+            0,
+            &self.win_state_buf,
+            base + n_embd as u32,
+            n_embd,
+        )?;
+        self.record_vec_copy(
+            rec,
+            &self.prelude_buf,
+            0,
+            &self.win_state_buf,
+            base + (2 * n_embd) as u32,
+            n_embd,
+        )?;
+        self.record_vec_copy(
+            rec,
+            &self.bank_out_buf,
+            0,
+            &self.win_state_buf,
+            base + (3 * n_embd) as u32,
+            n_embd,
+        )?;
+        if blocks_len > 0 {
+            self.record_vec_copy(
+                rec,
+                &self.blocks_buf,
+                0,
+                &self.win_state_buf,
+                base + (4 * n_embd) as u32,
+                blocks_len * n_embd,
+            )?;
+        }
+        if prelude_blocks_len > 0 {
+            self.record_vec_copy(
+                rec,
+                &self.prelude_blocks_buf,
+                0,
+                &self.win_state_buf,
+                base + ((4 + max_b) * n_embd) as u32,
+                prelude_blocks_len * n_embd,
+            )?;
+        }
+        if bank_len > 0 {
+            self.record_vec_copy(
+                rec,
+                &self.bank_buf,
+                0,
+                &self.win_state_buf,
+                base + ((4 + 2 * max_b) * n_embd) as u32,
+                bank_len * n_embd,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn record_save_tok_state(
+        &self,
+        rec: &mut Recorder<'_>,
+        tok_i: usize,
+        blocks_len: usize,
+        prelude_blocks_len: usize,
+        bank_len: usize,
+    ) -> Result<(), VulkanError> {
+        let n_embd = self.cfg.n_embd;
+        let max_b = self.cfg.max_depth_blocks();
+        let base = (tok_i * self.per_tok_state_f32s) as u32;
+        self.record_vec_copy(rec, &self.win_state_buf, base, &self.cur_buf, 0, n_embd)?;
+        self.record_vec_copy(
+            rec,
+            &self.win_state_buf,
+            base + n_embd as u32,
+            &self.ffn_inp_buf,
+            0,
+            n_embd,
+        )?;
+        self.record_vec_copy(
+            rec,
+            &self.win_state_buf,
+            base + (2 * n_embd) as u32,
+            &self.prelude_buf,
+            0,
+            n_embd,
+        )?;
+        self.record_vec_copy(
+            rec,
+            &self.win_state_buf,
+            base + (3 * n_embd) as u32,
+            &self.bank_out_buf,
+            0,
+            n_embd,
+        )?;
+        if blocks_len > 0 {
+            self.record_vec_copy(
+                rec,
+                &self.win_state_buf,
+                base + (4 * n_embd) as u32,
+                &self.blocks_buf,
+                0,
+                blocks_len * n_embd,
+            )?;
+        }
+        if prelude_blocks_len > 0 {
+            self.record_vec_copy(
+                rec,
+                &self.win_state_buf,
+                base + ((4 + max_b) * n_embd) as u32,
+                &self.prelude_blocks_buf,
+                0,
+                prelude_blocks_len * n_embd,
+            )?;
+        }
+        if bank_len > 0 {
+            self.record_vec_copy(
+                rec,
+                &self.win_state_buf,
+                base + ((4 + 2 * max_b) * n_embd) as u32,
+                &self.bank_buf,
+                0,
+                bank_len * n_embd,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_window_internal(
+        &mut self,
+        window_tokens: &[u32],
+        start_pos: usize,
+        compute_last_logits: bool,
+        compute_all_argmax: bool,
+        save_conv_snapshots: bool,
+        dspark_target_visits: &[usize],
+        host_moe_win: &mut Option<&mut HostMoeWindowFn<'_>>,
+    ) -> Result<(), VulkanError> {
+        let w = window_tokens.len();
+        let n_embd = self.cfg.n_embd;
+        let top_k = self.cfg.n_expert_used;
+        let hist_len = self.cfg.shortconv_l_cache - 1;
+        let n_taps = dspark_target_visits.len();
+
+        write_mapped_u32(&self.ctx, &self.step_buf, window_tokens)?;
+
+        #[derive(Clone, Copy)]
+        struct ExecStep {
+            visit: usize,
+            il: usize,
+            ip: usize,
+            pass: usize,
+            save_prelude_before: bool,
+            reset_pass_before: bool,
+        }
+
+        let mut schedule = Vec::with_capacity(self.cfg.n_layers);
+        let mut visit_ctr = 0usize;
+        if !self.cfg.is_looped() {
+            for il in 0..self.cfg.n_layers_phys {
+                schedule.push(ExecStep {
+                    visit: visit_ctr,
+                    il,
+                    ip: il,
+                    pass: 0,
+                    save_prelude_before: false,
+                    reset_pass_before: false,
+                });
+                visit_ctr += 1;
+            }
+        } else {
+            let cs = self.cfg.core_start;
+            let ce = self.cfg.core_end;
+            for il in 0..cs {
+                schedule.push(ExecStep {
+                    visit: visit_ctr,
+                    il,
+                    ip: il,
+                    pass: 0,
+                    save_prelude_before: false,
+                    reset_pass_before: false,
+                });
+                visit_ctr += 1;
+            }
+            for pass in 0..self.cfg.n_passes {
+                for ip in cs..ce {
+                    let il = if pass == 0 {
+                        ip
+                    } else {
+                        self.cfg.n_layers_phys + (pass - 1) * (ce - cs) + (ip - cs)
+                    };
+                    schedule.push(ExecStep {
+                        visit: visit_ctr,
+                        il,
+                        ip,
+                        pass,
+                        save_prelude_before: pass == 0 && ip == cs,
+                        reset_pass_before: pass > 0 && ip == cs,
+                    });
+                    visit_ctr += 1;
+                }
+            }
+            for il in ce..self.cfg.n_layers_phys {
+                schedule.push(ExecStep {
+                    visit: visit_ctr,
+                    il,
+                    ip: il,
+                    pass: 0,
+                    save_prelude_before: false,
+                    reset_pass_before: false,
+                });
+                visit_ctr += 1;
+            }
+        }
+
+        let mut taus = [1.0f32; MAX_INKLING2_VK_WINDOW];
+        for (tok_i, tau_slot) in taus.iter_mut().enumerate().take(w) {
+            let ratio = ((start_pos + tok_i + 1) as f32) / (self.cfg.log_scale_floor as f32);
+            *tau_slot = 1.0 + self.cfg.log_scale_alpha * ratio.max(1.0).ln();
+        }
+
+        let mut blocks_len = 0usize;
+        let mut prelude_blocks_len = 0usize;
+        let mut bank_len = 0usize;
+        let mut cursor = 0usize;
+        let mut need_embed = true;
+        let mut pending_post_moe: Option<(usize, usize)> = None;
+
+        while cursor < schedule.len() {
+            let mut stop_for_host_ip: Option<(usize, usize)> = None;
+            self.ctx.run(|rec| {
+                if need_embed {
+                    for tok_i in 0..w {
+                        self.record_buf_copy_bytes(
+                            rec,
+                            &self.step_tok0_buf,
+                            0,
+                            &self.step_buf,
+                            (tok_i * 4) as u64,
+                            4,
+                        );
+                        let emb_wg = self.pipe_embed.wg_size;
+                        rec.dispatch(
+                            &self.pipe_embed,
+                            &[&self.tok_embd.buf, &self.step_tok0_buf, &self.inp_sa_buf],
+                            &[n_embd as u32, self.tok_embd.row_u16s],
+                            (n_embd as u32).div_ceil(emb_wg),
+                        )?;
+                        rec.dispatch(
+                            &self.pipe_ops,
+                            &[
+                                &self.inp_sa_buf,
+                                &self.cur_buf,
+                                &self.f32_params,
+                                &self.dummy_buf,
+                                &self.dummy_buf,
+                                &self.dummy_buf,
+                            ],
+                            &[
+                                0,
+                                n_embd as u32,
+                                0,
+                                0,
+                                1,
+                                self.cfg.rms_eps.to_bits(),
+                                0,
+                                self.tok_norm_off,
+                            ],
+                            1,
+                        )?;
+                        let base = (tok_i * self.per_tok_state_f32s) as u32;
+                        self.record_vec_copy(
+                            rec,
+                            &self.win_state_buf,
+                            base,
+                            &self.cur_buf,
+                            0,
+                            n_embd,
+                        )?;
+                    }
+                    need_embed = false;
+                }
+
+                if let Some((prev_il, prev_ip)) = pending_post_moe.take() {
+                    let prev_kv_dim = self.cfg.kv_dim(prev_ip);
+                    let ffn_conv_off_f32 = self.slot_conv_bases[prev_il] as usize
+                        + (2 * prev_kv_dim + n_embd) * hist_len;
+                    let ffn_conv_len_f32 = n_embd * hist_len;
+                    for tok_i in 0..w {
+                        let base = (tok_i * self.per_tok_state_f32s) as u32;
+                        self.record_vec_copy(
+                            rec,
+                            &self.ffn_inp_buf,
+                            0,
+                            &self.win_state_buf,
+                            base + n_embd as u32,
+                            n_embd,
+                        )?;
+                        self.record_vec_copy(
+                            rec,
+                            &self.wo_out_buf,
+                            0,
+                            &self.moe_out_bridge,
+                            (tok_i * n_embd) as u32,
+                            n_embd,
+                        )?;
+                        self.record_layer_post_moe(rec, prev_il, prev_ip, true)?;
+                        if save_conv_snapshots && ffn_conv_len_f32 > 0 {
+                            let snap_dst = tok_i * self.total_conv_f32s + ffn_conv_off_f32;
+                            self.record_vec_copy(
+                                rec,
+                                &self.conv_snapshots_buf,
+                                snap_dst as u32,
+                                &self.conv_hist,
+                                ffn_conv_off_f32 as u32,
+                                ffn_conv_len_f32,
+                            )?;
+                        }
+                        self.record_vec_copy(
+                            rec,
+                            &self.win_state_buf,
+                            base,
+                            &self.cur_buf,
+                            0,
+                            n_embd,
+                        )?;
+                    }
+                }
+
+                while cursor < schedule.len() {
+                    let st = schedule[cursor];
+                    let in_vram = self.layers[st.ip].vram_experts.is_some();
+                    let kv_dim = self.cfg.kv_dim(st.ip);
+                    let attn_conv_off_f32 = self.slot_conv_bases[st.il] as usize;
+                    let attn_conv_len_f32 = (2 * kv_dim + n_embd) * hist_len;
+                    let ffn_conv_off_f32 = attn_conv_off_f32 + attn_conv_len_f32;
+                    let ffn_conv_len_f32 = n_embd * hist_len;
+                    let tap_slot = dspark_target_visits.iter().position(|&v| v == st.visit);
+
+                    let mut next_b = blocks_len;
+                    let mut next_pb = prelude_blocks_len;
+                    let mut next_bk = bank_len;
+
+                    for (tok_i, &tau_t) in taus.iter().enumerate().take(w) {
+                        let mut b_t = blocks_len;
+                        let mut pb_t = prelude_blocks_len;
+                        let mut bk_t = bank_len;
+
+                        self.record_load_tok_state(rec, tok_i, b_t, pb_t, bk_t)?;
+                        self.record_pre_step_transitions(
+                            rec,
+                            st.save_prelude_before,
+                            st.reset_pass_before,
+                            &mut b_t,
+                            &mut pb_t,
+                            &mut bk_t,
+                        )?;
+
+                        if let Some(t_pos) = tap_slot {
+                            self.record_vec_copy(
+                                rec,
+                                &self.dspark_taps_buf,
+                                ((tok_i * n_taps + t_pos) * n_embd) as u32,
+                                &self.cur_buf,
+                                0,
+                                n_embd,
+                            )?;
+                        }
+
+                        if in_vram {
+                            self.record_layer_pre_moe(
+                                rec,
+                                st.il,
+                                st.ip,
+                                start_pos + tok_i,
+                                tau_t,
+                                st.pass > 0,
+                                &mut b_t,
+                                bk_t,
+                            )?;
+                            if save_conv_snapshots && attn_conv_len_f32 > 0 {
+                                let snap_dst = tok_i * self.total_conv_f32s + attn_conv_off_f32;
+                                self.record_vec_copy(
+                                    rec,
+                                    &self.conv_snapshots_buf,
+                                    snap_dst as u32,
+                                    &self.conv_hist,
+                                    attn_conv_off_f32 as u32,
+                                    attn_conv_len_f32,
+                                )?;
+                            }
+                            self.record_vram_moe(rec, st.ip)?;
+                            self.record_layer_post_moe(rec, st.il, st.ip, true)?;
+                            if save_conv_snapshots && ffn_conv_len_f32 > 0 {
+                                let snap_dst = tok_i * self.total_conv_f32s + ffn_conv_off_f32;
+                                self.record_vec_copy(
+                                    rec,
+                                    &self.conv_snapshots_buf,
+                                    snap_dst as u32,
+                                    &self.conv_hist,
+                                    ffn_conv_off_f32 as u32,
+                                    ffn_conv_len_f32,
+                                )?;
+                            }
+                        } else {
+                            self.record_layer_pre_moe_into(
+                                rec,
+                                st.il,
+                                st.ip,
+                                start_pos + tok_i,
+                                tau_t,
+                                st.pass > 0,
+                                &mut b_t,
+                                bk_t,
+                                &self.wo_out_buf,
+                                &self.top_ids_tmp_buf,
+                                &self.top_weights_tmp_buf,
+                            )?;
+                            if save_conv_snapshots && attn_conv_len_f32 > 0 {
+                                let snap_dst = tok_i * self.total_conv_f32s + attn_conv_off_f32;
+                                self.record_vec_copy(
+                                    rec,
+                                    &self.conv_snapshots_buf,
+                                    snap_dst as u32,
+                                    &self.conv_hist,
+                                    attn_conv_off_f32 as u32,
+                                    attn_conv_len_f32,
+                                )?;
+                            }
+                            self.record_vec_copy(
+                                rec,
+                                &self.ffn_normed_bridge,
+                                (tok_i * n_embd) as u32,
+                                &self.wo_out_buf,
+                                0,
+                                n_embd,
+                            )?;
+                            self.record_buf_copy_bytes(
+                                rec,
+                                &self.top_ids_bridge,
+                                (tok_i * top_k * 4) as u64,
+                                &self.top_ids_tmp_buf,
+                                0,
+                                (top_k * 4) as u64,
+                            );
+                            self.record_buf_copy_bytes(
+                                rec,
+                                &self.top_weights_bridge,
+                                (tok_i * top_k * 4) as u64,
+                                &self.top_weights_tmp_buf,
+                                0,
+                                (top_k * 4) as u64,
+                            );
+                        }
+
+                        self.record_save_tok_state(rec, tok_i, b_t, pb_t, bk_t)?;
+                        next_b = b_t;
+                        next_pb = pb_t;
+                        next_bk = bk_t;
+                    }
+
+                    blocks_len = next_b;
+                    prelude_blocks_len = next_pb;
+                    bank_len = next_bk;
+                    cursor += 1;
+
+                    if !in_vram {
+                        stop_for_host_ip = Some((st.il, st.ip));
+                        break;
+                    }
+                }
+
+                if stop_for_host_ip.is_none() {
+                    self.record_window_outputs(
+                        rec,
+                        w,
+                        blocks_len,
+                        compute_last_logits,
+                        compute_all_argmax,
+                        dspark_target_visits,
+                    )?;
+                }
+                Ok(())
+            })?;
+
+            if let Some((h_il, h_ip)) = stop_for_host_ip {
+                let eval_win = host_moe_win.as_deref_mut().ok_or_else(|| {
+                    VulkanError::InvalidDimensions(format!(
+                        "layer {h_ip} MoE experts are offloaded from VRAM, but no HostMoeWindowFn was supplied"
+                    ))
+                })?;
+                let mut raw_ids = [0u32; MAX_INKLING2_VK_WINDOW * 32];
+                read_mapped_f32(
+                    &self.ctx,
+                    &self.ffn_normed_bridge,
+                    &mut self.host_cur_scratch[..w * n_embd],
+                )?;
+                read_mapped_u32(&self.top_ids_bridge, &mut raw_ids[..w * top_k])?;
+                read_mapped_f32(
+                    &self.ctx,
+                    &self.top_weights_bridge,
+                    &mut self.host_weights_scratch[..w * top_k],
+                )?;
+                for (dst_id, &raw_id) in self.host_ids_scratch[..w * top_k]
+                    .iter_mut()
+                    .zip(&raw_ids[..w * top_k])
+                {
+                    *dst_id = raw_id as usize;
+                }
+                eval_win(
+                    h_ip,
+                    w,
+                    &self.host_cur_scratch[..w * n_embd],
+                    &self.host_ids_scratch[..w * top_k],
+                    &self.host_weights_scratch[..w * top_k],
+                    &mut self.host_moe_out_scratch[..w * n_embd],
+                );
+                write_mapped_f32(
+                    &self.ctx,
+                    &self.moe_out_bridge,
+                    &self.host_moe_out_scratch[..w * n_embd],
+                )?;
+                pending_post_moe = Some((h_il, h_ip));
+            }
+        }
+
+        if let Some((last_il, last_ip)) = pending_post_moe.take() {
+            let prev_kv_dim = self.cfg.kv_dim(last_ip);
+            let ffn_conv_off_f32 =
+                self.slot_conv_bases[last_il] as usize + (2 * prev_kv_dim + n_embd) * hist_len;
+            let ffn_conv_len_f32 = n_embd * hist_len;
+            self.ctx.run(|rec| {
+                for tok_i in 0..w {
+                    let base = (tok_i * self.per_tok_state_f32s) as u32;
+                    self.record_vec_copy(
+                        rec,
+                        &self.ffn_inp_buf,
+                        0,
+                        &self.win_state_buf,
+                        base + n_embd as u32,
+                        n_embd,
+                    )?;
+                    self.record_vec_copy(
+                        rec,
+                        &self.wo_out_buf,
+                        0,
+                        &self.moe_out_bridge,
+                        (tok_i * n_embd) as u32,
+                        n_embd,
+                    )?;
+                    self.record_layer_post_moe(rec, last_il, last_ip, true)?;
+                    if save_conv_snapshots && ffn_conv_len_f32 > 0 {
+                        let snap_dst = tok_i * self.total_conv_f32s + ffn_conv_off_f32;
+                        self.record_vec_copy(
+                            rec,
+                            &self.conv_snapshots_buf,
+                            snap_dst as u32,
+                            &self.conv_hist,
+                            ffn_conv_off_f32 as u32,
+                            ffn_conv_len_f32,
+                        )?;
+                    }
+                    self.record_vec_copy(rec, &self.win_state_buf, base, &self.cur_buf, 0, n_embd)?;
+                }
+                self.record_window_outputs(
+                    rec,
+                    w,
+                    blocks_len,
+                    compute_last_logits,
+                    compute_all_argmax,
+                    dspark_target_visits,
+                )
+            })?;
+        }
+
+        Ok(())
+    }
+
+    fn record_window_outputs(
+        &self,
+        rec: &mut Recorder<'_>,
+        w: usize,
+        blocks_len: usize,
+        compute_last_logits: bool,
+        compute_all_argmax: bool,
+        dspark_target_visits: &[usize],
+    ) -> Result<(), VulkanError> {
+        let n_embd = self.cfg.n_embd;
+        let n_taps = dspark_target_visits.len();
+        let final_tap = dspark_target_visits
+            .iter()
+            .position(|&v| v == self.cfg.n_layers);
+
+        for tok_i in 0..w {
+            let is_last = tok_i + 1 == w;
+            let want_lg = compute_all_argmax || (compute_last_logits && is_last);
+            let want_am = compute_all_argmax;
+            if !want_lg && final_tap.is_none() {
+                continue;
+            }
+            let base = (tok_i * self.per_tok_state_f32s) as u32;
+            self.record_vec_copy(rec, &self.cur_buf, 0, &self.win_state_buf, base, n_embd)?;
+            if blocks_len > 0 {
+                self.record_vec_copy(
+                    rec,
+                    &self.blocks_buf,
+                    0,
+                    &self.win_state_buf,
+                    base + (4 * n_embd) as u32,
+                    blocks_len * n_embd,
+                )?;
+            }
+            self.record_output_stage(rec, blocks_len, want_lg, want_am)?;
+            if let Some(t_pos) = final_tap {
+                self.record_vec_copy(
+                    rec,
+                    &self.dspark_taps_buf,
+                    ((tok_i * n_taps + t_pos) * n_embd) as u32,
+                    &self.wo_out_buf,
+                    0,
+                    n_embd,
+                )?;
+            }
+            if want_am {
+                self.record_buf_copy_bytes(
+                    rec,
+                    &self.win_argmax_buf,
+                    (tok_i * 4) as u64,
+                    &self.argmax_buf,
+                    0,
+                    4,
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn write_mapped_u32(ctx: &VulkanContext, buf: &VkBuffer, src: &[u32]) -> Result<(), VulkanError> {
+    if let Some(ptr) = buf.mapped_ptr() {
+        // SAFETY: `buf` is persistently mapped coherent memory, idle before next `ctx.run`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), ptr as *mut u32, src.len());
+        }
+        Ok(())
+    } else {
+        // SAFETY: POD `u32` slice viewed as bytes.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(src.as_ptr() as *const u8, core::mem::size_of_val(src))
+        };
+        ctx.write_bytes(buf, 0, bytes)
     }
 }
 

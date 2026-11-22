@@ -124,6 +124,7 @@ fn parity_vk_inkling2_pure_gpu_and_3tier_hybrid() {
         &Inkling2LoadOptions {
             vram_expert_layers: hybrid_runner.vram_expert_mask().to_vec(),
             ram_expert_budget_bytes: Some(two_core_bytes),
+            host_moe_only: true,
         },
     )
     .unwrap();
@@ -173,6 +174,119 @@ fn parity_vk_inkling2_pure_gpu_and_3tier_hybrid() {
             hybrid_runner.weights_mode()
         );
     }
+
+    // 3. Lockstep multi-token window (`W = 4`) + `commit_speculative_window(2)` rollback +
+    //    `DSpark` target visit tap capture (`[1, 5, 11, 16]`):
+    //    Run `toks[0..4]` in a single lockstep window with `save_conv_snapshots = true`,
+    //    verify all 4 GPU argmax IDs match `ref_logits[0..4]`, roll back to `committed = 2`,
+    //    then run `toks[2..5]` in a 3-token window and verify `argmax` & final logits match `ref_logits[4]`!
+    hybrid_runner.reset_state().unwrap();
+    let tap_visits = [1usize, 5, 11, 16];
+    let mut win_argmax = [0u32; 4];
+    {
+        let mut cb_win = |ip: usize,
+                          w_len: usize,
+                          cur_win: &[f32],
+                          ids_win: &[usize],
+                          w_win: &[f32],
+                          out_win: &mut [f32]| {
+            let (serial_pool, expert_slots, mv_scratch, win_slot_outs) =
+                host_state.host_moe_window_parts_mut();
+            host_model.eval_moe_experts_window_f32(
+                ip,
+                w_len,
+                cur_win,
+                ids_win,
+                w_win,
+                &pool,
+                serial_pool,
+                kt,
+                expert_slots,
+                mv_scratch,
+                win_slot_outs,
+                out_win,
+            );
+        };
+        let _ = hybrid_runner
+            .forward_window_hybrid(
+                &toks[0..4],
+                0,
+                false,
+                true,
+                &tap_visits,
+                Some(&mut cb_win),
+                Some(&mut win_argmax),
+            )
+            .unwrap();
+    }
+    for s in 0..4 {
+        assert_eq!(
+            win_argmax[s],
+            argmax(&ref_logits[s]),
+            "window argmax mismatch at slot {s}"
+        );
+    }
+    let mut taps_read = vec![0.0f32; 4 * tap_visits.len() * 64];
+    hybrid_runner
+        .read_dspark_taps(4, tap_visits.len(), &mut taps_read)
+        .unwrap();
+    assert!(taps_read.iter().any(|&v| v.abs() > 1e-3));
+
+    // Roll back from 4 tokens (`pos=0..4`) to `committed = 2` (`pos=0..2`), then evaluate `toks[2..5]` at `start_pos = 2`!
+    hybrid_runner.commit_speculative_window(2).unwrap();
+    let mut win_argmax_after = [0u32; 3];
+    let got_step4 = {
+        let mut cb_win = |ip: usize,
+                          w_len: usize,
+                          cur_win: &[f32],
+                          ids_win: &[usize],
+                          w_win: &[f32],
+                          out_win: &mut [f32]| {
+            let (serial_pool, expert_slots, mv_scratch, win_slot_outs) =
+                host_state.host_moe_window_parts_mut();
+            host_model.eval_moe_experts_window_f32(
+                ip,
+                w_len,
+                cur_win,
+                ids_win,
+                w_win,
+                &pool,
+                serial_pool,
+                kt,
+                expert_slots,
+                mv_scratch,
+                win_slot_outs,
+                out_win,
+            );
+        };
+        hybrid_runner
+            .forward_window_hybrid(
+                &toks[2..5],
+                2,
+                true,
+                false,
+                &[],
+                Some(&mut cb_win),
+                Some(&mut win_argmax_after),
+            )
+            .unwrap()
+    };
+    for s in 0..3 {
+        assert_eq!(
+            win_argmax_after[s],
+            argmax(&ref_logits[2 + s]),
+            "post-rollback window argmax mismatch at step {}",
+            2 + s
+        );
+    }
+    let mut max_diff_rb = 0.0f32;
+    for (&a, &b) in got_step4.iter().zip(ref_logits[4].iter()) {
+        max_diff_rb = max_diff_rb.max((a - b).abs());
+    }
+    assert!(
+        max_diff_rb < 5e-3,
+        "post-rollback step 4 max_diff {max_diff_rb} >= 5e-3"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }

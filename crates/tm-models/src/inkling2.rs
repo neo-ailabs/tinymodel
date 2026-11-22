@@ -19,13 +19,17 @@
 
 use tm_core::{DType, KvType, QK8_0, dequantize_row_bytes, probe_system_memory};
 use tm_cpu::{
-    KernelTable, MAX_CPU_BATCH, MatvecScratch, ThreadPool, matmul_f32, matvec_f32,
-    matvec_f32_unquant_act, rms_norm, rms_norm_unit_inplace, softcap_inplace_parallel,
+    KernelTable, MAX_CPU_BATCH, MatvecScratch, ThreadPool, matmul_f32,
+    matvec_batch_f32_unquant_act, matvec_f32, matvec_f32_unquant_act, rms_norm,
+    rms_norm_unit_inplace, softcap_inplace_parallel,
 };
 use tm_gguf::{DirectTensorReader, GgufError, GgufFile, PageAlignedSlot};
 
 use crate::llama::ModelError;
 use crate::state::{LayerState, MAX_SPEC_WINDOW, SpecVerifyBuf, decode_embedding_row};
+
+/// Maximum multi-token lockstep window for `eval_moe_experts_window_f32` (`DSpark` verify + 32-tok prefill).
+pub const MAX_INKLING2_WINDOW: usize = 32;
 
 /// Controller indices for `inkling2_loop` cross-pass messages (`inkling2-loop.cpp:48-50`).
 pub const LOOP_CTRL_Q: usize = 0;
@@ -157,11 +161,14 @@ impl Inkling2Config {
 #[derive(Debug, Clone, Default)]
 pub struct Inkling2LoadOptions {
     /// Physical layers `[0..n_layers_phys)` whose MoE experts are already resident in GPU VRAM
-    /// (`Inkling2VkHybridRunner`), so host RAM skips allocating them (`0` duplicate bytes).
+    /// (`Inkling2VkRunner`), so host RAM skips allocating them (`0` duplicate bytes).
     pub vram_expert_layers: Vec<bool>,
     /// Optional explicit host anonymous-RAM budget (in bytes) for MoE expert layers.
-    /// When `None`, checks `TM_INKLING2_RAM_MIB`, then `probe_system_memory()` (`2 GiB` headroom).
+    /// When `None`, checks `TM_INKLING2_RAM_MIB`, then `probe_system_memory()`.
     pub ram_expert_budget_bytes: Option<u64>,
+    /// When `true` (`Inkling2VkRunner` already owns all dense/KV weights in VRAM), skips reading
+    /// `~1.70 GiB` of dense tensors into host RAM, freeing `~1.70 GiB` for 2 additional MoE layers!
+    pub host_moe_only: bool,
 }
 
 /// Summary of loop-aware MoE expert tier placement (`ADR-015`).
@@ -304,6 +311,12 @@ pub struct ExpertWorkSlot {
     pub mv_scratch: MatvecScratch,
     pub gate_up_buf: Vec<f32>,
     pub hidden_buf: Vec<f32>,
+    /// Multi-token window gathered input `[MAX_INKLING2_WINDOW * n_embd.max(n_ff_exp)]`.
+    pub win_in_buf: Vec<f32>,
+    /// Multi-token window gate_up buffer `[MAX_INKLING2_WINDOW * 2 * n_ff_exp]`.
+    pub win_gate_up_buf: Vec<f32>,
+    /// Multi-token window hidden buffer `[MAX_INKLING2_WINDOW * n_ff_exp]` for grouped MoE.
+    pub win_hidden_buf: Vec<f32>,
     pub out_buf: Vec<f32>,
 }
 
@@ -353,13 +366,16 @@ pub struct Inkling2State {
     logits_padded: Vec<f32>,
     logits: Vec<f32>,
     pub last_hidden: Vec<f32>,
-    /// Saved outputs for DFlash/DSpark feature extraction: `[0..n_slots)` = `l_out` per logical slot,
-    /// slot `n_slots` = `result_norm` (`last_hidden`).
+    /// Saved visit inputs for `DSpark` (`dflash`) feature extraction (`inkling2-loop.cpp` PR #32218):
+    /// `[0..n_slots)` = `cur` entering visit `v`, slot `n_slots` = `result_norm` (`last_hidden`).
     pub slot_outputs: Vec<f32>,
     mv_scratch: MatvecScratch,
     /// Single-thread pool handle (`0` worker threads spawned) passed into per-expert workers.
     serial_pool: ThreadPool,
     pub expert_slots: Vec<ExpertWorkSlot>,
+    /// Pre-allocated `[MAX_SPEC_WINDOW * n_expert_used * n_embd]` per-slot outputs for `0-ULP`
+    /// deterministic multi-token grouped MoE evaluation.
+    pub win_slot_outs: Vec<f32>,
 }
 
 fn read_u_or_arr(
@@ -402,6 +418,21 @@ fn load_f32_vec(
     layer: &str,
     expected_dims: &[usize],
 ) -> Result<Vec<f32>, ModelError> {
+    load_f32_vec_opt(gguf, direct, name, layer, expected_dims, false)
+}
+
+fn load_f32_vec_opt(
+    gguf: &GgufFile,
+    direct: Option<(&DirectTensorReader, &mut PageAlignedSlot)>,
+    name: &str,
+    layer: &str,
+    expected_dims: &[usize],
+    skip_data: bool,
+) -> Result<Vec<f32>, ModelError> {
+    if skip_data {
+        let _ = gguf.req_tensor_file_range(name, layer, expected_dims)?;
+        return Ok(Vec::new());
+    }
     let n_elem: usize = expected_dims.iter().product();
     let mut out = vec![0.0f32; n_elem];
     if let Some((reader, slot)) = direct {
@@ -416,7 +447,8 @@ fn load_f32_vec(
     Ok(out)
 }
 
-fn load_dense_mat<'a>(
+#[allow(clippy::too_many_arguments)]
+fn load_dense_mat_opt<'a>(
     gguf: &'a GgufFile,
     mut direct: Option<(&DirectTensorReader, &mut PageAlignedSlot)>,
     name: &str,
@@ -424,7 +456,17 @@ fn load_dense_mat<'a>(
     cols: usize,
     rows: usize,
     dense_bytes_acc: &mut u64,
+    skip_data: bool,
 ) -> Result<OwnedOrBorrowedMat<'a>, ModelError> {
+    if skip_data {
+        let (info, _, _) = gguf.req_tensor_file_range(name, layer, &[cols, rows])?;
+        return Ok(OwnedOrBorrowedMat {
+            backing: BytesBacking::Borrowed(&[]),
+            dtype: info.dtype,
+            rows,
+            cols,
+        });
+    }
     if let Some((reader, ref mut slot)) = direct {
         let (info, f_off, b_len) = gguf.req_tensor_file_range(name, layer, &[cols, rows])?;
         let dtype = info.dtype;
@@ -703,7 +745,8 @@ impl<'a> Inkling2Model<'a> {
             ..Default::default()
         };
 
-        let token_embd = load_dense_mat(
+        let skip_dense = opts.host_moe_only;
+        let token_embd = load_dense_mat_opt(
             gguf,
             direct_reader.as_ref().map(|r| (r, &mut io_slot)),
             "token_embd.weight",
@@ -711,29 +754,33 @@ impl<'a> Inkling2Model<'a> {
             n_embd,
             cfg.vocab_padded,
             &mut stats.dense_bytes,
+            skip_dense,
         )?;
-        let token_embd_norm = load_f32_vec(
+        let token_embd_norm = load_f32_vec_opt(
             gguf,
             direct_reader.as_ref().map(|r| (r, &mut io_slot)),
             "token_embd_norm.weight",
             "global",
             &[n_embd],
+            skip_dense,
         )?;
-        let output_res_query = load_f32_vec(
+        let output_res_query = load_f32_vec_opt(
             gguf,
             direct_reader.as_ref().map(|r| (r, &mut io_slot)),
             "output_res_query.weight",
             "global",
             &[n_embd],
+            skip_dense,
         )?;
-        let output_norm = load_f32_vec(
+        let output_norm = load_f32_vec_opt(
             gguf,
             direct_reader.as_ref().map(|r| (r, &mut io_slot)),
             "output_norm.weight",
             "global",
             &[n_embd],
+            skip_dense,
         )?;
-        let output = load_dense_mat(
+        let output = load_dense_mat_opt(
             gguf,
             direct_reader.as_ref().map(|r| (r, &mut io_slot)),
             "output.weight",
@@ -741,6 +788,7 @@ impl<'a> Inkling2Model<'a> {
             n_embd,
             cfg.vocab_padded,
             &mut stats.dense_bytes,
+            skip_dense,
         )?;
 
         // Determine loop-prioritized placement for each physical layer's MoE experts:
@@ -750,13 +798,17 @@ impl<'a> Inkling2Model<'a> {
         if !use_direct {
             ram_expert_plan.fill(true);
         } else {
-            // Estimate dense bytes (~1.7 GiB on 26B Q8) + 2.2 GiB OS/KV/scratch reserve when auto-planning
             let auto_budget = {
                 let fresh_avail = probe_system_memory()
                     .map(|b| b.available_bytes)
                     .unwrap_or(sys_avail);
-                // Dense layer tensors not yet loaded (~1.15 GiB) + 2.2 GiB OS/state headroom
-                let reserve = 3400 * 1024 * 1024u64;
+                // When `skip_dense` is true (`host_moe_only`), dense weights are 0 bytes on host,
+                // so we only reserve 2.3 GiB for OS + optional 384 MiB DSpark drafter!
+                let reserve = if skip_dense {
+                    2300 * 1024 * 1024u64
+                } else {
+                    3400 * 1024 * 1024u64
+                };
                 fresh_avail.saturating_sub(reserve)
             };
             let mut rem_budget = explicit_budget.unwrap_or(auto_budget);
@@ -791,7 +843,7 @@ impl<'a> Inkling2Model<'a> {
             let n_conv = cfg.shortconv_l_cache;
             let extent = cfg.rel_extent_for(ip);
 
-            let wq = load_dense_mat(
+            let wq = load_dense_mat_opt(
                 gguf,
                 direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                 &format!("blk.{ip}.attn_q.weight"),
@@ -799,8 +851,9 @@ impl<'a> Inkling2Model<'a> {
                 n_embd,
                 q_dim,
                 &mut stats.dense_bytes,
+                skip_dense,
             )?;
-            let wk = load_dense_mat(
+            let wk = load_dense_mat_opt(
                 gguf,
                 direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                 &format!("blk.{ip}.attn_k.weight"),
@@ -808,8 +861,9 @@ impl<'a> Inkling2Model<'a> {
                 n_embd,
                 kv_dim,
                 &mut stats.dense_bytes,
+                skip_dense,
             )?;
-            let wv = load_dense_mat(
+            let wv = load_dense_mat_opt(
                 gguf,
                 direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                 &format!("blk.{ip}.attn_v.weight"),
@@ -817,8 +871,9 @@ impl<'a> Inkling2Model<'a> {
                 n_embd,
                 kv_dim,
                 &mut stats.dense_bytes,
+                skip_dense,
             )?;
-            let wo = load_dense_mat(
+            let wo = load_dense_mat_opt(
                 gguf,
                 direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                 &format!("blk.{ip}.attn_output.weight"),
@@ -826,8 +881,9 @@ impl<'a> Inkling2Model<'a> {
                 q_dim,
                 n_embd,
                 &mut stats.dense_bytes,
+                skip_dense,
             )?;
-            let wqkv_gate = load_dense_mat(
+            let wqkv_gate = load_dense_mat_opt(
                 gguf,
                 direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                 &format!("blk.{ip}.attn_gate.weight"),
@@ -835,15 +891,17 @@ impl<'a> Inkling2Model<'a> {
                 n_embd,
                 q_dim,
                 &mut stats.dense_bytes,
+                skip_dense,
             )?;
-            let attn_q_clip = load_f32_vec(
+            let attn_q_clip = load_f32_vec_opt(
                 gguf,
                 direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                 &format!("blk.{ip}.attn_q_clip.weight"),
                 &ltag,
                 &[hd, nh],
+                skip_dense,
             )?;
-            let attn_sink_proj = load_dense_mat(
+            let attn_sink_proj = load_dense_mat_opt(
                 gguf,
                 direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                 &format!("blk.{ip}.attn_sink_proj.weight"),
@@ -851,8 +909,9 @@ impl<'a> Inkling2Model<'a> {
                 n_embd,
                 nh,
                 &mut stats.dense_bytes,
+                skip_dense,
             )?;
-            let attn_rel = load_dense_mat(
+            let attn_rel = load_dense_mat_opt(
                 gguf,
                 direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                 &format!("blk.{ip}.attn_rel.weight"),
@@ -860,49 +919,56 @@ impl<'a> Inkling2Model<'a> {
                 n_embd,
                 n_rel * nh,
                 &mut stats.dense_bytes,
+                skip_dense,
             )?;
-            let attn_rel_bias = load_f32_vec(
+            let attn_rel_bias = load_f32_vec_opt(
                 gguf,
                 direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                 &format!("blk.{ip}.attn_rel_bias.weight"),
                 &ltag,
                 &[n_rel, extent],
+                skip_dense,
             )?;
-            let attn_rel_clip = load_f32_vec(
+            let attn_rel_clip = load_f32_vec_opt(
                 gguf,
                 direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                 &format!("blk.{ip}.attn_rel_clip.weight"),
                 &ltag,
                 &[n_rel, nh],
+                skip_dense,
             )?;
 
-            let attn_k_conv = load_f32_vec(
+            let attn_k_conv = load_f32_vec_opt(
                 gguf,
                 direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                 &format!("blk.{ip}.attn_k_conv.weight"),
                 &ltag,
                 &[n_conv, kv_dim],
+                skip_dense,
             )?;
-            let attn_v_conv = load_f32_vec(
+            let attn_v_conv = load_f32_vec_opt(
                 gguf,
                 direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                 &format!("blk.{ip}.attn_v_conv.weight"),
                 &ltag,
                 &[n_conv, kv_dim],
+                skip_dense,
             )?;
-            let attn_post_conv = load_f32_vec(
+            let attn_post_conv = load_f32_vec_opt(
                 gguf,
                 direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                 &format!("blk.{ip}.attn_post_conv.weight"),
                 &ltag,
                 &[n_conv, n_embd],
+                skip_dense,
             )?;
-            let ffn_post_conv = load_f32_vec(
+            let ffn_post_conv = load_f32_vec_opt(
                 gguf,
                 direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                 &format!("blk.{ip}.ffn_post_conv.weight"),
                 &ltag,
                 &[n_conv, n_embd],
+                skip_dense,
             )?;
 
             let (
@@ -913,37 +979,41 @@ impl<'a> Inkling2Model<'a> {
                 attn_k_conv_proj,
                 attn_v_conv_proj,
             ) = if swa {
-                let an = load_f32_vec(
+                let an = load_f32_vec_opt(
                     gguf,
                     direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                     &format!("blk.{ip}.attn_norm.weight"),
                     &ltag,
                     &[n_embd],
+                    skip_dense,
                 )?;
                 (Some(an), None, None, None, None, None)
             } else {
-                let qn = load_f32_vec(
+                let qn = load_f32_vec_opt(
                     gguf,
                     direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                     &format!("blk.{ip}.attn_q_inp_norm.weight"),
                     &ltag,
                     &[n_embd],
+                    skip_dense,
                 )?;
-                let kn = load_f32_vec(
+                let kn = load_f32_vec_opt(
                     gguf,
                     direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                     &format!("blk.{ip}.attn_k_inp_norm.weight"),
                     &ltag,
                     &[n_embd],
+                    skip_dense,
                 )?;
-                let vn = load_f32_vec(
+                let vn = load_f32_vec_opt(
                     gguf,
                     direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                     &format!("blk.{ip}.attn_v_inp_norm.weight"),
                     &ltag,
                     &[n_embd],
+                    skip_dense,
                 )?;
-                let kp = load_dense_mat(
+                let kp = load_dense_mat_opt(
                     gguf,
                     direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                     &format!("blk.{ip}.attn_k_conv_proj.weight"),
@@ -951,8 +1021,9 @@ impl<'a> Inkling2Model<'a> {
                     n_embd,
                     n_conv * nh_kv,
                     &mut stats.dense_bytes,
+                    skip_dense,
                 )?;
-                let vp = load_dense_mat(
+                let vp = load_dense_mat_opt(
                     gguf,
                     direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                     &format!("blk.{ip}.attn_v_conv_proj.weight"),
@@ -960,6 +1031,7 @@ impl<'a> Inkling2Model<'a> {
                     n_embd,
                     n_conv * nh_kv,
                     &mut stats.dense_bytes,
+                    skip_dense,
                 )?;
                 (
                     Some(qn.clone()),
@@ -974,31 +1046,34 @@ impl<'a> Inkling2Model<'a> {
 
             let attn_res_query = if ip > 0 {
                 let dims: &[usize] = if swa { &[n_embd] } else { &[n_embd, 3] };
-                Some(load_f32_vec(
+                Some(load_f32_vec_opt(
                     gguf,
                     direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                     &format!("blk.{ip}.attn_res_query.weight"),
                     &ltag,
                     dims,
+                    skip_dense,
                 )?)
             } else {
                 None
             };
-            let ffn_res_query = load_f32_vec(
+            let ffn_res_query = load_f32_vec_opt(
                 gguf,
                 direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                 &format!("blk.{ip}.ffn_res_query.weight"),
                 &ltag,
                 &[n_embd],
+                skip_dense,
             )?;
-            let ffn_norm = load_f32_vec(
+            let ffn_norm = load_f32_vec_opt(
                 gguf,
                 direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                 &format!("blk.{ip}.ffn_norm.weight"),
                 &ltag,
                 &[n_embd],
+                skip_dense,
             )?;
-            let ffn_gate_inp = load_dense_mat(
+            let ffn_gate_inp = load_dense_mat_opt(
                 gguf,
                 direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                 &format!("blk.{ip}.ffn_gate_inp.weight"),
@@ -1006,17 +1081,19 @@ impl<'a> Inkling2Model<'a> {
                 n_embd,
                 n_exp,
                 &mut stats.dense_bytes,
+                skip_dense,
             )?;
             let exp_probs_b = if gguf
                 .tensor_info(&format!("blk.{ip}.exp_probs_b.bias"))
                 .is_some()
             {
-                Some(load_f32_vec(
+                Some(load_f32_vec_opt(
                     gguf,
                     direct_reader.as_ref().map(|r| (r, &mut io_slot)),
                     &format!("blk.{ip}.exp_probs_b.bias"),
                     &ltag,
                     &[n_exp],
+                    skip_dense,
                 )?)
             } else {
                 None
@@ -1148,7 +1225,7 @@ impl<'a> Inkling2Model<'a> {
         }
 
         let mut loop_layers = Vec::new();
-        if cfg.is_looped() {
+        if cfg.is_looped() && !skip_dense {
             loop_layers.reserve(cfg.core_end - cfg.core_start);
             let rank = cfg.gate_rank;
             for ip in cfg.core_start..cfg.core_end {
@@ -1220,6 +1297,345 @@ impl<'a> Inkling2Model<'a> {
             token_id as usize,
             out_emb,
         );
+    }
+
+    /// Computes `rms_norm(token_embd[token_id], token_embd_norm, rms_eps)` (`dspark.cpp:990`).
+    #[inline]
+    pub fn embed_token_normed(&self, token_id: u32, tmp_emb: &mut [f32], out_normed: &mut [f32]) {
+        let n_embd = self.cfg.n_embd;
+        self.embed_token(token_id, &mut tmp_emb[..n_embd]);
+        rms_norm(
+            &mut out_normed[..n_embd],
+            &tmp_emb[..n_embd],
+            &self.token_embd_norm,
+            self.cfg.rms_eps,
+        );
+    }
+
+    /// Projects a hidden vector `[n_embd]` directly through `output.weight` (`[vocab_size]`, unpadded,
+    /// without `output_norm` or softcapping — used by `DFlashModel` / `DSpark` Markov head).
+    pub fn project_lm_head_raw(
+        &self,
+        state: &mut Inkling2State,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        hidden: &[f32],
+        out_logits: &mut [f32],
+    ) {
+        let vp = self.cfg.vocab_padded;
+        let vu = self.cfg.vocab_size;
+        matvec_f32(
+            pool,
+            kt,
+            self.output.dtype,
+            self.output.bytes(),
+            hidden,
+            &mut state.mv_scratch,
+            &mut state.logits_padded[..vp],
+            vp,
+            self.cfg.n_embd,
+        );
+        out_logits[..vu].copy_from_slice(&state.logits_padded[..vu]);
+    }
+
+    /// Copies the requested `DSpark` target visit taps (`e.g. [5, 23, 41, 48]`) from `state.slot_outputs`
+    /// into `out_taps` (`target_layers.len() * n_embd` floats).
+    pub fn extract_dspark_taps(
+        &self,
+        state: &Inkling2State,
+        target_layers: &[usize],
+        out_taps: &mut [f32],
+    ) {
+        let n_embd = self.cfg.n_embd;
+        assert_eq!(out_taps.len(), target_layers.len() * n_embd);
+        for (i, &visit) in target_layers.iter().enumerate() {
+            assert!(visit <= self.cfg.n_layers);
+            let s = visit * n_embd;
+            out_taps[i * n_embd..(i + 1) * n_embd]
+                .copy_from_slice(&state.slot_outputs[s..s + n_embd]);
+        }
+    }
+
+    /// Evaluates selected MoE experts across a window of `window_len` (`1 <= W <= MAX_SPEC_WINDOW`)
+    /// tokens simultaneously by **grouping unique expert IDs** (`0..n_expert`), so every requested
+    /// NVMe `O_DIRECT` or Host RAM expert is read **at most once** across all `W` tokens while
+    /// maintaining `0-ULP` bit-exact equivalence with sequential `eval_moe_experts_f32`!
+    #[allow(clippy::too_many_arguments)]
+    pub fn eval_moe_experts_window_f32(
+        &self,
+        ip: usize,
+        window_len: usize,
+        cur_normed_win: &[f32],
+        top_ids_win: &[usize],
+        top_weights_win: &[f32],
+        pool: &ThreadPool,
+        serial_pool: &ThreadPool,
+        kt: &KernelTable,
+        expert_slots: &mut [ExpertWorkSlot],
+        mv_scratch: &mut MatvecScratch,
+        win_slot_outs: &mut [f32],
+        moe_out_win: &mut [f32],
+    ) {
+        let n_embd = self.cfg.n_embd;
+        let n_ff = self.cfg.n_ff_exp;
+        let top_k = self.cfg.n_expert_used;
+        let beta = self.cfg.situ_beta;
+        let lb = self.cfg.situ_linear_beta;
+        assert!((1..=MAX_INKLING2_WINDOW).contains(&window_len));
+        assert_eq!(cur_normed_win.len(), window_len * n_embd);
+        assert_eq!(top_ids_win.len(), window_len * top_k);
+        assert_eq!(top_weights_win.len(), window_len * top_k);
+        assert_eq!(moe_out_win.len(), window_len * n_embd);
+
+        if window_len == 1 {
+            self.eval_moe_experts_f32(
+                ip,
+                cur_normed_win,
+                top_ids_win,
+                top_weights_win,
+                pool,
+                serial_pool,
+                kt,
+                expert_slots,
+                mv_scratch,
+                moe_out_win,
+            );
+            return;
+        }
+
+        // Build deduplicated expert table on stack (`MAX_INKLING2_WINDOW * 32 <= 1024`, zero heap allocs!)
+        const MAX_REQS: usize = MAX_INKLING2_WINDOW * 32;
+        let total_reqs = window_len * top_k;
+        assert!(total_reqs <= MAX_REQS);
+        let mut uniq_exps = [0usize; MAX_REQS];
+        let mut uniq_mask = [0u32; MAX_REQS];
+        let mut uniq_kslot = [[0u8; MAX_INKLING2_WINDOW]; MAX_REQS];
+        let mut n_uniq = 0usize;
+
+        for tok_i in 0..window_len {
+            for k_idx in 0..top_k {
+                let e_id = top_ids_win[tok_i * top_k + k_idx];
+                let mut found = None;
+                for (u, &ue) in uniq_exps.iter().enumerate().take(n_uniq) {
+                    if ue == e_id {
+                        found = Some(u);
+                        break;
+                    }
+                }
+                let u = match found {
+                    Some(u) => u,
+                    None => {
+                        let u = n_uniq;
+                        uniq_exps[u] = e_id;
+                        n_uniq += 1;
+                        u
+                    }
+                };
+                uniq_mask[u] |= 1u32 << tok_i;
+                uniq_kslot[u][tok_i] = k_idx as u8;
+            }
+        }
+
+        match &self.layers[ip].experts {
+            ExpertLayerStore::InMemory {
+                gate_up,
+                gate_up_dtype,
+                gate_up_expert_bytes,
+                down,
+                down_dtype,
+                down_expert_bytes,
+            } => {
+                let gu_all = gate_up.as_slice();
+                let dn_all = down.as_slice();
+                let n_workers = expert_slots.len().max(1);
+                let mut base_u = 0usize;
+                while base_u < n_uniq {
+                    let batch_u = (n_uniq - base_u).min(n_workers);
+                    pool.parallel_for_each_mut(&mut expert_slots[..batch_u], |rel_u, ws| {
+                        let u = base_u + rel_u;
+                        let e_id = uniq_exps[u];
+                        let mask = uniq_mask[u];
+                        let gu_slice =
+                            &gu_all[e_id * gate_up_expert_bytes..(e_id + 1) * gate_up_expert_bytes];
+                        let dn_slice =
+                            &dn_all[e_id * down_expert_bytes..(e_id + 1) * down_expert_bytes];
+
+                        let mut m_cnt = 0usize;
+                        for tok_i in 0..window_len {
+                            if (mask & (1u32 << tok_i)) != 0 {
+                                ws.win_in_buf[m_cnt * n_embd..(m_cnt + 1) * n_embd]
+                                    .copy_from_slice(
+                                        &cur_normed_win[tok_i * n_embd..(tok_i + 1) * n_embd],
+                                    );
+                                m_cnt += 1;
+                            }
+                        }
+                        matvec_batch_f32_unquant_act(
+                            serial_pool,
+                            kt,
+                            *gate_up_dtype,
+                            gu_slice,
+                            &ws.win_in_buf[..m_cnt * n_embd],
+                            m_cnt,
+                            &mut ws.mv_scratch,
+                            &mut ws.win_gate_up_buf[..m_cnt * 2 * n_ff],
+                            2 * n_ff,
+                            n_embd,
+                        );
+                        for m in 0..m_cnt {
+                            let gu_m = &ws.win_gate_up_buf[m * 2 * n_ff..(m + 1) * 2 * n_ff];
+                            apply_situ_glu(
+                                &gu_m[..n_ff],
+                                &gu_m[n_ff..2 * n_ff],
+                                &mut ws.win_hidden_buf[m * n_ff..(m + 1) * n_ff],
+                                beta,
+                                lb,
+                            );
+                        }
+                        matvec_batch_f32_unquant_act(
+                            serial_pool,
+                            kt,
+                            *down_dtype,
+                            dn_slice,
+                            &ws.win_hidden_buf[..m_cnt * n_ff],
+                            m_cnt,
+                            &mut ws.mv_scratch,
+                            &mut ws.out_buf[..m_cnt * n_embd],
+                            n_embd,
+                            n_ff,
+                        );
+                    });
+                    for (rel_u, ws) in expert_slots.iter().enumerate().take(batch_u) {
+                        let u = base_u + rel_u;
+                        let mask = uniq_mask[u];
+                        let kslots = &uniq_kslot[u];
+                        let mut m_idx = 0usize;
+                        for (tok_i, &ks) in kslots.iter().enumerate().take(window_len) {
+                            if (mask & (1u32 << tok_i)) == 0 {
+                                continue;
+                            }
+                            let k_idx = ks as usize;
+                            let dst_off = (tok_i * top_k + k_idx) * n_embd;
+                            win_slot_outs[dst_off..dst_off + n_embd]
+                                .copy_from_slice(&ws.out_buf[m_idx * n_embd..(m_idx + 1) * n_embd]);
+                            m_idx += 1;
+                        }
+                    }
+                    base_u += batch_u;
+                }
+            }
+            ExpertLayerStore::NvmeDirect {
+                gate_up_offset,
+                gate_up_dtype,
+                gate_up_expert_bytes,
+                down_offset,
+                down_dtype,
+                down_expert_bytes,
+            } => {
+                let rdr = self
+                    .direct_reader
+                    .as_ref()
+                    .expect("DirectTensorReader required for NvmeDirect expert layer");
+                let n_workers = expert_slots.len().max(1);
+                let mut base_u = 0usize;
+                while base_u < n_uniq {
+                    let batch_u = (n_uniq - base_u).min(n_workers);
+                    pool.parallel_for_each_mut(&mut expert_slots[..batch_u], |rel_u, ws| {
+                        let u = base_u + rel_u;
+                        let e_id = uniq_exps[u];
+                        let mask = uniq_mask[u];
+                        let mut m_cnt = 0usize;
+                        for tok_i in 0..window_len {
+                            if (mask & (1u32 << tok_i)) != 0 {
+                                ws.win_in_buf[m_cnt * n_embd..(m_cnt + 1) * n_embd]
+                                    .copy_from_slice(
+                                        &cur_normed_win[tok_i * n_embd..(tok_i + 1) * n_embd],
+                                    );
+                                m_cnt += 1;
+                            }
+                        }
+                        let gu_off = *gate_up_offset + (e_id * *gate_up_expert_bytes) as u64;
+                        let gu_bytes = rdr
+                            .read_into_slot(gu_off, *gate_up_expert_bytes, &mut ws.slot)
+                            .expect("O_DIRECT gate_up expert read failed");
+                        matvec_batch_f32_unquant_act(
+                            serial_pool,
+                            kt,
+                            *gate_up_dtype,
+                            gu_bytes,
+                            &ws.win_in_buf[..m_cnt * n_embd],
+                            m_cnt,
+                            &mut ws.mv_scratch,
+                            &mut ws.win_gate_up_buf[..m_cnt * 2 * n_ff],
+                            2 * n_ff,
+                            n_embd,
+                        );
+                        for m in 0..m_cnt {
+                            let gu_m = &ws.win_gate_up_buf[m * 2 * n_ff..(m + 1) * 2 * n_ff];
+                            apply_situ_glu(
+                                &gu_m[..n_ff],
+                                &gu_m[n_ff..2 * n_ff],
+                                &mut ws.win_hidden_buf[m * n_ff..(m + 1) * n_ff],
+                                beta,
+                                lb,
+                            );
+                        }
+                        let dn_off = *down_offset + (e_id * *down_expert_bytes) as u64;
+                        let dn_bytes = rdr
+                            .read_into_slot(dn_off, *down_expert_bytes, &mut ws.slot)
+                            .expect("O_DIRECT down expert read failed");
+                        matvec_batch_f32_unquant_act(
+                            serial_pool,
+                            kt,
+                            *down_dtype,
+                            dn_bytes,
+                            &ws.win_hidden_buf[..m_cnt * n_ff],
+                            m_cnt,
+                            &mut ws.mv_scratch,
+                            &mut ws.out_buf[..m_cnt * n_embd],
+                            n_embd,
+                            n_ff,
+                        );
+                    });
+                    for (rel_u, ws) in expert_slots.iter().enumerate().take(batch_u) {
+                        let u = base_u + rel_u;
+                        let mask = uniq_mask[u];
+                        let kslots = &uniq_kslot[u];
+                        let mut m_idx = 0usize;
+                        for (tok_i, &ks) in kslots.iter().enumerate().take(window_len) {
+                            if (mask & (1u32 << tok_i)) == 0 {
+                                continue;
+                            }
+                            let k_idx = ks as usize;
+                            let dst_off = (tok_i * top_k + k_idx) * n_embd;
+                            win_slot_outs[dst_off..dst_off + n_embd]
+                                .copy_from_slice(&ws.out_buf[m_idx * n_embd..(m_idx + 1) * n_embd]);
+                            m_idx += 1;
+                        }
+                    }
+                    base_u += batch_u;
+                }
+            }
+            ExpertLayerStore::DeviceVram => {
+                panic!(
+                    "Physical layer {ip} experts reside in GPU VRAM; host fallback cannot run DeviceVram layer"
+                );
+            }
+        }
+
+        // Deterministic `0..top_k` reduction per token (`0-ULP` identical to single-token!)
+        moe_out_win.fill(0.0);
+        for tok_i in 0..window_len {
+            let out_t = &mut moe_out_win[tok_i * n_embd..(tok_i + 1) * n_embd];
+            for k_idx in 0..top_k {
+                let w_e = top_weights_win[tok_i * top_k + k_idx];
+                let slot_o = &win_slot_outs
+                    [(tok_i * top_k + k_idx) * n_embd..(tok_i * top_k + k_idx + 1) * n_embd];
+                for (m, &o) in out_t.iter_mut().zip(slot_o.iter()) {
+                    *m += w_e * o;
+                }
+            }
+        }
     }
 
     /// Evaluates selected MoE experts `(top_ids, top_weights)` on a single normed input vector `cur_normed`
@@ -1323,45 +1739,90 @@ impl<'a> Inkling2Model<'a> {
             } => {
                 let gu_all = gate_up.as_slice();
                 let dn_all = down.as_slice();
-                let ws = &mut expert_slots[0];
-                for j in 0..top_k {
-                    let e_id = top_ids[j];
-                    let w_e = top_weights[j];
-                    let gu_slice =
-                        &gu_all[e_id * gate_up_expert_bytes..(e_id + 1) * gate_up_expert_bytes];
-                    mv_fn(
-                        pool,
-                        kt,
-                        *gate_up_dtype,
-                        gu_slice,
-                        cur_normed,
-                        mv_scratch,
-                        &mut ws.gate_up_buf[..2 * n_ff],
-                        2 * n_ff,
-                        n_embd,
-                    );
-                    apply_situ_glu(
-                        &ws.gate_up_buf[..n_ff],
-                        &ws.gate_up_buf[n_ff..2 * n_ff],
-                        &mut ws.hidden_buf[..n_ff],
-                        beta,
-                        lb,
-                    );
-                    let dn_slice =
-                        &dn_all[e_id * down_expert_bytes..(e_id + 1) * down_expert_bytes];
-                    mv_fn(
-                        pool,
-                        kt,
-                        *down_dtype,
-                        dn_slice,
-                        &ws.hidden_buf[..n_ff],
-                        mv_scratch,
-                        &mut ws.out_buf[..n_embd],
-                        n_embd,
-                        n_ff,
-                    );
-                    for (m, &o) in moe_out[..n_embd].iter_mut().zip(&ws.out_buf[..n_embd]) {
-                        *m += w_e * o;
+                if expert_slots.len() >= top_k && pool.num_threads() > 1 {
+                    pool.parallel_for_each_mut(&mut expert_slots[..top_k], |j, ws| {
+                        let e_id = top_ids[j];
+                        let gu_slice =
+                            &gu_all[e_id * gate_up_expert_bytes..(e_id + 1) * gate_up_expert_bytes];
+                        mv_fn(
+                            serial_pool,
+                            kt,
+                            *gate_up_dtype,
+                            gu_slice,
+                            cur_normed,
+                            &mut ws.mv_scratch,
+                            &mut ws.gate_up_buf[..2 * n_ff],
+                            2 * n_ff,
+                            n_embd,
+                        );
+                        apply_situ_glu(
+                            &ws.gate_up_buf[..n_ff],
+                            &ws.gate_up_buf[n_ff..2 * n_ff],
+                            &mut ws.hidden_buf[..n_ff],
+                            beta,
+                            lb,
+                        );
+                        let dn_slice =
+                            &dn_all[e_id * down_expert_bytes..(e_id + 1) * down_expert_bytes];
+                        mv_fn(
+                            serial_pool,
+                            kt,
+                            *down_dtype,
+                            dn_slice,
+                            &ws.hidden_buf[..n_ff],
+                            &mut ws.mv_scratch,
+                            &mut ws.out_buf[..n_embd],
+                            n_embd,
+                            n_ff,
+                        );
+                    });
+                    for (j, &w_e) in top_weights.iter().enumerate().take(top_k) {
+                        let out_j = &expert_slots[j].out_buf[..n_embd];
+                        for (m, &o) in moe_out[..n_embd].iter_mut().zip(out_j) {
+                            *m += w_e * o;
+                        }
+                    }
+                } else {
+                    let ws = &mut expert_slots[0];
+                    for j in 0..top_k {
+                        let e_id = top_ids[j];
+                        let w_e = top_weights[j];
+                        let gu_slice =
+                            &gu_all[e_id * gate_up_expert_bytes..(e_id + 1) * gate_up_expert_bytes];
+                        mv_fn(
+                            pool,
+                            kt,
+                            *gate_up_dtype,
+                            gu_slice,
+                            cur_normed,
+                            mv_scratch,
+                            &mut ws.gate_up_buf[..2 * n_ff],
+                            2 * n_ff,
+                            n_embd,
+                        );
+                        apply_situ_glu(
+                            &ws.gate_up_buf[..n_ff],
+                            &ws.gate_up_buf[n_ff..2 * n_ff],
+                            &mut ws.hidden_buf[..n_ff],
+                            beta,
+                            lb,
+                        );
+                        let dn_slice =
+                            &dn_all[e_id * down_expert_bytes..(e_id + 1) * down_expert_bytes];
+                        mv_fn(
+                            pool,
+                            kt,
+                            *down_dtype,
+                            dn_slice,
+                            &ws.hidden_buf[..n_ff],
+                            mv_scratch,
+                            &mut ws.out_buf[..n_embd],
+                            n_embd,
+                            n_ff,
+                        );
+                        for (m, &o) in moe_out[..n_embd].iter_mut().zip(&ws.out_buf[..n_embd]) {
+                            *m += w_e * o;
+                        }
                     }
                 }
             }
@@ -1536,14 +1997,21 @@ impl<'a> Inkling2Model<'a> {
         let tau = 1.0 + self.cfg.log_scale_alpha * ratio.max(1.0).ln();
 
         state.blocks_len = 0;
+        let mut visit = 0usize;
         if !self.cfg.is_looped() {
             for il in 0..self.cfg.n_layers_phys {
+                state.slot_outputs[visit * n_embd..(visit + 1) * n_embd]
+                    .copy_from_slice(&state.cur);
+                visit += 1;
                 self.run_layer_single(il, il, pos, tau, false, state, pool, kt);
             }
         } else {
             let cs = self.cfg.core_start;
             let ce = self.cfg.core_end;
             for il in 0..cs {
+                state.slot_outputs[visit * n_embd..(visit + 1) * n_embd]
+                    .copy_from_slice(&state.cur);
+                visit += 1;
                 self.run_layer_single(il, il, pos, tau, false, state, pool, kt);
             }
 
@@ -1575,6 +2043,9 @@ impl<'a> Inkling2Model<'a> {
                     } else {
                         self.cfg.n_layers_phys + (pass - 1) * (ce - cs) + (ip - cs)
                     };
+                    state.slot_outputs[visit * n_embd..(visit + 1) * n_embd]
+                        .copy_from_slice(&state.cur);
+                    visit += 1;
                     if pass == 0 {
                         self.run_layer_single(il, ip, pos, tau, false, state, pool, kt);
                     } else {
@@ -1596,9 +2067,13 @@ impl<'a> Inkling2Model<'a> {
             }
 
             for il in ce..self.cfg.n_layers_phys {
+                state.slot_outputs[visit * n_embd..(visit + 1) * n_embd]
+                    .copy_from_slice(&state.cur);
+                visit += 1;
                 self.run_layer_single(il, il, pos, tau, false, state, pool, kt);
             }
         }
+        debug_assert_eq!(visit, self.cfg.n_layers);
 
         // Output depth-attention mix + output RMSNorm (`inkling2.cpp:421-430`)
         mix_depth_into(
@@ -2158,8 +2633,6 @@ impl<'a> Inkling2Model<'a> {
         for c in 0..n_embd {
             state.cur[c] = state.ffn_inp[c] + state.moe_out[c];
         }
-        let slot_off = il * n_embd;
-        state.slot_outputs[slot_off..slot_off + n_embd].copy_from_slice(&state.cur);
     }
 
     /// Evaluates a prompt/prefill batch `token_ids` starting at `start_pos`.
@@ -2352,11 +2825,7 @@ impl Inkling2State {
         } else {
             4096
         };
-        let n_exp_slots = if need_direct_slots {
-            cfg.n_expert_used
-        } else {
-            1
-        };
+        let n_exp_slots = cfg.n_expert_used.max(8);
         let mut expert_slots = Vec::with_capacity(n_exp_slots);
         for _ in 0..n_exp_slots {
             expert_slots.push(ExpertWorkSlot {
@@ -2364,7 +2833,10 @@ impl Inkling2State {
                 mv_scratch: MatvecScratch::new(cfg.n_embd.max(cfg.n_ff_exp)),
                 gate_up_buf: vec![0.0; 2 * cfg.n_ff_exp],
                 hidden_buf: vec![0.0; cfg.n_ff_exp],
-                out_buf: vec![0.0; cfg.n_embd],
+                win_in_buf: vec![0.0; MAX_INKLING2_WINDOW * cfg.n_embd],
+                win_gate_up_buf: vec![0.0; MAX_INKLING2_WINDOW * 2 * cfg.n_ff_exp],
+                win_hidden_buf: vec![0.0; MAX_INKLING2_WINDOW * cfg.n_ff_exp],
+                out_buf: vec![0.0; MAX_INKLING2_WINDOW * cfg.n_embd],
             });
         }
 
@@ -2416,6 +2888,83 @@ impl Inkling2State {
             mv_scratch: MatvecScratch::new(max_cols / MAX_CPU_BATCH.max(1) + max_cols),
             serial_pool: ThreadPool::new(1),
             expert_slots,
+            win_slot_outs: vec![0.0; MAX_INKLING2_WINDOW * cfg.n_expert_used * cfg.n_embd],
+        }
+    }
+
+    /// Lightweight host MoE scratch state (`0` CPU KV/ShortConv caches allocated, saving `~220 MiB`
+    /// when `Inkling2VkRunner` owns KV/ShortConv in GPU VRAM).
+    pub fn new_host_moe_only(model: &Inkling2Model<'_>) -> Self {
+        let cfg = &model.cfg;
+        let need_direct_slots = model.stats.nvme_direct_expert_layers > 0;
+        let slot_cap = if need_direct_slots {
+            model.max_expert_chunk_bytes + 8192
+        } else {
+            4096
+        };
+        let n_exp_slots = cfg.n_expert_used.max(8);
+        let mut expert_slots = Vec::with_capacity(n_exp_slots);
+        for _ in 0..n_exp_slots {
+            expert_slots.push(ExpertWorkSlot {
+                slot: PageAlignedSlot::new(slot_cap),
+                mv_scratch: MatvecScratch::new(cfg.n_embd.max(cfg.n_ff_exp)),
+                gate_up_buf: vec![0.0; 2 * cfg.n_ff_exp],
+                hidden_buf: vec![0.0; cfg.n_ff_exp],
+                win_in_buf: vec![0.0; MAX_INKLING2_WINDOW * cfg.n_embd],
+                win_gate_up_buf: vec![0.0; MAX_INKLING2_WINDOW * 2 * cfg.n_ff_exp],
+                win_hidden_buf: vec![0.0; MAX_INKLING2_WINDOW * cfg.n_ff_exp],
+                out_buf: vec![0.0; MAX_INKLING2_WINDOW * cfg.n_embd],
+            });
+        }
+        Self {
+            max_ctx: 0,
+            layers: Vec::new(),
+            cur: Vec::new(),
+            inp_sa: Vec::new(),
+            ffn_inp: Vec::new(),
+            prelude: Vec::new(),
+            bank_out: Vec::new(),
+            blocks_buf: Vec::new(),
+            blocks_len: 0,
+            prelude_blocks_buf: Vec::new(),
+            prelude_blocks_len: 0,
+            bank_buf: Vec::new(),
+            bank_len: 0,
+            mix_states_hat: Vec::new(),
+            mix_scores: Vec::new(),
+            inputs: Vec::new(),
+            messages: Vec::new(),
+            ctrl_in: Vec::new(),
+            ctrl_g: Vec::new(),
+            ctrl_gain: Vec::new(),
+            ctrl_forget: Vec::new(),
+            q_buf: Vec::new(),
+            k_buf: Vec::new(),
+            v_buf: Vec::new(),
+            r_buf: Vec::new(),
+            k_dyn: Vec::new(),
+            v_dyn: Vec::new(),
+            conv_tmp: Vec::new(),
+            sinks: Vec::new(),
+            rel_table: Vec::new(),
+            scores: Vec::new(),
+            attn_vec: Vec::new(),
+            gate_buf: Vec::new(),
+            wo_out: Vec::new(),
+            router_logits: Vec::new(),
+            router_probs: Vec::new(),
+            router_sel: Vec::new(),
+            top_ids: Vec::new(),
+            top_weights: Vec::new(),
+            moe_out: Vec::new(),
+            logits_padded: Vec::new(),
+            logits: Vec::new(),
+            last_hidden: Vec::new(),
+            slot_outputs: Vec::new(),
+            mv_scratch: MatvecScratch::new(cfg.n_embd.max(cfg.n_ff_exp)),
+            serial_pool: ThreadPool::new(1),
+            expert_slots,
+            win_slot_outs: vec![0.0; MAX_INKLING2_WINDOW * cfg.n_expert_used * cfg.n_embd],
         }
     }
 
@@ -2440,6 +2989,22 @@ impl Inkling2State {
             &self.serial_pool,
             &mut self.expert_slots,
             &mut self.mv_scratch,
+        )
+    }
+
+    pub fn host_moe_window_parts_mut(
+        &mut self,
+    ) -> (
+        &ThreadPool,
+        &mut [ExpertWorkSlot],
+        &mut MatvecScratch,
+        &mut [f32],
+    ) {
+        (
+            &self.serial_pool,
+            &mut self.expert_slots,
+            &mut self.mv_scratch,
+            &mut self.win_slot_outs,
         )
     }
 

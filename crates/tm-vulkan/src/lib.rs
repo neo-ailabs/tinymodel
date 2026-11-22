@@ -14,7 +14,10 @@ pub mod llama_runner;
 pub mod qwen35_runner;
 
 pub use context::{DeviceInfo, VkBuffer, VkPrefillMode, VulkanContext};
-pub use inkling2_runner::{HostMoeFn, Inkling2VkConfig, Inkling2VkRunner};
+pub use inkling2_runner::{
+    HostMoeFn, HostMoeWindowFn, Inkling2VkConfig, Inkling2VkRunner, MAX_INKLING2_SPEC_WINDOW,
+    MAX_INKLING2_VK_WINDOW,
+};
 pub use kernels::{Q4Layout, VkMatQ4_0};
 pub use llama_runner::{LlamaVkConfig, LlamaVkRunner, VkProfileReport, VkStageStat};
 pub use qwen35_runner::{Qwen35VkConfig, Qwen35VkRunner};

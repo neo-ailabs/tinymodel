@@ -127,6 +127,7 @@ fn inkling2_loop_matches_fp64_python_oracle_and_tiered_nvme_streaming_bit_exact(
         &Inkling2LoadOptions {
             vram_expert_layers: Vec::new(),
             ram_expert_budget_bytes: Some(four_core_budget),
+            host_moe_only: false,
         },
     )
     .unwrap();

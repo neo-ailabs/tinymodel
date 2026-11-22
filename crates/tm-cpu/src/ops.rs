@@ -129,6 +129,96 @@ pub fn matvec_f32_unquant_act(
     matvec_f32(pool, kt, dtype, w_bytes, x, scratch, out, rows, cols);
 }
 
+/// Multi-vector exact float-activation matrix-vector product `out_batch[m, r] = dot(W[r], x_batch[m])`
+/// across `n_vec` vectors (`x_batch: [n_vec, cols]`, `out_batch: [n_vec, rows]`), streaming each
+/// row of `W` **once** into L1D cache across all `n_vec` vectors while preserving `0-ULP`
+/// bit-for-bit equivalence with `n_vec` calls to [`matvec_f32_unquant_act`].
+#[allow(clippy::too_many_arguments)]
+pub fn matvec_batch_f32_unquant_act(
+    pool: &ThreadPool,
+    kt: &KernelTable,
+    dtype: DType,
+    w_bytes: &[u8],
+    x_batch: &[f32],
+    n_vec: usize,
+    scratch: &mut MatvecScratch,
+    out_batch: &mut [f32],
+    rows: usize,
+    cols: usize,
+) {
+    if n_vec == 0 {
+        return;
+    }
+    if n_vec == 1 {
+        matvec_f32_unquant_act(
+            pool,
+            kt,
+            dtype,
+            w_bytes,
+            &x_batch[..cols],
+            scratch,
+            &mut out_batch[..rows],
+            rows,
+            cols,
+        );
+        return;
+    }
+    if dtype == DType::Q8_0 {
+        assert_eq!(x_batch.len(), n_vec * cols);
+        assert_eq!(out_batch.len(), n_vec * rows);
+        assert_eq!(w_bytes.len(), rows * dtype.row_bytes(cols));
+        let cols_blocks = cols / QK8_0;
+        assert!(
+            (w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockQ8_0>()),
+            "Q8_0 tensor pointer misaligned"
+        );
+        // SAFETY: Length and alignment of `w_bytes` verified above; `BlockQ8_0` is `#[repr(C)]` POD.
+        let w: &[BlockQ8_0] = unsafe {
+            core::slice::from_raw_parts(w_bytes.as_ptr() as *const BlockQ8_0, rows * cols_blocks)
+        };
+        let n_thr = pool.num_threads();
+        if n_thr <= 1 {
+            for r in 0..rows {
+                let row = &w[r * cols_blocks..(r + 1) * cols_blocks];
+                for m in 0..n_vec {
+                    let xm = &x_batch[m * cols..(m + 1) * cols];
+                    out_batch[m * rows + r] = (kt.dot_f32_q8_0)(xm, row);
+                }
+            }
+        } else {
+            let chunk = dynamic_row_chunk(rows, n_thr);
+            let out_ptr = out_batch.as_mut_ptr() as usize;
+            pool.parallel_for(rows, chunk, |r0, r1| {
+                for r in r0..r1 {
+                    let row = &w[r * cols_blocks..(r + 1) * cols_blocks];
+                    for m in 0..n_vec {
+                        let xm = &x_batch[m * cols..(m + 1) * cols];
+                        let val = (kt.dot_f32_q8_0)(xm, row);
+                        // SAFETY: Each `(m, r)` with `r in r0..r1` writes to a unique element `m * rows + r`.
+                        unsafe {
+                            *(out_ptr as *mut f32).add(m * rows + r) = val;
+                        }
+                    }
+                }
+            });
+        }
+        return;
+    }
+    for m in 0..n_vec {
+        matvec_f32_unquant_act(
+            pool,
+            kt,
+            dtype,
+            w_bytes,
+            &x_batch[m * cols..(m + 1) * cols],
+            scratch,
+            &mut out_batch[m * rows..(m + 1) * rows],
+            rows,
+            cols,
+        );
+    }
+}
+
 /// Dispatches quantized `y = W * x` across `pool` strictly by `dtype` of tensor `W`.
 ///
 /// Zero heap allocations: activation quantization uses `scratch`.

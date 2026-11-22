@@ -11,8 +11,8 @@ use crate::{VkResultExt, VulkanError};
 const VENDOR_AMD: u32 = 0x1002;
 const VENDOR_INTEL: u32 = 0x8086;
 const STAGING_BYTES: u64 = 64 << 20;
-const DESC_POOL_SETS: u32 = 4096;
-const DESC_POOL_BUFFERS: u32 = 4096 * 8;
+const DESC_POOL_SETS: u32 = 65536;
+const DESC_POOL_BUFFERS: u32 = 65536 * 8;
 
 /// Batched prefill kernel selection policy for [`VulkanContext`] / [`crate::LlamaVkRunner`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
