@@ -157,6 +157,14 @@ fn write_synthetic_llama_or_qwen3_gguf(
         dtype: DType::F32,
         bytes: encode_1d_f32(&norm_vec(&mut rng, n_embd)),
     });
+    if arch == "qwen2" {
+        tensors.push(T {
+            name: "output.bias".to_string(),
+            dims: vec![vocab],
+            dtype: DType::F32,
+            bytes: encode_1d_f32(&rand_vec(&mut rng, vocab, 0.25)),
+        });
+    }
 
     for l in 0..n_layers {
         let pfx = format!("blk.{l}");
@@ -185,6 +193,21 @@ fn write_synthetic_llama_or_qwen3_gguf(
                 dtype: DType::F32,
                 bytes: encode_1d_f32(&norm_vec(&mut rng, hd)),
             });
+        }
+        if arch == "qwen2" {
+            for (bsuf, blen) in [
+                ("attn_q.bias", q_dim),
+                ("attn_k.bias", kv_dim),
+                ("attn_v.bias", kv_dim),
+                ("attn_output.bias", n_embd),
+            ] {
+                tensors.push(T {
+                    name: format!("{pfx}.{bsuf}"),
+                    dims: vec![blen],
+                    dtype: DType::F32,
+                    bytes: encode_1d_f32(&rand_vec(&mut rng, blen, 0.35)),
+                });
+            }
         }
         for (suf, cols, rows) in [
             ("attn_q.weight", n_embd, q_dim),
@@ -226,7 +249,7 @@ fn zero_ulp_training_forward_parity_with_inference() {
     let pool = ThreadPool::new(4);
     let kt = active_kernels();
 
-    for arch in ["llama", "qwen3"] {
+    for arch in ["llama", "qwen2", "qwen3"] {
         let mpath = tmp.path.join(format!("{arch}_q4.gguf"));
         write_synthetic_llama_or_qwen3_gguf(&mpath, arch, DType::Q4_0, 2, 64, 128, 4, 2, 96, 123);
         let gguf = GgufFile::open(&mpath).expect("open");

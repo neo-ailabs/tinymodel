@@ -92,7 +92,7 @@ impl MetalRunner {
     ) -> Result<Self, MetalError> {
         let arch = gguf.req_str("general.architecture")?.to_string();
         match arch.as_str() {
-            "llama" | "qwen3" => Ok(MetalRunner::Llama(LlamaMetalRunner::from_gguf(
+            "llama" | "qwen2" | "qwen3" => Ok(MetalRunner::Llama(LlamaMetalRunner::from_gguf(
                 gguf, max_ctx,
             )?)),
             "qwen35" => Ok(MetalRunner::Qwen35(Qwen35MetalRunner::from_gguf(

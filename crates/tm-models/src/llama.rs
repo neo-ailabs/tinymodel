@@ -1,7 +1,8 @@
-//! Llama / SmolLM2 / Qwen3 GQA Transformer forward pass.
+//! Llama / SmolLM2 / Qwen2 / Qwen2.5 / Qwen3 GQA Transformer forward pass.
 //!
-//! Supports both `llama` (Norm RoPE, optional `rope_freqs.weight`) and
-//! `qwen3` (NeoX RoPE + per-head QK-Norm `attn_q_norm` / `attn_k_norm`).
+//! Supports `llama` (Norm RoPE, optional `rope_freqs.weight`),
+//! `qwen2` (Qwen2 & Qwen2.5: NeoX RoPE `1e6` + `attn_{q,k,v}.bias` + optional `attn_output.bias` / `output.bias`),
+//! and `qwen3` (NeoX RoPE `1e6` + per-head QK-Norm `attn_q_norm` / `attn_k_norm`).
 
 use thiserror::Error;
 use tm_core::{BlockQ8_0, DType, KvType, QK8_0, dequantize_row_bytes};
@@ -22,7 +23,7 @@ pub enum ModelError {
     #[error(transparent)]
     Gguf(#[from] GgufError),
     #[error(
-        "unsupported model architecture '{0}' (supports 'llama', 'qwen3', 'qwen35', 'gemma4', 'lfm2', 'inkling2', and 'inkling2_loop')"
+        "unsupported model architecture '{0}' (supports 'llama', 'qwen2', 'qwen3', 'qwen35', 'gemma4', 'lfm2', 'inkling2', and 'inkling2_loop')"
     )]
     UnsupportedArch(String),
     #[error("invalid model configuration: {0}")]
@@ -65,12 +66,16 @@ pub struct RawMatView<'a> {
 
 type MatView<'a> = RawMatView<'a>;
 
-/// Per-layer weights for `LlamaModel` (`llama` / `qwen3` / `SmolLM2`).
+/// Per-layer weights for `LlamaModel` (`llama` / `qwen2` / `qwen3` / `SmolLM2`).
 pub struct LlamaLayerWeights<'a> {
     pub attn_norm: Vec<f32>,
     pub ffn_norm: Vec<f32>,
     pub q_norm: Option<Vec<f32>>,
     pub k_norm: Option<Vec<f32>>,
+    pub bq: Option<Vec<f32>>,
+    pub bk: Option<Vec<f32>>,
+    pub bv: Option<Vec<f32>>,
+    pub bo: Option<Vec<f32>>,
     pub wq: RawMatView<'a>,
     pub wk: RawMatView<'a>,
     pub wv: RawMatView<'a>,
@@ -82,11 +87,12 @@ pub struct LlamaLayerWeights<'a> {
 
 type LayerWeights<'a> = LlamaLayerWeights<'a>;
 
-/// Loaded Llama / Qwen3 model borrowing quantized weight slices directly from `GgufFile`.
+/// Loaded Llama / Qwen2 / Qwen2.5 / Qwen3 model borrowing quantized weight slices directly from `GgufFile`.
 pub struct LlamaModel<'a> {
     pub cfg: LlamaConfig,
     pub token_embd: RawMatView<'a>,
     pub output: RawMatView<'a>,
+    pub output_bias: Option<Vec<f32>>,
     pub output_norm: Vec<f32>,
     /// Precomputed `freq_base^(-2i / rope_dim) / rope_freqs[i]` for `i in 0..rope_dim/2`.
     pub rope_inv_freqs: Vec<f64>,
@@ -244,15 +250,44 @@ fn load_mat<'a>(
     })
 }
 
+fn load_opt_f32_vec(
+    gguf: &GgufFile,
+    name: &str,
+    layer: &str,
+    len: usize,
+) -> Result<Option<Vec<f32>>, ModelError> {
+    if gguf.tensor_info(name).is_some() {
+        Ok(Some(load_f32_vec(gguf, name, layer, len)?))
+    } else {
+        Ok(None)
+    }
+}
+
+#[inline]
+fn add_bias_slice(dst: &mut [f32], bias: &[f32]) {
+    for (y, &b) in dst.iter_mut().zip(bias.iter()) {
+        *y += b;
+    }
+}
+
+#[inline]
+fn add_bias_rows(dst: &mut [f32], bias: &[f32], rows: usize) {
+    let cols = bias.len();
+    for r in 0..rows {
+        add_bias_slice(&mut dst[r * cols..(r + 1) * cols], bias);
+    }
+}
+
 impl<'a> LlamaModel<'a> {
-    /// Loads and strictly validates a `llama` or `qwen3` GGUF model (zero-copy weight views).
+    /// Loads and strictly validates a `llama`, `qwen2` (Qwen2 & Qwen2.5), or `qwen3` GGUF model (zero-copy weight views).
     pub fn from_gguf(gguf: &'a GgufFile) -> Result<Self, ModelError> {
         let arch = gguf.req_str("general.architecture")?.to_string();
-        if arch != "llama" && arch != "qwen3" {
+        if arch != "llama" && arch != "qwen2" && arch != "qwen3" {
             return Err(ModelError::UnsupportedArch(arch));
         }
 
         let pfx = arch.as_str();
+        let is_qwen = matches!(pfx, "qwen2" | "qwen3");
         let n_layers = gguf.req_usize(&format!("{pfx}.block_count"))?;
         let n_embd = gguf.req_usize(&format!("{pfx}.embedding_length"))?;
         let n_ff = gguf.req_usize(&format!("{pfx}.feed_forward_length"))?;
@@ -276,12 +311,12 @@ impl<'a> LlamaModel<'a> {
         let rope_freq_base = gguf
             .get_meta(&format!("{pfx}.rope.freq_base"))
             .and_then(|v| v.as_f32())
-            .unwrap_or(if pfx == "qwen3" { 1_000_000.0 } else { 10000.0 });
+            .unwrap_or(if is_qwen { 1_000_000.0 } else { 10000.0 });
         let rms_eps = gguf
             .get_meta(&format!("{pfx}.attention.layer_norm_rms_epsilon"))
             .and_then(|v| v.as_f32())
-            .unwrap_or(if pfx == "qwen3" { 1e-6 } else { 1e-5 });
-        let rope_type = if pfx == "qwen3" {
+            .unwrap_or(if is_qwen { 1e-6 } else { 1e-5 });
+        let rope_type = if is_qwen {
             RopeType::Neox
         } else {
             RopeType::Norm
@@ -324,6 +359,7 @@ impl<'a> LlamaModel<'a> {
                 ..token_embd
             }
         };
+        let output_bias = load_opt_f32_vec(gguf, "output.bias", "global", vocab_size)?;
         let output_norm = load_f32_vec(gguf, "output_norm.weight", "global", n_embd)?;
         let rope_freqs = if gguf.tensor_info("rope_freqs.weight").is_some() {
             Some(load_f32_vec(
@@ -355,24 +391,24 @@ impl<'a> LlamaModel<'a> {
 
         for l in 0..n_layers {
             let ltag = format!("blk.{l}");
-            let qn_name = format!("{ltag}.attn_q_norm.weight");
-            let kn_name = format!("{ltag}.attn_k_norm.weight");
-            let q_norm = if gguf.tensor_info(&qn_name).is_some() {
-                Some(load_f32_vec(gguf, &qn_name, &ltag, head_dim)?)
-            } else {
-                None
-            };
-            let k_norm = if gguf.tensor_info(&kn_name).is_some() {
-                Some(load_f32_vec(gguf, &kn_name, &ltag, head_dim)?)
-            } else {
-                None
-            };
+            let q_norm =
+                load_opt_f32_vec(gguf, &format!("{ltag}.attn_q_norm.weight"), &ltag, head_dim)?;
+            let k_norm =
+                load_opt_f32_vec(gguf, &format!("{ltag}.attn_k_norm.weight"), &ltag, head_dim)?;
+            let bq = load_opt_f32_vec(gguf, &format!("{ltag}.attn_q.bias"), &ltag, q_dim)?;
+            let bk = load_opt_f32_vec(gguf, &format!("{ltag}.attn_k.bias"), &ltag, kv_dim)?;
+            let bv = load_opt_f32_vec(gguf, &format!("{ltag}.attn_v.bias"), &ltag, kv_dim)?;
+            let bo = load_opt_f32_vec(gguf, &format!("{ltag}.attn_output.bias"), &ltag, n_embd)?;
 
             layers.push(LayerWeights {
                 attn_norm: load_f32_vec(gguf, &format!("{ltag}.attn_norm.weight"), &ltag, n_embd)?,
                 ffn_norm: load_f32_vec(gguf, &format!("{ltag}.ffn_norm.weight"), &ltag, n_embd)?,
                 q_norm,
                 k_norm,
+                bq,
+                bk,
+                bv,
+                bo,
                 wq: load_mat(gguf, &format!("{ltag}.attn_q.weight"), &ltag, n_embd, q_dim)?,
                 wk: load_mat(
                     gguf,
@@ -417,6 +453,7 @@ impl<'a> LlamaModel<'a> {
             cfg,
             token_embd,
             output,
+            output_bias,
             output_norm,
             rope_inv_freqs,
             layers,
@@ -549,6 +586,15 @@ impl<'a> LlamaModel<'a> {
                     &mut state.lora_scratch,
                 );
             }
+            if let Some(ref bq) = layer.bq {
+                add_bias_slice(&mut state.q[..q_dim], bq);
+            }
+            if let Some(ref bk) = layer.bk {
+                add_bias_slice(&mut state.k[..kv_dim], bk);
+            }
+            if let Some(ref bv) = layer.bv {
+                add_bias_slice(&mut state.v[..kv_dim], bv);
+            }
 
             // Optional per-head QK-Norm (Qwen3) applied before RoPE
             if let Some(ref qn) = layer.q_norm {
@@ -668,6 +714,9 @@ impl<'a> LlamaModel<'a> {
             for i in 0..n_embd {
                 state.x[i] += state.xb2[i];
             }
+            if let Some(ref bo) = layer.bo {
+                add_bias_slice(&mut state.x[..n_embd], bo);
+            }
 
             // FFN (SwiGLU)
             rms_norm(
@@ -766,6 +815,9 @@ impl<'a> LlamaModel<'a> {
                 1,
                 &mut state.lora_scratch,
             );
+            if let Some(ref ob) = self.output_bias {
+                add_bias_slice(&mut state.logits, ob);
+            }
         }
 
         Ok(())
@@ -974,6 +1026,15 @@ impl<'a> LlamaModel<'a> {
                         &mut state.lora_scratch,
                     );
                 }
+                if let Some(ref bq) = layer.bq {
+                    add_bias_rows(&mut state.q[..b * q_dim], bq, b);
+                }
+                if let Some(ref bk) = layer.bk {
+                    add_bias_rows(&mut state.k[..b * kv_dim], bk, b);
+                }
+                if let Some(ref bv) = layer.bv {
+                    add_bias_rows(&mut state.v[..b * kv_dim], bv, b);
+                }
                 if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
                     p.attn_qkv_ns += ts.elapsed().as_nanos() as u64;
                 }
@@ -1122,6 +1183,9 @@ impl<'a> LlamaModel<'a> {
                 for i in 0..(b * n_embd) {
                     state.x[i] += state.xb2[i];
                 }
+                if let Some(ref bo) = layer.bo {
+                    add_bias_rows(&mut state.x[..b * n_embd], bo, b);
+                }
                 if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
                     p.attn_wo_ns += ts.elapsed().as_nanos() as u64;
                 }
@@ -1256,6 +1320,9 @@ impl<'a> LlamaModel<'a> {
                     1,
                     &mut state.lora_scratch,
                 );
+                if let Some(ref ob) = self.output_bias {
+                    add_bias_slice(&mut state.logits, ob);
+                }
                 if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
                     p.lm_head_ns += ts.elapsed().as_nanos() as u64;
                 }
@@ -1384,6 +1451,15 @@ impl<'a> LlamaModel<'a> {
                     1,
                     &mut state.lora_scratch,
                 );
+            }
+            if let Some(ref bq) = layer.bq {
+                add_bias_slice(&mut state.q[..q_dim], bq);
+            }
+            if let Some(ref bk) = layer.bk {
+                add_bias_slice(&mut state.k[..kv_dim], bk);
+            }
+            if let Some(ref bv) = layer.bv {
+                add_bias_slice(&mut state.v[..kv_dim], bv);
             }
             prof.attn_qkv_ns += t0.elapsed().as_nanos() as u64;
             prof.attn_qkv_bytes +=
@@ -1521,6 +1597,9 @@ impl<'a> LlamaModel<'a> {
             for i in 0..n_embd {
                 state.x[i] += state.xb2[i];
             }
+            if let Some(ref bo) = layer.bo {
+                add_bias_slice(&mut state.x[..n_embd], bo);
+            }
             prof.attn_wo_ns += t0.elapsed().as_nanos() as u64;
             prof.attn_wo_bytes += layer.wo.bytes.len() as u64;
 
@@ -1637,6 +1716,9 @@ impl<'a> LlamaModel<'a> {
                 1,
                 &mut state.lora_scratch,
             );
+            if let Some(ref ob) = self.output_bias {
+                add_bias_slice(&mut state.logits, ob);
+            }
             prof.lm_head_ns += t0.elapsed().as_nanos() as u64;
             prof.lm_head_bytes += self.output.bytes.len() as u64;
         }
@@ -1718,6 +1800,9 @@ impl<'a> LlamaModel<'a> {
             w,
             &mut state.lora_scratch,
         );
+        if let Some(ref ob) = self.output_bias {
+            add_bias_rows(&mut spec_buf.logits_win[..w * vocab], ob, w);
+        }
         Ok(())
     }
 
@@ -1776,6 +1861,9 @@ impl<'a> LlamaModel<'a> {
             1,
             &mut state.lora_scratch,
         );
+        if let Some(ref ob) = self.output_bias {
+            add_bias_slice(out_logits, ob);
+        }
     }
 
     /// Decodes a single token's input embedding `[n_embd]` (used by MTP cells).

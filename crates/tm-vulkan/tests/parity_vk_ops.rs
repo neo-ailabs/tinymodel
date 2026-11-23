@@ -236,10 +236,10 @@ fn serialize_gguf(
 }
 
 fn build_f32_gguf(arch: &str) -> Vec<u8> {
-    let mut rng = Rng(if arch == "qwen3" {
-        0x1122_3344_5566_7788
-    } else {
-        0x8877_6655_4433_2211
+    let mut rng = Rng(match arch {
+        "qwen3" => 0x1122_3344_5566_7788,
+        "qwen2" => 0x55AA_33CC_77EE_9911,
+        _ => 0x8877_6655_4433_2211,
     });
     let (n_layers, n_embd, n_ff, n_head, n_head_kv, head_dim, vocab) = (2, 128, 256, 4, 2, 32, 40);
     let q_dim = n_head * head_dim;
@@ -259,6 +259,14 @@ fn build_f32_gguf(arch: &str) -> Vec<u8> {
             data: make_f32_bytes(&mut rng, n_embd, 1.0, 0.2),
         },
     ];
+    if arch == "qwen2" {
+        tensors.push(TensorEntry {
+            name: "output.bias".into(),
+            dims: vec![vocab as u64],
+            ggml_type: 0,
+            data: make_f32_bytes(&mut rng, vocab, 0.0, 0.3),
+        });
+    }
     for l in 0..n_layers {
         let p = format!("blk.{l}");
         tensors.push(TensorEntry {
@@ -287,6 +295,21 @@ fn build_f32_gguf(arch: &str) -> Vec<u8> {
                 data: make_f32_bytes(&mut rng, head_dim, 1.0, 0.2),
             });
         }
+        if arch == "qwen2" {
+            for (bsuf, blen) in [
+                ("attn_q.bias", q_dim),
+                ("attn_k.bias", kv_dim),
+                ("attn_v.bias", kv_dim),
+                ("attn_output.bias", n_embd),
+            ] {
+                tensors.push(TensorEntry {
+                    name: format!("{p}.{bsuf}"),
+                    dims: vec![blen as u64],
+                    ggml_type: 0,
+                    data: make_f32_bytes(&mut rng, blen, 0.0, 0.45),
+                });
+            }
+        }
         for (suf, cols, rows) in [
             ("attn_q.weight", n_embd, q_dim),
             ("attn_k.weight", n_embd, kv_dim),
@@ -310,10 +333,10 @@ fn build_f32_gguf(arch: &str) -> Vec<u8> {
 }
 
 fn build_mixed_quant_gguf(arch: &str) -> Vec<u8> {
-    let mut rng = Rng(if arch == "qwen3" {
-        0xCAFE_BABE_9060_1200
-    } else {
-        0xDEAD_BEEF_1234_5678
+    let mut rng = Rng(match arch {
+        "qwen3" => 0xCAFE_BABE_9060_1200,
+        "qwen2" => 0xBADC_0FFE_2026_0500,
+        _ => 0xDEAD_BEEF_1234_5678,
     });
     let (n_layers, n_embd, n_ff, n_head, n_head_kv, head_dim, vocab) = (2, 256, 512, 4, 2, 64, 48);
     let q_dim = n_head * head_dim;
@@ -367,6 +390,20 @@ fn build_mixed_quant_gguf(arch: &str) -> Vec<u8> {
                 ggml_type: 0,
                 data: make_f32_bytes(&mut rng, head_dim, 1.0, 0.25),
             });
+        }
+        if arch == "qwen2" {
+            for (bsuf, blen) in [
+                ("attn_q.bias", q_dim),
+                ("attn_k.bias", kv_dim),
+                ("attn_v.bias", kv_dim),
+            ] {
+                tensors.push(TensorEntry {
+                    name: format!("{p}.{bsuf}"),
+                    dims: vec![blen as u64],
+                    ggml_type: 0,
+                    data: make_f32_bytes(&mut rng, blen, 0.0, 0.5),
+                });
+            }
         }
         for (suf, cols, rows) in [
             ("attn_q.weight", n_embd, q_dim),
@@ -444,7 +481,7 @@ fn get_ctx_or_skip() -> Option<VulkanContext> {
 
 #[test]
 fn vk_f32_exact_cpu_parity_llama_and_qwen3() {
-    for arch in ["llama", "qwen3"] {
+    for arch in ["llama", "qwen2", "qwen3"] {
         let Some(ctx) = get_ctx_or_skip() else { return };
         let gguf = open_bytes_as_gguf(&format!("f32_{arch}"), &build_f32_gguf(arch));
         let cpu_model = LlamaModel::from_gguf(&gguf).unwrap();
@@ -499,7 +536,7 @@ fn vk_f32_exact_cpu_parity_llama_and_qwen3() {
 
 #[test]
 fn vk_mixed_quant_decode_vs_batch_and_cpu_kl_parity() {
-    for arch in ["llama", "qwen3"] {
+    for arch in ["llama", "qwen2", "qwen3"] {
         let Some(ctx1) = get_ctx_or_skip() else {
             return;
         };

@@ -581,6 +581,33 @@ impl<'a> LlamaTrainer<'a> {
                 }
             }
 
+            if let Some(ref bq) = lw.bq {
+                for t in 0..b {
+                    let dst = &mut arena.q_rope[(offset + t) * q_dim..(offset + t + 1) * q_dim];
+                    for (y, &bi) in dst.iter_mut().zip(bq.iter()) {
+                        *y += bi;
+                    }
+                }
+            }
+            if let Some(ref bk) = lw.bk {
+                for t in 0..b {
+                    let dst =
+                        &mut arena.k_rope_f32[(offset + t) * kv_dim..(offset + t + 1) * kv_dim];
+                    for (y, &bi) in dst.iter_mut().zip(bk.iter()) {
+                        *y += bi;
+                    }
+                }
+            }
+            if let Some(ref bv) = lw.bv {
+                for t in 0..b {
+                    let dst =
+                        &mut arena.v_full_f32[(offset + t) * kv_dim..(offset + t + 1) * kv_dim];
+                    for (y, &bi) in dst.iter_mut().zip(bv.iter()) {
+                        *y += bi;
+                    }
+                }
+            }
+
             if save_recompute {
                 if lw.q_norm.is_some() {
                     arena.q_pre_norm[offset * q_dim..(offset + b) * q_dim]
@@ -717,6 +744,14 @@ impl<'a> LlamaTrainer<'a> {
                     arena.x_cur[offset * d + i]
                 };
                 arena.x_mid[offset * d + i] = xin_i + arena.xb2_chunk[i];
+            }
+            if let Some(ref bo) = lw.bo {
+                for t in 0..b {
+                    let dst = &mut arena.x_mid[(offset + t) * d..(offset + t + 1) * d];
+                    for (y, &bi) in dst.iter_mut().zip(bo.iter()) {
+                        *y += bi;
+                    }
+                }
             }
 
             // 6. FFN RMSNorm + SwiGLU FFN + residual
@@ -947,6 +982,11 @@ impl<'a> LlamaTrainer<'a> {
             1,
             &mut self.arena.lora_scratch,
         );
+        if let Some(ref ob) = self.model.output_bias {
+            for (y, &bi) in out_last_logits.iter_mut().zip(ob.iter()) {
+                *y += bi;
+            }
+        }
     }
 
     /// Executes 1 micro-batch forward + masked chunked cross-entropy + per-layer recomputed backward,
@@ -1070,6 +1110,14 @@ impl<'a> LlamaTrainer<'a> {
                 &mut self.arena.mv_scratch,
                 &mut self.arena.lora_scratch,
             );
+            if let Some(ref ob) = self.model.output_bias {
+                for k in 0..b {
+                    let row = &mut self.arena.ce_logits[k * vocab..(k + 1) * vocab];
+                    for (y, &bi) in row.iter_mut().zip(ob.iter()) {
+                        *y += bi;
+                    }
+                }
+            }
 
             for k in 0..b {
                 let target = self.arena.ce_pos[c0 + k].1 as usize;

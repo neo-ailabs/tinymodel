@@ -3964,3 +3964,20 @@ kernel void lora_embed_f32(
     }
     x[ulong(t) * ulong(a.d_out) + col] += acc;
 }
+
+struct BiasArgs {
+    uint d_out;
+    uint n_tok;
+};
+
+kernel void add_bias_f32(
+    device const float* bias [[buffer(0)]],
+    device float* y [[buffer(1)]],
+    constant BiasArgs& a [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint col = gid.x;
+    const uint t = gid.y;
+    if (col >= a.d_out || t >= a.n_tok) return;
+    y[ulong(t) * ulong(a.d_out) + col] += bias[col];
+}

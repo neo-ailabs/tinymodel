@@ -1471,16 +1471,22 @@ impl GgufFile {
 
         for name in &self.tensor_order {
             let info = &self.tensors[name];
-            let is_vocab_tensor = matches!(
+            let is_vocab_2d = matches!(
                 name.as_str(),
                 "token_embd.weight" | "output.weight" | "per_layer_token_embd.weight"
-            );
-            let vocab_sliced = prune_plan.is_some() && is_vocab_tensor && info.dims.len() == 2;
+            ) && info.dims.len() == 2;
+            let is_vocab_1d =
+                name == "output.bias" && info.dims.len() == 1 && info.dims[0] == old_vocab;
+            let vocab_sliced = prune_plan.is_some() && (is_vocab_2d || is_vocab_1d);
             let mut new_dims = info.dims.clone();
             if let Some(ref plan) = prune_plan
                 && vocab_sliced
             {
-                new_dims[1] = plan.kept_old_ids.len();
+                if is_vocab_1d {
+                    new_dims[0] = plan.kept_old_ids.len();
+                } else {
+                    new_dims[1] = plan.kept_old_ids.len();
+                }
             }
 
             let new_dtype = if info.dims.len() == 2 {
@@ -1618,6 +1624,18 @@ impl GgufFile {
                     );
                     writer.write_all(&q4_group_rep).map_err(io_err)?;
                 }
+            } else if p.vocab_sliced && p.dims.len() == 1 {
+                // 1D vocab-sized vector (e.g. `output.bias`): gather kept token entries.
+                let kept = &prune_plan
+                    .as_ref()
+                    .expect("vocab_sliced implies plan")
+                    .kept_old_ids;
+                f32_row.resize(src_info.dims[0], 0.0);
+                dequantize_row_bytes(src_info.dtype, src_bytes, &mut f32_row);
+                let gathered: Vec<f32> = kept.iter().map(|&idx| f32_row[idx]).collect();
+                out_row_buf.resize(p.byte_len, 0);
+                quantize_row_to_bytes(p.new_dtype, &gathered, &mut out_row_buf);
+                writer.write_all(&out_row_buf).map_err(io_err)?;
             } else if p.vocab_sliced
                 && p.new_dtype == src_info.dtype
                 && src_info.dtype != DType::Q4_0x4

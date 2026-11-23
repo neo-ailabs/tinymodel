@@ -49,6 +49,7 @@ const SPV_GEMM_PAIR_SILU_COOPMAT_F16: &[u8] =
 const SPV_QUANTIZE_Q8_1: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quantize_q8_1.spv"));
 const SPV_GEMM_COOPMAT_I8: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_i8.spv"));
 const SPV_ARGMAX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/argmax.spv"));
+const SPV_ADD_BIAS_AXPY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/lora_up_axpy.spv"));
 
 /// Preferred maximum tokens per batched prefill submission (`pp512` executes in a single pass!).
 const PREFERRED_MAX_BATCH: usize = 512;
@@ -292,6 +293,10 @@ struct LayerPlan {
     wq_batch: BatchGemmEntry,
     wk_batch: BatchGemmEntry,
     wv_batch: BatchGemmEntry,
+    bq_set: Option<vk::DescriptorSet>,
+    bk_set: Option<vk::DescriptorSet>,
+    bv_set: Option<vk::DescriptorSet>,
+    bo_set: Option<vk::DescriptorSet>,
     q_norm_set: Option<vk::DescriptorSet>,
     k_norm_set: Option<vk::DescriptorSet>,
     rope_dec_set: vk::DescriptorSet,
@@ -324,6 +329,7 @@ struct RunnerPipes {
     embed_batch: Arc<Pipeline>,
     rms_norm: Arc<Pipeline>,
     qk_norm: Arc<Pipeline>,
+    add_bias: Arc<Pipeline>,
     rope_dec: Arc<Pipeline>,
     rope_batch: Arc<Pipeline>,
     attn_dec: Arc<Pipeline>,
@@ -355,6 +361,7 @@ pub struct LlamaVkRunner {
     quant_hb_set: Option<vk::DescriptorSet>,
     output_norm_set: vk::DescriptorSet,
     lm_head_dec: (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
+    output_bias_set: Option<vk::DescriptorSet>,
     argmax_set: vk::DescriptorSet,
     layers: Vec<LayerPlan>,
     has_rope_freqs: bool,
@@ -435,13 +442,27 @@ fn plan_mat<'a>(
     })
 }
 
+fn plan_opt_f32_vec(
+    planner: &mut ArenaPlanner,
+    gguf: &GgufFile,
+    name: &str,
+    layer: &str,
+    len: usize,
+) -> Result<Option<PendingF32>, VulkanError> {
+    if gguf.tensor_info(name).is_some() {
+        Ok(Some(plan_f32_vec(planner, gguf, name, layer, len)?))
+    } else {
+        Ok(None)
+    }
+}
+
 impl LlamaVkRunner {
-    /// Loads a `llama` or `qwen3` GGUF model onto the selected Vulkan device.
+    /// Loads a `llama`, `qwen2` (Qwen2 & Qwen2.5), or `qwen3` GGUF model onto the selected Vulkan device.
     pub fn from_gguf(gguf: Arc<GgufFile>, max_ctx: usize) -> Result<Self, VulkanError> {
         Self::from_gguf_with_context(VulkanContext::new()?, gguf, max_ctx)
     }
 
-    /// Loads a `llama` or `qwen3` GGUF model onto an explicit [`VulkanContext`].
+    /// Loads a `llama`, `qwen2` (Qwen2 & Qwen2.5), or `qwen3` GGUF model onto an explicit [`VulkanContext`].
     pub fn from_gguf_with_context(
         ctx: VulkanContext,
         gguf: Arc<GgufFile>,
@@ -454,11 +475,12 @@ impl LlamaVkRunner {
         }
         let gguf_ref: &GgufFile = &gguf;
         let arch = gguf_ref.req_str("general.architecture")?.to_string();
-        if arch != "llama" && arch != "qwen3" {
+        if arch != "llama" && arch != "qwen2" && arch != "qwen3" {
             return Err(VulkanError::UnsupportedArch(arch));
         }
 
         let pfx = arch.as_str();
+        let is_qwen = matches!(pfx, "qwen2" | "qwen3");
         let n_layers = gguf_ref.req_usize(&format!("{pfx}.block_count"))?;
         let n_embd = gguf_ref.req_usize(&format!("{pfx}.embedding_length"))?;
         let n_ff = gguf_ref.req_usize(&format!("{pfx}.feed_forward_length"))?;
@@ -478,12 +500,12 @@ impl LlamaVkRunner {
         let rope_freq_base = gguf_ref
             .get_meta(&format!("{pfx}.rope.freq_base"))
             .and_then(|v| v.as_f32())
-            .unwrap_or(if pfx == "qwen3" { 1_000_000.0 } else { 10000.0 });
+            .unwrap_or(if is_qwen { 1_000_000.0 } else { 10000.0 });
         let rms_eps = gguf_ref
             .get_meta(&format!("{pfx}.attention.layer_norm_rms_epsilon"))
             .and_then(|v| v.as_f32())
-            .unwrap_or(if pfx == "qwen3" { 1e-6 } else { 1e-5 });
-        let rope_type = if pfx == "qwen3" { 1 } else { 0 };
+            .unwrap_or(if is_qwen { 1e-6 } else { 1e-5 });
+        let rope_type = if is_qwen { 1 } else { 0 };
 
         if head_dim > 256 {
             return Err(VulkanError::InvalidDimensions(format!(
@@ -569,6 +591,8 @@ impl LlamaVkRunner {
         } else {
             None
         };
+        let p_output_bias =
+            plan_opt_f32_vec(&mut planner, gguf_ref, "output.bias", "global", vocab_size)?;
         let p_output_norm = plan_f32_vec(
             &mut planner,
             gguf_ref,
@@ -608,6 +632,10 @@ impl LlamaVkRunner {
             ffn_norm: PendingF32,
             q_norm: Option<PendingF32>,
             k_norm: Option<PendingF32>,
+            bq: Option<PendingF32>,
+            bk: Option<PendingF32>,
+            bv: Option<PendingF32>,
+            bo: Option<PendingF32>,
             wq: PendingMat<'a>,
             wk: PendingMat<'a>,
             wv: PendingMat<'a>,
@@ -622,30 +650,48 @@ impl LlamaVkRunner {
         let mut p_layers = Vec::with_capacity(n_layers);
         for l in 0..n_layers {
             let ltag = format!("blk.{l}");
-            let qn_name = format!("{ltag}.attn_q_norm.weight");
-            let kn_name = format!("{ltag}.attn_k_norm.weight");
-            let q_norm = if gguf_ref.tensor_info(&qn_name).is_some() {
-                Some(plan_f32_vec(
-                    &mut planner,
-                    gguf_ref,
-                    &qn_name,
-                    &ltag,
-                    head_dim,
-                )?)
-            } else {
-                None
-            };
-            let k_norm = if gguf_ref.tensor_info(&kn_name).is_some() {
-                Some(plan_f32_vec(
-                    &mut planner,
-                    gguf_ref,
-                    &kn_name,
-                    &ltag,
-                    head_dim,
-                )?)
-            } else {
-                None
-            };
+            let q_norm = plan_opt_f32_vec(
+                &mut planner,
+                gguf_ref,
+                &format!("{ltag}.attn_q_norm.weight"),
+                &ltag,
+                head_dim,
+            )?;
+            let k_norm = plan_opt_f32_vec(
+                &mut planner,
+                gguf_ref,
+                &format!("{ltag}.attn_k_norm.weight"),
+                &ltag,
+                head_dim,
+            )?;
+            let bq = plan_opt_f32_vec(
+                &mut planner,
+                gguf_ref,
+                &format!("{ltag}.attn_q.bias"),
+                &ltag,
+                q_dim,
+            )?;
+            let bk = plan_opt_f32_vec(
+                &mut planner,
+                gguf_ref,
+                &format!("{ltag}.attn_k.bias"),
+                &ltag,
+                kv_dim,
+            )?;
+            let bv = plan_opt_f32_vec(
+                &mut planner,
+                gguf_ref,
+                &format!("{ltag}.attn_v.bias"),
+                &ltag,
+                kv_dim,
+            )?;
+            let bo = plan_opt_f32_vec(
+                &mut planner,
+                gguf_ref,
+                &format!("{ltag}.attn_output.bias"),
+                &ltag,
+                n_embd,
+            )?;
             p_layers.push(PendingLayer {
                 attn_norm: plan_f32_vec(
                     &mut planner,
@@ -663,6 +709,10 @@ impl LlamaVkRunner {
                 )?,
                 q_norm,
                 k_norm,
+                bq,
+                bk,
+                bv,
+                bo,
                 wq: plan_mat(
                     &mut planner,
                     gguf_ref,
@@ -765,6 +815,13 @@ impl LlamaVkRunner {
             (None, None)
         };
         let logits_dev = planner.reserve((vocab_size * 4) as u64)?;
+        let p_bias_ones = {
+            let slice = planner.reserve((max_batch * 4) as u64)?;
+            PendingF32 {
+                slice,
+                vals: vec![1.0f32; max_batch],
+            }
+        };
 
         let total_needed = planner.total_bytes();
         if total_needed > budget {
@@ -817,8 +874,12 @@ impl LlamaVkRunner {
         if let Some(ref po) = p_output {
             write_mat(po)?;
         }
+        if let Some(ref pob) = p_output_bias {
+            write_f32(pob)?;
+        }
         write_f32(&p_output_norm)?;
         write_f32(&p_rope_freqs)?;
+        write_f32(&p_bias_ones)?;
         for pl in &p_layers {
             write_f32(&pl.attn_norm)?;
             write_f32(&pl.ffn_norm)?;
@@ -827,6 +888,18 @@ impl LlamaVkRunner {
             }
             if let Some(ref kn) = pl.k_norm {
                 write_f32(kn)?;
+            }
+            if let Some(ref bq) = pl.bq {
+                write_f32(bq)?;
+            }
+            if let Some(ref bk) = pl.bk {
+                write_f32(bk)?;
+            }
+            if let Some(ref bv) = pl.bv {
+                write_f32(bv)?;
+            }
+            if let Some(ref bo) = pl.bo {
+                write_f32(bo)?;
             }
             write_mat(&pl.wq)?;
             write_mat(&pl.wk)?;
@@ -900,6 +973,7 @@ impl LlamaVkRunner {
             )?,
             rms_norm: ctx.pipeline("rms_norm", 0, SPV_RMS_NORM, 3, 12, &[256])?,
             qk_norm: ctx.pipeline("qk_norm", 0, SPV_QK_NORM, 2, 8, &[64])?,
+            add_bias: ctx.pipeline("add_bias", 256, SPV_ADD_BIAS_AXPY, 3, 20, &[256])?,
             rope_dec: ctx.pipeline("rope_dec", 0, SPV_ROPE_KV, 7, 32, &[64, 0])?,
             rope_batch: ctx.pipeline("rope_batch", 1, SPV_ROPE_KV, 7, 32, &[64, 1])?,
             attn_dec: ctx.pipeline(
@@ -935,7 +1009,7 @@ impl LlamaVkRunner {
         };
 
         // 4. Allocate static descriptor pool, command pool, pre-bound descriptor sets.
-        let max_sets = (n_layers as u32) * 34 + 32;
+        let max_sets = (n_layers as u32) * 40 + 40;
         let max_desc = max_sets * 8;
         let d = &ctx.inner.device;
         // SAFETY: `d` is a valid logical device and `ctx.inner.queue_family` is its compute queue family.
@@ -1182,6 +1256,17 @@ impl LlamaVkRunner {
             ],
         )?;
         let lm_head_dec = (lm_pipe, lm_set, lm_groups, lm_push);
+        let output_bias_set = match p_output_bias {
+            Some(ref pob) => Some(alloc_set(
+                &pipes.add_bias,
+                &[
+                    Binding::Arena(pob.slice),
+                    Binding::Arena(p_bias_ones.slice),
+                    Binding::Arena(logits_dev),
+                ],
+            )?),
+            None => None,
+        };
         let argmax_set = alloc_set(
             &pipes.argmax,
             &[Binding::Arena(logits_dev), Binding::Raw(&argmax_buf)],
@@ -1301,6 +1386,26 @@ impl LlamaVkRunner {
             let wq_batch = make_batch_gemm(pl.wq.mat, s_xb, s_q)?;
             let wk_batch = make_batch_gemm(pl.wk.mat, s_xb, s_k)?;
             let wv_batch = make_batch_gemm(pl.wv.mat, s_xb, s_v)?;
+
+            let mk_bias_set = |pb: &Option<PendingF32>,
+                               dst: VkSlice|
+             -> Result<Option<vk::DescriptorSet>, VulkanError> {
+                match pb {
+                    Some(b) => Ok(Some(alloc_set(
+                        &pipes.add_bias,
+                        &[
+                            Binding::Arena(b.slice),
+                            Binding::Arena(p_bias_ones.slice),
+                            Binding::Arena(dst),
+                        ],
+                    )?)),
+                    None => Ok(None),
+                }
+            };
+            let bq_set = mk_bias_set(&pl.bq, s_q)?;
+            let bk_set = mk_bias_set(&pl.bk, s_k)?;
+            let bv_set = mk_bias_set(&pl.bv, s_v)?;
+            let bo_set = mk_bias_set(&pl.bo, s_x)?;
 
             let q_norm_set = match pl.q_norm {
                 Some(ref qn) => Some(alloc_set(
@@ -1513,6 +1618,10 @@ impl LlamaVkRunner {
                 wq_batch,
                 wk_batch,
                 wv_batch,
+                bq_set,
+                bk_set,
+                bv_set,
+                bo_set,
                 q_norm_set,
                 k_norm_set,
                 rope_dec_set,
@@ -1571,6 +1680,7 @@ impl LlamaVkRunner {
             quant_hb_set,
             output_norm_set,
             lm_head_dec,
+            output_bias_set,
             argmax_set,
             layers,
             has_rope_freqs,
@@ -1695,6 +1805,25 @@ impl LlamaVkRunner {
         Ok(())
     }
 
+    fn cmd_add_bias(
+        &self,
+        cb: vk::CommandBuffer,
+        bias_set: vk::DescriptorSet,
+        d_out: usize,
+        n_tok: u32,
+        barrier_after: bool,
+    ) -> Result<(), VulkanError> {
+        self.cmd_dispatch_set(
+            cb,
+            &self.pipes.add_bias,
+            bias_set,
+            &[0, d_out as u32, 1, n_tok, 1.0f32.to_bits()],
+            (d_out as u32).div_ceil(256),
+            n_tok,
+            barrier_after,
+        )
+    }
+
     fn cmd_compute_barrier(d: &ash::Device, cb: vk::CommandBuffer) {
         let barrier = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
@@ -1748,6 +1877,8 @@ impl LlamaVkRunner {
         let norm_push = [self.cfg.n_embd as u32, 0, eps_bits];
         let qk_push = [self.cfg.head_dim as u32, eps_bits];
         let half_rope = self.cfg.rope_dim / 2;
+        let q_dim = self.cfg.n_head * self.cfg.head_dim;
+        let kv_dim = self.cfg.n_head_kv * self.cfg.head_dim;
         let rope_total = ((self.cfg.n_head + self.cfg.n_head_kv) * half_rope)
             .max(self.cfg.n_head_kv * self.cfg.head_dim);
         let rope_groups = (rope_total as u32).div_ceil(64);
@@ -1806,6 +1937,18 @@ impl LlamaVkRunner {
             self.lora.cmd_record_linear(&self.ctx, cb, &wq_n, 1)?;
             self.lora.cmd_record_linear(&self.ctx, cb, &wk_n, 1)?;
             self.lora.cmd_record_linear(&self.ctx, cb, &wv_n, 1)?;
+            if layer.bq_set.is_some() || layer.bk_set.is_some() || layer.bv_set.is_some() {
+                if let Some(bqs) = layer.bq_set {
+                    self.cmd_add_bias(cb, bqs, q_dim, 1, false)?;
+                }
+                if let Some(bks) = layer.bk_set {
+                    self.cmd_add_bias(cb, bks, kv_dim, 1, false)?;
+                }
+                if let Some(bvs) = layer.bv_set {
+                    self.cmd_add_bias(cb, bvs, kv_dim, 1, false)?;
+                }
+                Self::cmd_compute_barrier(d, cb);
+            }
 
             if layer.q_norm_set.is_some() || layer.k_norm_set.is_some() {
                 if let Some(qns) = layer.q_norm_set {
@@ -1863,6 +2006,9 @@ impl LlamaVkRunner {
                 true,
             )?;
             self.lora.cmd_record_linear(&self.ctx, cb, &wo_n, 1)?;
+            if let Some(bos) = layer.bo_set {
+                self.cmd_add_bias(cb, bos, self.cfg.n_embd, 1, true)?;
+            }
 
             self.cmd_dispatch_set(
                 cb,
@@ -1945,6 +2091,9 @@ impl LlamaVkRunner {
                 self.cmd_dispatch_set(cb, &lm.0, lm.1, &lm.3, lm.2, 1, true)?;
                 self.lora
                     .cmd_record_linear(&self.ctx, cb, "output.weight", 1)?;
+                if let Some(obs) = self.output_bias_set {
+                    self.cmd_add_bias(cb, obs, self.cfg.vocab_size, 1, true)?;
+                }
                 self.cmd_dispatch_set(
                     cb,
                     &self.pipes.argmax,
@@ -1970,9 +2119,14 @@ impl LlamaVkRunner {
                     );
                 }
             } else {
-                self.cmd_dispatch_set(cb, &lm.0, lm.1, &lm.3, lm.2, 1, false)?;
+                let need_post_lm_bar =
+                    self.lora.has_linear("output.weight") || self.output_bias_set.is_some();
+                self.cmd_dispatch_set(cb, &lm.0, lm.1, &lm.3, lm.2, 1, need_post_lm_bar)?;
                 self.lora
                     .cmd_record_linear(&self.ctx, cb, "output.weight", 1)?;
+                if let Some(obs) = self.output_bias_set {
+                    self.cmd_add_bias(cb, obs, self.cfg.vocab_size, 1, false)?;
+                }
                 let to_xfer = vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
@@ -2255,6 +2409,7 @@ impl LlamaVkRunner {
             .max(self.cfg.n_head_kv * self.cfg.head_dim);
         let rope_groups_x = (rope_total as u32).div_ceil(64);
         let q_dim = self.cfg.n_head * self.cfg.head_dim;
+        let kv_dim = self.cfg.n_head_kv * self.cfg.head_dim;
 
         let d = &self.ctx.inner.device;
         let cb = self.cb_batch;
@@ -2354,6 +2509,18 @@ impl LlamaVkRunner {
                 self.lora.cmd_record_linear(&self.ctx, cb, &wq_n, b_u32)?;
                 self.lora.cmd_record_linear(&self.ctx, cb, &wk_n, b_u32)?;
                 self.lora.cmd_record_linear(&self.ctx, cb, &wv_n, b_u32)?;
+                if layer.bq_set.is_some() || layer.bk_set.is_some() || layer.bv_set.is_some() {
+                    if let Some(bqs) = layer.bq_set {
+                        self.cmd_add_bias(cb, bqs, q_dim, b_u32, false)?;
+                    }
+                    if let Some(bks) = layer.bk_set {
+                        self.cmd_add_bias(cb, bks, kv_dim, b_u32, false)?;
+                    }
+                    if let Some(bvs) = layer.bv_set {
+                        self.cmd_add_bias(cb, bvs, kv_dim, b_u32, false)?;
+                    }
+                    Self::cmd_compute_barrier(d, cb);
+                }
 
                 if layer.q_norm_set.is_some() || layer.k_norm_set.is_some() {
                     if let Some(qns) = layer.q_norm_set {
@@ -2402,6 +2569,9 @@ impl LlamaVkRunner {
                 )?;
                 self.cmd_gemm(cb, &layer.wo_batch, b_u32, true, true)?;
                 self.lora.cmd_record_linear(&self.ctx, cb, &wo_n, b_u32)?;
+                if let Some(bos) = layer.bo_set {
+                    self.cmd_add_bias(cb, bos, self.cfg.n_embd, b_u32, true)?;
+                }
 
                 self.cmd_dispatch_set(
                     cb,
@@ -2504,9 +2674,14 @@ impl LlamaVkRunner {
                     true,
                 )?;
                 let lm = &self.lm_head_dec;
-                self.cmd_dispatch_set(cb, &lm.0, lm.1, &lm.3, lm.2, 1, false)?;
+                let need_post_lm_bar =
+                    self.lora.has_linear("output.weight") || self.output_bias_set.is_some();
+                self.cmd_dispatch_set(cb, &lm.0, lm.1, &lm.3, lm.2, 1, need_post_lm_bar)?;
                 self.lora
                     .cmd_record_linear(&self.ctx, cb, "output.weight", 1)?;
+                if let Some(obs) = self.output_bias_set {
+                    self.cmd_add_bias(cb, obs, self.cfg.vocab_size, 1, false)?;
+                }
 
                 let to_xfer = vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
@@ -2768,6 +2943,18 @@ impl LlamaVkRunner {
                             self.cmd_dispatch_set(cb, &wk.0, wk.1, &wk.3, wk.2, 1, false)?;
                             self.cmd_dispatch_set(cb, &wv.0, wv.1, &wv.3, wv.2, 1, true)?;
                         }
+                    }
+                    if layer.bq_set.is_some() || layer.bk_set.is_some() || layer.bv_set.is_some() {
+                        if let Some(bqs) = layer.bq_set {
+                            self.cmd_add_bias(cb, bqs, q_dim, 1, false)?;
+                        }
+                        if let Some(bks) = layer.bk_set {
+                            self.cmd_add_bias(cb, bks, kv_dim, 1, false)?;
+                        }
+                        if let Some(bvs) = layer.bv_set {
+                            self.cmd_add_bias(cb, bvs, kv_dim, 1, false)?;
+                        }
+                        Self::cmd_compute_barrier(d, cb);
                     }
                     let cur = mark(cb);
                     spans.push((2, prev, cur));
@@ -3031,6 +3218,18 @@ impl LlamaVkRunner {
                     self.cmd_gemm(cb, &layer.wq_batch, b_u32, false, false)?;
                     self.cmd_gemm(cb, &layer.wk_batch, b_u32, false, false)?;
                     self.cmd_gemm(cb, &layer.wv_batch, b_u32, false, true)?;
+                    if layer.bq_set.is_some() || layer.bk_set.is_some() || layer.bv_set.is_some() {
+                        if let Some(bqs) = layer.bq_set {
+                            self.cmd_add_bias(cb, bqs, q_dim, b_u32, false)?;
+                        }
+                        if let Some(bks) = layer.bk_set {
+                            self.cmd_add_bias(cb, bks, kv_dim, b_u32, false)?;
+                        }
+                        if let Some(bvs) = layer.bv_set {
+                            self.cmd_add_bias(cb, bvs, kv_dim, b_u32, false)?;
+                        }
+                        Self::cmd_compute_barrier(d, cb);
+                    }
                     let cur = mark_pp(cb);
                     pp_spans.push((2, prev, cur));
                     prev = cur;

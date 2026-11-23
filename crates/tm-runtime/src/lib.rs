@@ -46,11 +46,11 @@ pub enum CpuState {
 }
 
 impl<'a> CpuModel<'a> {
-    /// Loads and validates any supported GGUF model (`llama`, `qwen3`, `qwen35`, `gemma4`, `lfm2`, `inkling2`, `inkling2_loop`).
+    /// Loads and validates any supported GGUF model (`llama`, `qwen2`, `qwen3`, `qwen35`, `gemma4`, `lfm2`, `inkling2`, `inkling2_loop`).
     pub fn from_gguf(gguf: &'a GgufFile) -> Result<Self, ModelError> {
         let arch = gguf.req_str("general.architecture")?;
         match arch {
-            "llama" | "qwen3" => Ok(CpuModel::Llama(LlamaModel::from_gguf(gguf)?)),
+            "llama" | "qwen2" | "qwen3" => Ok(CpuModel::Llama(LlamaModel::from_gguf(gguf)?)),
             "qwen35" => Ok(CpuModel::Qwen35(Qwen35Model::from_gguf(gguf)?)),
             "gemma4" => Ok(CpuModel::Gemma4(Gemma4Model::from_gguf(gguf)?)),
             "lfm2" => Ok(CpuModel::Lfm2(Lfm2Model::from_gguf(gguf)?)),

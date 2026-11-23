@@ -105,6 +105,13 @@ struct EmbedArgs {
     row_bytes: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BiasArgs {
+    d_out: u32,
+    n_tok: u32,
+}
+
 type MtlBuf = Retained<ProtocolObject<dyn MTLBuffer>>;
 type MtlPipe = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 
@@ -141,6 +148,10 @@ struct GpuLayer {
     ffn_norm: MtlBuf,
     q_norm: Option<MtlBuf>,
     k_norm: Option<MtlBuf>,
+    bq: Option<MtlBuf>,
+    bk: Option<MtlBuf>,
+    bv: Option<MtlBuf>,
+    bo: Option<MtlBuf>,
     wq: GpuMat,
     wk: GpuMat,
     wv: GpuMat,
@@ -160,6 +171,7 @@ struct Pipelines {
     embed_f32: MtlPipe,
     rms_norm: MtlPipe,
     qk_norm: MtlPipe,
+    add_bias: MtlPipe,
     rope_kv: MtlPipe,
     gqa_attn: MtlPipe,
     gemv_q4_0: MtlPipe,
@@ -202,6 +214,7 @@ pub struct LlamaMetalRunner {
     token_embd: GpuMat,
     output_tied: bool,
     output_separate: Option<GpuMat>,
+    output_bias: Option<MtlBuf>,
     output_norm: MtlBuf,
     rope_freqs: MtlBuf,
     has_rope_freqs: bool,
@@ -377,19 +390,34 @@ fn require_fit(
     Ok(())
 }
 
+fn load_opt_gpu_f32_vec(
+    device: &ProtocolObject<dyn MTLDevice>,
+    gguf: &GgufFile,
+    name: &str,
+    layer: &str,
+    len: usize,
+) -> Result<Option<MtlBuf>, MetalError> {
+    if gguf.tensor_info(name).is_some() {
+        Ok(Some(load_gpu_f32_vec(device, gguf, name, layer, len)?))
+    } else {
+        Ok(None)
+    }
+}
+
 impl LlamaMetalRunner {
-    /// Loads a `llama` or `qwen3` GGUF model onto the default Apple Metal GPU.
+    /// Loads a `llama`, `qwen2` (Qwen2 & Qwen2.5), or `qwen3` GGUF model onto the default Apple Metal GPU.
     ///
     /// Uses zero-copy `newBufferWithBytesNoCopy` over `gguf`'s memory map whenever
     /// the mapping is page-aligned (standard for all `GgufFile::open` files on Apple Silicon).
     pub fn from_gguf(gguf: Arc<GgufFile>, max_ctx: usize) -> Result<Self, MetalError> {
         let gguf_ref: &GgufFile = &gguf;
         let arch = gguf_ref.req_str("general.architecture")?.to_string();
-        if arch != "llama" && arch != "qwen3" {
+        if arch != "llama" && arch != "qwen2" && arch != "qwen3" {
             return Err(MetalError::UnsupportedArch(arch));
         }
 
         let pfx = arch.as_str();
+        let is_qwen = matches!(pfx, "qwen2" | "qwen3");
         let n_layers = gguf_ref.req_usize(&format!("{pfx}.block_count"))?;
         let n_embd = gguf_ref.req_usize(&format!("{pfx}.embedding_length"))?;
         let n_ff = gguf_ref.req_usize(&format!("{pfx}.feed_forward_length"))?;
@@ -409,12 +437,12 @@ impl LlamaMetalRunner {
         let rope_freq_base = gguf_ref
             .get_meta(&format!("{pfx}.rope.freq_base"))
             .and_then(|v| v.as_f32())
-            .unwrap_or(if pfx == "qwen3" { 1_000_000.0 } else { 10000.0 });
+            .unwrap_or(if is_qwen { 1_000_000.0 } else { 10000.0 });
         let rms_eps = gguf_ref
             .get_meta(&format!("{pfx}.attention.layer_norm_rms_epsilon"))
             .and_then(|v| v.as_f32())
-            .unwrap_or(if pfx == "qwen3" { 1e-6 } else { 1e-5 });
-        let rope_type = if pfx == "qwen3" { 1 } else { 0 };
+            .unwrap_or(if is_qwen { 1e-6 } else { 1e-5 });
+        let rope_type = if is_qwen { 1 } else { 0 };
 
         let embd_info =
             gguf_ref
@@ -446,6 +474,7 @@ impl LlamaMetalRunner {
             embed_f32: build_pipe(&device, &lib, "embed_f32", 64)?,
             rms_norm: build_pipe(&device, &lib, "rms_norm_f32", 256)?,
             qk_norm: build_pipe(&device, &lib, "qk_norm_f32", 32)?,
+            add_bias: build_pipe(&device, &lib, "add_bias_f32", 256)?,
             rope_kv: build_pipe(&device, &lib, "rope_and_kv_store_f16", 64)?,
             gqa_attn: build_pipe(&device, &lib, "gqa_attn_f16_kv", 128)?,
             gemv_q4_0: build_pipe(&device, &lib, "gemv_q4_0_res", 128)?,
@@ -508,6 +537,8 @@ impl LlamaMetalRunner {
         } else {
             (true, None)
         };
+        let output_bias =
+            load_opt_gpu_f32_vec(&device, gguf_ref, "output.bias", "global", vocab_size)?;
         let output_norm =
             load_gpu_f32_vec(&device, gguf_ref, "output_norm.weight", "global", n_embd)?;
         let (has_rope_freqs, rope_freqs) = if gguf_ref.tensor_info("rope_freqs.weight").is_some() {
@@ -532,22 +563,48 @@ impl LlamaMetalRunner {
         let mut layers = Vec::with_capacity(n_layers);
         for l in 0..n_layers {
             let ltag = format!("blk.{l}");
-            let qn_name = format!("{ltag}.attn_q_norm.weight");
-            let kn_name = format!("{ltag}.attn_k_norm.weight");
-            let q_norm = if gguf_ref.tensor_info(&qn_name).is_some() {
-                Some(load_gpu_f32_vec(
-                    &device, gguf_ref, &qn_name, &ltag, head_dim,
-                )?)
-            } else {
-                None
-            };
-            let k_norm = if gguf_ref.tensor_info(&kn_name).is_some() {
-                Some(load_gpu_f32_vec(
-                    &device, gguf_ref, &kn_name, &ltag, head_dim,
-                )?)
-            } else {
-                None
-            };
+            let q_norm = load_opt_gpu_f32_vec(
+                &device,
+                gguf_ref,
+                &format!("{ltag}.attn_q_norm.weight"),
+                &ltag,
+                head_dim,
+            )?;
+            let k_norm = load_opt_gpu_f32_vec(
+                &device,
+                gguf_ref,
+                &format!("{ltag}.attn_k_norm.weight"),
+                &ltag,
+                head_dim,
+            )?;
+            let bq = load_opt_gpu_f32_vec(
+                &device,
+                gguf_ref,
+                &format!("{ltag}.attn_q.bias"),
+                &ltag,
+                q_dim,
+            )?;
+            let bk = load_opt_gpu_f32_vec(
+                &device,
+                gguf_ref,
+                &format!("{ltag}.attn_k.bias"),
+                &ltag,
+                kv_dim,
+            )?;
+            let bv = load_opt_gpu_f32_vec(
+                &device,
+                gguf_ref,
+                &format!("{ltag}.attn_v.bias"),
+                &ltag,
+                kv_dim,
+            )?;
+            let bo = load_opt_gpu_f32_vec(
+                &device,
+                gguf_ref,
+                &format!("{ltag}.attn_output.bias"),
+                &ltag,
+                n_embd,
+            )?;
 
             layers.push(GpuLayer {
                 attn_norm: load_gpu_f32_vec(
@@ -566,6 +623,10 @@ impl LlamaMetalRunner {
                 )?,
                 q_norm,
                 k_norm,
+                bq,
+                bk,
+                bv,
+                bo,
                 wq: load_gpu_mat(
                     &device,
                     gguf_ref,
@@ -668,6 +729,7 @@ impl LlamaMetalRunner {
             token_embd,
             output_tied,
             output_separate,
+            output_bias,
             output_norm,
             rope_freqs,
             has_rope_freqs,
@@ -826,13 +888,61 @@ impl LlamaMetalRunner {
                 .encode_linear(enc, &layer.wk.name, &self.xb, 0, &self.k, 0, 1);
             self.lora
                 .encode_linear(enc, &layer.wv.name, &self.xb, 0, &self.v, 0, 1);
-            Ok(())
         } else {
             self.encode_gemv(enc, &layer.wq, &self.xb, &self.q, false)?;
             self.encode_gemv(enc, &layer.wk, &self.xb, &self.k, false)?;
             self.encode_gemv(enc, &layer.wv, &self.xb, &self.v, false)?;
-            Ok(())
         }
+        if let Some(ref bq) = layer.bq {
+            self.encode_add_bias(enc, bq, &self.q, layer.wq.rows, 1)?;
+        }
+        if let Some(ref bk) = layer.bk {
+            self.encode_add_bias(enc, bk, &self.k, layer.wk.rows, 1)?;
+        }
+        if let Some(ref bv) = layer.bv {
+            self.encode_add_bias(enc, bv, &self.v, layer.wv.rows, 1)?;
+        }
+        Ok(())
+    }
+
+    fn encode_add_bias(
+        &self,
+        enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        bias_buf: &ProtocolObject<dyn MTLBuffer>,
+        y_buf: &ProtocolObject<dyn MTLBuffer>,
+        d_out: usize,
+        n_tok: usize,
+    ) -> Result<(), MetalError> {
+        const TG: usize = 256;
+        require_fit(&self.pipes.add_bias, "add_bias_f32", TG)?;
+        let bargs = BiasArgs {
+            d_out: d_out as u32,
+            n_tok: n_tok as u32,
+        };
+        enc.setComputePipelineState(&self.pipes.add_bias);
+        // SAFETY: Buffers remain alive on `self` until `waitUntilCompleted`.
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(bias_buf), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(y_buf), 0, 1);
+            enc.setBytes_length_atIndex(
+                NonNull::from(&bargs).cast::<c_void>(),
+                core::mem::size_of::<BiasArgs>(),
+                2,
+            );
+        }
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: d_out.div_ceil(TG),
+                height: n_tok,
+                depth: 1,
+            },
+            MTLSize {
+                width: TG,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
     }
 
     fn encode_decode_attn(
@@ -1365,6 +1475,15 @@ impl LlamaMetalRunner {
                 self.encode_gemm(&enc, &layer.wq, &self.xb, &self.q, b, false)?;
                 self.encode_gemm(&enc, &layer.wk, &self.xb, &self.k, b, false)?;
                 self.encode_gemm(&enc, &layer.wv, &self.xb, &self.v, b, false)?;
+                if let Some(ref bq) = layer.bq {
+                    self.encode_add_bias(&enc, bq, &self.q, layer.wq.rows, b)?;
+                }
+                if let Some(ref bk) = layer.bk {
+                    self.encode_add_bias(&enc, bk, &self.k, layer.wk.rows, b)?;
+                }
+                if let Some(ref bv) = layer.bv {
+                    self.encode_add_bias(&enc, bv, &self.v, layer.wv.rows, b)?;
+                }
 
                 if let Some(ref qn) = layer.q_norm {
                     require_fit(&self.pipes.qk_norm_batch, "qk_norm_f32_batch", 32)?;
@@ -1475,6 +1594,9 @@ impl LlamaMetalRunner {
 
                 // Wo + residual add
                 self.encode_gemm(&enc, &layer.wo, &self.xb, &self.x, b, true)?;
+                if let Some(ref bo) = layer.bo {
+                    self.encode_add_bias(&enc, bo, &self.x, self.cfg.n_embd, b)?;
+                }
 
                 // FFN RMSNorm
                 self.encode_rms_norm_batch(
@@ -1545,6 +1667,9 @@ impl LlamaMetalRunner {
                     &self.logits,
                     false,
                 )?;
+                if let Some(ref ob) = self.output_bias {
+                    self.encode_add_bias(&enc, ob, &self.logits, self.cfg.vocab_size, 1)?;
+                }
             }
 
             enc.endEncoding();
@@ -1749,6 +1874,9 @@ impl LlamaMetalRunner {
             self.encode_decode_attn(enc, layer, pos + 1);
 
             self.encode_gemv(enc, &layer.wo, &self.xb, &self.x, true)?;
+            if let Some(ref bo) = layer.bo {
+                self.encode_add_bias(enc, bo, &self.x, self.cfg.n_embd, 1)?;
+            }
             self.encode_rms_norm(enc, &self.x, &layer.ffn_norm, &self.xb, self.cfg.n_embd)?;
 
             if layer.w_gate.dtype == DType::Q4_0
@@ -1831,6 +1959,9 @@ impl LlamaMetalRunner {
                 self.output_separate.as_ref().unwrap_or(&self.token_embd)
             };
             self.encode_gemv_named(enc, out_mat, "output.weight", &self.xb, &self.logits, false)?;
+            if let Some(ref ob) = self.output_bias {
+                self.encode_add_bias(enc, ob, &self.logits, self.cfg.vocab_size, 1)?;
+            }
         }
         Ok(())
     }
