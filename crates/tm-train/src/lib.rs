@@ -115,6 +115,10 @@ pub fn estimate_cpu_qlora_dirty_bytes(
             estimate_gemma4_qlora_dirty_bytes(m, max_seq, rank, targets, ckpt_mode)
         }
         CpuModel::Lfm2(m) => estimate_lfm2_qlora_dirty_bytes(m, max_seq, rank, targets, ckpt_mode),
+        CpuModel::Inkling2(m) => {
+            let c = &m.cfg;
+            ((max_seq * c.n_embd * 16 + c.vocab_padded * 2) * 4) as u64
+        }
     }
 }
 
@@ -131,20 +135,24 @@ impl<'a> PolyTrainer<'a> {
         max_seq: usize,
         max_rank: usize,
         ckpt_mode: CheckpointMode,
-    ) -> Self {
+    ) -> Result<Self, TrainError> {
         match model {
-            CpuModel::Llama(m) => {
-                Self::Llama(Box::new(LlamaTrainer::new(m, max_seq, max_rank, ckpt_mode)))
-            }
-            CpuModel::Qwen35(m) => Self::Qwen35(Box::new(Qwen35Trainer::new(
+            CpuModel::Llama(m) => Ok(Self::Llama(Box::new(LlamaTrainer::new(
                 m, max_seq, max_rank, ckpt_mode,
-            ))),
-            CpuModel::Gemma4(m) => Self::Gemma4(Box::new(Gemma4Trainer::new(
+            )))),
+            CpuModel::Qwen35(m) => Ok(Self::Qwen35(Box::new(Qwen35Trainer::new(
                 m, max_seq, max_rank, ckpt_mode,
+            )))),
+            CpuModel::Gemma4(m) => Ok(Self::Gemma4(Box::new(Gemma4Trainer::new(
+                m, max_seq, max_rank, ckpt_mode,
+            )))),
+            CpuModel::Lfm2(m) => Ok(Self::Lfm2(Box::new(Lfm2Trainer::new(
+                m, max_seq, max_rank, ckpt_mode,
+            )))),
+            CpuModel::Inkling2(m) => Err(TrainError::InvalidConfig(format!(
+                "QLoRA fine-tuning is not yet supported on architecture '{}'",
+                m.cfg.arch
             ))),
-            CpuModel::Lfm2(m) => {
-                Self::Lfm2(Box::new(Lfm2Trainer::new(m, max_seq, max_rank, ckpt_mode)))
-            }
         }
     }
 
@@ -216,7 +224,7 @@ where
         .unwrap_or(cfg.rank);
     let mut grads = LoraGradStore::from_adapter(&adapter);
     let trainable_params = grads.total_trainable_params();
-    let mut trainer = PolyTrainer::new(model, max_seq, max_rank, cfg.checkpoint_mode);
+    let mut trainer = PolyTrainer::new(model, max_seq, max_rank, cfg.checkpoint_mode)?;
 
     let t_total = Instant::now();
     let start_step = opt.step as usize;

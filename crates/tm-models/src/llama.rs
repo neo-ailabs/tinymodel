@@ -22,9 +22,11 @@ pub enum ModelError {
     #[error(transparent)]
     Gguf(#[from] GgufError),
     #[error(
-        "unsupported model architecture '{0}' (supports 'llama', 'qwen3', 'qwen35', 'gemma4', and 'lfm2')"
+        "unsupported model architecture '{0}' (supports 'llama', 'qwen3', 'qwen35', 'gemma4', 'lfm2', 'inkling2', and 'inkling2_loop')"
     )]
     UnsupportedArch(String),
+    #[error("invalid model configuration: {0}")]
+    InvalidConfig(String),
     #[error("position {pos} exceeds configured max_ctx {max_ctx}")]
     ContextOverflow { pos: usize, max_ctx: usize },
     #[error("token id {token_id} out of vocab range {vocab_size}")]

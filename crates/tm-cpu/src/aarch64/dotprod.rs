@@ -544,7 +544,10 @@ pub unsafe fn gemv_q4_1_q8_1(
     }
 }
 
-/// ARMv8.2 `dotprod` `vec_dot_q8_0_q8_0` (2-block unrolled).
+/// ARMv8.2 `dotprod` `vec_dot_q8_0_q8_0` (`0-ULP` bit-exact with `generic::vec_dot_q8_0_q8_0`).
+///
+/// Reduces all 32 `i8 * i8` products per block in exact `i32` arithmetic (`vpaddq_s32` / `vaddvq_s32`)
+/// before scaling by `bx.d * by.d`, matching `generic` and `avx2` bit-for-bit across all scales.
 ///
 /// # Safety
 /// Caller must ensure CPU supports `dotprod` and `x.len() == y.len()`.
@@ -553,49 +556,58 @@ pub unsafe fn vec_dot_q8_0_q8_0(x: &[BlockQ8_0], y: &[BlockQ8_0]) -> f32 {
     debug_assert_eq!(x.len(), y.len());
     let nb = x.len();
     let mut ib = 0usize;
+    let mut sumf = 0.0f32;
 
     // SAFETY: `ib` stays strictly within `0..nb`.
     unsafe {
         let zero = vdupq_n_s32(0);
-        let mut sumv0 = vdupq_n_f32(0.0);
-        let mut sumv1 = vdupq_n_f32(0.0);
 
-        while ib + 1 < nb {
+        while ib + 4 <= nb {
             let x0 = x.get_unchecked(ib);
             let x1 = x.get_unchecked(ib + 1);
+            let x2 = x.get_unchecked(ib + 2);
+            let x3 = x.get_unchecked(ib + 3);
             let y0 = y.get_unchecked(ib);
             let y1 = y.get_unchecked(ib + 1);
+            let y2 = y.get_unchecked(ib + 2);
+            let y3 = y.get_unchecked(ib + 3);
 
-            let x0l = vld1q_s8(x0.qs.as_ptr());
-            let x0h = vld1q_s8(x0.qs.as_ptr().add(16));
-            let x1l = vld1q_s8(x1.qs.as_ptr());
-            let x1h = vld1q_s8(x1.qs.as_ptr().add(16));
+            let p0 = vdotq_s32(
+                vdotq_s32(zero, vld1q_s8(x0.qs.as_ptr()), vld1q_s8(y0.qs.as_ptr())),
+                vld1q_s8(x0.qs.as_ptr().add(16)),
+                vld1q_s8(y0.qs.as_ptr().add(16)),
+            );
+            let p1 = vdotq_s32(
+                vdotq_s32(zero, vld1q_s8(x1.qs.as_ptr()), vld1q_s8(y1.qs.as_ptr())),
+                vld1q_s8(x1.qs.as_ptr().add(16)),
+                vld1q_s8(y1.qs.as_ptr().add(16)),
+            );
+            let p2 = vdotq_s32(
+                vdotq_s32(zero, vld1q_s8(x2.qs.as_ptr()), vld1q_s8(y2.qs.as_ptr())),
+                vld1q_s8(x2.qs.as_ptr().add(16)),
+                vld1q_s8(y2.qs.as_ptr().add(16)),
+            );
+            let p3 = vdotq_s32(
+                vdotq_s32(zero, vld1q_s8(x3.qs.as_ptr()), vld1q_s8(y3.qs.as_ptr())),
+                vld1q_s8(x3.qs.as_ptr().add(16)),
+                vld1q_s8(y3.qs.as_ptr().add(16)),
+            );
 
-            let y0l = vld1q_s8(y0.qs.as_ptr());
-            let y0h = vld1q_s8(y0.qs.as_ptr().add(16));
-            let y1l = vld1q_s8(y1.qs.as_ptr());
-            let y1h = vld1q_s8(y1.qs.as_ptr().add(16));
-
-            let p0 = vdotq_s32(vdotq_s32(zero, x0l, y0l), x0h, y0h);
-            let p1 = vdotq_s32(vdotq_s32(zero, x1l, y1l), x1h, y1h);
-
-            sumv0 = vmlaq_n_f32(
-                sumv0,
-                vcvtq_f32_s32(p0),
+            let sum4 = vpaddq_s32(vpaddq_s32(p0, p1), vpaddq_s32(p2, p3));
+            let scales = [
                 f16_to_f32_hw(x0.d) * f16_to_f32_hw(y0.d),
-            );
-            sumv1 = vmlaq_n_f32(
-                sumv1,
-                vcvtq_f32_s32(p1),
                 f16_to_f32_hw(x1.d) * f16_to_f32_hw(y1.d),
-            );
-
-            ib += 2;
+                f16_to_f32_hw(x2.d) * f16_to_f32_hw(y2.d),
+                f16_to_f32_hw(x3.d) * f16_to_f32_hw(y3.d),
+            ];
+            let prod4 = vmulq_f32(vcvtq_f32_s32(sum4), vld1q_f32(scales.as_ptr()));
+            let mut lanes = [0.0f32; 4];
+            vst1q_f32(lanes.as_mut_ptr(), prod4);
+            sumf = (((sumf + lanes[0]) + lanes[1]) + lanes[2]) + lanes[3];
+            ib += 4;
         }
 
-        let mut sumf = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
-
-        if ib < nb {
+        while ib < nb {
             let x0 = x.get_unchecked(ib);
             let y0 = y.get_unchecked(ib);
             let x0l = vld1q_s8(x0.qs.as_ptr());
@@ -604,6 +616,7 @@ pub unsafe fn vec_dot_q8_0_q8_0(x: &[BlockQ8_0], y: &[BlockQ8_0]) -> f32 {
             let y0h = vld1q_s8(y0.qs.as_ptr().add(16));
             let p0 = vdotq_s32(vdotq_s32(zero, x0l, y0l), x0h, y0h);
             sumf += (vaddvq_s32(p0) as f32) * (f16_to_f32_hw(x0.d) * f16_to_f32_hw(y0.d));
+            ib += 1;
         }
 
         sumf
@@ -700,7 +713,9 @@ pub unsafe fn vec_dot_q6_k_q8_k(x: &[BlockQ6K], y: &[BlockQ8K]) -> f32 {
     sumf
 }
 
-/// 4-row unrolled `dotprod` GEMV for `Q8_0 x Q8_0`: loads `x` once across 4 weight rows.
+/// 4-row unrolled `dotprod` GEMV for `Q8_0 x Q8_0`: loads `x` once across 4 weight rows and
+/// reduces each 32-element block in exact `i32` (`vpaddq_s32`) before scaling (`0-ULP` bit-exact
+/// with `generic::gemv_q8_0_q8_0` and `avx2::gemv_q8_0_q8_0`).
 ///
 /// # Safety
 /// Caller must ensure CPU supports `dotprod` and buffer lengths match dimensions.
@@ -726,80 +741,55 @@ pub unsafe fn gemv_q8_0_q8_0(
             let w1 = &w[(r + 1) * cols_blocks..(r + 2) * cols_blocks];
             let w2 = &w[(r + 2) * cols_blocks..(r + 3) * cols_blocks];
             let w3 = &w[(r + 3) * cols_blocks..(r + 4) * cols_blocks];
+            let mut acc4 = vdupq_n_f32(0.0);
 
-            let mut s0a = vdupq_n_f32(0.0);
-            let mut s0b = vdupq_n_f32(0.0);
-            let mut s1a = vdupq_n_f32(0.0);
-            let mut s1b = vdupq_n_f32(0.0);
-            let mut s2a = vdupq_n_f32(0.0);
-            let mut s2b = vdupq_n_f32(0.0);
-            let mut s3a = vdupq_n_f32(0.0);
-            let mut s3b = vdupq_n_f32(0.0);
+            for ib in 0..cols_blocks {
+                let by = x.get_unchecked(ib);
+                let yl = vld1q_s8(by.qs.as_ptr());
+                let yh = vld1q_s8(by.qs.as_ptr().add(16));
+                let dy = vdupq_n_f32(f16_to_f32_hw(by.d));
 
-            let mut ib = 0usize;
-            while ib + 1 < cols_blocks {
-                let y0 = x.get_unchecked(ib);
-                let y1 = x.get_unchecked(ib + 1);
-                let y0l = vld1q_s8(y0.qs.as_ptr());
-                let y0h = vld1q_s8(y0.qs.as_ptr().add(16));
-                let y1l = vld1q_s8(y1.qs.as_ptr());
-                let y1h = vld1q_s8(y1.qs.as_ptr().add(16));
-                let dy0 = f16_to_f32_hw(y0.d);
-                let dy1 = f16_to_f32_hw(y1.d);
+                let b0 = w0.get_unchecked(ib);
+                let b1 = w1.get_unchecked(ib);
+                let b2 = w2.get_unchecked(ib);
+                let b3 = w3.get_unchecked(ib);
 
-                macro_rules! step_q8 {
-                    ($row:expr, $sa:expr, $sb:expr) => {{
-                        let xa = $row.get_unchecked(ib);
-                        let xb = $row.get_unchecked(ib + 1);
-                        let xal = vld1q_s8(xa.qs.as_ptr());
-                        let xah = vld1q_s8(xa.qs.as_ptr().add(16));
-                        let xbl = vld1q_s8(xb.qs.as_ptr());
-                        let xbh = vld1q_s8(xb.qs.as_ptr().add(16));
-                        let pa = vdotq_s32(vdotq_s32(zero, xal, y0l), xah, y0h);
-                        let pb = vdotq_s32(vdotq_s32(zero, xbl, y1l), xbh, y1h);
-                        $sa = vmlaq_n_f32($sa, vcvtq_f32_s32(pa), f16_to_f32_hw(xa.d) * dy0);
-                        $sb = vmlaq_n_f32($sb, vcvtq_f32_s32(pb), f16_to_f32_hw(xb.d) * dy1);
-                    }};
-                }
+                let p0 = vdotq_s32(
+                    vdotq_s32(zero, vld1q_s8(b0.qs.as_ptr()), yl),
+                    vld1q_s8(b0.qs.as_ptr().add(16)),
+                    yh,
+                );
+                let p1 = vdotq_s32(
+                    vdotq_s32(zero, vld1q_s8(b1.qs.as_ptr()), yl),
+                    vld1q_s8(b1.qs.as_ptr().add(16)),
+                    yh,
+                );
+                let p2 = vdotq_s32(
+                    vdotq_s32(zero, vld1q_s8(b2.qs.as_ptr()), yl),
+                    vld1q_s8(b2.qs.as_ptr().add(16)),
+                    yh,
+                );
+                let p3 = vdotq_s32(
+                    vdotq_s32(zero, vld1q_s8(b3.qs.as_ptr()), yl),
+                    vld1q_s8(b3.qs.as_ptr().add(16)),
+                    yh,
+                );
 
-                step_q8!(w0, s0a, s0b);
-                step_q8!(w1, s1a, s1b);
-                step_q8!(w2, s2a, s2b);
-                step_q8!(w3, s3a, s3b);
-                ib += 2;
+                let sum4 = vpaddq_s32(vpaddq_s32(p0, p1), vpaddq_s32(p2, p3));
+                let dx4 = vld1q_f32(
+                    [
+                        f16_to_f32_hw(b0.d),
+                        f16_to_f32_hw(b1.d),
+                        f16_to_f32_hw(b2.d),
+                        f16_to_f32_hw(b3.d),
+                    ]
+                    .as_ptr(),
+                );
+                let scale4 = vmulq_f32(dx4, dy);
+                acc4 = vaddq_f32(acc4, vmulq_f32(vcvtq_f32_s32(sum4), scale4));
             }
 
-            let mut o0 = vaddvq_f32(s0a) + vaddvq_f32(s0b);
-            let mut o1 = vaddvq_f32(s1a) + vaddvq_f32(s1b);
-            let mut o2 = vaddvq_f32(s2a) + vaddvq_f32(s2b);
-            let mut o3 = vaddvq_f32(s3a) + vaddvq_f32(s3b);
-
-            if ib < cols_blocks {
-                let y0 = x.get_unchecked(ib);
-                let y0l = vld1q_s8(y0.qs.as_ptr());
-                let y0h = vld1q_s8(y0.qs.as_ptr().add(16));
-                let dy0 = f16_to_f32_hw(y0.d);
-
-                macro_rules! tail_q8 {
-                    ($row:expr, $acc:expr) => {{
-                        let xa = $row.get_unchecked(ib);
-                        let xal = vld1q_s8(xa.qs.as_ptr());
-                        let xah = vld1q_s8(xa.qs.as_ptr().add(16));
-                        let pa = vdotq_s32(vdotq_s32(zero, xal, y0l), xah, y0h);
-                        $acc += (vaddvq_s32(pa) as f32) * (f16_to_f32_hw(xa.d) * dy0);
-                    }};
-                }
-
-                tail_q8!(w0, o0);
-                tail_q8!(w1, o1);
-                tail_q8!(w2, o2);
-                tail_q8!(w3, o3);
-            }
-
-            *out.get_unchecked_mut(r) = o0;
-            *out.get_unchecked_mut(r + 1) = o1;
-            *out.get_unchecked_mut(r + 2) = o2;
-            *out.get_unchecked_mut(r + 3) = o3;
+            vst1q_f32(out.as_mut_ptr().add(r), acc4);
             r += 4;
         }
 
@@ -1357,7 +1347,8 @@ pub unsafe fn gemm_q4_0x4_q8_0(
 }
 
 /// Multi-token shared-weight `dotprod` GEMM for `Q8_0 x Q8_0`: loads each weight block once
-/// across up to 4 tokens per inner loop, bit-exact with `vec_dot_q8_0_q8_0`.
+/// across up to 4 tokens per inner loop (`0-ULP` bit-exact with `generic::gemm_q8_0_q8_0` and
+/// `vec_dot_q8_0_q8_0` across all batch widths).
 ///
 /// # Safety
 /// Caller must ensure CPU supports `dotprod` and buffer lengths match dimensions.
@@ -1394,84 +1385,60 @@ pub unsafe fn gemm_q8_0_q8_0(
 
             for r in 0..rows {
                 let row = &w[r * cols_blocks..(r + 1) * cols_blocks];
-                let mut s0a = vdupq_n_f32(0.0);
-                let mut s0b = vdupq_n_f32(0.0);
-                let mut s1a = vdupq_n_f32(0.0);
-                let mut s1b = vdupq_n_f32(0.0);
-                let mut s2a = vdupq_n_f32(0.0);
-                let mut s2b = vdupq_n_f32(0.0);
-                let mut s3a = vdupq_n_f32(0.0);
-                let mut s3b = vdupq_n_f32(0.0);
+                let mut acc4 = vdupq_n_f32(0.0);
 
-                let mut ib = 0usize;
-                while ib + 1 < cols_blocks {
-                    let xa = row.get_unchecked(ib);
-                    let xb = row.get_unchecked(ib + 1);
-                    let xal = vld1q_s8(xa.qs.as_ptr());
-                    let xah = vld1q_s8(xa.qs.as_ptr().add(16));
-                    let xbl = vld1q_s8(xb.qs.as_ptr());
-                    let xbh = vld1q_s8(xb.qs.as_ptr().add(16));
-                    let dxa = f16_to_f32_hw(xa.d);
-                    let dxb = f16_to_f32_hw(xb.d);
-
-                    macro_rules! step_tok_q8 {
-                        ($xt:expr, $sa:expr, $sb:expr) => {{
-                            let ya = $xt.get_unchecked(ib);
-                            let yb = $xt.get_unchecked(ib + 1);
-                            let pa = vdotq_s32(
-                                vdotq_s32(zero, xal, vld1q_s8(ya.qs.as_ptr())),
-                                xah,
-                                vld1q_s8(ya.qs.as_ptr().add(16)),
-                            );
-                            let pb = vdotq_s32(
-                                vdotq_s32(zero, xbl, vld1q_s8(yb.qs.as_ptr())),
-                                xbh,
-                                vld1q_s8(yb.qs.as_ptr().add(16)),
-                            );
-                            $sa = vmlaq_n_f32($sa, vcvtq_f32_s32(pa), dxa * f16_to_f32_hw(ya.d));
-                            $sb = vmlaq_n_f32($sb, vcvtq_f32_s32(pb), dxb * f16_to_f32_hw(yb.d));
-                        }};
-                    }
-
-                    step_tok_q8!(xt0, s0a, s0b);
-                    step_tok_q8!(xt1, s1a, s1b);
-                    step_tok_q8!(xt2, s2a, s2b);
-                    step_tok_q8!(xt3, s3a, s3b);
-                    ib += 2;
-                }
-
-                let mut o0 = vaddvq_f32(s0a) + vaddvq_f32(s0b);
-                let mut o1 = vaddvq_f32(s1a) + vaddvq_f32(s1b);
-                let mut o2 = vaddvq_f32(s2a) + vaddvq_f32(s2b);
-                let mut o3 = vaddvq_f32(s3a) + vaddvq_f32(s3b);
-
-                if ib < cols_blocks {
+                for ib in 0..cols_blocks {
                     let xa = row.get_unchecked(ib);
                     let xal = vld1q_s8(xa.qs.as_ptr());
                     let xah = vld1q_s8(xa.qs.as_ptr().add(16));
-                    let dxa = f16_to_f32_hw(xa.d);
+                    let dx = vdupq_n_f32(f16_to_f32_hw(xa.d));
 
-                    macro_rules! tail_tok_q8 {
-                        ($xt:expr, $acc:expr) => {{
-                            let ya = $xt.get_unchecked(ib);
-                            let pa = vdotq_s32(
-                                vdotq_s32(zero, xal, vld1q_s8(ya.qs.as_ptr())),
-                                xah,
-                                vld1q_s8(ya.qs.as_ptr().add(16)),
-                            );
-                            $acc += (vaddvq_s32(pa) as f32) * (dxa * f16_to_f32_hw(ya.d));
-                        }};
-                    }
-                    tail_tok_q8!(xt0, o0);
-                    tail_tok_q8!(xt1, o1);
-                    tail_tok_q8!(xt2, o2);
-                    tail_tok_q8!(xt3, o3);
+                    let y0 = xt0.get_unchecked(ib);
+                    let y1 = xt1.get_unchecked(ib);
+                    let y2 = xt2.get_unchecked(ib);
+                    let y3 = xt3.get_unchecked(ib);
+
+                    let p0 = vdotq_s32(
+                        vdotq_s32(zero, xal, vld1q_s8(y0.qs.as_ptr())),
+                        xah,
+                        vld1q_s8(y0.qs.as_ptr().add(16)),
+                    );
+                    let p1 = vdotq_s32(
+                        vdotq_s32(zero, xal, vld1q_s8(y1.qs.as_ptr())),
+                        xah,
+                        vld1q_s8(y1.qs.as_ptr().add(16)),
+                    );
+                    let p2 = vdotq_s32(
+                        vdotq_s32(zero, xal, vld1q_s8(y2.qs.as_ptr())),
+                        xah,
+                        vld1q_s8(y2.qs.as_ptr().add(16)),
+                    );
+                    let p3 = vdotq_s32(
+                        vdotq_s32(zero, xal, vld1q_s8(y3.qs.as_ptr())),
+                        xah,
+                        vld1q_s8(y3.qs.as_ptr().add(16)),
+                    );
+
+                    let sum4 = vpaddq_s32(vpaddq_s32(p0, p1), vpaddq_s32(p2, p3));
+                    let dy4 = vld1q_f32(
+                        [
+                            f16_to_f32_hw(y0.d),
+                            f16_to_f32_hw(y1.d),
+                            f16_to_f32_hw(y2.d),
+                            f16_to_f32_hw(y3.d),
+                        ]
+                        .as_ptr(),
+                    );
+                    let scale4 = vmulq_f32(dx, dy4);
+                    acc4 = vaddq_f32(acc4, vmulq_f32(vcvtq_f32_s32(sum4), scale4));
                 }
 
-                *out.get_unchecked_mut(t0 * rows + r) = o0;
-                *out.get_unchecked_mut((t0 + 1) * rows + r) = o1;
-                *out.get_unchecked_mut((t0 + 2) * rows + r) = o2;
-                *out.get_unchecked_mut((t0 + 3) * rows + r) = o3;
+                let mut res = [0.0f32; 4];
+                vst1q_f32(res.as_mut_ptr(), acc4);
+                *out.get_unchecked_mut(t0 * rows + r) = res[0];
+                *out.get_unchecked_mut((t0 + 1) * rows + r) = res[1];
+                *out.get_unchecked_mut((t0 + 2) * rows + r) = res[2];
+                *out.get_unchecked_mut((t0 + 3) * rows + r) = res[3];
             }
             t0 += 4;
         }

@@ -611,6 +611,36 @@ impl GgufFile {
         self.tensors.get(name)
     }
 
+    /// Returns `(TensorInfo, absolute_file_offset, byte_len)` after validating `expected_dims`,
+    /// WITHOUT touching the `mmap` pages of the tensor (allowing `DirectTensorReader` to load
+    /// multi-GiB tensors via `O_DIRECT` without polluting Linux page cache).
+    pub fn req_tensor_file_range(
+        &self,
+        name: &str,
+        layer: &str,
+        expected_dims: &[usize],
+    ) -> Result<(&TensorInfo, u64, usize), GgufError> {
+        let info = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| GgufError::MissingTensor {
+                path: self.path.display().to_string(),
+                tensor: name.to_string(),
+                layer: layer.to_string(),
+            })?;
+        if info.dims.as_slice() != expected_dims {
+            return Err(GgufError::TensorShapeMismatch {
+                path: self.path.display().to_string(),
+                tensor: name.to_string(),
+                layer: layer.to_string(),
+                expected: expected_dims.to_vec(),
+                actual: info.dims.clone(),
+            });
+        }
+        let abs_offset = (self.data_offset + info.offset) as u64;
+        Ok((info, abs_offset, info.byte_len))
+    }
+
     /// Borrows the raw mmap bytes for tensor `name` (zero copy).
     pub fn tensor_bytes(&self, name: &str, layer: &str) -> Result<(&TensorInfo, &[u8]), GgufError> {
         let info = self
@@ -2005,6 +2035,188 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// Pre-allocated 4096-byte page-aligned buffer for zero-allocation `O_DIRECT` NVMe reads.
+///
+/// Implemented in 100% safe Rust (zero `unsafe` blocks) by over-allocating `4096` bytes and
+/// computing the runtime alignment offset once at construction.
+pub struct PageAlignedSlot {
+    buf: Vec<u8>,
+    base_pad: usize,
+    cap_aligned: usize,
+}
+
+impl PageAlignedSlot {
+    pub fn new(min_bytes: usize) -> Self {
+        // Add 2 extra 4 KiB pages for unaligned head/tail file offsets + 1 page for base pointer alignment.
+        let cap_aligned = (min_bytes + 8192).next_multiple_of(4096);
+        let buf = vec![0u8; cap_aligned + 4096];
+        let addr = buf.as_ptr() as usize;
+        let base_pad = (4096 - (addr & 4095)) & 4095;
+        debug_assert_eq!((addr + base_pad) & 4095, 0);
+        Self {
+            buf,
+            base_pad,
+            cap_aligned,
+        }
+    }
+
+    #[inline]
+    pub fn aligned_mut(&mut self, aligned_len: usize) -> &mut [u8] {
+        assert!(aligned_len <= self.cap_aligned && aligned_len.is_multiple_of(4096));
+        &mut self.buf[self.base_pad..self.base_pad + aligned_len]
+    }
+
+    #[inline]
+    pub fn subslice(&self, offset: usize, len: usize) -> &[u8] {
+        &self.buf[self.base_pad + offset..self.base_pad + offset + len]
+    }
+}
+
+/// Uncached (`O_DIRECT` on Linux when supported, standard `pread` fallback) random-access GGUF
+/// tensor & MoE expert reader (`ADR-016`).
+///
+/// Keeps multi-GiB Tier 0 / Tier 1 / Tier 2 expert reads completely out of the OS page cache
+/// while performing zero heap allocations on the token generation path.
+pub struct DirectTensorReader {
+    path: String,
+    #[cfg(unix)]
+    direct_file: Option<File>,
+    fallback_file: File,
+}
+
+impl DirectTensorReader {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, GgufError> {
+        let p = path.as_ref();
+        let path_str = p.display().to_string();
+        let fallback_file = File::open(p).map_err(|source| GgufError::Io {
+            path: path_str.clone(),
+            source,
+        })?;
+
+        #[cfg(target_os = "linux")]
+        let direct_file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
+            const O_DIRECT_FLAG: i32 = 0x10000;
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
+            const O_DIRECT_FLAG: i32 = 0x4000;
+
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(O_DIRECT_FLAG)
+                .open(p)
+                .ok()
+        };
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let direct_file: Option<File> = None;
+
+        Ok(Self {
+            path: path_str,
+            #[cfg(unix)]
+            direct_file,
+            fallback_file,
+        })
+    }
+
+    pub fn is_o_direct(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.direct_file.is_some()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    /// Reads `[file_offset .. file_offset + len)` directly into `slot` and returns the exact
+    /// sub-slice `&[u8]` inside `slot` (preserving 32-byte GGUF block alignment without extra copies!).
+    pub fn read_into_slot<'a>(
+        &self,
+        file_offset: u64,
+        len: usize,
+        slot: &'a mut PageAlignedSlot,
+    ) -> Result<&'a [u8], GgufError> {
+        let aligned_start = file_offset & !4095u64;
+        let head_pad = (file_offset - aligned_start) as usize;
+        let aligned_len = (head_pad + len).next_multiple_of(4096);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            let dst = slot.aligned_mut(aligned_len);
+            if let Some(ref df) = self.direct_file {
+                let mut read_total = 0usize;
+                let mut ok = true;
+                while read_total < aligned_len {
+                    match df.read_at(&mut dst[read_total..], aligned_start + read_total as u64) {
+                        Ok(0) => break,
+                        Ok(n) => read_total += n,
+                        Err(_) => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok && read_total >= head_pad + len {
+                    return Ok(slot.subslice(head_pad, len));
+                }
+            }
+            // Fallback (e.g., EOF tail page shorter than 4096 bytes or filesystem without O_DIRECT)
+            self.fallback_file
+                .read_exact_at(&mut dst[head_pad..head_pad + len], file_offset)
+                .map_err(|source| GgufError::Io {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            Ok(slot.subslice(head_pad, len))
+        }
+
+        #[cfg(not(unix))]
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f = self
+                .fallback_file
+                .try_clone()
+                .map_err(|source| GgufError::Io {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            f.seek(SeekFrom::Start(file_offset))
+                .map_err(|source| GgufError::Io {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            let dst = slot.aligned_mut(aligned_len);
+            f.read_exact(&mut dst[head_pad..head_pad + len])
+                .map_err(|source| GgufError::Io {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            Ok(slot.subslice(head_pad, len))
+        }
+    }
+
+    /// Streams a large tensor range `[file_offset .. file_offset + dst.len())` into `dst` in
+    /// reusable `O_DIRECT` chunks (`slot`), leaving 0 bytes of clean file cache behind in RAM.
+    pub fn read_exact_uncached(
+        &self,
+        file_offset: u64,
+        dst: &mut [u8],
+        slot: &mut PageAlignedSlot,
+    ) -> Result<(), GgufError> {
+        let max_chunk = slot.cap_aligned.saturating_sub(8192).max(4096);
+        let mut done = 0usize;
+        while done < dst.len() {
+            let take = (dst.len() - done).min(max_chunk);
+            let s = self.read_into_slot(file_offset + done as u64, take, slot)?;
+            dst[done..done + take].copy_from_slice(s);
+            done += take;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2035,11 +2247,70 @@ mod tests {
 
         // Crafted huge n_kv (must not OOM, must return UnexpectedEof)
         let mut buf = Vec::new();
-        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&b"GGUF"[..]);
         buf.extend_from_slice(&3u32.to_le_bytes());
         buf.extend_from_slice(&0u64.to_le_bytes());
         buf.extend_from_slice(&u64::MAX.to_le_bytes());
         let err = GgufFile::from_bytes("huge_kv.gguf", buf).err().unwrap();
         assert!(matches!(err, GgufError::UnexpectedEof { .. }));
+    }
+
+    #[test]
+    fn direct_tensor_reader_matches_mmap_bytes_and_preserves_alignment() {
+        let mut slot = PageAlignedSlot::new(65536);
+        let ptr = slot.aligned_mut(4096).as_ptr() as usize;
+        assert_eq!(ptr % 4096, 0, "PageAlignedSlot base must be 4096-aligned");
+
+        // Test against a temporary file with non-4096-aligned 32-byte-aligned offsets & EOF tail
+        let tmp_path =
+            std::env::temp_dir().join(format!("tm_direct_reader_test_{}.bin", std::process::id()));
+        let total = 20_000usize; // deliberately not a multiple of 4096 to exercise EOF fallback too
+        let expected: Vec<u8> = (0..total)
+            .map(|i| ((i.wrapping_mul(131).wrapping_add(17)) & 0xFF) as u8)
+            .collect();
+        std::fs::write(&tmp_path, &expected).unwrap();
+
+        let reader = DirectTensorReader::open(&tmp_path).unwrap();
+        for &(off, len) in &[(0usize, 4096usize), (96, 8192), (4128, 5024), (16032, 3968)] {
+            let got = reader.read_into_slot(off as u64, len, &mut slot).unwrap();
+            assert_eq!(
+                got,
+                &expected[off..off + len],
+                "mismatch at off={off} len={len}"
+            );
+            assert_eq!(
+                (got.as_ptr() as usize) % 32,
+                off % 32,
+                "32-byte GGUF alignment modulo must be preserved"
+            );
+        }
+
+        let mut full_copy = vec![0u8; 12_345];
+        reader
+            .read_exact_uncached(320, &mut full_copy, &mut slot)
+            .unwrap();
+        assert_eq!(&full_copy[..], &expected[320..320 + 12_345]);
+        let _ = std::fs::remove_file(&tmp_path);
+
+        // If dspark GGUF is present locally, also verify req_tensor_file_range vs req_tensor_bytes
+        let dspark = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/inkling2/dspark-Inkling-2-Mini-Q8_0.gguf");
+        if dspark.exists() {
+            let gguf = GgufFile::open(&dspark).unwrap();
+            let dreader = DirectTensorReader::open(&dspark).unwrap();
+            let mut dslot = PageAlignedSlot::new(16 * 1024 * 1024);
+            for tname in gguf.tensor_names().iter().take(4) {
+                let (info, mmap_bytes) = gguf.tensor_bytes(tname, "test").unwrap();
+                let (_, f_off, b_len) = gguf
+                    .req_tensor_file_range(tname, "test", &info.dims)
+                    .unwrap();
+                assert_eq!(b_len, mmap_bytes.len());
+                let direct_bytes = dreader.read_into_slot(f_off, b_len, &mut dslot).unwrap();
+                assert_eq!(
+                    direct_bytes, mmap_bytes,
+                    "DirectTensorReader mismatch on {tname}"
+                );
+            }
+        }
     }
 }

@@ -1,0 +1,995 @@
+//! `x86_64` `AVX2 + FMA` compute kernels (`100%` Rust stable, `0-ULP` bit-exact with `generic`).
+//!
+//! Algorithm design inspired by ggml `ggml/src/ggml-cpu/arch/x86/quants.c`
+//! (Copyright (c) 2023-2026 The ggml authors, MIT License) and Strata `src/quant/x86/`
+//! (Copyright (c) 2026 Niko1221 and the Strata contributors, MIT License).
+//!
+//! Key arithmetic invariants (`AGENTS.md` Rule #3 & §9):
+//! - Every integer block dot product (`32` elements for `Q8_0` / `Q4_0` / `Q4_0x4`) is widened
+//!   through `_mm256_cvtepi8_epi16` + `_mm256_madd_epi16` directly into `i32` lanes, completely
+//!   eliminating `i16` overflow even on adversarial `[-128; 32] x [-128; 32]` inputs (`+524,288`).
+//! - Floating-point block accumulation strictly mirrors `generic`:
+//!   - `Q8_0`: `_mm_add_ps(acc, _mm_mul_ps(sumi, scale))` (matches `generic::vec_dot_q8_0_q8_0`);
+//!   - `Q4_0` / `Q4_0x4`: `_mm_fmadd_ps(sumi, scale, acc)` (matches `generic::vec_dot_q4_0_q8_0`
+//!     and `generic::gemv_q4_0x4_q8_0`);
+//!   - `rms_norm_f32` / `l2_norm_f32` / `dot_f32_bf16` / `dot_f32_q8_0`: 8-wide `_mm256_fmadd_ps`
+//!     with exact `(lo128 + hi128)` pairwise reduction matching `generic` bit-for-bit.
+
+use core::arch::x86_64::*;
+use tm_core::{BlockQ4_0, BlockQ4_0x4, BlockQ8_0, QK8_0, f16_to_f32};
+
+use crate::generic;
+
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn hsum_epi32_avx2(v: __m256i) -> i32 {
+    let lo = _mm256_castsi256_si128(v);
+    let hi = _mm256_extracti128_si256::<1>(v);
+    let s4 = _mm_add_epi32(lo, hi);
+    let s2 = _mm_add_epi32(s4, _mm_srli_si128::<8>(s4));
+    let s1 = _mm_add_epi32(s2, _mm_srli_si128::<4>(s2));
+    _mm_cvtsi128_si32(s1)
+}
+
+/// Reduces four 8-lane `__m256i` integer accumulators `[p0, p1, p2, p3]` into a single
+/// 4-lane `__m128i` `[sum(p0), sum(p1), sum(p2), sum(p3)]`.
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn hsum4_epi32_avx2(p0: __m256i, p1: __m256i, p2: __m256i, p3: __m256i) -> __m128i {
+    let h01 = _mm256_hadd_epi32(p0, p1);
+    let h23 = _mm256_hadd_epi32(p2, p3);
+    let h0123 = _mm256_hadd_epi32(h01, h23);
+    _mm_add_epi32(
+        _mm256_castsi256_si128(h0123),
+        _mm256_extracti128_si256::<1>(h0123),
+    )
+}
+
+/// Unpacks 16 packed `Q4_0` bytes (`low` nibbles -> `[0..16]`, `high` nibbles -> `[16..32]`, minus 8)
+/// into two 16-lane `i16` AVX2 vectors `(xl16, xh16)`.
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn unpack_q4_0_i16_avx2(
+    q128: __m128i,
+    mask_lo: __m128i,
+    eight8: __m128i,
+) -> (__m256i, __m256i) {
+    let lo8 = _mm_sub_epi8(_mm_and_si128(q128, mask_lo), eight8);
+    let hi8 = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16::<4>(q128), mask_lo), eight8);
+    (_mm256_cvtepi8_epi16(lo8), _mm256_cvtepi8_epi16(hi8))
+}
+
+/// Single-row `AVX2 + FMA` `vec_dot_q4_0_q8_0` (`0-ULP` bit-exact with `generic::vec_dot_q4_0_q8_0`).
+///
+/// # Safety
+/// Caller must ensure `avx2` and `fma` CPU features are supported.
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn vec_dot_q4_0_q8_0(x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
+    debug_assert_eq!(x.len(), y.len());
+    let nb = x.len();
+    let mask_lo = _mm_set1_epi8(0x0F);
+    let eight8 = _mm_set1_epi8(8);
+    let mut sumf = 0.0f32;
+
+    // SAFETY: Loop index `ib` is strictly `< nb == x.len() == y.len()`, and `qs` arrays have fixed lengths 16 and 32.
+    unsafe {
+        for ib in 0..nb {
+            let bx = x.get_unchecked(ib);
+            let by = y.get_unchecked(ib);
+            let q = _mm_loadu_si128(bx.qs.as_ptr() as *const __m128i);
+            let (xl16, xh16) = unpack_q4_0_i16_avx2(q, mask_lo, eight8);
+            let yl16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(by.qs.as_ptr() as *const __m128i));
+            let yh16 =
+                _mm256_cvtepi8_epi16(_mm_loadu_si128(by.qs.as_ptr().add(16) as *const __m128i));
+            let p = _mm256_add_epi32(_mm256_madd_epi16(xl16, yl16), _mm256_madd_epi16(xh16, yh16));
+            let sumi = hsum_epi32_avx2(p);
+            let scale = f16_to_f32(bx.d) * f16_to_f32(by.d);
+            sumf = (sumi as f32).mul_add(scale, sumf);
+        }
+    }
+
+    sumf
+}
+
+/// 4-row shared-activation `AVX2 + FMA` `gemv_q4_0_q8_0`.
+///
+/// # Safety
+/// Caller must ensure `avx2` and `fma` CPU features are supported.
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn gemv_q4_0_q8_0(
+    w: &[BlockQ4_0],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), cols_blocks);
+    assert_eq!(out.len(), rows);
+
+    let mask_lo = _mm_set1_epi8(0x0F);
+    let eight8 = _mm_set1_epi8(8);
+    let mut r = 0usize;
+
+    // SAFETY: Row and block bounds are verified by assertions above.
+    unsafe {
+        while r + 4 <= rows {
+            let w0 = &w[r * cols_blocks..(r + 1) * cols_blocks];
+            let w1 = &w[(r + 1) * cols_blocks..(r + 2) * cols_blocks];
+            let w2 = &w[(r + 2) * cols_blocks..(r + 3) * cols_blocks];
+            let w3 = &w[(r + 3) * cols_blocks..(r + 4) * cols_blocks];
+            let mut acc4 = _mm_setzero_ps();
+
+            for ib in 0..cols_blocks {
+                let by = x.get_unchecked(ib);
+                let yl16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(by.qs.as_ptr() as *const __m128i));
+                let yh16 =
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(by.qs.as_ptr().add(16) as *const __m128i));
+                let dy = _mm_set1_ps(f16_to_f32(by.d));
+
+                let b0 = w0.get_unchecked(ib);
+                let b1 = w1.get_unchecked(ib);
+                let b2 = w2.get_unchecked(ib);
+                let b3 = w3.get_unchecked(ib);
+
+                let (x0l, x0h) = unpack_q4_0_i16_avx2(
+                    _mm_loadu_si128(b0.qs.as_ptr() as *const __m128i),
+                    mask_lo,
+                    eight8,
+                );
+                let (x1l, x1h) = unpack_q4_0_i16_avx2(
+                    _mm_loadu_si128(b1.qs.as_ptr() as *const __m128i),
+                    mask_lo,
+                    eight8,
+                );
+                let (x2l, x2h) = unpack_q4_0_i16_avx2(
+                    _mm_loadu_si128(b2.qs.as_ptr() as *const __m128i),
+                    mask_lo,
+                    eight8,
+                );
+                let (x3l, x3h) = unpack_q4_0_i16_avx2(
+                    _mm_loadu_si128(b3.qs.as_ptr() as *const __m128i),
+                    mask_lo,
+                    eight8,
+                );
+
+                let p0 =
+                    _mm256_add_epi32(_mm256_madd_epi16(x0l, yl16), _mm256_madd_epi16(x0h, yh16));
+                let p1 =
+                    _mm256_add_epi32(_mm256_madd_epi16(x1l, yl16), _mm256_madd_epi16(x1h, yh16));
+                let p2 =
+                    _mm256_add_epi32(_mm256_madd_epi16(x2l, yl16), _mm256_madd_epi16(x2h, yh16));
+                let p3 =
+                    _mm256_add_epi32(_mm256_madd_epi16(x3l, yl16), _mm256_madd_epi16(x3h, yh16));
+
+                let sum4 = _mm_cvtepi32_ps(hsum4_epi32_avx2(p0, p1, p2, p3));
+                let dx4 = _mm_set_ps(
+                    f16_to_f32(b3.d),
+                    f16_to_f32(b2.d),
+                    f16_to_f32(b1.d),
+                    f16_to_f32(b0.d),
+                );
+                let scale4 = _mm_mul_ps(dx4, dy);
+                acc4 = _mm_fmadd_ps(sum4, scale4, acc4);
+            }
+
+            _mm_storeu_ps(out.as_mut_ptr().add(r), acc4);
+            r += 4;
+        }
+
+        while r < rows {
+            *out.get_unchecked_mut(r) =
+                vec_dot_q4_0_q8_0(&w[r * cols_blocks..(r + 1) * cols_blocks], x);
+            r += 1;
+        }
+    }
+}
+
+/// Multi-token shared-weight `AVX2 + FMA` `gemm_q4_0_q8_0`: unpacks each weight block ONCE
+/// across up to `4` tokens in registers (`0-ULP` batch-width invariant!).
+///
+/// # Safety
+/// Caller must ensure `avx2` and `fma` CPU features are supported.
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn gemm_q4_0_q8_0(
+    w: &[BlockQ4_0],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+    n_tokens: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), n_tokens * cols_blocks);
+    assert_eq!(out.len(), n_tokens * rows);
+
+    if n_tokens == 0 {
+        return;
+    }
+    if n_tokens == 1 {
+        // SAFETY: Same target features guaranteed by caller.
+        unsafe { gemv_q4_0_q8_0(w, x, out, rows, cols_blocks) };
+        return;
+    }
+
+    let mask_lo = _mm_set1_epi8(0x0F);
+    let eight8 = _mm_set1_epi8(8);
+
+    // SAFETY: All slice accesses are bounded by assertions above.
+    unsafe {
+        let mut t0 = 0usize;
+        while t0 < n_tokens {
+            let bt = (n_tokens - t0).min(4);
+            let mut r = 0usize;
+            while r + 4 <= rows {
+                let w0 = &w[r * cols_blocks..(r + 1) * cols_blocks];
+                let w1 = &w[(r + 1) * cols_blocks..(r + 2) * cols_blocks];
+                let w2 = &w[(r + 2) * cols_blocks..(r + 3) * cols_blocks];
+                let w3 = &w[(r + 3) * cols_blocks..(r + 4) * cols_blocks];
+                let mut acc = [_mm_setzero_ps(); 4];
+
+                for ib in 0..cols_blocks {
+                    let b0 = w0.get_unchecked(ib);
+                    let b1 = w1.get_unchecked(ib);
+                    let b2 = w2.get_unchecked(ib);
+                    let b3 = w3.get_unchecked(ib);
+
+                    let (x0l, x0h) = unpack_q4_0_i16_avx2(
+                        _mm_loadu_si128(b0.qs.as_ptr() as *const __m128i),
+                        mask_lo,
+                        eight8,
+                    );
+                    let (x1l, x1h) = unpack_q4_0_i16_avx2(
+                        _mm_loadu_si128(b1.qs.as_ptr() as *const __m128i),
+                        mask_lo,
+                        eight8,
+                    );
+                    let (x2l, x2h) = unpack_q4_0_i16_avx2(
+                        _mm_loadu_si128(b2.qs.as_ptr() as *const __m128i),
+                        mask_lo,
+                        eight8,
+                    );
+                    let (x3l, x3h) = unpack_q4_0_i16_avx2(
+                        _mm_loadu_si128(b3.qs.as_ptr() as *const __m128i),
+                        mask_lo,
+                        eight8,
+                    );
+                    let dx4 = _mm_set_ps(
+                        f16_to_f32(b3.d),
+                        f16_to_f32(b2.d),
+                        f16_to_f32(b1.d),
+                        f16_to_f32(b0.d),
+                    );
+
+                    for (ti, acc_ti) in acc.iter_mut().enumerate().take(bt) {
+                        let by = x.get_unchecked((t0 + ti) * cols_blocks + ib);
+                        let yl16 =
+                            _mm256_cvtepi8_epi16(_mm_loadu_si128(by.qs.as_ptr() as *const __m128i));
+                        let yh16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                            by.qs.as_ptr().add(16) as *const __m128i
+                        ));
+                        let p0 = _mm256_add_epi32(
+                            _mm256_madd_epi16(x0l, yl16),
+                            _mm256_madd_epi16(x0h, yh16),
+                        );
+                        let p1 = _mm256_add_epi32(
+                            _mm256_madd_epi16(x1l, yl16),
+                            _mm256_madd_epi16(x1h, yh16),
+                        );
+                        let p2 = _mm256_add_epi32(
+                            _mm256_madd_epi16(x2l, yl16),
+                            _mm256_madd_epi16(x2h, yh16),
+                        );
+                        let p3 = _mm256_add_epi32(
+                            _mm256_madd_epi16(x3l, yl16),
+                            _mm256_madd_epi16(x3h, yh16),
+                        );
+                        let sum4 = _mm_cvtepi32_ps(hsum4_epi32_avx2(p0, p1, p2, p3));
+                        let scale4 = _mm_mul_ps(dx4, _mm_set1_ps(f16_to_f32(by.d)));
+                        *acc_ti = _mm_fmadd_ps(sum4, scale4, *acc_ti);
+                    }
+                }
+
+                for (ti, &acc_ti) in acc.iter().enumerate().take(bt) {
+                    _mm_storeu_ps(out.as_mut_ptr().add((t0 + ti) * rows + r), acc_ti);
+                }
+                r += 4;
+            }
+
+            while r < rows {
+                let w_row = &w[r * cols_blocks..(r + 1) * cols_blocks];
+                for ti in 0..bt {
+                    let xt = &x[(t0 + ti) * cols_blocks..(t0 + ti + 1) * cols_blocks];
+                    *out.get_unchecked_mut((t0 + ti) * rows + r) = vec_dot_q4_0_q8_0(w_row, xt);
+                }
+                r += 1;
+            }
+            t0 += bt;
+        }
+    }
+}
+
+/// 4-row `AVX2 + FMA` `gemv_q4_0x4_q8_0` (`0-ULP` bit-exact with `generic::gemv_q4_0x4_q8_0`).
+///
+/// # Safety
+/// Caller must ensure `avx2` and `fma` CPU features are supported.
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn gemv_q4_0x4_q8_0(
+    w: &[BlockQ4_0x4],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+) {
+    assert_eq!(rows % 4, 0);
+    assert_eq!(w.len(), (rows / 4) * cols_blocks);
+    assert_eq!(x.len(), cols_blocks);
+    assert_eq!(out.len(), rows);
+
+    let mask_lo = _mm_set1_epi8(0x0F);
+    let eight8 = _mm_set1_epi8(8);
+
+    // SAFETY: `rg` and `ib` stay within verified slice bounds.
+    unsafe {
+        for rg in 0..(rows / 4) {
+            let w_group = &w[rg * cols_blocks..(rg + 1) * cols_blocks];
+            let mut acc4 = _mm_setzero_ps();
+
+            for ib in 0..cols_blocks {
+                let sb = w_group.get_unchecked(ib);
+                let by = x.get_unchecked(ib);
+                let yl16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(by.qs.as_ptr() as *const __m128i));
+                let yh16 =
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(by.qs.as_ptr().add(16) as *const __m128i));
+                let dy = _mm_set1_ps(f16_to_f32(by.d));
+
+                let qs_ptr = sb.qs.as_ptr();
+                let r0_q = _mm_set_epi64x(
+                    core::ptr::read_unaligned(qs_ptr.add(16) as *const i64),
+                    core::ptr::read_unaligned(qs_ptr as *const i64),
+                );
+                let r1_q = _mm_set_epi64x(
+                    core::ptr::read_unaligned(qs_ptr.add(24) as *const i64),
+                    core::ptr::read_unaligned(qs_ptr.add(8) as *const i64),
+                );
+                let r2_q = _mm_set_epi64x(
+                    core::ptr::read_unaligned(qs_ptr.add(48) as *const i64),
+                    core::ptr::read_unaligned(qs_ptr.add(32) as *const i64),
+                );
+                let r3_q = _mm_set_epi64x(
+                    core::ptr::read_unaligned(qs_ptr.add(56) as *const i64),
+                    core::ptr::read_unaligned(qs_ptr.add(40) as *const i64),
+                );
+
+                let (x0l, x0h) = unpack_q4_0_i16_avx2(r0_q, mask_lo, eight8);
+                let (x1l, x1h) = unpack_q4_0_i16_avx2(r1_q, mask_lo, eight8);
+                let (x2l, x2h) = unpack_q4_0_i16_avx2(r2_q, mask_lo, eight8);
+                let (x3l, x3h) = unpack_q4_0_i16_avx2(r3_q, mask_lo, eight8);
+
+                let p0 =
+                    _mm256_add_epi32(_mm256_madd_epi16(x0l, yl16), _mm256_madd_epi16(x0h, yh16));
+                let p1 =
+                    _mm256_add_epi32(_mm256_madd_epi16(x1l, yl16), _mm256_madd_epi16(x1h, yh16));
+                let p2 =
+                    _mm256_add_epi32(_mm256_madd_epi16(x2l, yl16), _mm256_madd_epi16(x2h, yh16));
+                let p3 =
+                    _mm256_add_epi32(_mm256_madd_epi16(x3l, yl16), _mm256_madd_epi16(x3h, yh16));
+
+                let sum4 = _mm_cvtepi32_ps(hsum4_epi32_avx2(p0, p1, p2, p3));
+                let dx4 = _mm_set_ps(
+                    f16_to_f32(sb.d[3]),
+                    f16_to_f32(sb.d[2]),
+                    f16_to_f32(sb.d[1]),
+                    f16_to_f32(sb.d[0]),
+                );
+                acc4 = _mm_fmadd_ps(sum4, _mm_mul_ps(dx4, dy), acc4);
+            }
+
+            _mm_storeu_ps(out.as_mut_ptr().add(rg * 4), acc4);
+        }
+    }
+}
+
+/// Multi-token shared-weight `AVX2 + FMA` `gemm_q4_0x4_q8_0`.
+///
+/// # Safety
+/// Caller must ensure `avx2` and `fma` CPU features are supported.
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn gemm_q4_0x4_q8_0(
+    w: &[BlockQ4_0x4],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+    n_tokens: usize,
+) {
+    assert_eq!(rows % 4, 0);
+    assert_eq!(w.len(), (rows / 4) * cols_blocks);
+    assert_eq!(x.len(), n_tokens * cols_blocks);
+    assert_eq!(out.len(), n_tokens * rows);
+
+    if n_tokens == 0 {
+        return;
+    }
+    if n_tokens == 1 {
+        // SAFETY: Same target features guaranteed by caller.
+        unsafe { gemv_q4_0x4_q8_0(w, x, out, rows, cols_blocks) };
+        return;
+    }
+
+    let mask_lo = _mm_set1_epi8(0x0F);
+    let eight8 = _mm_set1_epi8(8);
+
+    // SAFETY: All slice accesses stay within asserted bounds.
+    unsafe {
+        let mut t0 = 0usize;
+        while t0 < n_tokens {
+            let bt = (n_tokens - t0).min(4);
+            for rg in 0..(rows / 4) {
+                let w_group = &w[rg * cols_blocks..(rg + 1) * cols_blocks];
+                let mut acc = [_mm_setzero_ps(); 4];
+
+                for ib in 0..cols_blocks {
+                    let sb = w_group.get_unchecked(ib);
+                    let qs_ptr = sb.qs.as_ptr();
+                    let r0_q = _mm_set_epi64x(
+                        core::ptr::read_unaligned(qs_ptr.add(16) as *const i64),
+                        core::ptr::read_unaligned(qs_ptr as *const i64),
+                    );
+                    let r1_q = _mm_set_epi64x(
+                        core::ptr::read_unaligned(qs_ptr.add(24) as *const i64),
+                        core::ptr::read_unaligned(qs_ptr.add(8) as *const i64),
+                    );
+                    let r2_q = _mm_set_epi64x(
+                        core::ptr::read_unaligned(qs_ptr.add(48) as *const i64),
+                        core::ptr::read_unaligned(qs_ptr.add(32) as *const i64),
+                    );
+                    let r3_q = _mm_set_epi64x(
+                        core::ptr::read_unaligned(qs_ptr.add(56) as *const i64),
+                        core::ptr::read_unaligned(qs_ptr.add(40) as *const i64),
+                    );
+
+                    let (x0l, x0h) = unpack_q4_0_i16_avx2(r0_q, mask_lo, eight8);
+                    let (x1l, x1h) = unpack_q4_0_i16_avx2(r1_q, mask_lo, eight8);
+                    let (x2l, x2h) = unpack_q4_0_i16_avx2(r2_q, mask_lo, eight8);
+                    let (x3l, x3h) = unpack_q4_0_i16_avx2(r3_q, mask_lo, eight8);
+                    let dx4 = _mm_set_ps(
+                        f16_to_f32(sb.d[3]),
+                        f16_to_f32(sb.d[2]),
+                        f16_to_f32(sb.d[1]),
+                        f16_to_f32(sb.d[0]),
+                    );
+
+                    for (ti, acc_ti) in acc.iter_mut().enumerate().take(bt) {
+                        let by = x.get_unchecked((t0 + ti) * cols_blocks + ib);
+                        let yl16 =
+                            _mm256_cvtepi8_epi16(_mm_loadu_si128(by.qs.as_ptr() as *const __m128i));
+                        let yh16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                            by.qs.as_ptr().add(16) as *const __m128i
+                        ));
+                        let p0 = _mm256_add_epi32(
+                            _mm256_madd_epi16(x0l, yl16),
+                            _mm256_madd_epi16(x0h, yh16),
+                        );
+                        let p1 = _mm256_add_epi32(
+                            _mm256_madd_epi16(x1l, yl16),
+                            _mm256_madd_epi16(x1h, yh16),
+                        );
+                        let p2 = _mm256_add_epi32(
+                            _mm256_madd_epi16(x2l, yl16),
+                            _mm256_madd_epi16(x2h, yh16),
+                        );
+                        let p3 = _mm256_add_epi32(
+                            _mm256_madd_epi16(x3l, yl16),
+                            _mm256_madd_epi16(x3h, yh16),
+                        );
+                        let sum4 = _mm_cvtepi32_ps(hsum4_epi32_avx2(p0, p1, p2, p3));
+                        let scale4 = _mm_mul_ps(dx4, _mm_set1_ps(f16_to_f32(by.d)));
+                        *acc_ti = _mm_fmadd_ps(sum4, scale4, *acc_ti);
+                    }
+                }
+
+                for (ti, &acc_ti) in acc.iter().enumerate().take(bt) {
+                    _mm_storeu_ps(out.as_mut_ptr().add((t0 + ti) * rows + rg * 4), acc_ti);
+                }
+            }
+            t0 += bt;
+        }
+    }
+}
+
+/// Single-row `AVX2` `vec_dot_q8_0_q8_0` (`0-ULP` bit-exact with `generic::vec_dot_q8_0_q8_0`,
+/// immune to `-128 * -128` `i16` overflow via `_mm256_madd_epi16` `i32` widening).
+///
+/// # Safety
+/// Caller must ensure `avx2` CPU feature is supported.
+#[target_feature(enable = "avx2")]
+pub unsafe fn vec_dot_q8_0_q8_0(x: &[BlockQ8_0], y: &[BlockQ8_0]) -> f32 {
+    debug_assert_eq!(x.len(), y.len());
+    let nb = x.len();
+    let mut sumf = 0.0f32;
+
+    // SAFETY: `ib` stays strictly `< nb == x.len() == y.len()`.
+    unsafe {
+        for ib in 0..nb {
+            let bx = x.get_unchecked(ib);
+            let by = y.get_unchecked(ib);
+            let xl16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(bx.qs.as_ptr() as *const __m128i));
+            let xh16 =
+                _mm256_cvtepi8_epi16(_mm_loadu_si128(bx.qs.as_ptr().add(16) as *const __m128i));
+            let yl16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(by.qs.as_ptr() as *const __m128i));
+            let yh16 =
+                _mm256_cvtepi8_epi16(_mm_loadu_si128(by.qs.as_ptr().add(16) as *const __m128i));
+            let p = _mm256_add_epi32(_mm256_madd_epi16(xl16, yl16), _mm256_madd_epi16(xh16, yh16));
+            let sumi = hsum_epi32_avx2(p);
+            sumf += (sumi as f32) * (f16_to_f32(bx.d) * f16_to_f32(by.d));
+        }
+    }
+
+    sumf
+}
+
+/// 4-row shared-activation `AVX2` `gemv_q8_0_q8_0` (`0-ULP` bit-exact with `generic::gemv_q8_0_q8_0`).
+///
+/// Primary workhorse for `Inkling-2-Mini-Q8_0` 128-expert MoE & dense `Q8_0` projections on x86_64!
+///
+/// # Safety
+/// Caller must ensure `avx2` CPU feature is supported.
+#[target_feature(enable = "avx2")]
+pub unsafe fn gemv_q8_0_q8_0(
+    w: &[BlockQ8_0],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), cols_blocks);
+    assert_eq!(out.len(), rows);
+
+    let mut r = 0usize;
+    // SAFETY: Row and block bounds are asserted above.
+    unsafe {
+        while r + 4 <= rows {
+            let w0 = &w[r * cols_blocks..(r + 1) * cols_blocks];
+            let w1 = &w[(r + 1) * cols_blocks..(r + 2) * cols_blocks];
+            let w2 = &w[(r + 2) * cols_blocks..(r + 3) * cols_blocks];
+            let w3 = &w[(r + 3) * cols_blocks..(r + 4) * cols_blocks];
+            let mut acc4 = _mm_setzero_ps();
+
+            for ib in 0..cols_blocks {
+                let by = x.get_unchecked(ib);
+                let yl16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(by.qs.as_ptr() as *const __m128i));
+                let yh16 =
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(by.qs.as_ptr().add(16) as *const __m128i));
+                let dy = _mm_set1_ps(f16_to_f32(by.d));
+
+                let b0 = w0.get_unchecked(ib);
+                let b1 = w1.get_unchecked(ib);
+                let b2 = w2.get_unchecked(ib);
+                let b3 = w3.get_unchecked(ib);
+
+                let p0 = _mm256_add_epi32(
+                    _mm256_madd_epi16(
+                        _mm256_cvtepi8_epi16(_mm_loadu_si128(b0.qs.as_ptr() as *const __m128i)),
+                        yl16,
+                    ),
+                    _mm256_madd_epi16(
+                        _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                            b0.qs.as_ptr().add(16) as *const __m128i
+                        )),
+                        yh16,
+                    ),
+                );
+                let p1 = _mm256_add_epi32(
+                    _mm256_madd_epi16(
+                        _mm256_cvtepi8_epi16(_mm_loadu_si128(b1.qs.as_ptr() as *const __m128i)),
+                        yl16,
+                    ),
+                    _mm256_madd_epi16(
+                        _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                            b1.qs.as_ptr().add(16) as *const __m128i
+                        )),
+                        yh16,
+                    ),
+                );
+                let p2 = _mm256_add_epi32(
+                    _mm256_madd_epi16(
+                        _mm256_cvtepi8_epi16(_mm_loadu_si128(b2.qs.as_ptr() as *const __m128i)),
+                        yl16,
+                    ),
+                    _mm256_madd_epi16(
+                        _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                            b2.qs.as_ptr().add(16) as *const __m128i
+                        )),
+                        yh16,
+                    ),
+                );
+                let p3 = _mm256_add_epi32(
+                    _mm256_madd_epi16(
+                        _mm256_cvtepi8_epi16(_mm_loadu_si128(b3.qs.as_ptr() as *const __m128i)),
+                        yl16,
+                    ),
+                    _mm256_madd_epi16(
+                        _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                            b3.qs.as_ptr().add(16) as *const __m128i
+                        )),
+                        yh16,
+                    ),
+                );
+
+                let sum4 = _mm_cvtepi32_ps(hsum4_epi32_avx2(p0, p1, p2, p3));
+                let dx4 = _mm_set_ps(
+                    f16_to_f32(b3.d),
+                    f16_to_f32(b2.d),
+                    f16_to_f32(b1.d),
+                    f16_to_f32(b0.d),
+                );
+                let scale4 = _mm_mul_ps(dx4, dy);
+                acc4 = _mm_add_ps(acc4, _mm_mul_ps(sum4, scale4));
+            }
+
+            _mm_storeu_ps(out.as_mut_ptr().add(r), acc4);
+            r += 4;
+        }
+
+        while r < rows {
+            *out.get_unchecked_mut(r) =
+                vec_dot_q8_0_q8_0(&w[r * cols_blocks..(r + 1) * cols_blocks], x);
+            r += 1;
+        }
+    }
+}
+
+/// Multi-token shared-weight `AVX2` `gemm_q8_0_q8_0`: loads each `BlockQ8_0` weight block ONCE
+/// across up to `4` tokens (`0-ULP` batch-width invariant!).
+///
+/// # Safety
+/// Caller must ensure `avx2` CPU feature is supported.
+#[target_feature(enable = "avx2")]
+pub unsafe fn gemm_q8_0_q8_0(
+    w: &[BlockQ8_0],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+    n_tokens: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), n_tokens * cols_blocks);
+    assert_eq!(out.len(), n_tokens * rows);
+
+    if n_tokens == 0 {
+        return;
+    }
+    if n_tokens == 1 {
+        // SAFETY: `avx2` guaranteed by caller.
+        unsafe { gemv_q8_0_q8_0(w, x, out, rows, cols_blocks) };
+        return;
+    }
+
+    // SAFETY: All slice bounds are asserted above.
+    unsafe {
+        let mut t0 = 0usize;
+        while t0 < n_tokens {
+            let bt = (n_tokens - t0).min(4);
+            let mut r = 0usize;
+            while r + 4 <= rows {
+                let w0 = &w[r * cols_blocks..(r + 1) * cols_blocks];
+                let w1 = &w[(r + 1) * cols_blocks..(r + 2) * cols_blocks];
+                let w2 = &w[(r + 2) * cols_blocks..(r + 3) * cols_blocks];
+                let w3 = &w[(r + 3) * cols_blocks..(r + 4) * cols_blocks];
+                let mut acc = [_mm_setzero_ps(); 4];
+
+                for ib in 0..cols_blocks {
+                    let b0 = w0.get_unchecked(ib);
+                    let b1 = w1.get_unchecked(ib);
+                    let b2 = w2.get_unchecked(ib);
+                    let b3 = w3.get_unchecked(ib);
+
+                    let x0l =
+                        _mm256_cvtepi8_epi16(_mm_loadu_si128(b0.qs.as_ptr() as *const __m128i));
+                    let x0h = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                        b0.qs.as_ptr().add(16) as *const __m128i
+                    ));
+                    let x1l =
+                        _mm256_cvtepi8_epi16(_mm_loadu_si128(b1.qs.as_ptr() as *const __m128i));
+                    let x1h = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                        b1.qs.as_ptr().add(16) as *const __m128i
+                    ));
+                    let x2l =
+                        _mm256_cvtepi8_epi16(_mm_loadu_si128(b2.qs.as_ptr() as *const __m128i));
+                    let x2h = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                        b2.qs.as_ptr().add(16) as *const __m128i
+                    ));
+                    let x3l =
+                        _mm256_cvtepi8_epi16(_mm_loadu_si128(b3.qs.as_ptr() as *const __m128i));
+                    let x3h = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                        b3.qs.as_ptr().add(16) as *const __m128i
+                    ));
+                    let dx4 = _mm_set_ps(
+                        f16_to_f32(b3.d),
+                        f16_to_f32(b2.d),
+                        f16_to_f32(b1.d),
+                        f16_to_f32(b0.d),
+                    );
+
+                    for (ti, acc_ti) in acc.iter_mut().enumerate().take(bt) {
+                        let by = x.get_unchecked((t0 + ti) * cols_blocks + ib);
+                        let yl16 =
+                            _mm256_cvtepi8_epi16(_mm_loadu_si128(by.qs.as_ptr() as *const __m128i));
+                        let yh16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                            by.qs.as_ptr().add(16) as *const __m128i
+                        ));
+                        let p0 = _mm256_add_epi32(
+                            _mm256_madd_epi16(x0l, yl16),
+                            _mm256_madd_epi16(x0h, yh16),
+                        );
+                        let p1 = _mm256_add_epi32(
+                            _mm256_madd_epi16(x1l, yl16),
+                            _mm256_madd_epi16(x1h, yh16),
+                        );
+                        let p2 = _mm256_add_epi32(
+                            _mm256_madd_epi16(x2l, yl16),
+                            _mm256_madd_epi16(x2h, yh16),
+                        );
+                        let p3 = _mm256_add_epi32(
+                            _mm256_madd_epi16(x3l, yl16),
+                            _mm256_madd_epi16(x3h, yh16),
+                        );
+                        let sum4 = _mm_cvtepi32_ps(hsum4_epi32_avx2(p0, p1, p2, p3));
+                        let scale4 = _mm_mul_ps(dx4, _mm_set1_ps(f16_to_f32(by.d)));
+                        *acc_ti = _mm_add_ps(*acc_ti, _mm_mul_ps(sum4, scale4));
+                    }
+                }
+
+                for (ti, &acc_ti) in acc.iter().enumerate().take(bt) {
+                    _mm_storeu_ps(out.as_mut_ptr().add((t0 + ti) * rows + r), acc_ti);
+                }
+                r += 4;
+            }
+
+            while r < rows {
+                let w_row = &w[r * cols_blocks..(r + 1) * cols_blocks];
+                for ti in 0..bt {
+                    let xt = &x[(t0 + ti) * cols_blocks..(t0 + ti + 1) * cols_blocks];
+                    *out.get_unchecked_mut((t0 + ti) * rows + r) = vec_dot_q8_0_q8_0(w_row, xt);
+                }
+                r += 1;
+            }
+            t0 += bt;
+        }
+    }
+}
+
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn hsum_8wide_pairwise_ps(acc256: __m256) -> f32 {
+    let lo = _mm256_castps256_ps128(acc256);
+    let hi = _mm256_extractf128_ps::<1>(acc256);
+    let s4 = _mm_add_ps(lo, hi); // [s0, s1, s2, s3]
+    let p2 = _mm_hadd_ps(s4, s4); // [s0 + s1, s2 + s3, ...]
+    let p1 = _mm_hadd_ps(p2, p2); // [(s0 + s1) + (s2 + s3), ...]
+    _mm_cvtss_f32(p1)
+}
+
+/// `AVX2 + FMA` `dot_f32_bf16` (`0-ULP` bit-exact with `generic::dot_f32_bf16`).
+///
+/// # Safety
+/// Caller must ensure `avx2` and `fma` CPU features are supported.
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn dot_f32_bf16(x: &[f32], w_bf16: &[u16]) -> f32 {
+    let n = x.len();
+    assert_eq!(w_bf16.len(), n);
+    let chunks8 = n / 8;
+
+    // SAFETY: `c * 8 + 8 <= n` in the SIMD loop.
+    unsafe {
+        let mut acc = _mm256_setzero_ps();
+        for c in 0..chunks8 {
+            let base = c * 8;
+            let raw16 = _mm_loadu_si128(w_bf16.as_ptr().add(base) as *const __m128i);
+            let w32 = _mm256_slli_epi32::<16>(_mm256_cvtepu16_epi32(raw16));
+            let w_ps = _mm256_castsi256_ps(w32);
+            let x_ps = _mm256_loadu_ps(x.as_ptr().add(base));
+            acc = _mm256_fmadd_ps(w_ps, x_ps, acc);
+        }
+        let mut sum = hsum_8wide_pairwise_ps(acc);
+        for i in chunks8 * 8..n {
+            let w = f32::from_bits((*w_bf16.get_unchecked(i) as u32) << 16);
+            sum = w.mul_add(*x.get_unchecked(i), sum);
+        }
+        sum
+    }
+}
+
+/// `AVX2 + FMA` `dot_f32_q8_0` (`0-ULP` bit-exact with `generic::dot_f32_q8_0`).
+///
+/// # Safety
+/// Caller must ensure `avx2` and `fma` CPU features are supported.
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn dot_f32_q8_0(q: &[f32], k_q8: &[BlockQ8_0]) -> f32 {
+    assert_eq!(q.len(), k_q8.len() * QK8_0);
+    let mut total = 0.0f32;
+
+    // SAFETY: Each block has `QK8_0 == 32` elements (`4 * 8` lanes).
+    unsafe {
+        for (ib, blk) in k_q8.iter().enumerate() {
+            let q_ptr = q.as_ptr().add(ib * QK8_0);
+            let k_ptr = blk.qs.as_ptr();
+            let mut acc = _mm256_setzero_ps();
+            for c in 0..4 {
+                let off = c * 8;
+                let k8 = _mm_loadl_epi64(k_ptr.add(off) as *const __m128i);
+                let k_ps = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(k8));
+                let q_ps = _mm256_loadu_ps(q_ptr.add(off));
+                acc = _mm256_fmadd_ps(k_ps, q_ps, acc);
+            }
+            let bsum = hsum_8wide_pairwise_ps(acc);
+            total = bsum.mul_add(f16_to_f32(blk.d), total);
+        }
+    }
+    total
+}
+
+/// `AVX2 + FMA` `axpy_f32_q8_0` (`0-ULP` bit-exact with `generic::axpy_f32_q8_0`).
+///
+/// # Safety
+/// Caller must ensure `avx2` and `fma` CPU features are supported.
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn axpy_f32_q8_0(out: &mut [f32], w: f32, v_q8: &[BlockQ8_0]) {
+    assert_eq!(out.len(), v_q8.len() * QK8_0);
+
+    // SAFETY: Each block spans 32 contiguous `f32` outputs and 32 `i8` values.
+    unsafe {
+        for (ib, blk) in v_q8.iter().enumerate() {
+            let scale = _mm256_set1_ps(w * f16_to_f32(blk.d));
+            let o_ptr = out.as_mut_ptr().add(ib * QK8_0);
+            let v_ptr = blk.qs.as_ptr();
+            for c in 0..4 {
+                let off = c * 8;
+                let v8 = _mm_loadl_epi64(v_ptr.add(off) as *const __m128i);
+                let v_ps = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v8));
+                let cur = _mm256_loadu_ps(o_ptr.add(off));
+                _mm256_storeu_ps(o_ptr.add(off), _mm256_fmadd_ps(v_ps, scale, cur));
+            }
+        }
+    }
+}
+
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn sum_sq_8wide_avx2(x: &[f32]) -> f32 {
+    let n = x.len();
+    let chunks8 = n / 8;
+    // SAFETY: `c * 8 + 8 <= n`.
+    unsafe {
+        let mut acc = _mm256_setzero_ps();
+        for c in 0..chunks8 {
+            let v = _mm256_loadu_ps(x.as_ptr().add(c * 8));
+            acc = _mm256_fmadd_ps(v, v, acc);
+        }
+        let mut sum = hsum_8wide_pairwise_ps(acc);
+        for &v in &x[chunks8 * 8..] {
+            sum = v.mul_add(v, sum);
+        }
+        sum
+    }
+}
+
+/// `AVX2 + FMA` `rms_norm_f32` (`0-ULP` bit-exact with `generic::rms_norm_f32`).
+///
+/// # Safety
+/// Caller must ensure `avx2` and `fma` CPU features are supported.
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn rms_norm_f32(out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
+    let n = x.len();
+    assert_eq!(out.len(), n);
+    assert_eq!(weight.len(), n);
+    if n == 0 {
+        return;
+    }
+    // SAFETY: `avx2,fma` enabled; slices have equal length `n`.
+    unsafe {
+        let ss = sum_sq_8wide_avx2(x);
+        let scale = (1.0 / (((ss as f64) / (n as f64)) + (eps as f64)).sqrt()) as f32;
+        let sv = _mm256_set1_ps(scale);
+        let chunks8 = n / 8;
+        for c in 0..chunks8 {
+            let off = c * 8;
+            let xv = _mm256_loadu_ps(x.as_ptr().add(off));
+            let wv = _mm256_loadu_ps(weight.as_ptr().add(off));
+            _mm256_storeu_ps(
+                out.as_mut_ptr().add(off),
+                _mm256_mul_ps(_mm256_mul_ps(xv, sv), wv),
+            );
+        }
+        for i in chunks8 * 8..n {
+            *out.get_unchecked_mut(i) = (*x.get_unchecked(i) * scale) * *weight.get_unchecked(i);
+        }
+    }
+}
+
+/// `AVX2 + FMA` `l2_norm_f32` (`0-ULP` bit-exact with `generic::l2_norm_f32`).
+///
+/// # Safety
+/// Caller must ensure `avx2` and `fma` CPU features are supported.
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn l2_norm_f32(x: &mut [f32], eps: f32) {
+    let n = x.len();
+    // SAFETY: `avx2,fma` enabled; `c * 8 + 8 <= n`.
+    unsafe {
+        let ss = sum_sq_8wide_avx2(x);
+        let scale = (1.0 / ((ss as f64) + (eps as f64)).sqrt()) as f32;
+        let sv = _mm256_set1_ps(scale);
+        let chunks8 = n / 8;
+        for c in 0..chunks8 {
+            let off = c * 8;
+            let xv = _mm256_loadu_ps(x.as_ptr().add(off));
+            _mm256_storeu_ps(x.as_mut_ptr().add(off), _mm256_mul_ps(xv, sv));
+        }
+        for v in &mut x[chunks8 * 8..] {
+            *v *= scale;
+        }
+    }
+}
+
+/// `AVX2 + FMA` single-head Gated DeltaNet recurrent step (`0-ULP` bit-exact with `generic::gdn_recurrence_head`).
+///
+/// # Safety
+/// Caller must ensure `avx2` and `fma` CPU features are supported.
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gdn_recurrence_head(
+    q_h: &[f32],
+    k_h: &[f32],
+    v_h: &[f32],
+    g: f32,
+    beta: f32,
+    scale: f32,
+    s_vh: &mut [f32],
+    o_h: &mut [f32],
+    head_dim: usize,
+) {
+    assert_eq!(q_h.len(), head_dim);
+    assert_eq!(k_h.len(), head_dim);
+    assert_eq!(v_h.len(), head_dim);
+    assert_eq!(s_vh.len(), head_dim * head_dim);
+    assert_eq!(o_h.len(), head_dim);
+
+    if !head_dim.is_multiple_of(8) {
+        generic::gdn_recurrence_head(q_h, k_h, v_h, g, beta, scale, s_vh, o_h, head_dim);
+        return;
+    }
+
+    let chunks8 = head_dim / 8;
+    // SAFETY: `head_dim` is a multiple of 8 and all slice lengths are verified above.
+    unsafe {
+        let gv = _mm256_set1_ps(g);
+        for j in 0..head_dim {
+            let s_ptr = s_vh.as_mut_ptr().add(j * head_dim);
+            let mut kv_acc = _mm256_setzero_ps();
+            for c in 0..chunks8 {
+                let off = c * 8;
+                let d = _mm256_mul_ps(_mm256_loadu_ps(s_ptr.add(off)), gv);
+                let kv = _mm256_loadu_ps(k_h.as_ptr().add(off));
+                kv_acc = _mm256_fmadd_ps(d, kv, kv_acc);
+            }
+            let sum_kv = hsum_8wide_pairwise_ps(kv_acc);
+            let delta_j = (*v_h.get_unchecked(j) - sum_kv) * beta;
+            let dv = _mm256_set1_ps(delta_j);
+
+            let mut oq_acc = _mm256_setzero_ps();
+            for c in 0..chunks8 {
+                let off = c * 8;
+                let s_dec = _mm256_mul_ps(_mm256_loadu_ps(s_ptr.add(off)), gv);
+                let kv = _mm256_loadu_ps(k_h.as_ptr().add(off));
+                let u = _mm256_fmadd_ps(dv, kv, s_dec);
+                _mm256_storeu_ps(s_ptr.add(off), u);
+                let qv = _mm256_loadu_ps(q_h.as_ptr().add(off));
+                oq_acc = _mm256_fmadd_ps(u, qv, oq_acc);
+            }
+            *o_h.get_unchecked_mut(j) = hsum_8wide_pairwise_ps(oq_acc) * scale;
+        }
+    }
+}

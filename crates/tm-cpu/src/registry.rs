@@ -1033,6 +1033,165 @@ mod aarch64_wrappers {
 
 /// Selects the kernel table for a requested `Isa`, falling back to the widest
 /// compiled tier if the target CPU or feature set does not include it.
+#[cfg(target_arch = "x86_64")]
+mod x86_64_wrappers {
+    use super::*;
+    use crate::x86_64::avx2;
+
+    fn avx2_vec_dot_q4_0(x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::vec_dot_q4_0_q8_0(x, y) }
+    }
+    fn avx2_gemv_q4_0(
+        w: &[BlockQ4_0],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::gemv_q4_0_q8_0(w, x, out, rows, cols_blocks) }
+    }
+    fn avx2_gemm_q4_0(
+        w: &[BlockQ4_0],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::gemm_q4_0_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+    fn avx2_gemv_q4_0x4(
+        w: &[BlockQ4_0x4],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::gemv_q4_0x4_q8_0(w, x, out, rows, cols_blocks) }
+    }
+    fn avx2_gemm_q4_0x4(
+        w: &[BlockQ4_0x4],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::gemm_q4_0x4_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+    fn avx2_vec_dot_q8_0(x: &[BlockQ8_0], y: &[BlockQ8_0]) -> f32 {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::vec_dot_q8_0_q8_0(x, y) }
+    }
+    fn avx2_gemv_q8_0(
+        w: &[BlockQ8_0],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::gemv_q8_0_q8_0(w, x, out, rows, cols_blocks) }
+    }
+    fn avx2_gemm_q8_0(
+        w: &[BlockQ8_0],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::gemm_q8_0_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+    fn avx2_dot_f32_bf16(x: &[f32], w_bf16: &[u16]) -> f32 {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::dot_f32_bf16(x, w_bf16) }
+    }
+    fn avx2_dot_f32_q8_0(q: &[f32], k_q8: &[BlockQ8_0]) -> f32 {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::dot_f32_q8_0(q, k_q8) }
+    }
+    fn avx2_axpy_f32_q8_0(out: &mut [f32], w: f32, v_q8: &[BlockQ8_0]) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::axpy_f32_q8_0(out, w, v_q8) }
+    }
+    fn avx2_rms_norm_f32(out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::rms_norm_f32(out, x, weight, eps) }
+    }
+    fn avx2_l2_norm_f32(x: &mut [f32], eps: f32) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::l2_norm_f32(x, eps) }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn avx2_gdn_recurrence_head(
+        q_h: &[f32],
+        k_h: &[f32],
+        v_h: &[f32],
+        g: f32,
+        beta: f32,
+        scale: f32,
+        s_vh: &mut [f32],
+        o_h: &mut [f32],
+        head_dim: usize,
+    ) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::gdn_recurrence_head(q_h, k_h, v_h, g, beta, scale, s_vh, o_h, head_dim) }
+    }
+
+    pub const AVX2_TABLE: KernelTable = KernelTable {
+        isa: Isa::Avx2,
+        vec_dot_q4_0_q8_0: avx2_vec_dot_q4_0,
+        gemv_q4_0_q8_0: avx2_gemv_q4_0,
+        gemm_q4_0_q8_0: avx2_gemm_q4_0,
+        gemv_q4_0x4_q8_0: avx2_gemv_q4_0x4,
+        gemm_q4_0x4_q8_0: avx2_gemm_q4_0x4,
+        vec_dot_q4_1_q8_1: generic::vec_dot_q4_1_q8_1,
+        gemv_q4_1_q8_1: generic::gemv_q4_1_q8_1,
+        vec_dot_q8_0_q8_0: avx2_vec_dot_q8_0,
+        gemv_q8_0_q8_0: avx2_gemv_q8_0,
+        gemm_q8_0_q8_0: avx2_gemm_q8_0,
+        vec_dot_q5_k_q8_k: generic::vec_dot_q5_k_q8_k,
+        gemv_q5_k_q8_k: generic::gemv_q5_k_q8_k,
+        vec_dot_q6_k_q8_k: generic::vec_dot_q6_k_q8_k,
+        gemv_q6_k_q8_k: generic::gemv_q6_k_q8_k,
+        gemm_q6_k_q8_k: generic::gemm_q6_k_q8_k,
+        vec_dot_q2_0_q8_0: generic::vec_dot_q2_0_q8_0,
+        gemv_q2_0_q8_0: generic::gemv_q2_0_q8_0,
+        gemm_q2_0_q8_0: generic::gemm_q2_0_q8_0,
+        vec_dot_tq2_0_q8_k: generic::vec_dot_tq2_0_q8_k,
+        gemv_tq2_0_q8_k: generic::gemv_tq2_0_q8_k,
+        gemm_tq2_0_q8_k: generic::gemm_tq2_0_q8_k,
+        vec_dot_iq2_xxs_q8_k: generic::vec_dot_iq2_xxs_q8_k,
+        gemv_iq2_xxs_q8_k: generic::gemv_iq2_xxs_q8_k,
+        gemm_iq2_xxs_q8_k: generic::gemm_iq2_xxs_q8_k,
+        vec_dot_iq3_xxs_q8_k: generic::vec_dot_iq3_xxs_q8_k,
+        gemv_iq3_xxs_q8_k: generic::gemv_iq3_xxs_q8_k,
+        gemm_iq3_xxs_q8_k: generic::gemm_iq3_xxs_q8_k,
+        vec_dot_iq4_nl_q8_0: generic::vec_dot_iq4_nl_q8_0,
+        gemv_iq4_nl_q8_0: generic::gemv_iq4_nl_q8_0,
+        gemm_iq4_nl_q8_0: generic::gemm_iq4_nl_q8_0,
+        dot_f32_f16: generic::dot_f32_f16,
+        dot_f32_bf16: avx2_dot_f32_bf16,
+        dot_f32_q8_0: avx2_dot_f32_q8_0,
+        axpy_f32_f16: generic::axpy_f32_f16,
+        axpy_f32_q8_0: avx2_axpy_f32_q8_0,
+        f32_to_f16_slice: generic::f32_to_f16_slice,
+        quantize_q8_0: generic::quantize_q8_0,
+        quantize_q8_1: generic::quantize_q8_1,
+        quantize_q8_k: generic::quantize_q8_k,
+        rms_norm_f32: avx2_rms_norm_f32,
+        l2_norm_f32: avx2_l2_norm_f32,
+        gdn_recurrence_head: avx2_gdn_recurrence_head,
+    };
+}
+
 pub fn select_kernels(isa: Isa) -> &'static KernelTable {
     let caps = detect_caps();
     if !isa_supported(isa, caps) {
@@ -1057,6 +1216,8 @@ pub fn select_kernels(isa: Isa) -> &'static KernelTable {
             not(feature = "dotprod")
         ))]
         Isa::NeonI8mm => &aarch64_wrappers::NEON_V80_TABLE,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx2 | Isa::Avx512 => &x86_64_wrappers::AVX2_TABLE,
         _ => &GENERIC_TABLE,
     }
 }

@@ -216,6 +216,10 @@ pub fn init_lora_adapter_for_cpu_model(
         CpuModel::Qwen35(m) => init_lora_adapter_qwen35(m, rank, alpha, targets, seed),
         CpuModel::Gemma4(m) => init_lora_adapter_gemma4(m, rank, alpha, targets, seed),
         CpuModel::Lfm2(m) => init_lora_adapter_lfm2(m, rank, alpha, targets, seed),
+        CpuModel::Inkling2(m) => Err(TrainError::InvalidConfig(format!(
+            "QLoRA fine-tuning is not yet supported on architecture '{}'",
+            m.cfg.arch
+        ))),
     }
 }
 

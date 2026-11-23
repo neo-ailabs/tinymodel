@@ -69,6 +69,8 @@ pub enum LoraError {
         d_in: usize,
         d_out: usize,
     },
+    #[error("LoRA dynamic binding is not yet supported on architecture '{0}'")]
+    UnsupportedBaseArch(String),
 }
 
 /// Decoded `(A, B)` factor pair for a single base weight tensor.

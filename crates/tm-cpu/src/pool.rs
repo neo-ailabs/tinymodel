@@ -125,7 +125,7 @@ impl ThreadPool {
 
         // Caller thread also claims chunks.
         loop {
-            let start = s.next_idx.fetch_add(chunk, Ordering::Relaxed);
+            let start = s.next_idx.fetch_add(chunk, Ordering::AcqRel);
             if start >= total {
                 break;
             }
@@ -138,6 +138,37 @@ impl ThreadPool {
         while s.done_workers.load(Ordering::Acquire) < n_workers {
             core::hint::spin_loop();
         }
+    }
+
+    /// Executes `f(idx, &mut items[idx])` in parallel across disjoint mutable elements of `items`
+    /// with chunk size `1`, allowing `#![forbid(unsafe_code)]` callers (such as parallel MoE
+    /// `O_DIRECT` slot readers + per-expert GEMV workers) to process independent work items
+    /// concurrently with zero heap allocations.
+    pub fn parallel_for_each_mut<T, F>(&self, items: &mut [T], f: F)
+    where
+        T: Send,
+        F: Fn(usize, &mut T) + Sync,
+    {
+        let total = items.len();
+        if total == 0 {
+            return;
+        }
+        if self.n_threads == 1 || total == 1 {
+            for (idx, item) in items.iter_mut().enumerate() {
+                f(idx, item);
+            }
+            return;
+        }
+        let base_ptr = items.as_mut_ptr() as usize;
+        self.parallel_for(total, 1, |start, end| {
+            for idx in start..end {
+                // SAFETY: `parallel_for` partitions `0..total` into pairwise disjoint ranges
+                // via atomic `fetch_add`, so each `idx` is claimed by exactly one thread for
+                // the duration of this epoch, and `items` outlives `parallel_for`.
+                let elem = unsafe { &mut *(base_ptr as *mut T).add(idx) };
+                f(idx, elem);
+            }
+        });
     }
 }
 
@@ -195,7 +226,7 @@ fn worker_loop(s: Arc<Shared>) {
         let func: Trampoline = unsafe { core::mem::transmute(fn_raw) };
 
         loop {
-            let start = s.next_idx.fetch_add(chunk, Ordering::Relaxed);
+            let start = s.next_idx.fetch_add(chunk, Ordering::AcqRel);
             if start >= total {
                 break;
             }
@@ -206,7 +237,7 @@ fn worker_loop(s: Arc<Shared>) {
             }
         }
 
-        s.done_workers.fetch_add(1, Ordering::Release);
+        s.done_workers.fetch_add(1, Ordering::AcqRel);
     }
 }
 

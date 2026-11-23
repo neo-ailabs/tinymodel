@@ -20,9 +20,11 @@ pub enum TokenizerError {
     UnsupportedModel(String),
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TokenizerMode {
     Gpt2ByteBpe,
+    Gpt4oByteBpe,
     Gemma4SpmBpe,
 }
 
@@ -57,6 +59,8 @@ pub struct Tokenizer {
     pub eot_id: Option<u32>,
     pub add_bos: bool,
     max_digits: usize,
+    /// Control / user-defined special tokens (`token_type == 3 | 4`), sorted by byte length descending.
+    special_tokens: Vec<(String, u32)>,
 }
 
 impl Tokenizer {
@@ -72,6 +76,11 @@ impl Tokenizer {
             .unwrap_or("");
         let mode = if model == "gemma4" || pre == "gemma4" {
             TokenizerMode::Gemma4SpmBpe
+        } else if matches!(
+            pre,
+            "inkling2" | "gpt-4o" | "llama4" | "kanana2" | "talkie" | "minimax-m2"
+        ) {
+            TokenizerMode::Gpt4oByteBpe
         } else if model == "gpt2" {
             TokenizerMode::Gpt2ByteBpe
         } else {
@@ -142,9 +151,13 @@ impl Tokenizer {
             }
         }
 
-        let bos_id = gguf
+        let mut bos_id = gguf
             .get_meta("tokenizer.ggml.bos_token_id")
             .and_then(|v| v.as_u32());
+        if pre == "inkling2" {
+            // Matches `llama-vocab.cpp:2674`: `inkling2` sets `special_bos_id = LLAMA_TOKEN_NULL`.
+            bos_id = None;
+        }
         let eos_id = gguf
             .get_meta("tokenizer.ggml.eos_token_id")
             .and_then(|v| v.as_u32());
@@ -176,6 +189,26 @@ impl Tokenizer {
         // Qwen2 / Qwen3 / Qwen3.5 BPE regex uses single-digit `\p{N}` instead of `\p{N}{1,3}`.
         let max_digits = if pre.starts_with("qwen") { 1 } else { 3 };
 
+        let mut special_tokens = Vec::new();
+        if let Some(ttypes) = gguf
+            .get_meta("tokenizer.ggml.token_type")
+            .and_then(|v| v.as_i32_array())
+        {
+            for (id, &tt) in ttypes.iter().enumerate().take(real_vocab_size) {
+                // `LLAMA_TOKEN_TYPE_CONTROL == 3`, `LLAMA_TOKEN_TYPE_USER_DEFINED == 4`
+                if tt == 3 || tt == 4 {
+                    let s_off = vocab_offsets[id] as usize;
+                    let e_off = vocab_offsets[id + 1] as usize;
+                    let tok_s = &vocab_pool[s_off..e_off];
+                    if tok_s.len() >= 2 {
+                        special_tokens.push((tok_s.to_string(), id as u32));
+                    }
+                }
+            }
+            // Longest special token first so greedy prefix scan matches exact longest control token.
+            special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.1.cmp(&b.1)));
+        }
+
         let (byte_to_char, char_to_byte) = build_gpt2_byte_maps();
 
         Ok(Self {
@@ -193,6 +226,7 @@ impl Tokenizer {
             eot_id,
             add_bos,
             max_digits,
+            special_tokens,
         })
     }
 
@@ -232,15 +266,85 @@ impl Tokenizer {
         }
 
         if self.mode == TokenizerMode::Gemma4SpmBpe {
-            self.encode_gemma4_into(text, &mut ids);
+            self.encode_with_specials(text, &mut ids, true);
             return ids;
         }
 
+        self.encode_with_specials(text, &mut ids, false);
+        ids
+    }
+
+    fn encode_with_specials(&self, text: &str, ids: &mut Vec<u32>, is_gemma4: bool) {
+        if self.special_tokens.is_empty() {
+            if is_gemma4 {
+                self.encode_gemma4_into(text, ids);
+            } else {
+                self.encode_byte_bpe_span(text, ids);
+            }
+            return;
+        }
+
+        let mut first_byte_mask = [0u64; 4];
+        for (st, _) in &self.special_tokens {
+            let b = st.as_bytes()[0];
+            first_byte_mask[(b >> 6) as usize] |= 1u64 << (b & 63);
+        }
+
+        let bytes = text.as_bytes();
+        let mut span_start = 0usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let b = bytes[i];
+            let maybe_special = (first_byte_mask[(b >> 6) as usize] & (1u64 << (b & 63))) != 0;
+            if maybe_special && text.is_char_boundary(i) {
+                let rem = &text[i..];
+                let mut matched: Option<(usize, u32)> = None;
+                for (st, st_id) in &self.special_tokens {
+                    if rem.starts_with(st.as_str()) {
+                        matched = Some((st.len(), *st_id));
+                        break;
+                    }
+                }
+                if let Some((st_len, st_id)) = matched {
+                    if span_start < i {
+                        let sub = &text[span_start..i];
+                        if is_gemma4 {
+                            self.encode_gemma4_into(sub, ids);
+                        } else {
+                            self.encode_byte_bpe_span(sub, ids);
+                        }
+                    }
+                    ids.push(st_id);
+                    i += st_len;
+                    span_start = i;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+
+        if span_start < text.len() {
+            let sub = &text[span_start..];
+            if is_gemma4 {
+                self.encode_gemma4_into(sub, ids);
+            } else {
+                self.encode_byte_bpe_span(sub, ids);
+            }
+        }
+    }
+
+    fn encode_byte_bpe_span(&self, text: &str, ids: &mut Vec<u32>) {
         let mut encoded = String::with_capacity(64);
         let mut sym_ids: Vec<u32> = Vec::with_capacity(64);
         let mut char_buf = [0u8; 4];
 
-        for chunk in pretokenize_bpe(text, self.max_digits) {
+        let chunks = if self.mode == TokenizerMode::Gpt4oByteBpe {
+            pretokenize_gpt4o(text)
+        } else {
+            pretokenize_bpe(text, self.max_digits)
+        };
+
+        for chunk in chunks {
             encoded.clear();
             for &b in chunk.as_bytes() {
                 encoded.push(self.byte_to_char[b as usize]);
@@ -276,8 +380,6 @@ impl Tokenizer {
                 }
             }
         }
-
-        ids
     }
 
     fn apply_bpe_merges(&self, sym_ids: &mut Vec<u32>) {
@@ -662,6 +764,201 @@ fn pretokenize_bpe(text: &str, max_digits: usize) -> Vec<&str> {
     chunks
 }
 
+fn match_contraction_suffix(s: &str) -> usize {
+    if !s.starts_with('\'') {
+        return 0;
+    }
+    let lower2 = s.get(1..3).unwrap_or("").to_ascii_lowercase();
+    if matches!(lower2.as_str(), "re" | "ve" | "ll") {
+        return 3;
+    }
+    let lower1 = s.get(1..2).unwrap_or("").to_ascii_lowercase();
+    if matches!(lower1.as_str(), "s" | "t" | "m" | "d") {
+        return 2;
+    }
+    0
+}
+
+/// Dependency-free pre-tokenizer matching `LLAMA_VOCAB_PRE_TYPE_GPT4O` (`inkling2` / `o200k_base`):
+/// 1. `[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?`
+/// 2. `[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?`
+/// 3. `\p{N}{1,3}`
+/// 4. `' '?[^\s\p{L}\p{N}]+[\r\n/]*`
+/// 5. `\s*[\r\n]+ | \s+(?!\S) | \s+`
+fn pretokenize_gpt4o(text: &str) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let len = text.len();
+    let mut i = 0usize;
+
+    while i < len {
+        let rest = &text[i..];
+        let mut chars = rest.char_indices();
+        let Some((_, c0)) = chars.next() else {
+            break;
+        };
+
+        // 1 & 2: Optional non-CRLF/non-alnum prefix + camelCase-aware letter run + optional contraction
+        let letter_start = if c0.is_alphabetic() {
+            Some((0usize, c0))
+        } else if c0 != '\r'
+            && c0 != '\n'
+            && !c0.is_numeric()
+            && let Some((idx1, c1)) = chars.clone().next()
+            && c1.is_alphabetic()
+        {
+            Some((idx1, c1))
+        } else {
+            None
+        };
+
+        if let Some((l_off, _)) = letter_start {
+            // Branch 1: `[upper]*[lower]+` vs Branch 2: `[upper]+[lower]*`
+            // In `llama-vocab.cpp:460`, `[^a-z]` acts as upper/caseless and `[^A-Z]` as lower/caseless.
+            let mut end1 = 0usize;
+            {
+                let mut seen_lower = false;
+                for (off, ch) in rest[l_off..].char_indices() {
+                    if !ch.is_alphabetic() {
+                        break;
+                    }
+                    let is_ascii_upper = ch.is_ascii_uppercase();
+                    if !seen_lower {
+                        if !is_ascii_upper {
+                            seen_lower = true;
+                            end1 = l_off + off + ch.len_utf8();
+                        }
+                    } else if !is_ascii_upper {
+                        end1 = l_off + off + ch.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            let end2 = {
+                let mut e = 0usize;
+                let mut in_lower_tail = false;
+                let mut has_upper = false;
+                for (off, ch) in rest[l_off..].char_indices() {
+                    if !ch.is_alphabetic() {
+                        break;
+                    }
+                    let is_ascii_lower = ch.is_ascii_lowercase();
+                    let is_ascii_upper = ch.is_ascii_uppercase();
+                    if !in_lower_tail {
+                        if !is_ascii_lower {
+                            has_upper = true;
+                            e = l_off + off + ch.len_utf8();
+                        } else if has_upper {
+                            in_lower_tail = true;
+                            e = l_off + off + ch.len_utf8();
+                        } else {
+                            break;
+                        }
+                    } else if !is_ascii_upper {
+                        e = l_off + off + ch.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+                e
+            };
+
+            let mut end = if end1 > 0 { end1 } else { end2 };
+            if end > 0 {
+                end += match_contraction_suffix(&rest[end..]);
+                chunks.push(&text[i..i + end]);
+                i += end;
+                continue;
+            }
+        }
+
+        // 3. \p{N}{1,3}
+        if c0.is_numeric() {
+            let mut end = c0.len_utf8();
+            let mut count = 1usize;
+            for (idx, c) in chars {
+                if c.is_numeric() && count < 3 {
+                    end = idx + c.len_utf8();
+                    count += 1;
+                } else {
+                    break;
+                }
+            }
+            chunks.push(&text[i..i + end]);
+            i += end;
+            continue;
+        }
+
+        // 4. ' '?[^\s\p{L}\p{N}]+[\r\n/]*
+        let is_punct = |c: char| !c.is_whitespace() && !c.is_alphabetic() && !c.is_numeric();
+        if is_punct(c0) || (c0 == ' ' && chars.clone().next().is_some_and(|(_, c1)| is_punct(c1))) {
+            let mut end = c0.len_utf8();
+            let mut iter = chars;
+            if c0 == ' '
+                && let Some((idx1, c1)) = iter.next()
+            {
+                end = idx1 + c1.len_utf8();
+            }
+            let mut in_tail = false;
+            for (idx, c) in iter {
+                if !in_tail && is_punct(c) {
+                    end = idx + c.len_utf8();
+                } else if c == '\r' || c == '\n' || c == '/' {
+                    in_tail = true;
+                    end = idx + c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            chunks.push(&text[i..i + end]);
+            i += end;
+            continue;
+        }
+
+        // 5. Whitespace: \s*[\r\n]+ | \s+(?!\S) | \s+
+        if c0.is_whitespace() {
+            let mut end = c0.len_utf8();
+            let mut last_nl_end = if c0 == '\r' || c0 == '\n' {
+                Some(end)
+            } else {
+                None
+            };
+            let mut last_ws_start = 0usize;
+            let mut hit_non_ws = false;
+
+            for (idx, c) in chars {
+                if c.is_whitespace() {
+                    last_ws_start = idx;
+                    end = idx + c.len_utf8();
+                    if c == '\r' || c == '\n' {
+                        last_nl_end = Some(end);
+                    }
+                } else {
+                    hit_non_ws = true;
+                    break;
+                }
+            }
+
+            if let Some(nl_end) = last_nl_end {
+                chunks.push(&text[i..i + nl_end]);
+                i += nl_end;
+            } else if hit_non_ws && last_ws_start > 0 {
+                chunks.push(&text[i..i + last_ws_start]);
+                i += last_ws_start;
+            } else {
+                chunks.push(&text[i..i + end]);
+                i += end;
+            }
+            continue;
+        }
+
+        chunks.push(&text[i..i + c0.len_utf8()]);
+        i += c0.len_utf8();
+    }
+
+    chunks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,5 +991,29 @@ mod tests {
         let ids = tok.encode(text, false);
         assert!(ids.len() > 5);
         assert_eq!(tok.decode(&ids), text);
+    }
+
+    #[test]
+    fn inkling2_200k_vocab_special_tokens_and_gpt4o_roundtrip() {
+        let model_path =
+            std::path::Path::new("../../models/inkling2/dspark-Inkling-2-Mini-Q8_0.gguf");
+        if !model_path.exists() {
+            return;
+        }
+        let gguf = GgufFile::open(model_path).expect("open dspark Inkling-2-Mini");
+        let tok = Tokenizer::from_gguf(&gguf).expect("load inkling2 tokenizer");
+        assert_eq!(tok.vocab_size(), 200_058);
+        assert_eq!(tok.bos_id, None);
+        assert!(!tok.add_bos);
+        assert_eq!(tok.eos_id, Some(200_006));
+        assert_eq!(tok.eot_id, Some(200_006));
+
+        // Verify exact special control token partitioning (`<|begin_of_text|>` == 200028)
+        let prompt = "<|begin_of_text|>HelloWorld don't 2026 中文测试!<|content_invoke_tool_json|>";
+        let ids = tok.encode(prompt, true);
+        assert_eq!(ids.first().copied(), Some(200_028));
+        assert_eq!(ids.last().copied(), Some(200_049));
+        let inner = &ids[1..ids.len() - 1];
+        assert_eq!(tok.decode(inner), "HelloWorld don't 2026 中文测试!");
     }
 }

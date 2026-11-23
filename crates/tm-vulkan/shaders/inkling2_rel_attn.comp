@@ -1,0 +1,166 @@
+#version 450
+// Subgroup-portable online-softmax GQA for `Inkling-2-Mini` with learned relative-position bias
+// table (`dot(attn_rel_bias[d], Rcur[head]) - sinks[head]`) and zero-logit attention sink
+// (`denom = exp(-m_all) + sum exp(s - m_all)`).
+//
+// Host passes `WG = 8 * subgroup_size` (or `4 * subgroup_size` if `8 * sg > max_wg`), with
+// `SG_COUNT` in `constant_id = 1` and `N_VEC` in `constant_id = 2`.
+// Shared memory footprint: `64*16 + 8*4 + 8*4 + 8*64*16 + 1025*4 = 13,380` bytes (< 16 KiB Vulkan min!).
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(constant_id = 0) const uint WG = 256;
+layout(constant_id = 1) const uint SG = 8;
+layout(constant_id = 2) const uint N_VEC = 8;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer QBuf    { vec4  q4[]; };
+layout(std430, binding = 1) readonly buffer RBuf    { float r_buf[]; };
+layout(std430, binding = 2) readonly buffer RelBias { float rel_bias[]; };
+layout(std430, binding = 3) readonly buffer Sinks   { float sinks[]; };
+layout(std430, binding = 4) readonly buffer KCache  { uvec2 k_cache4[]; };
+layout(std430, binding = 5) readonly buffer VCache  { uvec2 v_cache4[]; };
+layout(std430, binding = 6) writeonly buffer OutBuf { vec4  out4[]; };
+
+layout(push_constant) uniform PC {
+    uint nh_packed;       // n_head | (n_head_kv << 16)
+    uint hd_nrel_packed;  // head_dim | (n_rel << 16)
+    uint extent;
+    uint pos;
+    uint kv_start;
+    uint kv_slot_vec4_base;
+    uint rel_bias_off;
+} pc;
+
+const uint MAX_HD4 = 64u;
+const uint MAX_REL_CACHE = 1025u;
+
+shared vec4  q_shared[MAX_HD4];
+shared float tg_m[8];
+shared float tg_l[8];
+shared vec4  tg_o[8 * MAX_HD4];
+shared float rel_shared[MAX_REL_CACHE];
+
+vec4 unpack_f16x4(uvec2 p) {
+    return vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
+}
+
+float eval_rel_bias(uint head, uint n_rel, float sink_h, uint dist) {
+    if (dist >= pc.extent) {
+        return -sink_h;
+    }
+    const uint r_base = head * n_rel;
+    const uint b_base = pc.rel_bias_off + dist * n_rel;
+    float acc = 0.0;
+    for (uint r = 0u; r < n_rel; ++r) {
+        acc = fma(r_buf[r_base + r], rel_bias[b_base + r], acc);
+    }
+    return acc - sink_h;
+}
+
+void main() {
+    const uint head = gl_WorkGroupID.x;
+    const uint n_head = pc.nh_packed & 0xFFFFu;
+    const uint n_head_kv = pc.nh_packed >> 16u;
+    const uint head_dim = pc.hd_nrel_packed & 0xFFFFu;
+    const uint n_rel = pc.hd_nrel_packed >> 16u;
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sg = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg_size = gl_SubgroupSize;
+
+    const uint hd4 = head_dim >> 2u;
+    const uint kv_dim4 = n_head_kv * hd4;
+    const uint group = n_head / n_head_kv;
+    const uint kv_h = head / group;
+    const float scale = inversesqrt(float(head_dim));
+    const float sink_h = sinks[head];
+
+    const uint q_base4 = head * hd4;
+    for (uint d4 = tid; d4 < hd4; d4 += WG) {
+        q_shared[d4] = q4[q_base4 + d4] * scale;
+    }
+
+    const uint cache_lim = min(pc.extent, MAX_REL_CACHE - 1u);
+    for (uint d = tid; d < cache_lim; d += WG) {
+        rel_shared[d] = eval_rel_bias(head, n_rel, sink_h, d);
+    }
+    if (tid == 0u) {
+        rel_shared[cache_lim] = -sink_h;
+    }
+    barrier();
+
+    float m_local = -1.0e30;
+    float l_local = 0.0;
+    vec4 o_local[N_VEC];
+    [[unroll]] for (uint k = 0u; k < N_VEC; ++k) {
+        o_local[k] = vec4(0.0);
+    }
+
+    for (uint t = pc.kv_start + sg; t <= pc.pos; t += SG) {
+        const uint kv_off4 = pc.kv_slot_vec4_base + t * kv_dim4 + kv_h * hd4;
+        float dot_val = 0.0;
+        [[unroll]] for (uint k = 0u; k < N_VEC; ++k) {
+            const uint d4 = k * sg_size + lane;
+            if (d4 < hd4) {
+                dot_val += dot(q_shared[d4], unpack_f16x4(k_cache4[kv_off4 + d4]));
+            }
+        }
+        dot_val = subgroupAdd(dot_val);
+
+        const uint dist = pc.pos - t;
+        const float rel_b = (pc.extent <= MAX_REL_CACHE - 1u)
+            ? rel_shared[min(dist, pc.extent)]
+            : eval_rel_bias(head, n_rel, sink_h, dist);
+        const float score = dot_val + rel_b;
+
+        const float m_new = max(m_local, score);
+        const float alpha = (l_local == 0.0) ? 0.0 : exp(m_local - m_new);
+        const float p = exp(score - m_new);
+        l_local = l_local * alpha + p;
+        m_local = m_new;
+
+        [[unroll]] for (uint k = 0u; k < N_VEC; ++k) {
+            const uint d4 = k * sg_size + lane;
+            if (d4 < hd4) {
+                o_local[k] = o_local[k] * alpha + p * unpack_f16x4(v_cache4[kv_off4 + d4]);
+            }
+        }
+    }
+
+    if (subgroupElect()) {
+        tg_m[sg] = m_local;
+        tg_l[sg] = l_local;
+    }
+    [[unroll]] for (uint k = 0u; k < N_VEC; ++k) {
+        const uint d4 = k * sg_size + lane;
+        if (d4 < hd4) {
+            tg_o[sg * MAX_HD4 + d4] = o_local[k];
+        }
+    }
+    barrier();
+
+    // Zero attention sink (`exp(0 - m_all)` in denominator; `m_all >= 0.0`).
+    float m_all = 0.0;
+    for (uint s = 0u; s < SG; ++s) {
+        if (tg_l[s] > 0.0) {
+            m_all = max(m_all, tg_m[s]);
+        }
+    }
+
+    for (uint d4 = tid; d4 < hd4; d4 += WG) {
+        float denom = exp(-m_all);
+        vec4 acc = vec4(0.0);
+        for (uint s = 0u; s < SG; ++s) {
+            if (tg_l[s] > 0.0) {
+                const float w = exp(tg_m[s] - m_all);
+                denom += tg_l[s] * w;
+                acc += tg_o[s * MAX_HD4 + d4] * w;
+            }
+        }
+        out4[q_base4 + d4] = acc / denom;
+    }
+}

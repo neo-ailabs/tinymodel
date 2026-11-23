@@ -603,7 +603,8 @@ pub unsafe fn gemv_q4_1_q8_1(
     }
 }
 
-/// Pure ARMv8.0 NEON `vec_dot_q8_0_q8_0` (Raspberry Pi Zero 2W / Pi 4B).
+/// Pure ARMv8.0 NEON `vec_dot_q8_0_q8_0` (Raspberry Pi Zero 2W / Pi 4B, `0-ULP` bit-exact
+/// with `generic::vec_dot_q8_0_q8_0`).
 ///
 /// # Safety
 /// Caller must ensure NEON is available and `x.len() == y.len()`.
@@ -612,17 +613,19 @@ pub unsafe fn vec_dot_q8_0_q8_0(x: &[BlockQ8_0], y: &[BlockQ8_0]) -> f32 {
     debug_assert_eq!(x.len(), y.len());
     let nb = x.len();
     let mut ib = 0usize;
+    let mut sumf = 0.0f32;
 
     // SAFETY: `ib` stays strictly within `0..nb`.
     unsafe {
-        let mut sumv0 = vdupq_n_f32(0.0);
-        let mut sumv1 = vdupq_n_f32(0.0);
-
-        while ib + 1 < nb {
+        while ib + 4 <= nb {
             let x0 = x.get_unchecked(ib);
             let x1 = x.get_unchecked(ib + 1);
+            let x2 = x.get_unchecked(ib + 2);
+            let x3 = x.get_unchecked(ib + 3);
             let y0 = y.get_unchecked(ib);
             let y1 = y.get_unchecked(ib + 1);
+            let y2 = y.get_unchecked(ib + 2);
+            let y3 = y.get_unchecked(ib + 3);
 
             let p0 = dot32_s8_full_v80(
                 vld1q_s8(x0.qs.as_ptr()),
@@ -636,22 +639,34 @@ pub unsafe fn vec_dot_q8_0_q8_0(x: &[BlockQ8_0], y: &[BlockQ8_0]) -> f32 {
                 vld1q_s8(y1.qs.as_ptr()),
                 vld1q_s8(y1.qs.as_ptr().add(16)),
             );
+            let p2 = dot32_s8_full_v80(
+                vld1q_s8(x2.qs.as_ptr()),
+                vld1q_s8(x2.qs.as_ptr().add(16)),
+                vld1q_s8(y2.qs.as_ptr()),
+                vld1q_s8(y2.qs.as_ptr().add(16)),
+            );
+            let p3 = dot32_s8_full_v80(
+                vld1q_s8(x3.qs.as_ptr()),
+                vld1q_s8(x3.qs.as_ptr().add(16)),
+                vld1q_s8(y3.qs.as_ptr()),
+                vld1q_s8(y3.qs.as_ptr().add(16)),
+            );
 
-            sumv0 = vmlaq_n_f32(
-                sumv0,
-                vcvtq_f32_s32(p0),
+            let sum4 = vpaddq_s32(vpaddq_s32(p0, p1), vpaddq_s32(p2, p3));
+            let scales = [
                 f16_to_f32_hw(x0.d) * f16_to_f32_hw(y0.d),
-            );
-            sumv1 = vmlaq_n_f32(
-                sumv1,
-                vcvtq_f32_s32(p1),
                 f16_to_f32_hw(x1.d) * f16_to_f32_hw(y1.d),
-            );
-            ib += 2;
+                f16_to_f32_hw(x2.d) * f16_to_f32_hw(y2.d),
+                f16_to_f32_hw(x3.d) * f16_to_f32_hw(y3.d),
+            ];
+            let prod4 = vmulq_f32(vcvtq_f32_s32(sum4), vld1q_f32(scales.as_ptr()));
+            let mut lanes = [0.0f32; 4];
+            vst1q_f32(lanes.as_mut_ptr(), prod4);
+            sumf = (((sumf + lanes[0]) + lanes[1]) + lanes[2]) + lanes[3];
+            ib += 4;
         }
 
-        let mut sumf = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
-        if ib < nb {
+        while ib < nb {
             let x0 = x.get_unchecked(ib);
             let y0 = y.get_unchecked(ib);
             let p0 = dot32_s8_full_v80(
@@ -661,13 +676,15 @@ pub unsafe fn vec_dot_q8_0_q8_0(x: &[BlockQ8_0], y: &[BlockQ8_0]) -> f32 {
                 vld1q_s8(y0.qs.as_ptr().add(16)),
             );
             sumf += (vaddvq_s32(p0) as f32) * (f16_to_f32_hw(x0.d) * f16_to_f32_hw(y0.d));
+            ib += 1;
         }
         sumf
     }
 }
 
-/// 4-row unrolled ARMv8.0 NEON `gemv_q8_0_q8_0`: shares `x` loads across 4 weight rows.
-/// Accelerates `SmolLM2` `output.weight` (`lm_head`) by ~3x on Cortex-A53 / Cortex-A72!
+/// 4-row unrolled ARMv8.0 NEON `gemv_q8_0_q8_0`: shares `x` loads across 4 weight rows and
+/// reduces each 32-element block in exact `i32` (`vpaddq_s32`) before scaling (`0-ULP` bit-exact
+/// with `generic::gemv_q8_0_q8_0`).
 ///
 /// # Safety
 /// Caller must ensure NEON is available and buffer lengths match dimensions.
@@ -691,41 +708,59 @@ pub unsafe fn gemv_q8_0_q8_0(
             let w1 = &w[(r + 1) * cols_blocks..(r + 2) * cols_blocks];
             let w2 = &w[(r + 2) * cols_blocks..(r + 3) * cols_blocks];
             let w3 = &w[(r + 3) * cols_blocks..(r + 4) * cols_blocks];
-
-            let mut acc0 = vdupq_n_f32(0.0);
-            let mut acc1 = vdupq_n_f32(0.0);
-            let mut acc2 = vdupq_n_f32(0.0);
-            let mut acc3 = vdupq_n_f32(0.0);
+            let mut acc4 = vdupq_n_f32(0.0);
 
             for ib in 0..cols_blocks {
                 let by = x.get_unchecked(ib);
                 let yl = vld1q_s8(by.qs.as_ptr());
                 let yh = vld1q_s8(by.qs.as_ptr().add(16));
-                let dy = f16_to_f32_hw(by.d);
+                let dy = vdupq_n_f32(f16_to_f32_hw(by.d));
 
-                macro_rules! step_q80 {
-                    ($row:expr, $acc:expr) => {{
-                        let bx = $row.get_unchecked(ib);
-                        let p = dot32_s8_full_v80(
-                            vld1q_s8(bx.qs.as_ptr()),
-                            vld1q_s8(bx.qs.as_ptr().add(16)),
-                            yl,
-                            yh,
-                        );
-                        $acc = vmlaq_n_f32($acc, vcvtq_f32_s32(p), f16_to_f32_hw(bx.d) * dy);
-                    }};
-                }
+                let b0 = w0.get_unchecked(ib);
+                let b1 = w1.get_unchecked(ib);
+                let b2 = w2.get_unchecked(ib);
+                let b3 = w3.get_unchecked(ib);
 
-                step_q80!(w0, acc0);
-                step_q80!(w1, acc1);
-                step_q80!(w2, acc2);
-                step_q80!(w3, acc3);
+                let p0 = dot32_s8_full_v80(
+                    vld1q_s8(b0.qs.as_ptr()),
+                    vld1q_s8(b0.qs.as_ptr().add(16)),
+                    yl,
+                    yh,
+                );
+                let p1 = dot32_s8_full_v80(
+                    vld1q_s8(b1.qs.as_ptr()),
+                    vld1q_s8(b1.qs.as_ptr().add(16)),
+                    yl,
+                    yh,
+                );
+                let p2 = dot32_s8_full_v80(
+                    vld1q_s8(b2.qs.as_ptr()),
+                    vld1q_s8(b2.qs.as_ptr().add(16)),
+                    yl,
+                    yh,
+                );
+                let p3 = dot32_s8_full_v80(
+                    vld1q_s8(b3.qs.as_ptr()),
+                    vld1q_s8(b3.qs.as_ptr().add(16)),
+                    yl,
+                    yh,
+                );
+
+                let sum4 = vpaddq_s32(vpaddq_s32(p0, p1), vpaddq_s32(p2, p3));
+                let dx4 = vld1q_f32(
+                    [
+                        f16_to_f32_hw(b0.d),
+                        f16_to_f32_hw(b1.d),
+                        f16_to_f32_hw(b2.d),
+                        f16_to_f32_hw(b3.d),
+                    ]
+                    .as_ptr(),
+                );
+                let scale4 = vmulq_f32(dx4, dy);
+                acc4 = vaddq_f32(acc4, vmulq_f32(vcvtq_f32_s32(sum4), scale4));
             }
 
-            *out.get_unchecked_mut(r) = vaddvq_f32(acc0);
-            *out.get_unchecked_mut(r + 1) = vaddvq_f32(acc1);
-            *out.get_unchecked_mut(r + 2) = vaddvq_f32(acc2);
-            *out.get_unchecked_mut(r + 3) = vaddvq_f32(acc3);
+            vst1q_f32(out.as_mut_ptr().add(r), acc4);
             r += 4;
         }
 
