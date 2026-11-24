@@ -2928,7 +2928,7 @@ struct AttnExtArgs {
     uint n_tok;
     uint window;
     float attn_scale;
-    uint _pad;
+    float attn_softcap;
 };
 
 // Fast 1-simdgroup (32 threads, zero barriers, zero threadgroup memory) GQA decode attention
@@ -2972,6 +2972,9 @@ kernel void gqa_attn_f16_kv_ext_1sg(
                 dot = fma(q_reg[k], float(kh[k * 32 + lane]), dot);
             }
             dot = simd_sum(dot);
+            if (a.attn_softcap > 0.0f) {
+                dot = tanh(dot / a.attn_softcap) * a.attn_softcap;
+            }
             const float m_new = max(m_local, dot);
             const float alpha = (m_local == -INFINITY) ? 0.0f : exp(m_local - m_new);
             const float p = exp(dot - m_new);
@@ -3012,6 +3015,9 @@ kernel void gqa_attn_f16_kv_ext_1sg(
                 dot = fma(q_reg[k], float(kh[k * 32 + lane]), dot);
             }
             dot = simd_sum(dot);
+            if (a.attn_softcap > 0.0f) {
+                dot = tanh(dot / a.attn_softcap) * a.attn_softcap;
+            }
             const float m_new = max(m_local, dot);
             const float alpha = (m_local == -INFINITY) ? 0.0f : exp(m_local - m_new);
             const float p = exp(dot - m_new);
@@ -3061,6 +3067,9 @@ kernel void gqa_attn_f16_kv_ext_1sg(
             }
         }
         dot = simd_sum(dot);
+        if (a.attn_softcap > 0.0f) {
+            dot = tanh(dot / a.attn_softcap) * a.attn_softcap;
+        }
 
         const float m_new = max(m_local, dot);
         const float alpha = (m_local == -INFINITY) ? 0.0f : exp(m_local - m_new);
@@ -3469,6 +3478,9 @@ kernel void gqa_attn_f16_kv_ext_batch(
             }
         }
         dot = simd_sum(dot);
+        if (a.attn_softcap > 0.0f) {
+            dot = tanh(dot / a.attn_softcap) * a.attn_softcap;
+        }
 
         const float m_new = max(m_local, dot);
         const float alpha = (m_local == -INFINITY) ? 0.0f : exp(m_local - m_new);
@@ -3980,4 +3992,26 @@ kernel void add_bias_f32(
     const uint t = gid.y;
     if (col >= a.d_out || t >= a.n_tok) return;
     y[ulong(t) * ulong(a.d_out) + col] += bias[col];
+}
+
+struct HeadGateArgs {
+    uint n_head;
+    uint head_dim;
+    uint n_tok;
+    uint _pad;
+};
+
+kernel void sigmoid_head_gate_f32(
+    device float* attn_out [[buffer(0)]],
+    device const float* gate_raw [[buffer(1)]],
+    constant HeadGateArgs& a [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint idx = gid.x;
+    const uint t = gid.y;
+    const uint q_dim = a.n_head * a.head_dim;
+    if (idx >= q_dim || t >= a.n_tok) return;
+    const uint h = idx / a.head_dim;
+    const float g = 1.0f / (1.0f + exp(-gate_raw[ulong(t) * ulong(a.n_head) + h]));
+    attn_out[ulong(t) * ulong(q_dim) + idx] *= g;
 }

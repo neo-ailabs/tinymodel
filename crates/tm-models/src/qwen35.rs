@@ -278,6 +278,8 @@ fn load_mat<'a>(
         dtype: info.dtype,
         rows,
         cols,
+        row_offset: 0,
+        is_sliced: false,
         lora_slot: None,
     })
 }

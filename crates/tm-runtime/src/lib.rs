@@ -46,14 +46,16 @@ pub enum CpuState {
 }
 
 impl<'a> CpuModel<'a> {
-    /// Loads and validates any supported GGUF model (`llama`, `qwen2`, `qwen3`, `qwen35`, `gemma4`, `lfm2`, `inkling2`, `inkling2_loop`).
+    /// Loads and validates any supported GGUF model (`llama`, `qwen2`, `qwen3`, `smollm3`, `phi3`, `mistral`, `mistral3`, `qwen35`, `gemma2`, `gemma3`, `gemma4`, `lfm2`, `lfm3`, `inkling2`, `inkling2_loop`).
     pub fn from_gguf(gguf: &'a GgufFile) -> Result<Self, ModelError> {
         let arch = gguf.req_str("general.architecture")?;
         match arch {
-            "llama" | "qwen2" | "qwen3" => Ok(CpuModel::Llama(LlamaModel::from_gguf(gguf)?)),
+            "llama" | "qwen2" | "qwen3" | "smollm3" | "phi3" | "mistral" | "mistral3" => {
+                Ok(CpuModel::Llama(LlamaModel::from_gguf(gguf)?))
+            }
             "qwen35" => Ok(CpuModel::Qwen35(Qwen35Model::from_gguf(gguf)?)),
-            "gemma4" => Ok(CpuModel::Gemma4(Gemma4Model::from_gguf(gguf)?)),
-            "lfm2" => Ok(CpuModel::Lfm2(Lfm2Model::from_gguf(gguf)?)),
+            "gemma2" | "gemma3" | "gemma4" => Ok(CpuModel::Gemma4(Gemma4Model::from_gguf(gguf)?)),
+            "lfm2" | "lfm3" => Ok(CpuModel::Lfm2(Lfm2Model::from_gguf(gguf)?)),
             "inkling2" | "inkling2_loop" => Ok(CpuModel::Inkling2(Box::new(
                 Inkling2Model::from_gguf(gguf)?,
             ))),

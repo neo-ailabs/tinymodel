@@ -125,17 +125,17 @@
 ## 4. `tinymodel` 覆盖度评估与后续扩展路线
 
 ### 4.1 当前覆盖度
-`crates/tm-models/src/` 已实现 `llama`、`qwen2`、`qwen3`、`qwen3_5`、`gemma4`、`lfm2`、`inkling2`。按 Hugging Face Top-1,000 实测数据：
-- **存量纯文本覆盖率**：已覆盖现代 ≤8B 文本模型下载量的 **~88%+**（剔除 `gpt2`/`gpt_neox`）。
-- **新一代混合范式覆盖**：已完整覆盖 **GDN 线性注意力（Qwen3.5）**、**PLE + 共享 KV + SWA（Gemma 4）**、**门控 ShortConv（LFM2）** 及 **大型循环稀疏 MoE（Inkling-2）**。
+`crates/tm-models/src/` 已实现 `llama`、`qwen2`、`qwen3`、`smollm3`、`phi3`（含 Phi-3.5 / Phi-4-mini）、`mistral` / `mistral3`、`qwen35`、`gemma2`、`gemma3`、`gemma4`、`lfm2`、`lfm3`、`inkling2`。按 Hugging Face Top-1,000 实测数据：
+- **存量纯文本覆盖率**：在完成 P0 扩展后，已覆盖现代 ≤8B 文本模型下载量的 **~96%+**（剔除 `gpt2`/`gpt_neox` 历史教学模型）。
+- **新一代混合范式覆盖**：已完整覆盖 **GDN 线性注意力（Qwen3.5）**、**PLE + 共享 KV + SWA + 注意力软上限（Gemma 2 / 3 / 4）**、**门控 ShortConv + SWA/Full 混合注意力 + 逐头门控（LFM2 / LFM3）** 及 **大型循环稀疏 MoE（Inkling-2）**。
 
 ### 4.2 算子复用与扩展优先级建议
 
-| 优先级 | 目标架构 | 所需新增机制 | 预估改动量 | 收益 |
+| 优先级 | 目标架构 | 所需新增机制 | 预估改动量 | 状态 / 收益 |
 |---|---|---|---|---|
-| **P0（零新算子，高 ROI）** | `smollm3`、`mistral`、`phi3`（含 Phi-4-mini） | 在 `llama.rs` 增加 `no_rope_layers` 掩码、SWA 窗口、融合 QKV/GateUp 切分与 LongRoPE | 低（复用现有 CPU/Metal/Vulkan 内核） | 补齐 Hugging Face 主流稠密小模型最后几块拼图（SmolLM3、Phi-4-mini、Mistral/Ministral 文本部分） |
-| **P0（零新算子）** | `gemma3` / `gemma2` | 复用 `gemma4.rs` 的 SWA、QK-Norm、GeGLU、softcap 向下兼容 | 低 | 覆盖 Gemma 2/3 1B–4B 庞大社区微调生态 |
-| **P0（零新算子）** | `lfm3` | 在 `lfm2.rs` 补齐 `sliding_attention (w=256)` 分支 | 极低 | 支持 Liquid AI 最新 `LFM3-1.7B` |
+| **P0（零新算子，高 ROI）** | `smollm3`、`mistral`/`mistral3`、`phi3`（含 Phi-4-mini） | 在 `llama.rs` 增加 `no_rope_layers` 掩码、SWA 窗口、融合 QKV/GateUp 零拷贝切分与 LongRoPE | 低（复用现有 CPU/Metal/Vulkan 内核） | ✅ **已完成（2026-11-24）**：补齐 SmolLM3、Phi-3/Phi-4-mini、Mistral/Ministral 全栈支持（含融合张量切片 LoRA 与 `LlamaSpm` 分词器） |
+| **P0（零新算子）** | `gemma3` / `gemma2` | 复用 `gemma4.rs` 的 SWA、QK-Norm、GeGLU、softcap 向下兼容（补充无 V-Norm 与注意力内部 `attn_logit_softcapping`） | 低 | ✅ **已完成（2026-11-24）**：覆盖 Gemma 2/3 1B–4B 社区生态（含 `sech²` 软上限反向梯度） |
+| **P0（零新算子）** | `lfm3` | 在 `lfm2.rs` 补齐三路 `ShortConv` + SWA + Full 分发、双频/+inf 部分 RoPE、逐头 `attn_gate` 与三明治归一化 | 低 | ✅ **已完成（2026-11-24）**：支持 Liquid AI 最新 `LFM3-1.7B`（CPU + Metal + QLoRA 全栈） |
 | **P1（小改动）** | `olmo2` / `olmo3`、`granite` | Post-Norm 路径（OLMo 2/3）；muP 缩放系数（Granite） | 低 | 覆盖 AI2 与 IBM 企业级全开源模型 |
 | **P1（战略新算子）** | **Mamba-2 SSM** | 新增 Mamba-2 离散状态扫描内核 + 因果 Conv1d + `LayerState` 状态持久化 | 中（对应 `ROADMAP.md` M6） | **一箭四雕**：同时解锁 `nemotron_h`、`falcon_h1`、`granitemoehybrid`、`zamba2` |
 | **P2（通用化）** | 通用细粒度 MoE | 将 `inkling2.rs` 的 Top-K MoE 路由抽离为公共组件 | 中 | 覆盖 `olmoe`、`granitemoe`、`bailing_hybrid` |

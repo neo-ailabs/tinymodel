@@ -639,3 +639,95 @@ fn vk_mixed_quant_decode_vs_batch_and_cpu_kl_parity() {
         }
     }
 }
+
+#[test]
+fn vk_p0_smollm3_nope_phi3_sliced_longrope_and_mistral_swa_guard() {
+    let Some(ctx1) = get_ctx_or_skip() else {
+        return;
+    };
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap();
+    let script = repo_root.join("tools/oracle/p0_architectures_oracle.py");
+    let py = [
+        "/opt/anaconda3/bin/python3",
+        "/opt/homebrew/bin/python3",
+        "python3",
+    ]
+    .into_iter()
+    .find(|c| {
+        std::process::Command::new(c)
+            .args(["-c", "import numpy"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+    .unwrap_or("python3");
+
+    let dir = std::env::temp_dir().join(format!("tm_vk_p0_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 1. `smollm3` (NoPE every 4th layer) & `phi3` (fused `attn_qkv` + fused `ffn_up` + LongRoPE)
+    for (arch, ctx_cap, c_in) in [("smollm3", 64usize, Some(ctx1)), ("phi3", 64usize, None)] {
+        let ctx = c_in.or_else(get_ctx_or_skip).unwrap();
+        let p = dir.join(format!("{arch}_q4.gguf"));
+        assert!(
+            std::process::Command::new(py)
+                .arg(&script)
+                .arg("--arch")
+                .arg(arch)
+                .arg("--out-gguf")
+                .arg(&p)
+                .arg("--quant")
+                .arg("q4_0")
+                .arg("--eval-ctx")
+                .arg(ctx_cap.to_string())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let gguf = std::sync::Arc::new(GgufFile::open(&p).unwrap());
+        let cpu = LlamaModel::from_gguf(&gguf).unwrap();
+        let mut cpu_st = LlamaState::new(&cpu.cfg, ctx_cap);
+        let pool = ThreadPool::new(2);
+        let kt = active_kernels();
+        let mut vk = LlamaVkRunner::from_gguf_with_context(ctx, gguf.clone(), ctx_cap).unwrap();
+        let seq = [1u32, 5, 12, 7, 19, 3];
+        for (pos, &t) in seq.iter().enumerate() {
+            cpu.forward_token(&mut cpu_st, &pool, kt, t, pos, true)
+                .unwrap();
+            let vk_l = vk.forward_token(t, pos, true).unwrap();
+            assert!(
+                kl_div(cpu_st.logits(), vk_l) < 5e-3,
+                "Vulkan {arch} step {pos} KL too high"
+            );
+        }
+    }
+
+    // 2. `mistral` with `sliding_window = 3 < max_ctx = 64` cleanly returns `InvalidDimensions` (`AGENTS.md` Rule #6)
+    let p_mis = dir.join("mistral_q4.gguf");
+    assert!(
+        std::process::Command::new(py)
+            .arg(&script)
+            .arg("--arch")
+            .arg("mistral")
+            .arg("--out-gguf")
+            .arg(&p_mis)
+            .arg("--quant")
+            .arg("q4_0")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let gguf_mis = std::sync::Arc::new(GgufFile::open(&p_mis).unwrap());
+    let ctx_mis = get_ctx_or_skip().unwrap();
+    let res = LlamaVkRunner::from_gguf_with_context(ctx_mis, gguf_mis, 64);
+    assert!(matches!(
+        res,
+        Err(tm_vulkan::VulkanError::InvalidDimensions(_))
+    ));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

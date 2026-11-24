@@ -79,6 +79,19 @@ struct AttnArgs {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct AttnExtArgs {
+    n_head: u32,
+    n_head_kv: u32,
+    head_dim: u32,
+    start_pos: u32,
+    n_tok: u32,
+    window: u32,
+    attn_scale: f32,
+    attn_softcap: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct FlashAttnArgs {
     n_head: u32,
     n_head_kv: u32,
@@ -131,6 +144,15 @@ pub struct LlamaMetalConfig {
     pub rope_freq_base: f32,
     pub rms_eps: f32,
     pub rope_type: u32, // 0 = Norm, 1 = Neox
+    pub sliding_window: Option<usize>,
+    pub use_rope: Vec<bool>,
+}
+
+impl LlamaMetalConfig {
+    #[inline]
+    pub fn layer_uses_rope(&self, layer: usize) -> bool {
+        self.use_rope.get(layer).copied().unwrap_or(true)
+    }
 }
 
 struct GpuMat {
@@ -193,6 +215,7 @@ struct Pipelines {
     qk_norm_batch: MtlPipe,
     rope_kv_batch: MtlPipe,
     gqa_attn_batch: MtlPipe,
+    gqa_attn_ext_batch: MtlPipe,
     fa_gqa_batch: MtlPipe,
     fa_gqa_batch_hd256: MtlPipe,
     gemm_q4_0: MtlPipe,
@@ -374,6 +397,61 @@ fn load_gpu_mat(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn load_gpu_mat_slice(
+    device: &ProtocolObject<dyn MTLDevice>,
+    gguf: &GgufFile,
+    shared_weights: Option<&MtlBuf>,
+    fused_name: &str,
+    logical_name: String,
+    layer: &str,
+    cols: usize,
+    total_rows: usize,
+    row_start: usize,
+    rows: usize,
+) -> Result<GpuMat, MetalError> {
+    let (info, bytes) = gguf.req_tensor(fused_name, layer, &[cols, total_rows])?;
+    match info.dtype {
+        DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q5K | DType::Q6K | DType::F32 => {}
+        other => return Err(MetalError::UnsupportedDType(other)),
+    }
+    let row_bytes = info.dtype.row_bytes(cols);
+    let byte_off = row_start * row_bytes;
+    let byte_len = rows * row_bytes;
+    let (buf, offset) = if let Some(shared) = shared_weights {
+        (shared.clone(), gguf.tensor_file_offset(info) + byte_off)
+    } else {
+        (
+            upload_bytes(device, &bytes[byte_off..byte_off + byte_len])?,
+            0,
+        )
+    };
+    Ok(GpuMat {
+        name: logical_name,
+        buf,
+        offset,
+        dtype: info.dtype,
+        rows,
+        cols,
+        row_bytes,
+    })
+}
+
+fn load_opt_gpu_f32_vec_any(
+    device: &ProtocolObject<dyn MTLDevice>,
+    gguf: &GgufFile,
+    names: &[&str],
+    layer: &str,
+    len: usize,
+) -> Result<Option<MtlBuf>, MetalError> {
+    for &name in names {
+        if gguf.tensor_info(name).is_some() {
+            return Ok(Some(load_gpu_f32_vec(device, gguf, name, layer, len)?));
+        }
+    }
+    Ok(None)
+}
+
 fn require_fit(
     pipe: &ProtocolObject<dyn MTLComputePipelineState>,
     name: &'static str,
@@ -412,12 +490,16 @@ impl LlamaMetalRunner {
     pub fn from_gguf(gguf: Arc<GgufFile>, max_ctx: usize) -> Result<Self, MetalError> {
         let gguf_ref: &GgufFile = &gguf;
         let arch = gguf_ref.req_str("general.architecture")?.to_string();
-        if arch != "llama" && arch != "qwen2" && arch != "qwen3" {
+        if !matches!(
+            arch.as_str(),
+            "llama" | "qwen2" | "qwen3" | "smollm3" | "phi3" | "mistral" | "mistral3"
+        ) {
             return Err(MetalError::UnsupportedArch(arch));
         }
 
         let pfx = arch.as_str();
         let is_qwen = matches!(pfx, "qwen2" | "qwen3");
+        let is_neox = matches!(pfx, "qwen2" | "qwen3" | "phi3");
         let n_layers = gguf_ref.req_usize(&format!("{pfx}.block_count"))?;
         let n_embd = gguf_ref.req_usize(&format!("{pfx}.embedding_length"))?;
         let n_ff = gguf_ref.req_usize(&format!("{pfx}.feed_forward_length"))?;
@@ -434,15 +516,59 @@ impl LlamaMetalRunner {
             .get_meta(&format!("{pfx}.rope.dimension_count"))
             .and_then(|v| v.as_usize())
             .unwrap_or(head_dim);
+        let max_ctx_train = gguf_ref
+            .get_meta(&format!("{pfx}.context_length"))
+            .and_then(|v| v.as_usize())
+            .unwrap_or(2048);
+        let default_freq_base = if is_qwen {
+            1_000_000.0
+        } else if pfx == "smollm3" {
+            5_000_000.0
+        } else {
+            10_000.0
+        };
         let rope_freq_base = gguf_ref
             .get_meta(&format!("{pfx}.rope.freq_base"))
             .and_then(|v| v.as_f32())
-            .unwrap_or(if is_qwen { 1_000_000.0 } else { 10000.0 });
+            .unwrap_or(default_freq_base);
         let rms_eps = gguf_ref
             .get_meta(&format!("{pfx}.attention.layer_norm_rms_epsilon"))
             .and_then(|v| v.as_f32())
-            .unwrap_or(if is_qwen { 1e-6 } else { 1e-5 });
-        let rope_type = if is_qwen { 1 } else { 0 };
+            .unwrap_or(if is_qwen || pfx == "smollm3" {
+                1e-6
+            } else {
+                1e-5
+            });
+        let rope_type = if is_neox { 1 } else { 0 };
+        let use_rope = if let Some(pat) = gguf_ref
+            .get_meta(&format!("{pfx}.rope.pattern"))
+            .and_then(|v| v.as_bool_array())
+            && pat.len() == n_layers
+        {
+            pat
+        } else if let Some(step) = gguf_ref
+            .get_meta(&format!("{pfx}.rope.no_rope_layer_step"))
+            .and_then(|v| v.as_usize())
+            && step > 0
+        {
+            (0..n_layers).map(|l| (l + 1) % step != 0).collect()
+        } else if pfx == "smollm3" {
+            (0..n_layers).map(|l| (l + 1) % 4 != 0).collect()
+        } else {
+            vec![true; n_layers]
+        };
+        let sliding_window = if pfx == "phi3" {
+            None
+        } else {
+            gguf_ref
+                .get_meta(&format!("{pfx}.attention.sliding_window"))
+                .and_then(|v| v.as_usize())
+                .filter(|&w| w > 0)
+        };
+        let rope_orig_ctx = gguf_ref
+            .get_meta(&format!("{pfx}.rope.scaling.original_context_length"))
+            .and_then(|v| v.as_usize())
+            .unwrap_or(max_ctx_train);
 
         let embd_info =
             gguf_ref
@@ -495,6 +621,7 @@ impl LlamaMetalRunner {
             qk_norm_batch: build_pipe(&device, &lib, "qk_norm_f32_batch", 32)?,
             rope_kv_batch: build_pipe(&device, &lib, "rope_and_kv_store_f16_batch", 64)?,
             gqa_attn_batch: build_pipe(&device, &lib, "gqa_attn_f16_kv_batch", 128)?,
+            gqa_attn_ext_batch: build_pipe(&device, &lib, "gqa_attn_f16_kv_ext_batch", 128)?,
             fa_gqa_batch: build_pipe(&device, &lib, "fa_gqa_f16_kv_batch", 128)?,
             fa_gqa_batch_hd256: build_pipe(&device, &lib, "fa_gqa_f16_kv_batch_hd256", 128)?,
             gemm_q4_0: build_pipe(&device, &lib, "gemm_q4_0_res", 128)?,
@@ -541,19 +668,36 @@ impl LlamaMetalRunner {
             load_opt_gpu_f32_vec(&device, gguf_ref, "output.bias", "global", vocab_size)?;
         let output_norm =
             load_gpu_f32_vec(&device, gguf_ref, "output_norm.weight", "global", n_embd)?;
-        let (has_rope_freqs, rope_freqs) = if gguf_ref.tensor_info("rope_freqs.weight").is_some() {
-            (
-                true,
-                load_gpu_f32_vec(
-                    &device,
-                    gguf_ref,
+        let rope_freq_buf = if max_ctx > rope_orig_ctx {
+            load_opt_gpu_f32_vec_any(
+                &device,
+                gguf_ref,
+                &[
+                    "rope_factors_long.weight",
+                    "blk.0.rope_factors_long.weight",
                     "rope_freqs.weight",
-                    "global",
-                    rope_dim / 2,
-                )?,
-            )
+                    "rope_factors_short.weight",
+                    "blk.0.rope_factors_short.weight",
+                ],
+                "global",
+                rope_dim / 2,
+            )?
         } else {
-            (false, upload_f32(&device, &[1.0f32])?)
+            load_opt_gpu_f32_vec_any(
+                &device,
+                gguf_ref,
+                &[
+                    "rope_freqs.weight",
+                    "rope_factors_short.weight",
+                    "blk.0.rope_factors_short.weight",
+                ],
+                "global",
+                rope_dim / 2,
+            )?
+        };
+        let (has_rope_freqs, rope_freqs) = match rope_freq_buf {
+            Some(buf) => (true, buf),
+            None => (false, upload_f32(&device, &[1.0f32])?),
         };
 
         let q_dim = n_head * head_dim;
@@ -577,27 +721,45 @@ impl LlamaMetalRunner {
                 &ltag,
                 head_dim,
             )?;
-            let bq = load_opt_gpu_f32_vec(
-                &device,
-                gguf_ref,
-                &format!("{ltag}.attn_q.bias"),
-                &ltag,
-                q_dim,
-            )?;
-            let bk = load_opt_gpu_f32_vec(
-                &device,
-                gguf_ref,
-                &format!("{ltag}.attn_k.bias"),
-                &ltag,
-                kv_dim,
-            )?;
-            let bv = load_opt_gpu_f32_vec(
-                &device,
-                gguf_ref,
-                &format!("{ltag}.attn_v.bias"),
-                &ltag,
-                kv_dim,
-            )?;
+            let qkv_bias_name = format!("{ltag}.attn_qkv.bias");
+            let (bq, bk, bv) = if gguf_ref.tensor_info(&qkv_bias_name).is_some() {
+                let (info, bytes) =
+                    gguf_ref.req_tensor(&qkv_bias_name, &ltag, &[q_dim + 2 * kv_dim])?;
+                let mut full = vec![0.0f32; q_dim + 2 * kv_dim];
+                dequantize_row_bytes(info.dtype, bytes, &mut full);
+                (
+                    Some(upload_f32(&device, &full[..q_dim])?),
+                    Some(upload_f32(&device, &full[q_dim..q_dim + kv_dim])?),
+                    Some(upload_f32(
+                        &device,
+                        &full[q_dim + kv_dim..q_dim + 2 * kv_dim],
+                    )?),
+                )
+            } else {
+                (
+                    load_opt_gpu_f32_vec(
+                        &device,
+                        gguf_ref,
+                        &format!("{ltag}.attn_q.bias"),
+                        &ltag,
+                        q_dim,
+                    )?,
+                    load_opt_gpu_f32_vec(
+                        &device,
+                        gguf_ref,
+                        &format!("{ltag}.attn_k.bias"),
+                        &ltag,
+                        kv_dim,
+                    )?,
+                    load_opt_gpu_f32_vec(
+                        &device,
+                        gguf_ref,
+                        &format!("{ltag}.attn_v.bias"),
+                        &ltag,
+                        kv_dim,
+                    )?,
+                )
+            };
             let bo = load_opt_gpu_f32_vec(
                 &device,
                 gguf_ref,
@@ -605,6 +767,100 @@ impl LlamaMetalRunner {
                 &ltag,
                 n_embd,
             )?;
+
+            let q_name = format!("{ltag}.attn_q.weight");
+            let qkv_name = format!("{ltag}.attn_qkv.weight");
+            let (wq, wk, wv) = if gguf_ref.tensor_info(&q_name).is_some() {
+                (
+                    load_gpu_mat(&device, gguf_ref, sw, &q_name, &ltag, n_embd, q_dim)?,
+                    load_gpu_mat(
+                        &device,
+                        gguf_ref,
+                        sw,
+                        &format!("{ltag}.attn_k.weight"),
+                        &ltag,
+                        n_embd,
+                        kv_dim,
+                    )?,
+                    load_gpu_mat(
+                        &device,
+                        gguf_ref,
+                        sw,
+                        &format!("{ltag}.attn_v.weight"),
+                        &ltag,
+                        n_embd,
+                        kv_dim,
+                    )?,
+                )
+            } else {
+                let total_qkv = q_dim + 2 * kv_dim;
+                (
+                    load_gpu_mat_slice(
+                        &device, gguf_ref, sw, &qkv_name, q_name, &ltag, n_embd, total_qkv, 0,
+                        q_dim,
+                    )?,
+                    load_gpu_mat_slice(
+                        &device,
+                        gguf_ref,
+                        sw,
+                        &qkv_name,
+                        format!("{ltag}.attn_k.weight"),
+                        &ltag,
+                        n_embd,
+                        total_qkv,
+                        q_dim,
+                        kv_dim,
+                    )?,
+                    load_gpu_mat_slice(
+                        &device,
+                        gguf_ref,
+                        sw,
+                        &qkv_name,
+                        format!("{ltag}.attn_v.weight"),
+                        &ltag,
+                        n_embd,
+                        total_qkv,
+                        q_dim + kv_dim,
+                        kv_dim,
+                    )?,
+                )
+            };
+
+            let gate_name = format!("{ltag}.ffn_gate.weight");
+            let up_name = format!("{ltag}.ffn_up.weight");
+            let (w_gate, w_up) = if gguf_ref.tensor_info(&gate_name).is_some() {
+                (
+                    load_gpu_mat(&device, gguf_ref, sw, &gate_name, &ltag, n_embd, n_ff)?,
+                    load_gpu_mat(&device, gguf_ref, sw, &up_name, &ltag, n_embd, n_ff)?,
+                )
+            } else {
+                (
+                    load_gpu_mat_slice(
+                        &device,
+                        gguf_ref,
+                        sw,
+                        &up_name,
+                        gate_name,
+                        &ltag,
+                        n_embd,
+                        2 * n_ff,
+                        0,
+                        n_ff,
+                    )?,
+                    load_gpu_mat_slice(
+                        &device,
+                        gguf_ref,
+                        sw,
+                        &up_name,
+                        up_name.clone(),
+                        &ltag,
+                        n_embd,
+                        2 * n_ff,
+                        n_ff,
+                        n_ff,
+                    )?,
+                )
+            };
 
             layers.push(GpuLayer {
                 attn_norm: load_gpu_f32_vec(
@@ -627,33 +883,9 @@ impl LlamaMetalRunner {
                 bk,
                 bv,
                 bo,
-                wq: load_gpu_mat(
-                    &device,
-                    gguf_ref,
-                    sw,
-                    &format!("{ltag}.attn_q.weight"),
-                    &ltag,
-                    n_embd,
-                    q_dim,
-                )?,
-                wk: load_gpu_mat(
-                    &device,
-                    gguf_ref,
-                    sw,
-                    &format!("{ltag}.attn_k.weight"),
-                    &ltag,
-                    n_embd,
-                    kv_dim,
-                )?,
-                wv: load_gpu_mat(
-                    &device,
-                    gguf_ref,
-                    sw,
-                    &format!("{ltag}.attn_v.weight"),
-                    &ltag,
-                    n_embd,
-                    kv_dim,
-                )?,
+                wq,
+                wk,
+                wv,
                 wo: load_gpu_mat(
                     &device,
                     gguf_ref,
@@ -663,24 +895,8 @@ impl LlamaMetalRunner {
                     q_dim,
                     n_embd,
                 )?,
-                w_gate: load_gpu_mat(
-                    &device,
-                    gguf_ref,
-                    sw,
-                    &format!("{ltag}.ffn_gate.weight"),
-                    &ltag,
-                    n_embd,
-                    n_ff,
-                )?,
-                w_up: load_gpu_mat(
-                    &device,
-                    gguf_ref,
-                    sw,
-                    &format!("{ltag}.ffn_up.weight"),
-                    &ltag,
-                    n_embd,
-                    n_ff,
-                )?,
+                w_gate,
+                w_up,
                 w_down: load_gpu_mat(
                     &device,
                     gguf_ref,
@@ -722,6 +938,8 @@ impl LlamaMetalRunner {
                 rope_freq_base,
                 rms_eps,
                 rope_type,
+                sliding_window,
+                use_rope,
             },
             device,
             queue,
@@ -951,6 +1169,44 @@ impl LlamaMetalRunner {
         layer: &GpuLayer,
         seq_len: usize,
     ) {
+        if let Some(w) = self.cfg.sliding_window {
+            let aargs = AttnExtArgs {
+                n_head: self.cfg.n_head as u32,
+                n_head_kv: self.cfg.n_head_kv as u32,
+                head_dim: self.cfg.head_dim as u32,
+                start_pos: (seq_len - 1) as u32,
+                n_tok: 1,
+                window: w as u32,
+                attn_scale: 1.0 / (self.cfg.head_dim as f32).sqrt(),
+                attn_softcap: 0.0,
+            };
+            enc.setComputePipelineState(&self.pipes.gqa_attn_ext_batch);
+            // SAFETY: Buffers remain alive until `waitUntilCompleted`.
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&self.q), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(&layer.k_cache), 0, 1);
+                enc.setBuffer_offset_atIndex(Some(&layer.v_cache), 0, 2);
+                enc.setBuffer_offset_atIndex(Some(&self.xb), 0, 3);
+                enc.setBytes_length_atIndex(
+                    NonNull::from(&aargs).cast::<c_void>(),
+                    core::mem::size_of::<AttnExtArgs>(),
+                    4,
+                );
+            }
+            enc.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: self.cfg.n_head,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 128,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            return;
+        }
         let aargs = AttnArgs {
             n_head: self.cfg.n_head as u32,
             n_head_kv: self.cfg.n_head_kv as u32,
@@ -992,6 +1248,44 @@ impl LlamaMetalRunner {
         b: usize,
     ) {
         const TG: usize = 128;
+        if let Some(w) = self.cfg.sliding_window {
+            let aargs = AttnExtArgs {
+                n_head: self.cfg.n_head as u32,
+                n_head_kv: self.cfg.n_head_kv as u32,
+                head_dim: self.cfg.head_dim as u32,
+                start_pos: chunk_pos as u32,
+                n_tok: b as u32,
+                window: w as u32,
+                attn_scale: 1.0 / (self.cfg.head_dim as f32).sqrt(),
+                attn_softcap: 0.0,
+            };
+            enc.setComputePipelineState(&self.pipes.gqa_attn_ext_batch);
+            // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&self.q), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(&layer.k_cache), 0, 1);
+                enc.setBuffer_offset_atIndex(Some(&layer.v_cache), 0, 2);
+                enc.setBuffer_offset_atIndex(Some(&self.xb), 0, 3);
+                enc.setBytes_length_atIndex(
+                    NonNull::from(&aargs).cast::<c_void>(),
+                    core::mem::size_of::<AttnExtArgs>(),
+                    4,
+                );
+            }
+            enc.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: self.cfg.n_head,
+                    height: b,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: TG,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            return;
+        }
         if self.cfg.head_dim <= 256 && self.cfg.head_dim.is_multiple_of(8) {
             const BQ: usize = 32;
             let fa = FlashAttnArgs {
@@ -1462,7 +1756,7 @@ impl LlamaMetalRunner {
             }
 
             // 2. Transformer layers for all `b` tokens in ONE command buffer
-            for layer in &self.layers {
+            for (li, layer) in self.layers.iter().enumerate() {
                 self.encode_rms_norm_batch(
                     &enc,
                     &self.x,
@@ -1554,7 +1848,11 @@ impl LlamaMetalRunner {
                         n_head: self.cfg.n_head as u32,
                         n_head_kv: self.cfg.n_head_kv as u32,
                         head_dim: self.cfg.head_dim as u32,
-                        rope_dim: self.cfg.rope_dim as u32,
+                        rope_dim: if self.cfg.layer_uses_rope(li) {
+                            self.cfg.rope_dim as u32
+                        } else {
+                            0
+                        },
                         pos: chunk_pos as u32,
                         rope_type: self.cfg.rope_type,
                         has_freq_factors: u32::from(self.has_rope_freqs),
@@ -1767,7 +2065,7 @@ impl LlamaMetalRunner {
         let kv_dim = self.cfg.n_head_kv * self.cfg.head_dim;
         let rope_total = rope_threads.max(kv_dim);
 
-        for layer in &self.layers {
+        for (li, layer) in self.layers.iter().enumerate() {
             self.encode_rms_norm(enc, &self.x, &layer.attn_norm, &self.xb, self.cfg.n_embd)?;
             self.encode_qkv_gemv(enc, layer)?;
 
@@ -1836,7 +2134,11 @@ impl LlamaMetalRunner {
                     n_head: self.cfg.n_head as u32,
                     n_head_kv: self.cfg.n_head_kv as u32,
                     head_dim: self.cfg.head_dim as u32,
-                    rope_dim: self.cfg.rope_dim as u32,
+                    rope_dim: if self.cfg.layer_uses_rope(li) {
+                        self.cfg.rope_dim as u32
+                    } else {
+                        0
+                    },
                     pos: pos as u32,
                     rope_type: self.cfg.rope_type,
                     has_freq_factors: u32::from(self.has_rope_freqs),
@@ -2230,7 +2532,11 @@ impl LlamaMetalRunner {
                         n_head: self.cfg.n_head as u32,
                         n_head_kv: self.cfg.n_head_kv as u32,
                         head_dim: self.cfg.head_dim as u32,
-                        rope_dim: self.cfg.rope_dim as u32,
+                        rope_dim: if self.cfg.layer_uses_rope(li) {
+                            self.cfg.rope_dim as u32
+                        } else {
+                            0
+                        },
                         pos: pos as u32,
                         rope_type: self.cfg.rope_type,
                         has_freq_factors: u32::from(self.has_rope_freqs),
@@ -2602,7 +2908,11 @@ impl LlamaMetalRunner {
                         n_head: self.cfg.n_head as u32,
                         n_head_kv: self.cfg.n_head_kv as u32,
                         head_dim: self.cfg.head_dim as u32,
-                        rope_dim: self.cfg.rope_dim as u32,
+                        rope_dim: if self.cfg.layer_uses_rope(li) {
+                            self.cfg.rope_dim as u32
+                        } else {
+                            0
+                        },
                         pos: chunk_pos as u32,
                         rope_type: self.cfg.rope_type,
                         has_freq_factors: u32::from(self.has_rope_freqs),

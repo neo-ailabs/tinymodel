@@ -70,7 +70,8 @@ pub(crate) fn linear_fwd_with_accel(
     lora_scratch: &mut LoraScratch,
 ) {
     let mut handled = false;
-    if let Some(acc) = accel
+    if !w.is_sliced
+        && let Some(acc) = accel
         && let Ok(true) = acc.matmul_fwd(w.name, w.dtype, w.bytes, x, out, w.rows, w.cols, n_tok)
     {
         handled = true;
@@ -86,7 +87,17 @@ pub(crate) fn linear_fwd_with_accel(
             );
         }
     }
-    bound.apply_linear(slot, pool, kt, x, out, n_tok, lora_scratch);
+    bound.apply_linear_slice(
+        slot,
+        pool,
+        kt,
+        x,
+        out,
+        n_tok,
+        w.row_offset,
+        w.rows,
+        lora_scratch,
+    );
 }
 
 /// Symmetric backward for `y = W_base * x + scale * (x * A^T) * B^T` (`AGENTS.md` Rule #5):
@@ -110,7 +121,8 @@ pub(crate) fn linear_bwd_with_accel(
     lora_bt: &mut [f32],
 ) {
     let mut handled = false;
-    if let Some(acc) = accel
+    if !w.is_sliced
+        && let Some(acc) = accel
         && let Ok(true) = acc.matmul_bwd_transposed(
             w.name, w.dtype, w.bytes, dy, out_dx, w.rows, w.cols, n_tok, accum,
         )
@@ -136,15 +148,18 @@ pub(crate) fn linear_bwd_with_accel(
 
     let r = pair.rank;
     let d_in = pair.d_in;
-    let d_out = pair.d_out;
+    let slice_rows = w.rows;
+    let row_off = w.row_offset;
+    debug_assert!(row_off + slice_rows <= pair.d_out);
     let h = &mut lora_h[..n_tok * r];
     let dh = &mut lora_dh[..n_tok * r];
-    let b_t = &mut lora_bt[..r * d_out];
+    let b_t = &mut lora_bt[..r * slice_rows];
 
-    for o in 0..d_out {
-        let src = &pair.b[o * r..(o + 1) * r];
+    for o in 0..slice_rows {
+        let full_o = row_off + o;
+        let src = &pair.b[full_o * r..(full_o + 1) * r];
         for (r_idx, &val) in src.iter().enumerate() {
-            b_t[r_idx * d_out + o] = val;
+            b_t[r_idx * slice_rows + o] = val;
         }
     }
 
@@ -152,7 +167,7 @@ pub(crate) fn linear_bwd_with_accel(
 
     for t in 0..n_tok {
         let xt = &x[t * d_in..(t + 1) * d_in];
-        let dyt = &dy[t * d_out..(t + 1) * d_out];
+        let dyt = &dy[t * slice_rows..(t + 1) * slice_rows];
         let ht = &mut h[t * r..(t + 1) * r];
         let dht = &mut dh[t * r..(t + 1) * r];
 
@@ -164,7 +179,7 @@ pub(crate) fn linear_bwd_with_accel(
             }
             ht[r_idx] = sum_ax as f32;
 
-            let bt_r = &b_t[r_idx * d_out..(r_idx + 1) * d_out];
+            let bt_r = &b_t[r_idx * slice_rows..(r_idx + 1) * slice_rows];
             let mut sum_dyb = 0.0f64;
             for (&dyo, &bo) in dyt.iter().zip(bt_r.iter()) {
                 sum_dyb += (dyo as f64) * (bo as f64);
@@ -177,7 +192,8 @@ pub(crate) fn linear_bwd_with_accel(
                 continue;
             }
             let s_dyo = dyo * scale;
-            let db_row = &mut g.db[o * r..(o + 1) * r];
+            let full_o = row_off + o;
+            let db_row = &mut g.db[full_o * r..(full_o + 1) * r];
             for (db_v, &h_v) in db_row.iter_mut().zip(ht.iter()) {
                 *db_v = s_dyo.mul_add(h_v, *db_v);
             }

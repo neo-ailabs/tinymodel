@@ -89,6 +89,15 @@ pub struct LlamaVkConfig {
     pub rope_freq_base: f32,
     pub rms_eps: f32,
     pub rope_type: u32, // 0 = Norm, 1 = NeoX
+    pub sliding_window: Option<usize>,
+    pub use_rope: Vec<bool>,
+}
+
+impl LlamaVkConfig {
+    #[inline]
+    pub fn layer_uses_rope(&self, layer: usize) -> bool {
+        self.use_rope.get(layer).copied().unwrap_or(true)
+    }
 }
 
 /// Hardware GPU timing for one pipeline stage.
@@ -442,6 +451,70 @@ fn plan_mat<'a>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn plan_mat_slice<'a>(
+    planner: &mut ArenaPlanner,
+    gguf: &'a GgufFile,
+    fused_name: &str,
+    layer: &str,
+    cols: usize,
+    total_rows: usize,
+    row_start: usize,
+    rows: usize,
+) -> Result<PendingMat<'a>, VulkanError> {
+    let (info, raw_bytes) = gguf.req_tensor(fused_name, layer, &[cols, total_rows])?;
+    if info.dtype == DType::Q4_0x4 && (!row_start.is_multiple_of(4) || !rows.is_multiple_of(4)) {
+        return Err(VulkanError::InvalidDimensions(format!(
+            "cannot slice Q4_0x4 tensor '{fused_name}' at non-4-aligned row range {row_start}..{}",
+            row_start + rows
+        )));
+    }
+    let raw_row_bytes = info.dtype.row_bytes(cols);
+    let byte_off = row_start * raw_row_bytes;
+    let byte_end = (row_start + rows) * raw_row_bytes;
+    let sub_raw = &raw_bytes[byte_off..byte_end];
+    let (eff_dtype, bytes) = normalize_vk_mat_bytes(info.dtype, sub_raw, rows, cols)?;
+    let _ = dtype_code(eff_dtype)?;
+    let row_bytes = eff_dtype.row_bytes(cols);
+    let file_off = gguf.tensor_file_offset(info) as u64 + byte_off as u64;
+    let can_import = matches!(&bytes, std::borrow::Cow::Borrowed(_));
+    let (slice, imported) = if can_import {
+        match planner.try_import_slice(file_off, bytes.len() as u64) {
+            Some(s) => (s, true),
+            None => (planner.reserve(bytes.len() as u64)?, false),
+        }
+    } else {
+        (planner.reserve(bytes.len() as u64)?, false)
+    };
+    Ok(PendingMat {
+        slice,
+        bytes,
+        imported,
+        mat: VkMat {
+            slice,
+            dtype: eff_dtype,
+            rows,
+            cols,
+            row_bytes,
+        },
+    })
+}
+
+fn plan_opt_f32_vec_any(
+    planner: &mut ArenaPlanner,
+    gguf: &GgufFile,
+    names: &[&str],
+    layer: &str,
+    len: usize,
+) -> Result<Option<PendingF32>, VulkanError> {
+    for &name in names {
+        if gguf.tensor_info(name).is_some() {
+            return Ok(Some(plan_f32_vec(planner, gguf, name, layer, len)?));
+        }
+    }
+    Ok(None)
+}
+
 fn plan_opt_f32_vec(
     planner: &mut ArenaPlanner,
     gguf: &GgufFile,
@@ -475,12 +548,16 @@ impl LlamaVkRunner {
         }
         let gguf_ref: &GgufFile = &gguf;
         let arch = gguf_ref.req_str("general.architecture")?.to_string();
-        if arch != "llama" && arch != "qwen2" && arch != "qwen3" {
+        if !matches!(
+            arch.as_str(),
+            "llama" | "qwen2" | "qwen3" | "smollm3" | "phi3" | "mistral" | "mistral3"
+        ) {
             return Err(VulkanError::UnsupportedArch(arch));
         }
 
         let pfx = arch.as_str();
         let is_qwen = matches!(pfx, "qwen2" | "qwen3");
+        let is_neox = matches!(pfx, "qwen2" | "qwen3" | "phi3");
         let n_layers = gguf_ref.req_usize(&format!("{pfx}.block_count"))?;
         let n_embd = gguf_ref.req_usize(&format!("{pfx}.embedding_length"))?;
         let n_ff = gguf_ref.req_usize(&format!("{pfx}.feed_forward_length"))?;
@@ -497,15 +574,66 @@ impl LlamaVkRunner {
             .get_meta(&format!("{pfx}.rope.dimension_count"))
             .and_then(|v| v.as_usize())
             .unwrap_or(head_dim);
+        let max_ctx_train = gguf_ref
+            .get_meta(&format!("{pfx}.context_length"))
+            .and_then(|v| v.as_usize())
+            .unwrap_or(2048);
+        let default_freq_base = if is_qwen {
+            1_000_000.0
+        } else if pfx == "smollm3" {
+            5_000_000.0
+        } else {
+            10_000.0
+        };
         let rope_freq_base = gguf_ref
             .get_meta(&format!("{pfx}.rope.freq_base"))
             .and_then(|v| v.as_f32())
-            .unwrap_or(if is_qwen { 1_000_000.0 } else { 10000.0 });
+            .unwrap_or(default_freq_base);
         let rms_eps = gguf_ref
             .get_meta(&format!("{pfx}.attention.layer_norm_rms_epsilon"))
             .and_then(|v| v.as_f32())
-            .unwrap_or(if is_qwen { 1e-6 } else { 1e-5 });
-        let rope_type = if is_qwen { 1 } else { 0 };
+            .unwrap_or(if is_qwen || pfx == "smollm3" {
+                1e-6
+            } else {
+                1e-5
+            });
+        let rope_type = if is_neox { 1 } else { 0 };
+        let use_rope = if let Some(pat) = gguf_ref
+            .get_meta(&format!("{pfx}.rope.pattern"))
+            .and_then(|v| v.as_bool_array())
+            && pat.len() == n_layers
+        {
+            pat
+        } else if let Some(step) = gguf_ref
+            .get_meta(&format!("{pfx}.rope.no_rope_layer_step"))
+            .and_then(|v| v.as_usize())
+            && step > 0
+        {
+            (0..n_layers).map(|l| (l + 1) % step != 0).collect()
+        } else if pfx == "smollm3" {
+            (0..n_layers).map(|l| (l + 1) % 4 != 0).collect()
+        } else {
+            vec![true; n_layers]
+        };
+        let sliding_window = if pfx == "phi3" {
+            None
+        } else {
+            gguf_ref
+                .get_meta(&format!("{pfx}.attention.sliding_window"))
+                .and_then(|v| v.as_usize())
+                .filter(|&w| w > 0)
+        };
+        if let Some(w) = sliding_window
+            && max_ctx > w
+        {
+            return Err(VulkanError::InvalidDimensions(format!(
+                "sliding_window ({w}) < max_ctx ({max_ctx}) requires SWA shader on Vulkan LlamaVkRunner"
+            )));
+        }
+        let rope_orig_ctx = gguf_ref
+            .get_meta(&format!("{pfx}.rope.scaling.original_context_length"))
+            .and_then(|v| v.as_usize())
+            .unwrap_or(max_ctx_train);
 
         if head_dim > 256 {
             return Err(VulkanError::InvalidDimensions(format!(
@@ -600,27 +728,45 @@ impl LlamaVkRunner {
             "global",
             n_embd,
         )?;
-        let (has_rope_freqs, p_rope_freqs) = if gguf_ref.tensor_info("rope_freqs.weight").is_some()
-        {
-            (
-                true,
-                plan_f32_vec(
-                    &mut planner,
-                    gguf_ref,
+        let rope_freq_opt = if max_ctx > rope_orig_ctx {
+            plan_opt_f32_vec_any(
+                &mut planner,
+                gguf_ref,
+                &[
+                    "rope_factors_long.weight",
+                    "blk.0.rope_factors_long.weight",
                     "rope_freqs.weight",
-                    "global",
-                    rope_dim / 2,
-                )?,
-            )
+                    "rope_factors_short.weight",
+                    "blk.0.rope_factors_short.weight",
+                ],
+                "global",
+                rope_dim / 2,
+            )?
         } else {
-            let slice = planner.reserve(16)?;
-            (
-                false,
-                PendingF32 {
-                    slice,
-                    vals: vec![1.0f32],
-                },
-            )
+            plan_opt_f32_vec_any(
+                &mut planner,
+                gguf_ref,
+                &[
+                    "rope_freqs.weight",
+                    "rope_factors_short.weight",
+                    "blk.0.rope_factors_short.weight",
+                ],
+                "global",
+                rope_dim / 2,
+            )?
+        };
+        let (has_rope_freqs, p_rope_freqs) = match rope_freq_opt {
+            Some(p) => (true, p),
+            None => {
+                let slice = planner.reserve(16)?;
+                (
+                    false,
+                    PendingF32 {
+                        slice,
+                        vals: vec![1.0f32],
+                    },
+                )
+            }
         };
 
         let q_dim = n_head * head_dim;
@@ -664,27 +810,54 @@ impl LlamaVkRunner {
                 &ltag,
                 head_dim,
             )?;
-            let bq = plan_opt_f32_vec(
-                &mut planner,
-                gguf_ref,
-                &format!("{ltag}.attn_q.bias"),
-                &ltag,
-                q_dim,
-            )?;
-            let bk = plan_opt_f32_vec(
-                &mut planner,
-                gguf_ref,
-                &format!("{ltag}.attn_k.bias"),
-                &ltag,
-                kv_dim,
-            )?;
-            let bv = plan_opt_f32_vec(
-                &mut planner,
-                gguf_ref,
-                &format!("{ltag}.attn_v.bias"),
-                &ltag,
-                kv_dim,
-            )?;
+            let qkv_bias_name = format!("{ltag}.attn_qkv.bias");
+            let (bq, bk, bv) = if gguf_ref.tensor_info(&qkv_bias_name).is_some() {
+                let (info, bytes) =
+                    gguf_ref.req_tensor(&qkv_bias_name, &ltag, &[q_dim + 2 * kv_dim])?;
+                let mut full = vec![0.0f32; q_dim + 2 * kv_dim];
+                dequantize_row_bytes(info.dtype, bytes, &mut full);
+                let s_q = planner.reserve((q_dim * 4) as u64)?;
+                let s_k = planner.reserve((kv_dim * 4) as u64)?;
+                let s_v = planner.reserve((kv_dim * 4) as u64)?;
+                (
+                    Some(PendingF32 {
+                        slice: s_q,
+                        vals: full[..q_dim].to_vec(),
+                    }),
+                    Some(PendingF32 {
+                        slice: s_k,
+                        vals: full[q_dim..q_dim + kv_dim].to_vec(),
+                    }),
+                    Some(PendingF32 {
+                        slice: s_v,
+                        vals: full[q_dim + kv_dim..q_dim + 2 * kv_dim].to_vec(),
+                    }),
+                )
+            } else {
+                (
+                    plan_opt_f32_vec(
+                        &mut planner,
+                        gguf_ref,
+                        &format!("{ltag}.attn_q.bias"),
+                        &ltag,
+                        q_dim,
+                    )?,
+                    plan_opt_f32_vec(
+                        &mut planner,
+                        gguf_ref,
+                        &format!("{ltag}.attn_k.bias"),
+                        &ltag,
+                        kv_dim,
+                    )?,
+                    plan_opt_f32_vec(
+                        &mut planner,
+                        gguf_ref,
+                        &format!("{ltag}.attn_v.bias"),
+                        &ltag,
+                        kv_dim,
+                    )?,
+                )
+            };
             let bo = plan_opt_f32_vec(
                 &mut planner,
                 gguf_ref,
@@ -692,6 +865,94 @@ impl LlamaVkRunner {
                 &ltag,
                 n_embd,
             )?;
+            let q_name = format!("{ltag}.attn_q.weight");
+            let qkv_name = format!("{ltag}.attn_qkv.weight");
+            let (wq, wk, wv) = if gguf_ref.tensor_info(&q_name).is_some() {
+                (
+                    plan_mat(&mut planner, gguf_ref, &q_name, &ltag, n_embd, q_dim)?,
+                    plan_mat(
+                        &mut planner,
+                        gguf_ref,
+                        &format!("{ltag}.attn_k.weight"),
+                        &ltag,
+                        n_embd,
+                        kv_dim,
+                    )?,
+                    plan_mat(
+                        &mut planner,
+                        gguf_ref,
+                        &format!("{ltag}.attn_v.weight"),
+                        &ltag,
+                        n_embd,
+                        kv_dim,
+                    )?,
+                )
+            } else {
+                let total_qkv = q_dim + 2 * kv_dim;
+                (
+                    plan_mat_slice(
+                        &mut planner,
+                        gguf_ref,
+                        &qkv_name,
+                        &ltag,
+                        n_embd,
+                        total_qkv,
+                        0,
+                        q_dim,
+                    )?,
+                    plan_mat_slice(
+                        &mut planner,
+                        gguf_ref,
+                        &qkv_name,
+                        &ltag,
+                        n_embd,
+                        total_qkv,
+                        q_dim,
+                        kv_dim,
+                    )?,
+                    plan_mat_slice(
+                        &mut planner,
+                        gguf_ref,
+                        &qkv_name,
+                        &ltag,
+                        n_embd,
+                        total_qkv,
+                        q_dim + kv_dim,
+                        kv_dim,
+                    )?,
+                )
+            };
+            let gate_name = format!("{ltag}.ffn_gate.weight");
+            let up_name = format!("{ltag}.ffn_up.weight");
+            let (w_gate, w_up) = if gguf_ref.tensor_info(&gate_name).is_some() {
+                (
+                    plan_mat(&mut planner, gguf_ref, &gate_name, &ltag, n_embd, n_ff)?,
+                    plan_mat(&mut planner, gguf_ref, &up_name, &ltag, n_embd, n_ff)?,
+                )
+            } else {
+                (
+                    plan_mat_slice(
+                        &mut planner,
+                        gguf_ref,
+                        &up_name,
+                        &ltag,
+                        n_embd,
+                        2 * n_ff,
+                        0,
+                        n_ff,
+                    )?,
+                    plan_mat_slice(
+                        &mut planner,
+                        gguf_ref,
+                        &up_name,
+                        &ltag,
+                        n_embd,
+                        2 * n_ff,
+                        n_ff,
+                        n_ff,
+                    )?,
+                )
+            };
             p_layers.push(PendingLayer {
                 attn_norm: plan_f32_vec(
                     &mut planner,
@@ -713,30 +974,9 @@ impl LlamaVkRunner {
                 bk,
                 bv,
                 bo,
-                wq: plan_mat(
-                    &mut planner,
-                    gguf_ref,
-                    &format!("{ltag}.attn_q.weight"),
-                    &ltag,
-                    n_embd,
-                    q_dim,
-                )?,
-                wk: plan_mat(
-                    &mut planner,
-                    gguf_ref,
-                    &format!("{ltag}.attn_k.weight"),
-                    &ltag,
-                    n_embd,
-                    kv_dim,
-                )?,
-                wv: plan_mat(
-                    &mut planner,
-                    gguf_ref,
-                    &format!("{ltag}.attn_v.weight"),
-                    &ltag,
-                    n_embd,
-                    kv_dim,
-                )?,
+                wq,
+                wk,
+                wv,
                 wo: plan_mat(
                     &mut planner,
                     gguf_ref,
@@ -745,22 +985,8 @@ impl LlamaVkRunner {
                     q_dim,
                     n_embd,
                 )?,
-                w_gate: plan_mat(
-                    &mut planner,
-                    gguf_ref,
-                    &format!("{ltag}.ffn_gate.weight"),
-                    &ltag,
-                    n_embd,
-                    n_ff,
-                )?,
-                w_up: plan_mat(
-                    &mut planner,
-                    gguf_ref,
-                    &format!("{ltag}.ffn_up.weight"),
-                    &ltag,
-                    n_embd,
-                    n_ff,
-                )?,
+                w_gate,
+                w_up,
                 w_down: plan_mat(
                     &mut planner,
                     gguf_ref,
@@ -1661,6 +1887,8 @@ impl LlamaVkRunner {
                 rope_freq_base,
                 rms_eps,
                 rope_type,
+                sliding_window,
+                use_rope,
             },
             ctx,
             prefill_kind,
@@ -1976,11 +2204,15 @@ impl LlamaVkRunner {
                 Self::cmd_compute_barrier(d, cb);
             }
 
+            let mut l_rope_push = rope_push;
+            if !self.cfg.layer_uses_rope(layer.idx) {
+                l_rope_push[3] = 0;
+            }
             self.cmd_dispatch_set(
                 cb,
                 &self.pipes.rope_dec,
                 layer.rope_dec_set,
-                &rope_push,
+                &l_rope_push,
                 rope_groups,
                 1,
                 true,
@@ -2548,11 +2780,15 @@ impl LlamaVkRunner {
                     Self::cmd_compute_barrier(d, cb);
                 }
 
+                let mut l_rope_push = rope_push;
+                if !self.cfg.layer_uses_rope(layer.idx) {
+                    l_rope_push[3] = 0;
+                }
                 self.cmd_dispatch_set(
                     cb,
                     &self.pipes.rope_batch,
                     layer.rope_batch_set,
-                    &rope_push,
+                    &l_rope_push,
                     rope_groups_x,
                     b_u32,
                     true,
@@ -2989,11 +3225,15 @@ impl LlamaVkRunner {
                         prev = cur;
                     }
 
+                    let mut l_rope_push = rope_push;
+                    if !self.cfg.layer_uses_rope(layer.idx) {
+                        l_rope_push[3] = 0;
+                    }
                     self.cmd_dispatch_set(
                         cb,
                         &self.pipes.rope_dec,
                         layer.rope_dec_set,
-                        &rope_push,
+                        &l_rope_push,
                         rope_groups,
                         1,
                         true,
@@ -3263,11 +3503,15 @@ impl LlamaVkRunner {
                         prev = cur;
                     }
 
+                    let mut l_rope_push = rope_push;
+                    if !self.cfg.layer_uses_rope(layer.idx) {
+                        l_rope_push[3] = 0;
+                    }
                     self.cmd_dispatch_set(
                         cb,
                         &self.pipes.rope_batch,
                         layer.rope_batch_set,
-                        &rope_push,
+                        &l_rope_push,
                         rope_groups,
                         b_u32,
                         true,

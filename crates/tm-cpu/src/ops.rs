@@ -2057,6 +2057,18 @@ pub fn gqa_attention_f16_kv_batch_parallel(
 
 /// Extended single-token GQA attention supporting custom pre-softmax `attn_scale` (e.g. `1.0` on Gemma 4)
 /// and optional standard sliding-window `window` (`pos - step < window`, i.e. `[pos + 1 - window ..= pos]`).
+#[inline]
+fn apply_attn_softcap(scores: &mut [f32], softcap: Option<f32>) {
+    if let Some(cap) = softcap
+        && cap > 0.0
+    {
+        let inv = 1.0 / cap;
+        for s in scores.iter_mut() {
+            *s = (*s * inv).tanh() * cap;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn gqa_attention_f16_kv_ext_parallel(
     pool: &ThreadPool,
@@ -2071,6 +2083,31 @@ pub fn gqa_attention_f16_kv_ext_parallel(
     pos: usize,
     attn_scale: f32,
     window: Option<usize>,
+    max_ctx: usize,
+    scores: &mut [f32],
+) {
+    gqa_attention_f16_kv_softcap_parallel(
+        pool, kt, out, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim, pos, attn_scale, window,
+        None, max_ctx, scores,
+    );
+}
+
+/// Extended single-token GQA attention with custom `attn_scale`, `window`, and `attn_softcap`.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_f16_kv_softcap_parallel(
+    pool: &ThreadPool,
+    kt: &KernelTable,
+    out: &mut [f32],
+    q: &[f32],
+    k_cache: &[u16],
+    v_cache: &[u16],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    pos: usize,
+    attn_scale: f32,
+    window: Option<usize>,
+    attn_softcap: Option<f32>,
     max_ctx: usize,
     scores: &mut [f32],
 ) {
@@ -2092,6 +2129,7 @@ pub fn gqa_attention_f16_kv_ext_parallel(
                 let k_off = t * kv_dim + kv_h * head_dim;
                 sc[idx] = (kt.dot_f32_f16)(qh, &k_cache[k_off..k_off + head_dim]) * attn_scale;
             }
+            apply_attn_softcap(sc, attn_softcap);
             softmax_inplace(sc);
             let oh = &mut out[h * head_dim..(h + 1) * head_dim];
             oh.fill(0.0);
@@ -2123,6 +2161,7 @@ pub fn gqa_attention_f16_kv_ext_parallel(
                 let k_off = t * kv_dim + kv_h * head_dim;
                 sc[idx] = (kt.dot_f32_f16)(qh, &k_cache[k_off..k_off + head_dim]) * attn_scale;
             }
+            apply_attn_softcap(sc, attn_softcap);
             softmax_inplace(sc);
             // SAFETY: Disjoint `[h * head_dim .. (h + 1) * head_dim)` per head `h`.
             let oh = unsafe {
@@ -2156,6 +2195,32 @@ pub fn gqa_attention_f16_kv_ext_batch_parallel(
     max_ctx: usize,
     scores: &mut [f32],
 ) {
+    gqa_attention_f16_kv_softcap_batch_parallel(
+        pool, kt, out, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim, start_pos, n_tok,
+        attn_scale, window, None, max_ctx, scores,
+    );
+}
+
+/// Extended batched multi-token GQA attention with custom `attn_scale`, `window`, and `attn_softcap`.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_f16_kv_softcap_batch_parallel(
+    pool: &ThreadPool,
+    kt: &KernelTable,
+    out: &mut [f32],
+    q: &[f32],
+    k_cache: &[u16],
+    v_cache: &[u16],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    start_pos: usize,
+    n_tok: usize,
+    attn_scale: f32,
+    window: Option<usize>,
+    attn_softcap: Option<f32>,
+    max_ctx: usize,
+    scores: &mut [f32],
+) {
     let q_dim = n_heads * head_dim;
     assert_eq!(out.len(), n_tok * q_dim);
     assert_eq!(q.len(), n_tok * q_dim);
@@ -2167,7 +2232,7 @@ pub fn gqa_attention_f16_kv_ext_batch_parallel(
     };
     if pool.num_threads() == 1 || n_tok == 0 || max_win_needed > STACK_SCORES_CAP {
         for t in 0..n_tok {
-            gqa_attention_f16_kv_ext_parallel(
+            gqa_attention_f16_kv_softcap_parallel(
                 pool,
                 kt,
                 &mut out[t * q_dim..(t + 1) * q_dim],
@@ -2180,6 +2245,7 @@ pub fn gqa_attention_f16_kv_ext_batch_parallel(
                 start_pos + t,
                 attn_scale,
                 window,
+                attn_softcap,
                 max_ctx,
                 scores,
             );
@@ -2212,6 +2278,7 @@ pub fn gqa_attention_f16_kv_ext_batch_parallel(
                 let k_off = step * kv_dim + kv_h * head_dim;
                 sc[w_idx] = (kt.dot_f32_f16)(qh, &k_cache[k_off..k_off + head_dim]) * attn_scale;
             }
+            apply_attn_softcap(sc, attn_softcap);
             softmax_inplace(sc);
 
             // SAFETY: Disjoint `[head_dim]` slice of `out` per `(t, h)`.
@@ -2967,6 +3034,31 @@ pub fn gqa_attention_q8_0_kv_ext_parallel(
     max_ctx: usize,
     scores: &mut [f32],
 ) {
+    gqa_attention_q8_0_kv_softcap_parallel(
+        pool, kt, out, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim, pos, attn_scale, window,
+        None, max_ctx, scores,
+    );
+}
+
+/// Extended single-token GQA attention against `BlockQ8_0` KV cache with optional `attn_softcap`.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_q8_0_kv_softcap_parallel(
+    pool: &ThreadPool,
+    kt: &KernelTable,
+    out: &mut [f32],
+    q: &[f32],
+    k_cache: &[BlockQ8_0],
+    v_cache: &[BlockQ8_0],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    pos: usize,
+    attn_scale: f32,
+    window: Option<usize>,
+    attn_softcap: Option<f32>,
+    max_ctx: usize,
+    scores: &mut [f32],
+) {
     let end_pos = pos + 1;
     let start_kv = match window {
         Some(w) if w > 0 => end_pos.saturating_sub(w),
@@ -2986,6 +3078,7 @@ pub fn gqa_attention_q8_0_kv_ext_parallel(
                 let k_off = t * kv_blocks + kv_h * hb;
                 sc[idx] = (kt.dot_f32_q8_0)(qh, &k_cache[k_off..k_off + hb]) * attn_scale;
             }
+            apply_attn_softcap(sc, attn_softcap);
             softmax_inplace(sc);
             let oh = &mut out[h * head_dim..(h + 1) * head_dim];
             oh.fill(0.0);
@@ -3017,6 +3110,7 @@ pub fn gqa_attention_q8_0_kv_ext_parallel(
                 let k_off = t * kv_blocks + kv_h * hb;
                 sc[idx] = (kt.dot_f32_q8_0)(qh, &k_cache[k_off..k_off + hb]) * attn_scale;
             }
+            apply_attn_softcap(sc, attn_softcap);
             softmax_inplace(sc);
             // SAFETY: Disjoint `[h * head_dim .. (h + 1) * head_dim)` per head `h`.
             let oh = unsafe {
@@ -3050,6 +3144,32 @@ pub fn gqa_attention_q8_0_kv_ext_batch_parallel(
     max_ctx: usize,
     scores: &mut [f32],
 ) {
+    gqa_attention_q8_0_kv_softcap_batch_parallel(
+        pool, kt, out, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim, start_pos, n_tok,
+        attn_scale, window, None, max_ctx, scores,
+    );
+}
+
+/// Extended batched multi-token GQA attention against `BlockQ8_0` KV cache with optional `attn_softcap`.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_q8_0_kv_softcap_batch_parallel(
+    pool: &ThreadPool,
+    kt: &KernelTable,
+    out: &mut [f32],
+    q: &[f32],
+    k_cache: &[BlockQ8_0],
+    v_cache: &[BlockQ8_0],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    start_pos: usize,
+    n_tok: usize,
+    attn_scale: f32,
+    window: Option<usize>,
+    attn_softcap: Option<f32>,
+    max_ctx: usize,
+    scores: &mut [f32],
+) {
     let q_dim = n_heads * head_dim;
     assert_eq!(out.len(), n_tok * q_dim);
     assert_eq!(q.len(), n_tok * q_dim);
@@ -3061,7 +3181,7 @@ pub fn gqa_attention_q8_0_kv_ext_batch_parallel(
     };
     if pool.num_threads() == 1 || n_tok == 0 || max_win_needed > STACK_SCORES_CAP {
         for t in 0..n_tok {
-            gqa_attention_q8_0_kv_ext_parallel(
+            gqa_attention_q8_0_kv_softcap_parallel(
                 pool,
                 kt,
                 &mut out[t * q_dim..(t + 1) * q_dim],
@@ -3074,6 +3194,7 @@ pub fn gqa_attention_q8_0_kv_ext_batch_parallel(
                 start_pos + t,
                 attn_scale,
                 window,
+                attn_softcap,
                 max_ctx,
                 scores,
             );
@@ -3107,6 +3228,7 @@ pub fn gqa_attention_q8_0_kv_ext_batch_parallel(
                 let k_off = step * kv_blocks + kv_h * hb;
                 sc[w_idx] = (kt.dot_f32_q8_0)(qh, &k_cache[k_off..k_off + hb]) * attn_scale;
             }
+            apply_attn_softcap(sc, attn_softcap);
             softmax_inplace(sc);
 
             // SAFETY: Disjoint `[head_dim]` slice of `out` per `(t, h)`.
@@ -3648,6 +3770,31 @@ pub fn gqa_attention_f16_kv_bwd_ext_f32(
     attn_scale: f32,
     window: Option<usize>,
 ) {
+    gqa_attention_f16_kv_bwd_softcap_f32(
+        kt, dq, dk, dv, q, k_f16, v_f16, d_out, n_heads, n_kv_heads, head_dim, n_tok, attn_scale,
+        window, None,
+    );
+}
+
+/// Extended causal GQA attention backward pass supporting custom `attn_scale`, `window`, and `attn_softcap`.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_f16_kv_bwd_softcap_f32(
+    kt: &KernelTable,
+    dq: &mut [f32],
+    dk: &mut [f32],
+    dv: &mut [f32],
+    q: &[f32],
+    k_f16: &[u16],
+    v_f16: &[u16],
+    d_out: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    n_tok: usize,
+    attn_scale: f32,
+    window: Option<usize>,
+    attn_softcap: Option<f32>,
+) {
     let q_dim = n_heads * head_dim;
     let kv_dim = n_kv_heads * head_dim;
     assert_eq!(dq.len(), n_tok * q_dim);
@@ -3668,14 +3815,22 @@ pub fn gqa_attention_f16_kv_bwd_ext_f32(
     const STACK_CAP: usize = 2048;
     let mut stack_probs = [0.0f32; STACK_CAP];
     let mut stack_dp = [0.0f32; STACK_CAP];
+    let mut stack_sech2 = [1.0f32; STACK_CAP];
     let mut heap_probs: Vec<f32>;
     let mut heap_dp: Vec<f32>;
-    let (probs_all, dp_all): (&mut [f32], &mut [f32]) = if n_tok <= STACK_CAP {
-        (&mut stack_probs[..n_tok], &mut stack_dp[..n_tok])
+    let mut heap_sech2: Vec<f32>;
+    let (probs_all, dp_all, sech2_all): (&mut [f32], &mut [f32], &mut [f32]) = if n_tok <= STACK_CAP
+    {
+        (
+            &mut stack_probs[..n_tok],
+            &mut stack_dp[..n_tok],
+            &mut stack_sech2[..n_tok],
+        )
     } else {
         heap_probs = vec![0.0f32; n_tok];
         heap_dp = vec![0.0f32; n_tok];
-        (&mut heap_probs[..], &mut heap_dp[..])
+        heap_sech2 = vec![1.0f32; n_tok];
+        (&mut heap_probs[..], &mut heap_dp[..], &mut heap_sech2[..])
     };
 
     let group = n_heads / n_kv_heads;
@@ -3690,6 +3845,7 @@ pub fn gqa_attention_f16_kv_bwd_ext_f32(
         let win_len = end_pos - start_kv;
         let p = &mut probs_all[..win_len];
         let d_prob = &mut dp_all[..win_len];
+        let s2 = &mut sech2_all[..win_len];
 
         for h in 0..n_heads {
             let kv_h = h / group;
@@ -3698,7 +3854,17 @@ pub fn gqa_attention_f16_kv_bwd_ext_f32(
 
             for (w_idx, step) in (start_kv..end_pos).enumerate() {
                 let k_off = step * kv_dim + kv_h * head_dim;
-                p[w_idx] = (kt.dot_f32_f16)(qh, &k_f16[k_off..k_off + head_dim]) * scale;
+                let raw = (kt.dot_f32_f16)(qh, &k_f16[k_off..k_off + head_dim]) * scale;
+                if let Some(cap) = attn_softcap
+                    && cap > 0.0
+                {
+                    let th = (raw / cap).tanh();
+                    p[w_idx] = th * cap;
+                    s2[w_idx] = 1.0 - th * th;
+                } else {
+                    p[w_idx] = raw;
+                    s2[w_idx] = 1.0;
+                }
             }
             softmax_inplace(p);
 
@@ -3720,8 +3886,10 @@ pub fn gqa_attention_f16_kv_bwd_ext_f32(
 
             let dqh = &mut dq[t * q_dim + h * head_dim..t * q_dim + (h + 1) * head_dim];
             for (w_idx, step) in (start_kv..end_pos).enumerate() {
-                let ds = ((p[w_idx] as f64) * ((d_prob[w_idx] as f64) - sum_p_dp) * (scale as f64))
-                    as f32;
+                let ds = ((p[w_idx] as f64)
+                    * ((d_prob[w_idx] as f64) - sum_p_dp)
+                    * (s2[w_idx] as f64)
+                    * (scale as f64)) as f32;
                 if ds == 0.0 {
                     continue;
                 }

@@ -637,23 +637,44 @@ impl BoundLora {
     pub fn apply_linear(
         &self,
         slot: Option<usize>,
-        _pool: &ThreadPool,
+        pool: &ThreadPool,
         kt: &KernelTable,
         x: &[f32],
         y: &mut [f32],
         n_tok: usize,
         scratch: &mut LoraScratch,
     ) {
+        let slice_rows = y.len().checked_div(n_tok).unwrap_or(0);
+        self.apply_linear_slice(slot, pool, kt, x, y, n_tok, 0, slice_rows, scratch);
+    }
+
+    /// Applies linear LoRA delta to an output row sub-slice `row_offset .. row_offset + slice_rows`
+    /// of a (potentially fused, e.g. `attn_qkv.weight` or `ffn_up.weight`) base weight tensor.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_linear_slice(
+        &self,
+        slot: Option<usize>,
+        _pool: &ThreadPool,
+        kt: &KernelTable,
+        x: &[f32],
+        y: &mut [f32],
+        n_tok: usize,
+        row_offset: usize,
+        slice_rows: usize,
+        scratch: &mut LoraScratch,
+    ) {
         let Some(idx) = slot else {
             return;
         };
         debug_assert!(n_tok <= MAX_CPU_BATCH);
+        debug_assert_eq!(y.len(), n_tok * slice_rows);
         for e in &self.chains[idx] {
             if e.is_token_embd {
                 continue;
             }
             debug_assert_eq!(x.len(), n_tok * e.d_in);
-            debug_assert_eq!(y.len(), n_tok * e.d_out);
+            debug_assert!(row_offset + slice_rows <= e.d_out);
             let h_all = &mut scratch.hidden[..n_tok * e.rank];
             for t in 0..n_tok {
                 let xt = &x[t * e.d_in..(t + 1) * e.d_in];
@@ -666,10 +687,11 @@ impl BoundLora {
                     }
                     *hr_dst = sum * e.scale;
                 }
-                let yt = &mut y[t * e.d_out..(t + 1) * e.d_out];
+                let yt = &mut y[t * slice_rows..(t + 1) * slice_rows];
                 for (r, &hr) in ht.iter().enumerate() {
                     if hr != 0.0 {
-                        (kt.axpy_f32)(yt, hr, &e.b_t[r * e.d_out..(r + 1) * e.d_out]);
+                        let b_off = r * e.d_out + row_offset;
+                        (kt.axpy_f32)(yt, hr, &e.b_t[b_off..b_off + slice_rows]);
                     }
                 }
             }

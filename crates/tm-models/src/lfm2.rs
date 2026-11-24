@@ -23,7 +23,7 @@ use tm_lora::{BoundLora, LoraScratch, LoraSet};
 use crate::llama::{ModelError, RawMatView};
 use crate::state::{LayerState, MAX_SPEC_WINDOW, SpecVerifyBuf, decode_embedding_row};
 
-/// Hyperparameters for `general.architecture == "lfm2"`.
+/// Hyperparameters for `general.architecture == "lfm2"` or `"lfm3"`.
 #[derive(Debug, Clone)]
 pub struct Lfm2Config {
     pub arch: String,
@@ -36,9 +36,11 @@ pub struct Lfm2Config {
     pub rope_dim: usize,
     pub shortconv_l_cache: usize,
     pub n_swa: Option<usize>,
+    pub is_swa: Vec<bool>,
     pub vocab_size: usize,
     pub max_ctx_train: usize,
     pub rope_freq_base: f32,
+    pub rope_freq_base_swa: f32,
     pub rms_eps: f32,
 }
 
@@ -49,6 +51,15 @@ impl Lfm2Config {
     }
 
     #[inline]
+    pub fn layer_window(&self, il: usize) -> Option<usize> {
+        if self.is_swa.get(il).copied().unwrap_or(false) {
+            self.n_swa
+        } else {
+            None
+        }
+    }
+
+    #[inline]
     pub fn max_n_head_kv(&self) -> usize {
         self.n_head_kv_per_layer.iter().copied().max().unwrap_or(0)
     }
@@ -56,6 +67,7 @@ impl Lfm2Config {
 
 type MatView<'a> = RawMatView<'a>;
 
+#[allow(clippy::large_enum_variant)]
 pub enum Lfm2OpWeights<'a> {
     ShortConv {
         in_proj: RawMatView<'a>,
@@ -70,6 +82,7 @@ pub enum Lfm2OpWeights<'a> {
         wq: RawMatView<'a>,
         wk: RawMatView<'a>,
         wv: RawMatView<'a>,
+        w_attn_gate: Option<RawMatView<'a>>,
         wo: RawMatView<'a>,
     },
 }
@@ -77,24 +90,27 @@ pub enum Lfm2OpWeights<'a> {
 pub struct Lfm2LayerWeights<'a> {
     pub attn_norm: Vec<f32>,
     pub op: Lfm2OpWeights<'a>,
+    pub post_attn_norm: Option<Vec<f32>>,
     pub ffn_norm: Vec<f32>,
     pub w_gate: RawMatView<'a>,
     pub w_up: RawMatView<'a>,
     pub w_down: RawMatView<'a>,
+    pub post_ffw_norm: Option<Vec<f32>>,
 }
 
-/// Loaded LFM2 hybrid model borrowing quantized weight slices zero-copy from `GgufFile`.
+/// Loaded LFM2 / LFM3 hybrid model borrowing quantized weight slices zero-copy from `GgufFile`.
 pub struct Lfm2Model<'a> {
     pub cfg: Lfm2Config,
     pub token_embd: RawMatView<'a>,
     pub output: RawMatView<'a>,
     pub output_norm: Vec<f32>,
     pub rope_inv_freqs: Vec<f64>,
+    pub rope_inv_freqs_swa: Vec<f64>,
     pub layers: Vec<Lfm2LayerWeights<'a>>,
     pub lora: BoundLora,
 }
 
-/// Pre-allocated per-session inference state for LFM2 (`LayerState::ShortConv` + `LayerState::Kv`).
+/// Pre-allocated per-session inference state for LFM2 / LFM3 (`LayerState::ShortConv` + `LayerState::Kv`).
 pub struct Lfm2State {
     pub max_ctx: usize,
     pub layers: Vec<LayerState>,
@@ -106,11 +122,14 @@ pub struct Lfm2State {
     q_buf: Vec<f32>,
     k_buf: Vec<f32>,
     v_buf: Vec<f32>,
+    gate_buf: Vec<f32>,
     attn_out: Vec<f32>,
     hb: Vec<f32>,
     hb2: Vec<f32>,
     rope_cos: Vec<f32>,
     rope_sin: Vec<f32>,
+    rope_cos_swa: Vec<f32>,
+    rope_sin_swa: Vec<f32>,
     scores: Vec<f32>,
     logits: Vec<f32>,
     pub last_hidden: Vec<f32>,
@@ -134,7 +153,12 @@ impl Lfm2State {
                 });
             } else {
                 let kv_dim = cfg.n_head_kv_per_layer[il] * cfg.head_dim;
-                layers.push(LayerState::new_kv(max_ctx, kv_dim, cfg.n_swa, kv_type));
+                layers.push(LayerState::new_kv(
+                    max_ctx,
+                    kv_dim,
+                    cfg.layer_window(il),
+                    kv_type,
+                ));
             }
         }
 
@@ -153,11 +177,14 @@ impl Lfm2State {
             q_buf: vec![0.0; MAX_CPU_BATCH * q_dim.max(1)],
             k_buf: vec![0.0; MAX_CPU_BATCH * max_kv_dim.max(1)],
             v_buf: vec![0.0; MAX_CPU_BATCH * max_kv_dim.max(1)],
+            gate_buf: vec![0.0; MAX_CPU_BATCH * cfg.n_head.max(1)],
             attn_out: vec![0.0; MAX_CPU_BATCH * q_dim.max(1)],
             hb: vec![0.0; MAX_CPU_BATCH * cfg.n_ff],
             hb2: vec![0.0; MAX_CPU_BATCH * cfg.n_ff],
             rope_cos: vec![0.0; cfg.rope_dim / 2],
             rope_sin: vec![0.0; cfg.rope_dim / 2],
+            rope_cos_swa: vec![0.0; cfg.rope_dim / 2],
+            rope_sin_swa: vec![0.0; cfg.rope_dim / 2],
             scores: vec![0.0; cfg.n_head.max(1) * max_ctx],
             logits: vec![0.0; cfg.vocab_size],
             last_hidden: vec![0.0; cfg.n_embd],
@@ -204,19 +231,21 @@ fn load_mat<'a>(
         dtype: info.dtype,
         rows,
         cols,
+        row_offset: 0,
+        is_sliced: false,
         lora_slot: None,
     })
 }
 
 impl<'a> Lfm2Model<'a> {
-    /// Loads and strictly validates an `lfm2` GGUF model.
+    /// Loads and strictly validates an `lfm2` or `lfm3` GGUF model.
     pub fn from_gguf(gguf: &'a GgufFile) -> Result<Self, ModelError> {
         let arch = gguf.req_str("general.architecture")?.to_string();
-        if arch != "lfm2" {
+        if arch != "lfm2" && arch != "lfm3" {
             return Err(ModelError::UnsupportedArch(arch));
         }
 
-        let pfx = "lfm2";
+        let pfx = arch.as_str();
         let n_layers = gguf.req_usize(&format!("{pfx}.block_count"))?;
         let n_embd = gguf.req_usize(&format!("{pfx}.embedding_length"))?;
         let n_ff = if let Some(mv) = gguf.get_meta(&format!("{pfx}.feed_forward_length")) {
@@ -286,6 +315,24 @@ impl<'a> Lfm2Model<'a> {
             .get_meta(&format!("{pfx}.attention.sliding_window"))
             .and_then(|v| v.as_usize())
             .filter(|&w| w > 0);
+        let swa_pat_key = format!("{pfx}.attention.sliding_window_pattern");
+        let is_swa = if let Some(arr) = gguf
+            .get_meta(&swa_pat_key)
+            .and_then(|v| v.as_bool_array())
+            .filter(|v| v.len() == n_layers)
+        {
+            arr
+        } else if pfx == "lfm3" {
+            return Err(GgufError::MissingMetadata {
+                path: gguf.path().display().to_string(),
+                key: swa_pat_key,
+            }
+            .into());
+        } else {
+            (0..n_layers)
+                .map(|il| n_swa.is_some() && n_head_kv_per_layer[il] > 0)
+                .collect()
+        };
         let max_ctx_train = gguf
             .get_meta(&format!("{pfx}.context_length"))
             .and_then(|v| v.as_usize())
@@ -294,6 +341,14 @@ impl<'a> Lfm2Model<'a> {
             .get_meta(&format!("{pfx}.rope.freq_base"))
             .and_then(|v| v.as_f32())
             .unwrap_or(1_000_000.0);
+        let rope_freq_base_swa = gguf
+            .get_meta(&format!("{pfx}.rope.freq_base_swa"))
+            .and_then(|v| v.as_f32())
+            .unwrap_or(if pfx == "lfm3" {
+                10_000.0
+            } else {
+                rope_freq_base
+            });
         let rms_eps = gguf
             .get_meta(&format!("{pfx}.attention.layer_norm_rms_epsilon"))
             .and_then(|v| v.as_f32())
@@ -327,8 +382,44 @@ impl<'a> Lfm2Model<'a> {
             load_f32_vec(gguf, "output_norm.weight", "global", &[n_embd])?
         };
 
+        let mut rope_freqs: Option<Vec<f32>> = if gguf.tensor_info("rope_freqs.weight").is_some() {
+            Some(load_f32_vec(
+                gguf,
+                "rope_freqs.weight",
+                "global",
+                &[rope_dim / 2],
+            )?)
+        } else {
+            None
+        };
+        if rope_freqs.is_none() {
+            for il in 0..n_layers {
+                if n_head_kv_per_layer[il] > 0 && !is_swa[il] {
+                    let rf_name = format!("blk.{il}.rope_freqs.weight");
+                    if gguf.tensor_info(&rf_name).is_some() {
+                        rope_freqs = Some(load_f32_vec(
+                            gguf,
+                            &rf_name,
+                            &format!("blk.{il}"),
+                            &[rope_dim / 2],
+                        )?);
+                        break;
+                    }
+                }
+            }
+        }
+
         let rope_inv_freqs: Vec<f64> = (0..(rope_dim / 2))
-            .map(|i| (rope_freq_base as f64).powf(-2.0 * (i as f64) / (rope_dim as f64)))
+            .map(|i| {
+                let mut f = (rope_freq_base as f64).powf(-2.0 * (i as f64) / (rope_dim as f64));
+                if let Some(ref rf) = rope_freqs {
+                    f /= rf[i] as f64;
+                }
+                f
+            })
+            .collect();
+        let rope_inv_freqs_swa: Vec<f64> = (0..(rope_dim / 2))
+            .map(|i| (rope_freq_base_swa as f64).powf(-2.0 * (i as f64) / (rope_dim as f64)))
             .collect();
 
         let q_dim = n_head * head_dim;
@@ -339,6 +430,18 @@ impl<'a> Lfm2Model<'a> {
                 load_f32_vec(gguf, &format!("{ltag}.attn_norm.weight"), &ltag, &[n_embd])?;
             let ffn_norm =
                 load_f32_vec(gguf, &format!("{ltag}.ffn_norm.weight"), &ltag, &[n_embd])?;
+            let post_attn_name = format!("{ltag}.post_attention_norm.weight");
+            let post_attn_norm = if gguf.tensor_info(&post_attn_name).is_some() {
+                Some(load_f32_vec(gguf, &post_attn_name, &ltag, &[n_embd])?)
+            } else {
+                None
+            };
+            let post_ffw_name = format!("{ltag}.post_ffw_norm.weight");
+            let post_ffw_norm = if gguf.tensor_info(&post_ffw_name).is_some() {
+                Some(load_f32_vec(gguf, &post_ffw_name, &ltag, &[n_embd])?)
+            } else {
+                None
+            };
 
             let op = if n_head_kv == 0 {
                 let in_proj = load_mat(
@@ -399,6 +502,20 @@ impl<'a> Lfm2Model<'a> {
                         n_embd,
                         kv_dim,
                     )?,
+                    w_attn_gate: if gguf
+                        .tensor_info(&format!("{ltag}.attn_gate.weight"))
+                        .is_some()
+                    {
+                        Some(load_mat(
+                            gguf,
+                            &format!("{ltag}.attn_gate.weight"),
+                            &ltag,
+                            n_embd,
+                            n_head,
+                        )?)
+                    } else {
+                        None
+                    },
                     wo: load_mat(
                         gguf,
                         &format!("{ltag}.attn_output.weight"),
@@ -412,6 +529,7 @@ impl<'a> Lfm2Model<'a> {
             layers.push(Lfm2LayerWeights {
                 attn_norm,
                 op,
+                post_attn_norm,
                 ffn_norm,
                 w_gate: load_mat(
                     gguf,
@@ -428,6 +546,7 @@ impl<'a> Lfm2Model<'a> {
                     n_ff,
                     n_embd,
                 )?,
+                post_ffw_norm,
             });
         }
 
@@ -442,9 +561,11 @@ impl<'a> Lfm2Model<'a> {
             rope_dim,
             shortconv_l_cache,
             n_swa,
+            is_swa,
             vocab_size,
             max_ctx_train,
             rope_freq_base,
+            rope_freq_base_swa,
             rms_eps,
         };
 
@@ -454,6 +575,7 @@ impl<'a> Lfm2Model<'a> {
             output,
             output_norm,
             rope_inv_freqs,
+            rope_inv_freqs_swa,
             layers,
             lora: BoundLora::default(),
         })
@@ -471,10 +593,20 @@ impl<'a> Lfm2Model<'a> {
                     in_proj.lora_slot = bound.slot_for(in_proj.name);
                     out_proj.lora_slot = bound.slot_for(out_proj.name);
                 }
-                Lfm2OpWeights::Gqa { wq, wk, wv, wo, .. } => {
+                Lfm2OpWeights::Gqa {
+                    wq,
+                    wk,
+                    wv,
+                    w_attn_gate,
+                    wo,
+                    ..
+                } => {
                     wq.lora_slot = bound.slot_for(wq.name);
                     wk.lora_slot = bound.slot_for(wk.name);
                     wv.lora_slot = bound.slot_for(wv.name);
+                    if let Some(wg) = w_attn_gate {
+                        wg.lora_slot = bound.slot_for(wg.name);
+                    }
                     wo.lora_slot = bound.slot_for(wo.name);
                 }
             }
@@ -528,6 +660,12 @@ impl<'a> Lfm2Model<'a> {
             pos,
             &mut state.rope_cos,
             &mut state.rope_sin,
+        );
+        rope_compute_cos_sin(
+            &self.rope_inv_freqs_swa,
+            pos,
+            &mut state.rope_cos_swa,
+            &mut state.rope_sin_swa,
         );
 
         decode_embedding_row(
@@ -630,6 +768,7 @@ impl<'a> Lfm2Model<'a> {
                         wq,
                         wk,
                         wv,
+                        w_attn_gate,
                         wo,
                     },
                     kv_state @ LayerState::Kv { .. },
@@ -683,6 +822,28 @@ impl<'a> Lfm2Model<'a> {
                             &mut state.lora_scratch,
                         );
                     }
+                    if let Some(wg) = w_attn_gate {
+                        matvec_f32(
+                            pool,
+                            kt,
+                            wg.dtype,
+                            wg.bytes,
+                            &state.xb[..n_embd],
+                            &mut state.mv_scratch,
+                            &mut state.gate_buf[..self.cfg.n_head],
+                            self.cfg.n_head,
+                            n_embd,
+                        );
+                        self.lora.apply_linear(
+                            wg.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.gate_buf[..self.cfg.n_head],
+                            1,
+                            &mut state.lora_scratch,
+                        );
+                    }
 
                     for h in 0..self.cfg.n_head {
                         let s = h * hd;
@@ -707,13 +868,18 @@ impl<'a> Lfm2Model<'a> {
                         state.k_buf[s..e].copy_from_slice(&state.xb2[..hd]);
                     }
 
+                    let (cos_s, sin_s) = if self.cfg.is_swa[il] {
+                        (&state.rope_cos_swa[..], &state.rope_sin_swa[..])
+                    } else {
+                        (&state.rope_cos[..], &state.rope_sin[..])
+                    };
                     rope_inplace_tables(
                         &mut state.q_buf[..q_dim],
                         self.cfg.n_head,
                         hd,
                         self.cfg.rope_dim,
-                        &state.rope_cos,
-                        &state.rope_sin,
+                        cos_s,
+                        sin_s,
                         RopeType::Neox,
                     );
                     rope_inplace_tables(
@@ -721,8 +887,8 @@ impl<'a> Lfm2Model<'a> {
                         *n_head_kv,
                         hd,
                         self.cfg.rope_dim,
-                        &state.rope_cos,
-                        &state.rope_sin,
+                        cos_s,
+                        sin_s,
                         RopeType::Neox,
                     );
 
@@ -742,6 +908,14 @@ impl<'a> Lfm2Model<'a> {
                         state.max_ctx,
                         &mut state.scores,
                     );
+                    if w_attn_gate.is_some() {
+                        for h in 0..self.cfg.n_head {
+                            let g = 1.0 / (1.0 + (-state.gate_buf[h]).exp());
+                            for v in &mut state.attn_out[h * hd..(h + 1) * hd] {
+                                *v *= g;
+                            }
+                        }
+                    }
 
                     matvec_f32(
                         pool,
@@ -767,8 +941,20 @@ impl<'a> Lfm2Model<'a> {
                 _ => unreachable!("LayerState variant always matches Lfm2OpWeights"),
             }
 
-            for i in 0..n_embd {
-                state.x[i] += state.xb2[i];
+            if let Some(ref pan) = layer.post_attn_norm {
+                rms_norm(
+                    &mut state.xb[..n_embd],
+                    &state.xb2[..n_embd],
+                    pan,
+                    self.cfg.rms_eps,
+                );
+                for i in 0..n_embd {
+                    state.x[i] += state.xb[i];
+                }
+            } else {
+                for i in 0..n_embd {
+                    state.x[i] += state.xb2[i];
+                }
             }
 
             // SwiGLU dense FFN (`lfm-base.cpp:95-105`)
@@ -834,8 +1020,20 @@ impl<'a> Lfm2Model<'a> {
                 1,
                 &mut state.lora_scratch,
             );
-            for i in 0..n_embd {
-                state.x[i] += state.xb2[i];
+            if let Some(ref pfn) = layer.post_ffw_norm {
+                rms_norm(
+                    &mut state.xb[..n_embd],
+                    &state.xb2[..n_embd],
+                    pfn,
+                    self.cfg.rms_eps,
+                );
+                for i in 0..n_embd {
+                    state.x[i] += state.xb[i];
+                }
+            } else {
+                for i in 0..n_embd {
+                    state.x[i] += state.xb2[i];
+                }
             }
         }
 
@@ -1060,6 +1258,7 @@ impl<'a> Lfm2Model<'a> {
                         wq,
                         wk,
                         wv,
+                        w_attn_gate,
                         wo,
                     },
                     kv_state @ LayerState::Kv { .. },
@@ -1114,6 +1313,29 @@ impl<'a> Lfm2Model<'a> {
                             &mut state.lora_scratch,
                         );
                     }
+                    if let Some(wg) = w_attn_gate {
+                        matmul_f32(
+                            pool,
+                            kt,
+                            wg.dtype,
+                            wg.bytes,
+                            &state.xb[..b * n_embd],
+                            &mut state.mv_scratch,
+                            &mut state.gate_buf[..b * self.cfg.n_head],
+                            self.cfg.n_head,
+                            n_embd,
+                            b,
+                        );
+                        self.lora.apply_linear(
+                            wg.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..b * n_embd],
+                            &mut state.gate_buf[..b * self.cfg.n_head],
+                            b,
+                            &mut state.lora_scratch,
+                        );
+                    }
 
                     for t in 0..b {
                         let pos = start_pos + t;
@@ -1139,8 +1361,13 @@ impl<'a> Lfm2Model<'a> {
                             kt_vec[s..e].copy_from_slice(&state.xb2[..hd]);
                         }
 
+                        let inv_freqs = if self.cfg.is_swa[il] {
+                            &self.rope_inv_freqs_swa
+                        } else {
+                            &self.rope_inv_freqs
+                        };
                         rope_compute_cos_sin(
-                            &self.rope_inv_freqs,
+                            inv_freqs,
                             pos,
                             &mut state.rope_cos,
                             &mut state.rope_sin,
@@ -1182,6 +1409,18 @@ impl<'a> Lfm2Model<'a> {
                         state.max_ctx,
                         &mut state.scores,
                     );
+                    if w_attn_gate.is_some() {
+                        for t in 0..b {
+                            for h in 0..self.cfg.n_head {
+                                let g =
+                                    1.0 / (1.0 + (-state.gate_buf[t * self.cfg.n_head + h]).exp());
+                                let off = t * q_dim + h * hd;
+                                for v in &mut state.attn_out[off..off + hd] {
+                                    *v *= g;
+                                }
+                            }
+                        }
+                    }
 
                     matmul_f32(
                         pool,
@@ -1208,8 +1447,24 @@ impl<'a> Lfm2Model<'a> {
                 _ => unreachable!("LayerState variant always matches Lfm2OpWeights"),
             }
 
-            for i in 0..b * n_embd {
-                state.x[i] += state.xb2[i];
+            if let Some(ref pan) = layer.post_attn_norm {
+                rms_norm_batch_parallel(
+                    pool,
+                    kt,
+                    &mut state.xb[..b * n_embd],
+                    &state.xb2[..b * n_embd],
+                    pan,
+                    self.cfg.rms_eps,
+                    n_embd,
+                    b,
+                );
+                for i in 0..b * n_embd {
+                    state.x[i] += state.xb[i];
+                }
+            } else {
+                for i in 0..b * n_embd {
+                    state.x[i] += state.xb2[i];
+                }
             }
 
             rms_norm_batch_parallel(
@@ -1280,8 +1535,24 @@ impl<'a> Lfm2Model<'a> {
                 b,
                 &mut state.lora_scratch,
             );
-            for i in 0..b * n_embd {
-                state.x[i] += state.xb2[i];
+            if let Some(ref pfn) = layer.post_ffw_norm {
+                rms_norm_batch_parallel(
+                    pool,
+                    kt,
+                    &mut state.xb[..b * n_embd],
+                    &state.xb2[..b * n_embd],
+                    pfn,
+                    self.cfg.rms_eps,
+                    n_embd,
+                    b,
+                );
+                for i in 0..b * n_embd {
+                    state.x[i] += state.xb[i];
+                }
+            } else {
+                for i in 0..b * n_embd {
+                    state.x[i] += state.xb2[i];
+                }
             }
         }
 
@@ -1476,6 +1747,7 @@ impl<'a> Lfm2Model<'a> {
                         wq,
                         wk,
                         wv,
+                        w_attn_gate,
                         wo,
                     },
                     kv_state @ LayerState::Kv { .. },
@@ -1530,6 +1802,29 @@ impl<'a> Lfm2Model<'a> {
                             &mut state.lora_scratch,
                         );
                     }
+                    if let Some(wg) = w_attn_gate {
+                        matmul_f32(
+                            pool,
+                            kt,
+                            wg.dtype,
+                            wg.bytes,
+                            &state.xb[..w * n_embd],
+                            &mut state.mv_scratch,
+                            &mut state.gate_buf[..w * self.cfg.n_head],
+                            self.cfg.n_head,
+                            n_embd,
+                            w,
+                        );
+                        self.lora.apply_linear(
+                            wg.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..w * n_embd],
+                            &mut state.gate_buf[..w * self.cfg.n_head],
+                            w,
+                            &mut state.lora_scratch,
+                        );
+                    }
 
                     for t in 0..w {
                         let pos = start_pos + t;
@@ -1555,8 +1850,13 @@ impl<'a> Lfm2Model<'a> {
                             kt_vec[s..e].copy_from_slice(&state.xb2[..hd]);
                         }
 
+                        let inv_freqs = if self.cfg.is_swa[il] {
+                            &self.rope_inv_freqs_swa
+                        } else {
+                            &self.rope_inv_freqs
+                        };
                         rope_compute_cos_sin(
-                            &self.rope_inv_freqs,
+                            inv_freqs,
                             pos,
                             &mut state.rope_cos,
                             &mut state.rope_sin,
@@ -1598,6 +1898,18 @@ impl<'a> Lfm2Model<'a> {
                         state.max_ctx,
                         &mut state.scores,
                     );
+                    if w_attn_gate.is_some() {
+                        for t in 0..w {
+                            for h in 0..self.cfg.n_head {
+                                let g =
+                                    1.0 / (1.0 + (-state.gate_buf[t * self.cfg.n_head + h]).exp());
+                                let off = t * q_dim + h * hd;
+                                for v in &mut state.attn_out[off..off + hd] {
+                                    *v *= g;
+                                }
+                            }
+                        }
+                    }
 
                     matmul_f32(
                         pool,
@@ -1624,8 +1936,24 @@ impl<'a> Lfm2Model<'a> {
                 _ => unreachable!("LayerState variant always matches Lfm2OpWeights"),
             }
 
-            for i in 0..w * n_embd {
-                state.x[i] += state.xb2[i];
+            if let Some(ref pan) = layer.post_attn_norm {
+                rms_norm_batch_parallel(
+                    pool,
+                    kt,
+                    &mut state.xb[..w * n_embd],
+                    &state.xb2[..w * n_embd],
+                    pan,
+                    self.cfg.rms_eps,
+                    n_embd,
+                    w,
+                );
+                for i in 0..w * n_embd {
+                    state.x[i] += state.xb[i];
+                }
+            } else {
+                for i in 0..w * n_embd {
+                    state.x[i] += state.xb2[i];
+                }
             }
 
             rms_norm_batch_parallel(
@@ -1696,8 +2024,24 @@ impl<'a> Lfm2Model<'a> {
                 w,
                 &mut state.lora_scratch,
             );
-            for i in 0..w * n_embd {
-                state.x[i] += state.xb2[i];
+            if let Some(ref pfn) = layer.post_ffw_norm {
+                rms_norm_batch_parallel(
+                    pool,
+                    kt,
+                    &mut state.xb[..w * n_embd],
+                    &state.xb2[..w * n_embd],
+                    pfn,
+                    self.cfg.rms_eps,
+                    n_embd,
+                    w,
+                );
+                for i in 0..w * n_embd {
+                    state.x[i] += state.xb[i];
+                }
+            } else {
+                for i in 0..w * n_embd {
+                    state.x[i] += state.xb2[i];
+                }
             }
         }
 

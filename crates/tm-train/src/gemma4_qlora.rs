@@ -13,11 +13,11 @@
 use tm_core::f16_to_f32;
 use tm_cpu::{
     KernelTable, MAX_CPU_BATCH, MatvecScratch, RopeType, ThreadPool, active_kernels, geglu_bwd_f32,
-    geglu_inplace_parallel, gelu_tanh_bwd_f32, gelu_tanh_f32, gqa_attention_f16_kv_bwd_ext_f32,
-    gqa_attention_f16_kv_ext_batch_parallel, gqa_attention_f16_kv_ext_parallel, matmul_pair_f32,
-    matmul_triple_f32, matvec_pair_f32, matvec_triple_f32, rms_norm, rms_norm_batch_parallel,
-    rms_norm_bwd_f32, rms_norm_unit_bwd_f32, rms_norm_unit_inplace, rope_bwd_inplace_tables,
-    rope_compute_cos_sin, rope_inplace_tables, softcap_inplace_parallel,
+    geglu_inplace_parallel, gelu_tanh_bwd_f32, gelu_tanh_f32, gqa_attention_f16_kv_bwd_softcap_f32,
+    gqa_attention_f16_kv_softcap_batch_parallel, gqa_attention_f16_kv_softcap_parallel,
+    matmul_pair_f32, matmul_triple_f32, matvec_pair_f32, matvec_triple_f32, rms_norm,
+    rms_norm_batch_parallel, rms_norm_bwd_f32, rms_norm_unit_bwd_f32, rms_norm_unit_inplace,
+    rope_bwd_inplace_tables, rope_compute_cos_sin, rope_inplace_tables, softcap_inplace_parallel,
 };
 use tm_lora::{BoundLora, LoraAdapter, LoraScratch, LoraSet};
 use tm_models::{Gemma4Model, decode_embedding_row};
@@ -26,7 +26,7 @@ use crate::accel::{
     LinearAccel, embed_lora_backward, linear_bwd_with_accel, linear_fwd_with_accel,
     masked_chunked_ce_fwd_bwd, masked_chunked_ce_loss_f64,
 };
-use crate::lfm2_qlora::{gqa_attn_f32_bwd_ext, gqa_attn_f32_ext};
+use crate::lfm2_qlora::{gqa_attn_f32_bwd_ext_softcap, gqa_attn_f32_ext_softcap};
 use crate::optim::{LoraGradStore, LoraTargets};
 use crate::qlora::{CE_CHUNK_TOKENS, CheckpointMode};
 
@@ -804,11 +804,13 @@ impl<'a> Gemma4Trainer<'a> {
             for t in 0..b {
                 let pos = offset + t;
                 let qt = &mut arena.q_rope[pos * q_dim..(pos + 1) * q_dim];
-                for h in 0..c.n_head {
-                    let s = h * hd;
-                    let e = s + hd;
-                    rms_norm(&mut arena.tmp_head[..hd], &qt[s..e], &lw.q_norm, c.rms_eps);
-                    qt[s..e].copy_from_slice(&arena.tmp_head[..hd]);
+                if let Some(ref qn) = lw.q_norm {
+                    for h in 0..c.n_head {
+                        let s = h * hd;
+                        let e = s + hd;
+                        rms_norm(&mut arena.tmp_head[..hd], &qt[s..e], qn, c.rms_eps);
+                        qt[s..e].copy_from_slice(&arena.tmp_head[..hd]);
+                    }
                 }
 
                 if is_swa {
@@ -851,14 +853,13 @@ impl<'a> Gemma4Trainer<'a> {
                     for h in 0..c.n_head_kv {
                         let s = h * hd;
                         let e = s + hd;
-                        rms_norm(
-                            &mut arena.tmp_head[..hd],
-                            &kt_vec[s..e],
-                            &kv_w.k_norm,
-                            c.rms_eps,
-                        );
-                        kt_vec[s..e].copy_from_slice(&arena.tmp_head[..hd]);
-                        rms_norm_unit_inplace(&mut vt_vec[s..e], c.rms_eps);
+                        if let Some(ref kn) = kv_w.k_norm {
+                            rms_norm(&mut arena.tmp_head[..hd], &kt_vec[s..e], kn, c.rms_eps);
+                            kt_vec[s..e].copy_from_slice(&arena.tmp_head[..hd]);
+                        }
+                        if c.norm_v {
+                            rms_norm_unit_inplace(&mut vt_vec[s..e], c.rms_eps);
+                        }
                     }
                     let (cos_s, sin_s) = if is_swa {
                         (&arena.rope_cos_swa[..], &arena.rope_sin_swa[..])
@@ -894,9 +895,9 @@ impl<'a> Gemma4Trainer<'a> {
                 }
             }
 
-            // 4. Attention (`attn_scale = 1.0`, `kv_source[il]`)
+            // 4. Attention (`c.attn_scale`, `c.attn_logit_softcapping`, `kv_source[il]`)
             if exact_f32_kv {
-                gqa_attn_f32_ext(
+                gqa_attn_f32_ext_softcap(
                     &mut arena.attn_out[offset * q_dim..(offset + b) * q_dim],
                     &arena.q_rope[offset * q_dim..(offset + b) * q_dim],
                     &arena.own_k_f32[kv_src][..(offset + b) * kv_dim],
@@ -906,11 +907,12 @@ impl<'a> Gemma4Trainer<'a> {
                     hd,
                     offset,
                     b,
-                    1.0,
+                    c.attn_scale,
                     window,
+                    c.attn_logit_softcapping,
                 );
             } else if single_tok_mode {
-                gqa_attention_f16_kv_ext_parallel(
+                gqa_attention_f16_kv_softcap_parallel(
                     pool,
                     kt,
                     &mut arena.attn_out[..q_dim],
@@ -921,13 +923,14 @@ impl<'a> Gemma4Trainer<'a> {
                     c.n_head_kv,
                     hd,
                     0,
-                    1.0,
+                    c.attn_scale,
                     window,
+                    c.attn_logit_softcapping,
                     arena.max_seq,
                     &mut arena.attn_scores,
                 );
             } else {
-                gqa_attention_f16_kv_ext_batch_parallel(
+                gqa_attention_f16_kv_softcap_batch_parallel(
                     pool,
                     kt,
                     &mut arena.attn_out[offset * q_dim..(offset + b) * q_dim],
@@ -939,8 +942,9 @@ impl<'a> Gemma4Trainer<'a> {
                     hd,
                     offset,
                     b,
-                    1.0,
+                    c.attn_scale,
                     window,
+                    c.attn_logit_softcapping,
                     arena.max_seq,
                     &mut arena.attn_scores,
                 );
@@ -1619,7 +1623,7 @@ impl<'a> Gemma4Trainer<'a> {
             );
 
             if self.exact_f32_kv_gradcheck {
-                gqa_attn_f32_bwd_ext(
+                gqa_attn_f32_bwd_ext_softcap(
                     kt,
                     &mut self.arena.dq[..seq_len * q_dim],
                     &mut self.arena.dk_cur[..seq_len * kv_dim],
@@ -1632,11 +1636,12 @@ impl<'a> Gemma4Trainer<'a> {
                     c.n_head_kv,
                     hd,
                     seq_len,
-                    1.0,
+                    c.attn_scale,
                     window,
+                    c.attn_logit_softcapping,
                 );
             } else {
-                gqa_attention_f16_kv_bwd_ext_f32(
+                gqa_attention_f16_kv_bwd_softcap_f32(
                     kt,
                     &mut self.arena.dq[..seq_len * q_dim],
                     &mut self.arena.dk_cur[..seq_len * kv_dim],
@@ -1649,8 +1654,9 @@ impl<'a> Gemma4Trainer<'a> {
                     c.n_head_kv,
                     hd,
                     seq_len,
-                    1.0,
+                    c.attn_scale,
                     window,
+                    c.attn_logit_softcapping,
                 );
             }
 
@@ -1702,19 +1708,21 @@ impl<'a> Gemma4Trainer<'a> {
                     );
                 }
 
-                let q_pre_t = &self.arena.q_pre_norm[t * q_dim..(t + 1) * q_dim];
-                for h in 0..c.n_head {
-                    let s = h * hd;
-                    let e = s + hd;
-                    rms_norm_bwd_f32(
-                        &mut self.arena.tmp_head[..hd],
-                        None,
-                        &q_pre_t[s..e],
-                        &lw.q_norm,
-                        &dqt[s..e],
-                        c.rms_eps,
-                    );
-                    dqt[s..e].copy_from_slice(&self.arena.tmp_head[..hd]);
+                if let Some(ref qn) = lw.q_norm {
+                    let q_pre_t = &self.arena.q_pre_norm[t * q_dim..(t + 1) * q_dim];
+                    for h in 0..c.n_head {
+                        let s = h * hd;
+                        let e = s + hd;
+                        rms_norm_bwd_f32(
+                            &mut self.arena.tmp_head[..hd],
+                            None,
+                            &q_pre_t[s..e],
+                            qn,
+                            &dqt[s..e],
+                            c.rms_eps,
+                        );
+                        dqt[s..e].copy_from_slice(&self.arena.tmp_head[..hd]);
+                    }
                 }
             }
 
@@ -1785,23 +1793,27 @@ impl<'a> Gemma4Trainer<'a> {
                     for h in 0..c.n_head_kv {
                         let s = h * hd;
                         let e = s + hd;
-                        rms_norm_bwd_f32(
-                            &mut self.arena.tmp_head[..hd],
-                            None,
-                            &k_pre_t[s..e],
-                            &kv_w.k_norm,
-                            &dkt[s..e],
-                            c.rms_eps,
-                        );
-                        dkt[s..e].copy_from_slice(&self.arena.tmp_head[..hd]);
+                        if let Some(ref kn) = kv_w.k_norm {
+                            rms_norm_bwd_f32(
+                                &mut self.arena.tmp_head[..hd],
+                                None,
+                                &k_pre_t[s..e],
+                                kn,
+                                &dkt[s..e],
+                                c.rms_eps,
+                            );
+                            dkt[s..e].copy_from_slice(&self.arena.tmp_head[..hd]);
+                        }
 
-                        rms_norm_unit_bwd_f32(
-                            &mut self.arena.tmp_head[..hd],
-                            &v_pre_t[s..e],
-                            &dvt[s..e],
-                            c.rms_eps,
-                        );
-                        dvt[s..e].copy_from_slice(&self.arena.tmp_head[..hd]);
+                        if c.norm_v {
+                            rms_norm_unit_bwd_f32(
+                                &mut self.arena.tmp_head[..hd],
+                                &v_pre_t[s..e],
+                                &dvt[s..e],
+                                c.rms_eps,
+                            );
+                            dvt[s..e].copy_from_slice(&self.arena.tmp_head[..hd]);
+                        }
                     }
                 }
 

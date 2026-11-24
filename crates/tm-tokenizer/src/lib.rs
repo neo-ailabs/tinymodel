@@ -16,7 +16,7 @@ use tm_gguf::GgufFile;
 pub enum TokenizerError {
     #[error("GGUF missing tokenizer metadata key '{0}'")]
     MissingKey(&'static str),
-    #[error("unsupported tokenizer model '{0}' (currently supported: 'gpt2', 'gemma4')")]
+    #[error("unsupported tokenizer model '{0}' (currently supported: 'gpt2', 'llama', 'gemma4')")]
     UnsupportedModel(String),
 }
 
@@ -26,6 +26,7 @@ enum TokenizerMode {
     Gpt2ByteBpe,
     Gpt4oByteBpe,
     Gemma4SpmBpe,
+    LlamaSpm,
 }
 
 const EMPTY_SLOT: u32 = u32::MAX;
@@ -52,6 +53,9 @@ pub struct Tokenizer {
     vocab_mask: usize,
     /// Packed `(id_a << 32) | id_b` -> `(merge_rank, merged_id)`.
     merges: HashMap<u64, (u32, u32)>,
+    /// Optional SentencePiece scores (`tokenizer.ggml.scores` for `model == "llama"`).
+    scores: Vec<f32>,
+    add_space_prefix: bool,
     byte_to_char: [char; 256],
     char_to_byte: HashMap<char, u8>,
     pub bos_id: Option<u32>,
@@ -74,8 +78,14 @@ impl Tokenizer {
             .get_meta("tokenizer.ggml.pre")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let arch = gguf
+            .get_meta("general.architecture")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let mode = if model == "gemma4" || pre == "gemma4" {
             TokenizerMode::Gemma4SpmBpe
+        } else if model == "llama" {
+            TokenizerMode::LlamaSpm
         } else if matches!(
             pre,
             "inkling2" | "gpt-4o" | "llama4" | "kanana2" | "talkie" | "minimax-m2"
@@ -182,10 +192,22 @@ impl Tokenizer {
         let mut add_bos = gguf
             .get_meta("tokenizer.ggml.add_bos_token")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+            .unwrap_or(mode == TokenizerMode::LlamaSpm);
         if mode == TokenizerMode::Gemma4SpmBpe {
             add_bos = true;
         }
+        let add_space_prefix = gguf
+            .get_meta("tokenizer.ggml.add_space_prefix")
+            .and_then(|v| v.as_bool())
+            .unwrap_or_else(|| mode == TokenizerMode::LlamaSpm && !arch.starts_with("gemma"));
+        let scores = if mode == TokenizerMode::LlamaSpm {
+            gguf.get_meta("tokenizer.ggml.scores")
+                .and_then(|v| v.as_f32_slice())
+                .map(|s| s.to_vec())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         // Qwen2 / Qwen3 / Qwen3.5 BPE regex uses single-digit `\p{N}` instead of `\p{N}{1,3}`.
         let max_digits = if pre.starts_with("qwen") { 1 } else { 3 };
 
@@ -219,6 +241,8 @@ impl Tokenizer {
             vocab_table,
             vocab_mask,
             merges,
+            scores,
+            add_space_prefix,
             byte_to_char,
             char_to_byte,
             bos_id,
@@ -265,7 +289,10 @@ impl Tokenizer {
             ids.push(bos);
         }
 
-        if self.mode == TokenizerMode::Gemma4SpmBpe {
+        if matches!(
+            self.mode,
+            TokenizerMode::Gemma4SpmBpe | TokenizerMode::LlamaSpm
+        ) {
             self.encode_with_specials(text, &mut ids, true);
             return ids;
         }
@@ -274,10 +301,10 @@ impl Tokenizer {
         ids
     }
 
-    fn encode_with_specials(&self, text: &str, ids: &mut Vec<u32>, is_gemma4: bool) {
+    fn encode_with_specials(&self, text: &str, ids: &mut Vec<u32>, is_spm: bool) {
         if self.special_tokens.is_empty() {
-            if is_gemma4 {
-                self.encode_gemma4_into(text, ids);
+            if is_spm {
+                self.encode_spm_span(text, ids, true);
             } else {
                 self.encode_byte_bpe_span(text, ids);
             }
@@ -308,8 +335,8 @@ impl Tokenizer {
                 if let Some((st_len, st_id)) = matched {
                     if span_start < i {
                         let sub = &text[span_start..i];
-                        if is_gemma4 {
-                            self.encode_gemma4_into(sub, ids);
+                        if is_spm {
+                            self.encode_spm_span(sub, ids, span_start == 0);
                         } else {
                             self.encode_byte_bpe_span(sub, ids);
                         }
@@ -325,8 +352,8 @@ impl Tokenizer {
 
         if span_start < text.len() {
             let sub = &text[span_start..];
-            if is_gemma4 {
-                self.encode_gemma4_into(sub, ids);
+            if is_spm {
+                self.encode_spm_span(sub, ids, span_start == 0);
             } else {
                 self.encode_byte_bpe_span(sub, ids);
             }
@@ -405,6 +432,82 @@ impl Tokenizer {
         }
     }
 
+    fn encode_spm_span(&self, text: &str, ids: &mut Vec<u32>, is_first_span: bool) {
+        if text.is_empty() {
+            return;
+        }
+        if self.mode == TokenizerMode::Gemma4SpmBpe {
+            self.encode_gemma4_into(text, ids);
+            return;
+        }
+        // SentencePiece BPE (`tokenizer.ggml.model == "llama"` for Gemma 2/3, Phi-3, Mistral, Llama-2):
+        let mut escaped = String::with_capacity(text.len() + 4);
+        if is_first_span && self.add_space_prefix && !text.starts_with(' ') {
+            escaped.push('\u{2581}');
+        }
+        for ch in text.chars() {
+            escaped.push(if ch == ' ' { '\u{2581}' } else { ch });
+        }
+        let mut sym_ids: Vec<u32> = Vec::with_capacity(escaped.len());
+        let mut char_buf = [0u8; 4];
+        for ch in escaped.chars() {
+            let s = ch.encode_utf8(&mut char_buf);
+            if let Some(id) = self.lookup_id(s)
+                && (id as usize) < self.real_vocab_size
+            {
+                sym_ids.push(id);
+            } else {
+                for &b in s.as_bytes() {
+                    let hex_tok = format!("<0x{b:02X}>");
+                    if let Some(bid) = self.lookup_id(&hex_tok) {
+                        sym_ids.push(bid);
+                    }
+                }
+            }
+        }
+        if !self.merges.is_empty() {
+            self.apply_bpe_merges(&mut sym_ids);
+        } else if !self.scores.is_empty() {
+            let mut merged_scratch = String::with_capacity(64);
+            while sym_ids.len() >= 2 {
+                let mut best_score = f32::NEG_INFINITY;
+                let mut best_idx = usize::MAX;
+                let mut best_id = 0u32;
+                for i in 0..(sym_ids.len() - 1) {
+                    let Some(sa) = self.token_str(sym_ids[i]) else {
+                        continue;
+                    };
+                    let Some(sb) = self.token_str(sym_ids[i + 1]) else {
+                        continue;
+                    };
+                    merged_scratch.clear();
+                    merged_scratch.push_str(sa);
+                    merged_scratch.push_str(sb);
+                    if let Some(mid) = self.lookup_id(&merged_scratch)
+                        && (mid as usize) < self.scores.len()
+                    {
+                        let sc = self.scores[mid as usize];
+                        if sc > best_score {
+                            best_score = sc;
+                            best_idx = i;
+                            best_id = mid;
+                        }
+                    }
+                }
+                if best_idx == usize::MAX {
+                    break;
+                }
+                sym_ids[best_idx] = best_id;
+                sym_ids.remove(best_idx + 1);
+            }
+        }
+        for &id in &sym_ids {
+            if (id as usize) < self.real_vocab_size {
+                ids.push(id);
+            }
+        }
+    }
+
     fn encode_gemma4_into(&self, text: &str, ids: &mut Vec<u32>) {
         // Gemma 4 SPM-style BPE (`llama-vocab.cpp`: `LLAMA_VOCAB_PRE_TYPE_GEMMA4`):
         // 1. Split only on `[^\n]+|[\n]+`;
@@ -473,7 +576,10 @@ impl Tokenizer {
         let Some(tok) = self.token_str(id) else {
             return Vec::new();
         };
-        if self.mode == TokenizerMode::Gemma4SpmBpe {
+        if matches!(
+            self.mode,
+            TokenizerMode::Gemma4SpmBpe | TokenizerMode::LlamaSpm
+        ) {
             if tok.len() == 6
                 && tok.starts_with("<0x")
                 && tok.ends_with('>')

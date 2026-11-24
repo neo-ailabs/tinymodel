@@ -18,6 +18,7 @@ use tm_core::{f16_to_f32, probe_system_memory};
 use tm_cpu::{
     KernelTable, MAX_CPU_BATCH, MatvecScratch, ThreadPool, active_kernels,
     gqa_attention_f16_kv_batch_parallel, gqa_attention_f16_kv_bwd_f32,
+    gqa_attention_f16_kv_ext_batch_parallel, gqa_attention_f16_kv_ext_parallel,
     gqa_attention_f16_kv_parallel, matmul_f32, matmul_pair_f32, matmul_triple_f32, matvec_f32,
     matvec_pair_f32, matvec_triple_f32, rms_norm, rms_norm_batch_parallel, rms_norm_bwd_f32,
     rope_bwd_inplace_tables, rope_compute_cos_sin, rope_inplace_tables, swiglu_bwd_f32,
@@ -188,7 +189,7 @@ impl TrainArena {
         let has_k_norm = model.layers.iter().any(|l| l.k_norm.is_some());
         let max_cols = d.max(ff).max(q_dim).max(c.vocab_size);
         let r_cap = max_rank.max(1);
-        let max_d_out = d.max(ff).max(q_dim).max(kv_dim).max(c.vocab_size);
+        let max_d_out = d.max(2 * ff).max(q_dim + 2 * kv_dim).max(c.vocab_size);
 
         let (ckpt_f16, ckpt_f32) = match ckpt_mode {
             CheckpointMode::Fp16 => (vec![0u16; c.n_layers * max_seq * d], Vec::new()),
@@ -314,19 +315,39 @@ pub fn estimate_qlora_dirty_bytes(
         + CE_CHUNK_TOKENS * (c.vocab_size + 3 * d) * 4;
 
     let mut lora_params = 0usize;
-    let per_layer_pairs = [
-        (targets.q, d, q_dim),
-        (targets.k, d, kv_dim),
-        (targets.v, d, kv_dim),
-        (targets.o, q_dim, d),
-        (targets.gate, d, ff),
-        (targets.up, d, ff),
-        (targets.down, ff, d),
-    ];
-    for (en, din, dout) in per_layer_pairs {
-        if en {
-            lora_params += c.n_layers * rank * (din + dout);
+    let fused_qkv = model.layers.first().is_some_and(|l| l.wq.is_sliced);
+    let fused_up = model.layers.first().is_some_and(|l| l.w_gate.is_sliced);
+    if fused_qkv {
+        if targets.q || targets.k || targets.v {
+            lora_params += c.n_layers * rank * (d + q_dim + 2 * kv_dim);
         }
+    } else {
+        for (en, din, dout) in [
+            (targets.q, d, q_dim),
+            (targets.k, d, kv_dim),
+            (targets.v, d, kv_dim),
+        ] {
+            if en {
+                lora_params += c.n_layers * rank * (din + dout);
+            }
+        }
+    }
+    if targets.o {
+        lora_params += c.n_layers * rank * (q_dim + d);
+    }
+    if fused_up {
+        if targets.gate || targets.up {
+            lora_params += c.n_layers * rank * (d + 2 * ff);
+        }
+    } else {
+        for (en, din, dout) in [(targets.gate, d, ff), (targets.up, d, ff)] {
+            if en {
+                lora_params += c.n_layers * rank * (din + dout);
+            }
+        }
+    }
+    if targets.down {
+        lora_params += c.n_layers * rank * (ff + d);
     }
     if targets.embed {
         lora_params += rank * (c.vocab_size + d);
@@ -551,31 +572,37 @@ impl<'a> LlamaTrainer<'a> {
                     );
                 }
                 if !bound.is_empty() {
-                    bound.apply_linear(
+                    bound.apply_linear_slice(
                         slot_wq,
                         pool,
                         kt,
                         xn_chunk,
                         &mut arena.q_rope[offset * q_dim..(offset + b) * q_dim],
                         b,
+                        lw.wq.row_offset,
+                        q_dim,
                         &mut arena.lora_scratch,
                     );
-                    bound.apply_linear(
+                    bound.apply_linear_slice(
                         slot_wk,
                         pool,
                         kt,
                         xn_chunk,
                         &mut arena.k_rope_f32[offset * kv_dim..(offset + b) * kv_dim],
                         b,
+                        lw.wk.row_offset,
+                        kv_dim,
                         &mut arena.lora_scratch,
                     );
-                    bound.apply_linear(
+                    bound.apply_linear_slice(
                         slot_wv,
                         pool,
                         kt,
                         xn_chunk,
                         &mut arena.v_full_f32[offset * kv_dim..(offset + b) * kv_dim],
                         b,
+                        lw.wv.row_offset,
+                        kv_dim,
                         &mut arena.lora_scratch,
                     );
                 }
@@ -643,30 +670,32 @@ impl<'a> LlamaTrainer<'a> {
                     }
                 }
 
-                rope_compute_cos_sin(
-                    &model.rope_inv_freqs,
-                    pos,
-                    &mut arena.rope_cos,
-                    &mut arena.rope_sin,
-                );
-                rope_inplace_tables(
-                    qt,
-                    c.n_head,
-                    c.head_dim,
-                    c.rope_dim,
-                    &arena.rope_cos,
-                    &arena.rope_sin,
-                    c.rope_type,
-                );
-                rope_inplace_tables(
-                    kt_vec,
-                    c.n_head_kv,
-                    c.head_dim,
-                    c.rope_dim,
-                    &arena.rope_cos,
-                    &arena.rope_sin,
-                    c.rope_type,
-                );
+                if c.layer_uses_rope(layer_idx) {
+                    rope_compute_cos_sin(
+                        model.rope_inv_freqs_for_ctx(arena.max_seq),
+                        pos,
+                        &mut arena.rope_cos,
+                        &mut arena.rope_sin,
+                    );
+                    rope_inplace_tables(
+                        qt,
+                        c.n_head,
+                        c.head_dim,
+                        c.rope_dim,
+                        &arena.rope_cos,
+                        &arena.rope_sin,
+                        c.rope_type,
+                    );
+                    rope_inplace_tables(
+                        kt_vec,
+                        c.n_head_kv,
+                        c.head_dim,
+                        c.rope_dim,
+                        &arena.rope_cos,
+                        &arena.rope_sin,
+                        c.rope_type,
+                    );
+                }
 
                 if !exact_f32_kv {
                     let kv_off = pos * kv_dim;
@@ -687,19 +716,57 @@ impl<'a> LlamaTrainer<'a> {
                     c.head_dim,
                     offset,
                     b,
+                    c.sliding_window,
                 );
             } else if single_tok_mode {
-                gqa_attention_f16_kv_parallel(
+                if c.sliding_window.is_some() {
+                    gqa_attention_f16_kv_ext_parallel(
+                        pool,
+                        kt,
+                        &mut arena.attn_out[..q_dim],
+                        &arena.q_rope[..q_dim],
+                        &arena.k_f16,
+                        &arena.v_f16,
+                        c.n_head,
+                        c.n_head_kv,
+                        c.head_dim,
+                        0,
+                        1.0 / (c.head_dim as f32).sqrt(),
+                        c.sliding_window,
+                        arena.max_seq,
+                        &mut arena.attn_scores,
+                    );
+                } else {
+                    gqa_attention_f16_kv_parallel(
+                        pool,
+                        kt,
+                        &mut arena.attn_out[..q_dim],
+                        &arena.q_rope[..q_dim],
+                        &arena.k_f16,
+                        &arena.v_f16,
+                        c.n_head,
+                        c.n_head_kv,
+                        c.head_dim,
+                        1,
+                        arena.max_seq,
+                        &mut arena.attn_scores,
+                    );
+                }
+            } else if c.sliding_window.is_some() {
+                gqa_attention_f16_kv_ext_batch_parallel(
                     pool,
                     kt,
-                    &mut arena.attn_out[..q_dim],
-                    &arena.q_rope[..q_dim],
+                    &mut arena.attn_out[offset * q_dim..(offset + b) * q_dim],
+                    &arena.q_rope[offset * q_dim..(offset + b) * q_dim],
                     &arena.k_f16,
                     &arena.v_f16,
                     c.n_head,
                     c.n_head_kv,
                     c.head_dim,
-                    1,
+                    offset,
+                    b,
+                    1.0 / (c.head_dim as f32).sqrt(),
+                    c.sliding_window,
                     arena.max_seq,
                     &mut arena.attn_scores,
                 );
@@ -842,22 +909,26 @@ impl<'a> LlamaTrainer<'a> {
                     );
                 }
                 if !bound.is_empty() {
-                    bound.apply_linear(
+                    bound.apply_linear_slice(
                         slot_wg,
                         pool,
                         kt,
                         xfn_chunk,
                         &mut arena.gate_pre[offset * ff..(offset + b) * ff],
                         b,
+                        lw.w_gate.row_offset,
+                        ff,
                         &mut arena.lora_scratch,
                     );
-                    bound.apply_linear(
+                    bound.apply_linear_slice(
                         slot_wu,
                         pool,
                         kt,
                         xfn_chunk,
                         &mut arena.up_pre[offset * ff..(offset + b) * ff],
                         b,
+                        lw.w_up.row_offset,
+                        ff,
                         &mut arena.lora_scratch,
                     );
                 }
@@ -1297,6 +1368,7 @@ impl<'a> LlamaTrainer<'a> {
                     c.n_head_kv,
                     c.head_dim,
                     seq_len,
+                    c.sliding_window,
                     &mut self.arena.bwd_probs,
                     &mut self.arena.bwd_dp,
                 );
@@ -1314,37 +1386,39 @@ impl<'a> LlamaTrainer<'a> {
                     c.n_head_kv,
                     c.head_dim,
                     seq_len,
-                    None,
+                    c.sliding_window,
                 );
             }
 
             for t in 0..seq_len {
-                rope_compute_cos_sin(
-                    &self.model.rope_inv_freqs,
-                    t,
-                    &mut self.arena.rope_cos,
-                    &mut self.arena.rope_sin,
-                );
                 let dqt = &mut self.arena.dq[t * q_dim..(t + 1) * q_dim];
                 let dkt = &mut self.arena.dk[t * kv_dim..(t + 1) * kv_dim];
-                rope_bwd_inplace_tables(
-                    dqt,
-                    c.n_head,
-                    c.head_dim,
-                    c.rope_dim,
-                    &self.arena.rope_cos,
-                    &self.arena.rope_sin,
-                    c.rope_type,
-                );
-                rope_bwd_inplace_tables(
-                    dkt,
-                    c.n_head_kv,
-                    c.head_dim,
-                    c.rope_dim,
-                    &self.arena.rope_cos,
-                    &self.arena.rope_sin,
-                    c.rope_type,
-                );
+                if c.layer_uses_rope(l) {
+                    rope_compute_cos_sin(
+                        self.model.rope_inv_freqs_for_ctx(self.arena.max_seq),
+                        t,
+                        &mut self.arena.rope_cos,
+                        &mut self.arena.rope_sin,
+                    );
+                    rope_bwd_inplace_tables(
+                        dqt,
+                        c.n_head,
+                        c.head_dim,
+                        c.rope_dim,
+                        &self.arena.rope_cos,
+                        &self.arena.rope_sin,
+                        c.rope_type,
+                    );
+                    rope_bwd_inplace_tables(
+                        dkt,
+                        c.n_head_kv,
+                        c.head_dim,
+                        c.rope_dim,
+                        &self.arena.rope_cos,
+                        &self.arena.rope_sin,
+                        c.rope_type,
+                    );
+                }
 
                 if let Some(ref qn) = lw.q_norm {
                     let q_pre_t = &self.arena.q_pre_norm[t * q_dim..(t + 1) * q_dim];
@@ -1595,6 +1669,7 @@ fn gqa_attention_f32_kv_exact(
     head_dim: usize,
     start_pos: usize,
     n_tok: usize,
+    window: Option<usize>,
 ) {
     let q_dim = n_heads * head_dim;
     let kv_dim = n_kv_heads * head_dim;
@@ -1603,13 +1678,19 @@ fn gqa_attention_f32_kv_exact(
 
     for t in 0..n_tok {
         let end_pos = start_pos + t + 1;
+        let start_kv = match window {
+            Some(w) if w > 0 && end_pos > w => end_pos - w,
+            _ => 0,
+        };
+        let win_len = end_pos - start_kv;
         for h in 0..n_heads {
             let kv_h = h / group;
             let qh = &q[t * q_dim + h * head_dim..t * q_dim + (h + 1) * head_dim];
             let oh = &mut out[t * q_dim + h * head_dim..t * q_dim + (h + 1) * head_dim];
-            let mut scores = vec![0.0f64; end_pos];
+            let mut scores = vec![0.0f64; win_len];
             let mut max_s = f64::NEG_INFINITY;
-            for (step, sc) in scores.iter_mut().enumerate() {
+            for (idx, sc) in scores.iter_mut().enumerate() {
+                let step = start_kv + idx;
                 let kh =
                     &k_all[step * kv_dim + kv_h * head_dim..step * kv_dim + (kv_h + 1) * head_dim];
                 let mut dot = 0.0f64;
@@ -1629,7 +1710,8 @@ fn gqa_attention_f32_kv_exact(
             let inv = 1.0 / sum;
             for d in 0..head_dim {
                 let mut acc = 0.0f64;
-                for (step, &e) in scores.iter().enumerate() {
+                for (idx, &e) in scores.iter().enumerate() {
+                    let step = start_kv + idx;
                     acc += (e * inv) * (v_all[step * kv_dim + kv_h * head_dim + d] as f64);
                 }
                 oh[d] = acc as f32;
@@ -1652,6 +1734,7 @@ fn gqa_attention_f32_kv_bwd_exact(
     n_kv_heads: usize,
     head_dim: usize,
     n_tok: usize,
+    window: Option<usize>,
     probs: &mut [f64],
     dp: &mut [f64],
 ) {
@@ -1665,14 +1748,20 @@ fn gqa_attention_f32_kv_bwd_exact(
 
     for t in 0..n_tok {
         let end_pos = t + 1;
-        let p = &mut probs[..end_pos];
-        let d_prob = &mut dp[..end_pos];
+        let start_kv = match window {
+            Some(w) if w > 0 && end_pos > w => end_pos - w,
+            _ => 0,
+        };
+        let win_len = end_pos - start_kv;
+        let p = &mut probs[..win_len];
+        let d_prob = &mut dp[..win_len];
         for h in 0..n_heads {
             let kv_h = h / group;
             let qh = &q[t * q_dim + h * head_dim..t * q_dim + (h + 1) * head_dim];
             let doh = &d_out[t * q_dim + h * head_dim..t * q_dim + (h + 1) * head_dim];
             let mut max_s = f64::NEG_INFINITY;
-            for (step, ps) in p.iter_mut().enumerate() {
+            for (idx, ps) in p.iter_mut().enumerate() {
+                let step = start_kv + idx;
                 let kh =
                     &k_all[step * kv_dim + kv_h * head_dim..step * kv_dim + (kv_h + 1) * head_dim];
                 let mut dot = 0.0f64;
@@ -1695,8 +1784,9 @@ fn gqa_attention_f32_kv_bwd_exact(
             }
 
             let mut sum_p_dp = 0.0f64;
-            for step in 0..end_pos {
-                let pw = p[step];
+            for idx in 0..win_len {
+                let step = start_kv + idx;
+                let pw = p[idx];
                 let v_off = step * kv_dim + kv_h * head_dim;
                 let vh = &v_all[v_off..v_off + head_dim];
                 let dvh = &mut dv[v_off..v_off + head_dim];
@@ -1705,13 +1795,14 @@ fn gqa_attention_f32_kv_bwd_exact(
                     dvh[d] += (doh[d] as f64 * pw) as f32;
                     dot_dov += (doh[d] as f64) * (vh[d] as f64);
                 }
-                d_prob[step] = dot_dov;
+                d_prob[idx] = dot_dov;
                 sum_p_dp += pw * dot_dov;
             }
 
             let dqh = &mut dq[t * q_dim + h * head_dim..t * q_dim + (h + 1) * head_dim];
-            for step in 0..end_pos {
-                let ds = (p[step] * (d_prob[step] - sum_p_dp) * scale) as f32;
+            for idx in 0..win_len {
+                let step = start_kv + idx;
+                let ds = (p[idx] * (d_prob[idx] - sum_p_dp) * scale) as f32;
                 if ds == 0.0 {
                     continue;
                 }

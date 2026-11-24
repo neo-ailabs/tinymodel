@@ -47,6 +47,9 @@ pub struct Gemma4Config {
     pub vocab_size: usize,
     pub max_ctx_train: usize,
     pub rms_eps: f32,
+    pub norm_v: bool,
+    pub attn_scale: f32,
+    pub attn_logit_softcapping: Option<f32>,
     pub final_logit_softcapping: Option<f32>,
 }
 
@@ -103,13 +106,13 @@ pub struct PleLayerWeights<'a> {
 pub struct KvLayerWeights<'a> {
     pub wk: RawMatView<'a>,
     pub wv: Option<RawMatView<'a>>,
-    pub k_norm: Vec<f32>,
+    pub k_norm: Option<Vec<f32>>,
 }
 
 pub struct Gemma4LayerWeights<'a> {
     pub attn_norm: Vec<f32>,
     pub wq: RawMatView<'a>,
-    pub q_norm: Vec<f32>,
+    pub q_norm: Option<Vec<f32>>,
     pub kv: Option<KvLayerWeights<'a>>,
     pub wo: RawMatView<'a>,
     pub post_attn_norm: Vec<f32>,
@@ -267,19 +270,21 @@ fn load_mat<'a>(
         dtype: info.dtype,
         rows,
         cols,
+        row_offset: 0,
+        is_sliced: false,
         lora_slot: None,
     })
 }
 
 impl<'a> Gemma4Model<'a> {
-    /// Loads and validates a `gemma4` GGUF model.
+    /// Loads and validates a `gemma2`, `gemma3`, or `gemma4` GGUF model.
     pub fn from_gguf(gguf: &'a GgufFile) -> Result<Self, ModelError> {
         let arch = gguf.req_str("general.architecture")?.to_string();
-        if arch != "gemma4" {
+        if !matches!(arch.as_str(), "gemma2" | "gemma3" | "gemma4") {
             return Err(ModelError::UnsupportedArch(arch));
         }
 
-        let pfx = "gemma4";
+        let pfx = arch.as_str();
         let n_layers = gguf.req_usize(&format!("{pfx}.block_count"))?;
         let n_embd = gguf.req_usize(&format!("{pfx}.embedding_length"))?;
 
@@ -337,22 +342,53 @@ impl<'a> Gemma4Model<'a> {
         let freq_base_full = gguf
             .get_meta(&format!("{pfx}.rope.freq_base"))
             .and_then(|v| v.as_f32())
-            .unwrap_or(1_000_000.0);
+            .unwrap_or(if pfx == "gemma2" {
+                10_000.0
+            } else {
+                1_000_000.0
+            });
         let freq_base_swa = gguf
             .get_meta(&format!("{pfx}.rope.freq_base_swa"))
             .and_then(|v| v.as_f32())
-            .unwrap_or(10_000.0);
-        let n_swa = gguf.req_usize(&format!("{pfx}.attention.sliding_window"))?;
+            .unwrap_or(if pfx == "gemma2" {
+                freq_base_full
+            } else {
+                10_000.0
+            });
+        let n_swa = if pfx == "gemma4" {
+            gguf.req_usize(&format!("{pfx}.attention.sliding_window"))?
+        } else {
+            gguf.get_meta(&format!("{pfx}.attention.sliding_window"))
+                .and_then(|v| v.as_usize())
+                .unwrap_or(if pfx == "gemma2" { 4096 } else { 0 })
+        };
 
         let swa_pat_key = format!("{pfx}.attention.sliding_window_pattern");
-        let is_swa = gguf
+        let is_swa = if let Some(arr) = gguf
             .get_meta(&swa_pat_key)
             .and_then(|v| v.as_bool_array())
             .filter(|v| v.len() == n_layers)
-            .ok_or_else(|| GgufError::MissingMetadata {
+        {
+            arr
+        } else if let Some(step) = gguf
+            .get_meta(&swa_pat_key)
+            .and_then(|v| v.as_usize())
+            .filter(|&s| s > 0)
+        {
+            (0..n_layers).map(|il| (il + 1) % step != 0).collect()
+        } else if pfx == "gemma2" && n_swa > 0 {
+            (0..n_layers).map(|il| (il + 1) % 2 != 0).collect()
+        } else if pfx == "gemma3" && n_swa > 0 {
+            (0..n_layers).map(|il| (il + 1) % 6 != 0).collect()
+        } else if pfx == "gemma4" {
+            return Err(GgufError::MissingMetadata {
                 path: gguf.path().display().to_string(),
                 key: swa_pat_key,
-            })?;
+            }
+            .into());
+        } else {
+            vec![false; n_layers]
+        };
 
         let shared_kv_layers = gguf
             .get_meta(&format!("{pfx}.attention.shared_kv_layers"))
@@ -389,6 +425,17 @@ impl<'a> Gemma4Model<'a> {
             .get_meta(&format!("{pfx}.attention.layer_norm_rms_epsilon"))
             .and_then(|v| v.as_f32())
             .unwrap_or(1e-6);
+        let norm_v = pfx == "gemma4";
+        let attn_scale = match pfx {
+            "gemma4" => 1.0,
+            "gemma3" if n_layers == 62 => 1.0 / ((n_embd / n_head) as f32).sqrt(),
+            "gemma2" if n_layers == 46 => 1.0 / ((n_embd / n_head) as f32).sqrt(),
+            _ => 1.0 / (head_dim_full as f32).sqrt(),
+        };
+        let attn_logit_softcapping = gguf
+            .get_meta(&format!("{pfx}.attn_logit_softcapping"))
+            .and_then(|v| v.as_f32())
+            .filter(|&c| c > 0.0);
         let final_logit_softcapping = gguf
             .get_meta(&format!("{pfx}.final_logit_softcapping"))
             .and_then(|v| v.as_f32())
@@ -509,7 +556,12 @@ impl<'a> Gemma4Model<'a> {
                 } else {
                     None
                 };
-                let k_norm = load_f32_vec(gguf, &format!("{ltag}.attn_k_norm.weight"), &ltag, hd)?;
+                let k_norm_name = format!("{ltag}.attn_k_norm.weight");
+                let k_norm = if pfx == "gemma2" && gguf.tensor_info(&k_norm_name).is_none() {
+                    None
+                } else {
+                    Some(load_f32_vec(gguf, &k_norm_name, &ltag, hd)?)
+                };
                 Some(KvLayerWeights { wk, wv, k_norm })
             } else {
                 None
@@ -552,10 +604,17 @@ impl<'a> Gemma4Model<'a> {
                 None
             };
 
+            let q_norm_name = format!("{ltag}.attn_q_norm.weight");
+            let q_norm = if pfx == "gemma2" && gguf.tensor_info(&q_norm_name).is_none() {
+                None
+            } else {
+                Some(load_f32_vec(gguf, &q_norm_name, &ltag, hd)?)
+            };
+
             layers.push(Gemma4LayerWeights {
                 attn_norm: load_f32_vec(gguf, &format!("{ltag}.attn_norm.weight"), &ltag, n_embd)?,
                 wq: load_mat(gguf, &format!("{ltag}.attn_q.weight"), &ltag, n_embd, q_dim)?,
-                q_norm: load_f32_vec(gguf, &format!("{ltag}.attn_q_norm.weight"), &ltag, hd)?,
+                q_norm,
                 kv,
                 wo: load_mat(
                     gguf,
@@ -618,6 +677,9 @@ impl<'a> Gemma4Model<'a> {
             vocab_size,
             max_ctx_train,
             rms_eps,
+            norm_v,
+            attn_scale,
+            attn_logit_softcapping,
             final_logit_softcapping,
         };
 
@@ -861,16 +923,18 @@ impl<'a> Gemma4Model<'a> {
                     &mut state.lora_scratch,
                 );
             }
-            for h in 0..self.cfg.n_head {
-                let s = h * hd;
-                let e = s + hd;
-                rms_norm(
-                    &mut state.xb2[..hd],
-                    &state.q_buf[s..e],
-                    &layer.q_norm,
-                    self.cfg.rms_eps,
-                );
-                state.q_buf[s..e].copy_from_slice(&state.xb2[..hd]);
+            if let Some(ref qn) = layer.q_norm {
+                for h in 0..self.cfg.n_head {
+                    let s = h * hd;
+                    let e = s + hd;
+                    rms_norm(
+                        &mut state.xb2[..hd],
+                        &state.q_buf[s..e],
+                        qn,
+                        self.cfg.rms_eps,
+                    );
+                    state.q_buf[s..e].copy_from_slice(&state.xb2[..hd]);
+                }
             }
             let (cos_s, sin_s) = if is_swa {
                 (&state.rope_cos_swa[..], &state.rope_sin_swa[..])
@@ -953,14 +1017,18 @@ impl<'a> Gemma4Model<'a> {
                 for h in 0..self.cfg.n_head_kv {
                     let s = h * hd;
                     let e = s + hd;
-                    rms_norm(
-                        &mut state.xb2[..hd],
-                        &state.k_buf[s..e],
-                        &kv_w.k_norm,
-                        self.cfg.rms_eps,
-                    );
-                    state.k_buf[s..e].copy_from_slice(&state.xb2[..hd]);
-                    rms_norm_unit_inplace(&mut state.v_buf[s..e], self.cfg.rms_eps);
+                    if let Some(ref kn) = kv_w.k_norm {
+                        rms_norm(
+                            &mut state.xb2[..hd],
+                            &state.k_buf[s..e],
+                            kn,
+                            self.cfg.rms_eps,
+                        );
+                        state.k_buf[s..e].copy_from_slice(&state.xb2[..hd]);
+                    }
+                    if self.cfg.norm_v {
+                        rms_norm_unit_inplace(&mut state.v_buf[s..e], self.cfg.rms_eps);
+                    }
                 }
 
                 rope_inplace_tables(
@@ -982,8 +1050,7 @@ impl<'a> Gemma4Model<'a> {
             }
 
             let kv_src = self.cfg.kv_source[il];
-            // Gemma 4 uses `f_attention_scale = 1.0` (`gemma4.cpp:12`)
-            state.layers[kv_src].attend_single(
+            state.layers[kv_src].attend_single_softcap(
                 pool,
                 kt,
                 &mut state.attn_out[..q_dim],
@@ -992,8 +1059,9 @@ impl<'a> Gemma4Model<'a> {
                 self.cfg.n_head_kv,
                 hd,
                 pos,
-                1.0,
+                self.cfg.attn_scale,
                 window,
+                self.cfg.attn_logit_softcapping,
                 state.max_ctx,
                 &mut state.scores,
             );
@@ -1512,16 +1580,13 @@ impl<'a> Gemma4Model<'a> {
             for t in 0..active_rows {
                 let pos = row_pos_offset + t;
                 let qt = &mut state.q_buf[t * q_dim..(t + 1) * q_dim];
-                for h in 0..self.cfg.n_head {
-                    let s = h * hd;
-                    let e = s + hd;
-                    rms_norm(
-                        &mut state.xb2[..hd],
-                        &qt[s..e],
-                        &layer.q_norm,
-                        self.cfg.rms_eps,
-                    );
-                    qt[s..e].copy_from_slice(&state.xb2[..hd]);
+                if let Some(ref qn) = layer.q_norm {
+                    for h in 0..self.cfg.n_head {
+                        let s = h * hd;
+                        let e = s + hd;
+                        rms_norm(&mut state.xb2[..hd], &qt[s..e], qn, self.cfg.rms_eps);
+                        qt[s..e].copy_from_slice(&state.xb2[..hd]);
+                    }
                 }
 
                 if is_swa {
@@ -1564,14 +1629,13 @@ impl<'a> Gemma4Model<'a> {
                     for h in 0..self.cfg.n_head_kv {
                         let s = h * hd;
                         let e = s + hd;
-                        rms_norm(
-                            &mut state.xb2[..hd],
-                            &kt_vec[s..e],
-                            &kv_w.k_norm,
-                            self.cfg.rms_eps,
-                        );
-                        kt_vec[s..e].copy_from_slice(&state.xb2[..hd]);
-                        rms_norm_unit_inplace(&mut vt_vec[s..e], self.cfg.rms_eps);
+                        if let Some(ref kn) = kv_w.k_norm {
+                            rms_norm(&mut state.xb2[..hd], &kt_vec[s..e], kn, self.cfg.rms_eps);
+                            kt_vec[s..e].copy_from_slice(&state.xb2[..hd]);
+                        }
+                        if self.cfg.norm_v {
+                            rms_norm_unit_inplace(&mut vt_vec[s..e], self.cfg.rms_eps);
+                        }
                     }
 
                     let (cos_s, sin_s) = if is_swa {
@@ -1594,7 +1658,7 @@ impl<'a> Gemma4Model<'a> {
             }
 
             let kv_src = self.cfg.kv_source[il];
-            state.layers[kv_src].attend_batch(
+            state.layers[kv_src].attend_batch_softcap(
                 pool,
                 kt,
                 &mut state.attn_out[..active_rows * q_dim],
@@ -1604,8 +1668,9 @@ impl<'a> Gemma4Model<'a> {
                 hd,
                 row_pos_offset,
                 active_rows,
-                1.0,
+                self.cfg.attn_scale,
                 window,
+                self.cfg.attn_logit_softcapping,
                 state.max_ctx,
                 &mut state.scores,
             );

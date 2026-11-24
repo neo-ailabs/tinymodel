@@ -8,10 +8,9 @@ use tm_core::{
     BlockQ8_0, DType, KvType, QK8_0, dequantize_q4_0x4_single_row, dequantize_row_bytes,
 };
 use tm_cpu::{
-    KernelTable, ThreadPool, gqa_attention_f16_kv_batch_parallel,
-    gqa_attention_f16_kv_ext_batch_parallel, gqa_attention_f16_kv_ext_parallel,
-    gqa_attention_f16_kv_parallel, gqa_attention_q8_0_kv_ext_batch_parallel,
-    gqa_attention_q8_0_kv_ext_parallel,
+    KernelTable, ThreadPool, gqa_attention_f16_kv_batch_parallel, gqa_attention_f16_kv_parallel,
+    gqa_attention_f16_kv_softcap_batch_parallel, gqa_attention_f16_kv_softcap_parallel,
+    gqa_attention_q8_0_kv_softcap_batch_parallel, gqa_attention_q8_0_kv_softcap_parallel,
 };
 
 /// Maximum speculative verification window (`1` committed token + up to `8` draft tokens).
@@ -297,6 +296,41 @@ impl LayerState {
         max_ctx: usize,
         scores: &mut [f32],
     ) {
+        self.attend_single_softcap(
+            pool,
+            kt,
+            out,
+            q,
+            n_head,
+            n_head_kv,
+            head_dim,
+            pos,
+            attn_scale,
+            window_override,
+            None,
+            max_ctx,
+            scores,
+        );
+    }
+
+    /// Single-token GQA attention with optional pre-softmax `attn_softcap` (`Gemma 2`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attend_single_softcap(
+        &self,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        out: &mut [f32],
+        q: &[f32],
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        pos: usize,
+        attn_scale: f32,
+        window_override: Option<usize>,
+        attn_softcap: Option<f32>,
+        max_ctx: usize,
+        scores: &mut [f32],
+    ) {
         match self {
             LayerState::Kv {
                 kv_type: KvType::F16,
@@ -306,7 +340,10 @@ impl LayerState {
                 ..
             } => {
                 let win = window_override.or(*window);
-                if win.is_none() && (attn_scale - 1.0 / (head_dim as f32).sqrt()).abs() < 1e-7 {
+                if win.is_none()
+                    && attn_softcap.is_none()
+                    && (attn_scale - 1.0 / (head_dim as f32).sqrt()).abs() < 1e-7
+                {
                     gqa_attention_f16_kv_parallel(
                         pool,
                         kt,
@@ -322,9 +359,22 @@ impl LayerState {
                         scores,
                     );
                 } else {
-                    gqa_attention_f16_kv_ext_parallel(
-                        pool, kt, out, q, k_cache, v_cache, n_head, n_head_kv, head_dim, pos,
-                        attn_scale, win, max_ctx, scores,
+                    gqa_attention_f16_kv_softcap_parallel(
+                        pool,
+                        kt,
+                        out,
+                        q,
+                        k_cache,
+                        v_cache,
+                        n_head,
+                        n_head_kv,
+                        head_dim,
+                        pos,
+                        attn_scale,
+                        win,
+                        attn_softcap,
+                        max_ctx,
+                        scores,
                     );
                 }
             }
@@ -336,9 +386,22 @@ impl LayerState {
                 ..
             } => {
                 let win = window_override.or(*window);
-                gqa_attention_q8_0_kv_ext_parallel(
-                    pool, kt, out, q, k_q8, v_q8, n_head, n_head_kv, head_dim, pos, attn_scale,
-                    win, max_ctx, scores,
+                gqa_attention_q8_0_kv_softcap_parallel(
+                    pool,
+                    kt,
+                    out,
+                    q,
+                    k_q8,
+                    v_q8,
+                    n_head,
+                    n_head_kv,
+                    head_dim,
+                    pos,
+                    attn_scale,
+                    win,
+                    attn_softcap,
+                    max_ctx,
+                    scores,
                 );
             }
             _ => unreachable!("attend_single requires LayerState::Kv"),
@@ -363,6 +426,43 @@ impl LayerState {
         max_ctx: usize,
         scores: &mut [f32],
     ) {
+        self.attend_batch_softcap(
+            pool,
+            kt,
+            out,
+            q,
+            n_head,
+            n_head_kv,
+            head_dim,
+            start_pos,
+            n_tok,
+            attn_scale,
+            window_override,
+            None,
+            max_ctx,
+            scores,
+        );
+    }
+
+    /// Multi-token causal GQA attention with optional pre-softmax `attn_softcap` (`Gemma 2`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attend_batch_softcap(
+        &self,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        out: &mut [f32],
+        q: &[f32],
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        start_pos: usize,
+        n_tok: usize,
+        attn_scale: f32,
+        window_override: Option<usize>,
+        attn_softcap: Option<f32>,
+        max_ctx: usize,
+        scores: &mut [f32],
+    ) {
         match self {
             LayerState::Kv {
                 kv_type: KvType::F16,
@@ -372,15 +472,32 @@ impl LayerState {
                 ..
             } => {
                 let win = window_override.or(*window);
-                if win.is_none() && (attn_scale - 1.0 / (head_dim as f32).sqrt()).abs() < 1e-7 {
+                if win.is_none()
+                    && attn_softcap.is_none()
+                    && (attn_scale - 1.0 / (head_dim as f32).sqrt()).abs() < 1e-7
+                {
                     gqa_attention_f16_kv_batch_parallel(
                         pool, kt, out, q, k_cache, v_cache, n_head, n_head_kv, head_dim, start_pos,
                         n_tok, max_ctx, scores,
                     );
                 } else {
-                    gqa_attention_f16_kv_ext_batch_parallel(
-                        pool, kt, out, q, k_cache, v_cache, n_head, n_head_kv, head_dim, start_pos,
-                        n_tok, attn_scale, win, max_ctx, scores,
+                    gqa_attention_f16_kv_softcap_batch_parallel(
+                        pool,
+                        kt,
+                        out,
+                        q,
+                        k_cache,
+                        v_cache,
+                        n_head,
+                        n_head_kv,
+                        head_dim,
+                        start_pos,
+                        n_tok,
+                        attn_scale,
+                        win,
+                        attn_softcap,
+                        max_ctx,
+                        scores,
                     );
                 }
             }
@@ -392,9 +509,23 @@ impl LayerState {
                 ..
             } => {
                 let win = window_override.or(*window);
-                gqa_attention_q8_0_kv_ext_batch_parallel(
-                    pool, kt, out, q, k_q8, v_q8, n_head, n_head_kv, head_dim, start_pos, n_tok,
-                    attn_scale, win, max_ctx, scores,
+                gqa_attention_q8_0_kv_softcap_batch_parallel(
+                    pool,
+                    kt,
+                    out,
+                    q,
+                    k_q8,
+                    v_q8,
+                    n_head,
+                    n_head_kv,
+                    head_dim,
+                    start_pos,
+                    n_tok,
+                    attn_scale,
+                    win,
+                    attn_softcap,
+                    max_ctx,
+                    scores,
                 );
             }
             _ => unreachable!("attend_batch requires LayerState::Kv"),

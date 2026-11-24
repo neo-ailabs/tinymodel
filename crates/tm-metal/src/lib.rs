@@ -92,16 +92,16 @@ impl MetalRunner {
     ) -> Result<Self, MetalError> {
         let arch = gguf.req_str("general.architecture")?.to_string();
         match arch.as_str() {
-            "llama" | "qwen2" | "qwen3" => Ok(MetalRunner::Llama(LlamaMetalRunner::from_gguf(
-                gguf, max_ctx,
-            )?)),
+            "llama" | "qwen2" | "qwen3" | "smollm3" | "phi3" | "mistral" | "mistral3" => Ok(
+                MetalRunner::Llama(LlamaMetalRunner::from_gguf(gguf, max_ctx)?),
+            ),
             "qwen35" => Ok(MetalRunner::Qwen35(Qwen35MetalRunner::from_gguf(
                 gguf, max_ctx,
             )?)),
-            "gemma4" => Ok(MetalRunner::Gemma4(Gemma4MetalRunner::from_gguf(
-                gguf, max_ctx,
-            )?)),
-            "lfm2" => Ok(MetalRunner::Lfm2(Lfm2MetalRunner::from_gguf(
+            "gemma2" | "gemma3" | "gemma4" => Ok(MetalRunner::Gemma4(
+                Gemma4MetalRunner::from_gguf(gguf, max_ctx)?,
+            )),
+            "lfm2" | "lfm3" => Ok(MetalRunner::Lfm2(Lfm2MetalRunner::from_gguf(
                 gguf, max_ctx,
             )?)),
             _ => Err(MetalError::UnsupportedArch(arch)),

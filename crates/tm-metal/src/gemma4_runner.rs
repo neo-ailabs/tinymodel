@@ -108,7 +108,7 @@ struct AttnExtArgs {
     n_tok: u32,
     window: u32,
     attn_scale: f32,
-    _pad: u32,
+    attn_softcap: f32,
 }
 
 #[repr(C)]
@@ -154,6 +154,9 @@ pub struct Gemma4MetalConfig {
     pub is_swa: Vec<bool>,
     pub kv_source_layer: Vec<usize>,
     pub rms_eps: f32,
+    pub norm_v: bool,
+    pub attn_scale: f32,
+    pub attn_logit_softcapping: Option<f32>,
     pub final_logit_softcapping: Option<f32>,
     pub vocab_size: usize,
     pub max_ctx: usize,
@@ -212,7 +215,7 @@ struct GpuGemma4PleLayer {
 }
 
 struct GpuGemma4KvOwn {
-    k_norm: MtlBuf,
+    k_norm: Option<MtlBuf>,
     wk: GpuMat,
     wv: Option<GpuMat>,
     k_cache: MtlBuf,
@@ -222,7 +225,7 @@ struct GpuGemma4KvOwn {
 
 struct GpuGemma4Layer {
     attn_norm: MtlBuf,
-    q_norm: MtlBuf,
+    q_norm: Option<MtlBuf>,
     wq: GpuMat,
     kv: Option<GpuGemma4KvOwn>,
     wo: GpuMat,
@@ -471,9 +474,10 @@ fn load_gpu_mat(
 impl Gemma4MetalRunner {
     pub fn from_gguf(gguf: Arc<GgufFile>, max_ctx: usize) -> Result<Self, MetalError> {
         let arch = gguf.req_str("general.architecture")?.to_string();
-        if arch != "gemma4" {
+        if !matches!(arch.as_str(), "gemma2" | "gemma3" | "gemma4") {
             return Err(MetalError::UnsupportedArch(arch));
         }
+        let pfx = arch.clone();
 
         let device = MTLCreateSystemDefaultDevice().ok_or(MetalError::NoDevice)?;
         let queue = device
@@ -530,14 +534,14 @@ impl Gemma4MetalRunner {
         };
         let lora = MetalLoraEngine::new(&device, &lib)?;
 
-        let n_layers = gguf.req_usize("gemma4.block_count")?;
-        let n_embd = gguf.req_usize("gemma4.embedding_length")?;
+        let n_layers = gguf.req_usize(&format!("{pfx}.block_count"))?;
+        let n_embd = gguf.req_usize(&format!("{pfx}.embedding_length"))?;
         let n_embd_per_layer = gguf
-            .get_meta("gemma4.embedding_length_per_layer_input")
+            .get_meta(&format!("{pfx}.embedding_length_per_layer_input"))
             .and_then(|v| v.as_usize())
             .unwrap_or(0);
         let shared_kv_layers = gguf
-            .get_meta("gemma4.attention.shared_kv_layers")
+            .get_meta(&format!("{pfx}.attention.shared_kv_layers"))
             .and_then(|v| v.as_usize())
             .unwrap_or(0);
         if shared_kv_layers >= n_layers {
@@ -548,25 +552,25 @@ impl Gemma4MetalRunner {
         let n_layer_kv_from_start = n_layers - shared_kv_layers;
 
         let n_ff_per_layer = if let Some(arr) = gguf
-            .get_meta("gemma4.feed_forward_length")
+            .get_meta(&format!("{pfx}.feed_forward_length"))
             .and_then(|v| v.as_usize_array())
         {
             arr
         } else {
-            vec![gguf.req_usize("gemma4.feed_forward_length")?; n_layers]
+            vec![gguf.req_usize(&format!("{pfx}.feed_forward_length"))?; n_layers]
         };
 
-        let n_head = gguf.req_usize("gemma4.attention.head_count")?;
+        let n_head = gguf.req_usize(&format!("{pfx}.attention.head_count"))?;
         let n_head_kv = gguf
-            .get_meta("gemma4.attention.head_count_kv")
+            .get_meta(&format!("{pfx}.attention.head_count_kv"))
             .and_then(|v| v.as_usize())
             .unwrap_or(n_head);
         let head_dim_full = gguf
-            .get_meta("gemma4.attention.key_length")
+            .get_meta(&format!("{pfx}.attention.key_length"))
             .and_then(|v| v.as_usize())
             .unwrap_or(n_embd / n_head);
         let head_dim_swa = gguf
-            .get_meta("gemma4.attention.key_length_swa")
+            .get_meta(&format!("{pfx}.attention.key_length_swa"))
             .and_then(|v| v.as_usize())
             .unwrap_or(head_dim_full);
         if head_dim_full > 512 || head_dim_swa > 512 {
@@ -576,32 +580,60 @@ impl Gemma4MetalRunner {
         }
 
         let rope_dim_full = gguf
-            .get_meta("gemma4.rope.dimension_count")
+            .get_meta(&format!("{pfx}.rope.dimension_count"))
             .and_then(|v| v.as_usize())
             .unwrap_or(head_dim_full);
         let rope_dim_swa = gguf
-            .get_meta("gemma4.rope.dimension_count_swa")
+            .get_meta(&format!("{pfx}.rope.dimension_count_swa"))
             .and_then(|v| v.as_usize())
             .unwrap_or(head_dim_swa);
         let rope_freq_base_full = gguf
-            .get_meta("gemma4.rope.freq_base")
+            .get_meta(&format!("{pfx}.rope.freq_base"))
             .and_then(|v| v.as_f32())
-            .unwrap_or(1_000_000.0);
+            .unwrap_or(if pfx == "gemma2" {
+                10_000.0
+            } else {
+                1_000_000.0
+            });
         let rope_freq_base_swa = gguf
-            .get_meta("gemma4.rope.freq_base_swa")
+            .get_meta(&format!("{pfx}.rope.freq_base_swa"))
             .and_then(|v| v.as_f32())
-            .unwrap_or(10_000.0);
+            .unwrap_or(if pfx == "gemma2" {
+                rope_freq_base_full
+            } else {
+                10_000.0
+            });
         let n_swa = gguf
-            .get_meta("gemma4.attention.sliding_window")
+            .get_meta(&format!("{pfx}.attention.sliding_window"))
             .and_then(|v| v.as_usize())
-            .unwrap_or(512);
+            .unwrap_or(if pfx == "gemma4" {
+                512
+            } else if pfx == "gemma2" {
+                4096
+            } else {
+                0
+            });
+        let swa_pat_key = format!("{pfx}.attention.sliding_window_pattern");
         let is_swa = if let Some(arr) = gguf
-            .get_meta("gemma4.attention.sliding_window_pattern")
+            .get_meta(&swa_pat_key)
             .and_then(|v| v.as_bool_array())
+            .filter(|v| v.len() == n_layers)
         {
             arr
-        } else {
+        } else if let Some(step) = gguf
+            .get_meta(&swa_pat_key)
+            .and_then(|v| v.as_usize())
+            .filter(|&s| s > 0)
+        {
+            (0..n_layers).map(|il| (il + 1) % step != 0).collect()
+        } else if pfx == "gemma2" && n_swa > 0 {
+            (0..n_layers).map(|il| (il + 1) % 2 != 0).collect()
+        } else if pfx == "gemma3" && n_swa > 0 {
+            (0..n_layers).map(|il| (il + 1) % 6 != 0).collect()
+        } else if pfx == "gemma4" {
             (0..n_layers).map(|il| (il % 5) < 4).collect()
+        } else {
+            vec![false; n_layers]
         };
 
         let mut kv_source_layer = Vec::with_capacity(n_layers);
@@ -622,13 +654,27 @@ impl Gemma4MetalRunner {
             }
         }
 
-        let rms_eps = gguf.req_f32("gemma4.attention.layer_norm_rms_epsilon")?;
+        let rms_eps = gguf
+            .get_meta(&format!("{pfx}.attention.layer_norm_rms_epsilon"))
+            .and_then(|v| v.as_f32())
+            .unwrap_or(1e-6);
+        let norm_v = pfx == "gemma4";
+        let attn_scale = match pfx.as_str() {
+            "gemma4" => 1.0,
+            "gemma3" if n_layers == 62 => 1.0 / ((n_embd / n_head) as f32).sqrt(),
+            "gemma2" if n_layers == 46 => 1.0 / ((n_embd / n_head) as f32).sqrt(),
+            _ => 1.0 / (head_dim_full as f32).sqrt(),
+        };
+        let attn_logit_softcapping = gguf
+            .get_meta(&format!("{pfx}.attn_logit_softcapping"))
+            .and_then(|v| v.as_f32())
+            .filter(|&v| v > 0.0);
         let final_logit_softcapping = gguf
-            .get_meta("gemma4.final_logit_softcapping")
+            .get_meta(&format!("{pfx}.final_logit_softcapping"))
             .and_then(|v| v.as_f32())
             .filter(|&v| v > 0.0);
         let file_ctx = gguf
-            .get_meta("gemma4.context_length")
+            .get_meta(&format!("{pfx}.context_length"))
             .and_then(|v| v.as_usize())
             .unwrap_or(max_ctx);
         let max_ctx = max_ctx.min(file_ctx).max(1);
@@ -661,6 +707,9 @@ impl Gemma4MetalRunner {
             is_swa,
             kv_source_layer,
             rms_eps,
+            norm_v,
+            attn_scale,
+            attn_logit_softcapping,
             final_logit_softcapping,
             vocab_size,
             max_ctx,
@@ -763,13 +812,18 @@ impl Gemma4MetalRunner {
                 &ltag,
                 &[n_embd],
             )?;
-            let q_norm = load_gpu_f32_tensor(
-                &device,
-                &gguf,
-                &format!("{ltag}.attn_q_norm.weight"),
-                &ltag,
-                &[hd],
-            )?;
+            let q_norm_name = format!("{ltag}.attn_q_norm.weight");
+            let q_norm = if pfx == "gemma2" && gguf.tensor_info(&q_norm_name).is_none() {
+                None
+            } else {
+                Some(load_gpu_f32_tensor(
+                    &device,
+                    &gguf,
+                    &q_norm_name,
+                    &ltag,
+                    &[hd],
+                )?)
+            };
             let wq = load_gpu_mat(
                 &device,
                 &gguf,
@@ -781,13 +835,18 @@ impl Gemma4MetalRunner {
             )?;
 
             let kv = if il < n_layer_kv_from_start {
-                let k_norm = load_gpu_f32_tensor(
-                    &device,
-                    &gguf,
-                    &format!("{ltag}.attn_k_norm.weight"),
-                    &ltag,
-                    &[hd],
-                )?;
+                let k_norm_name = format!("{ltag}.attn_k_norm.weight");
+                let k_norm = if pfx == "gemma2" && gguf.tensor_info(&k_norm_name).is_none() {
+                    None
+                } else {
+                    Some(load_gpu_f32_tensor(
+                        &device,
+                        &gguf,
+                        &k_norm_name,
+                        &ltag,
+                        &[hd],
+                    )?)
+                };
                 let wk = load_gpu_mat(
                     &device,
                     &gguf,
@@ -1570,29 +1629,31 @@ impl Gemma4MetalRunner {
                 );
             }
 
-            enc.setComputePipelineState(&self.pipes.qk_norm_batch);
-            // SAFETY: Buffers outlive command buffer execution.
-            unsafe {
-                enc.setBuffer_offset_atIndex(Some(&self.q_buf), 0, 0);
-                enc.setBuffer_offset_atIndex(Some(&layer.q_norm), 0, 1);
-                enc.setBytes_length_atIndex(
-                    NonNull::from(&qn_args).cast::<c_void>(),
-                    core::mem::size_of::<NormArgs>(),
-                    2,
+            if let Some(ref q_norm_buf) = layer.q_norm {
+                enc.setComputePipelineState(&self.pipes.qk_norm_batch);
+                // SAFETY: Buffers outlive command buffer execution.
+                unsafe {
+                    enc.setBuffer_offset_atIndex(Some(&self.q_buf), 0, 0);
+                    enc.setBuffer_offset_atIndex(Some(q_norm_buf), 0, 1);
+                    enc.setBytes_length_atIndex(
+                        NonNull::from(&qn_args).cast::<c_void>(),
+                        core::mem::size_of::<NormArgs>(),
+                        2,
+                    );
+                }
+                enc.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: self.cfg.n_head,
+                        height: active_rows,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 32,
+                        height: 1,
+                        depth: 1,
+                    },
                 );
             }
-            enc.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
-                    width: self.cfg.n_head,
-                    height: active_rows,
-                    depth: 1,
-                },
-                MTLSize {
-                    width: 32,
-                    height: 1,
-                    depth: 1,
-                },
-            );
 
             // Own KV vs Shared KV
             if let Some(ref kv_own) = layer.kv {
@@ -1624,53 +1685,57 @@ impl Gemma4MetalRunner {
                     }
                 }
 
-                // K RMSNorm (weighted) + V RMSNorm (unit-weight `1.0`!)
-                enc.setComputePipelineState(&self.pipes.qk_norm_batch);
-                // SAFETY: Buffers outlive command buffer execution.
-                unsafe {
-                    enc.setBuffer_offset_atIndex(Some(&self.k_buf), 0, 0);
-                    enc.setBuffer_offset_atIndex(Some(&kv_own.k_norm), 0, 1);
-                    enc.setBytes_length_atIndex(
-                        NonNull::from(&qn_args).cast::<c_void>(),
-                        core::mem::size_of::<NormArgs>(),
-                        2,
+                // Optional K RMSNorm (weighted) + optional V RMSNorm (unit-weight `1.0` on Gemma 4)
+                if let Some(ref k_norm_buf) = kv_own.k_norm {
+                    enc.setComputePipelineState(&self.pipes.qk_norm_batch);
+                    // SAFETY: Buffers outlive command buffer execution.
+                    unsafe {
+                        enc.setBuffer_offset_atIndex(Some(&self.k_buf), 0, 0);
+                        enc.setBuffer_offset_atIndex(Some(k_norm_buf), 0, 1);
+                        enc.setBytes_length_atIndex(
+                            NonNull::from(&qn_args).cast::<c_void>(),
+                            core::mem::size_of::<NormArgs>(),
+                            2,
+                        );
+                    }
+                    enc.dispatchThreadgroups_threadsPerThreadgroup(
+                        MTLSize {
+                            width: self.cfg.n_head_kv,
+                            height: active_rows,
+                            depth: 1,
+                        },
+                        MTLSize {
+                            width: 32,
+                            height: 1,
+                            depth: 1,
+                        },
                     );
                 }
-                enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize {
-                        width: self.cfg.n_head_kv,
-                        height: active_rows,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: 32,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
 
-                enc.setComputePipelineState(&self.pipes.qk_norm_unit_batch);
-                // SAFETY: Buffers outlive command buffer execution.
-                unsafe {
-                    enc.setBuffer_offset_atIndex(Some(&self.v_buf), 0, 0);
-                    enc.setBytes_length_atIndex(
-                        NonNull::from(&qn_args).cast::<c_void>(),
-                        core::mem::size_of::<NormArgs>(),
-                        1,
+                if self.cfg.norm_v {
+                    enc.setComputePipelineState(&self.pipes.qk_norm_unit_batch);
+                    // SAFETY: Buffers outlive command buffer execution.
+                    unsafe {
+                        enc.setBuffer_offset_atIndex(Some(&self.v_buf), 0, 0);
+                        enc.setBytes_length_atIndex(
+                            NonNull::from(&qn_args).cast::<c_void>(),
+                            core::mem::size_of::<NormArgs>(),
+                            1,
+                        );
+                    }
+                    enc.dispatchThreadgroups_threadsPerThreadgroup(
+                        MTLSize {
+                            width: active_rows * self.cfg.n_head_kv,
+                            height: 1,
+                            depth: 1,
+                        },
+                        MTLSize {
+                            width: 32,
+                            height: 1,
+                            depth: 1,
+                        },
                     );
                 }
-                enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize {
-                        width: active_rows * self.cfg.n_head_kv,
-                        height: 1,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: 32,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
 
                 // NeoX RoPE on Q & K + store K/V into F16 cache
                 let rk_args = RopeKvArgs {
@@ -1793,8 +1858,8 @@ impl Gemma4MetalRunner {
                 start_pos: row_pos_offset as u32,
                 n_tok: active_rows as u32,
                 window,
-                attn_scale: 1.0,
-                _pad: 0,
+                attn_scale: self.cfg.attn_scale,
+                attn_softcap: self.cfg.attn_logit_softcapping.unwrap_or(0.0),
             };
             let seq_len_now = row_pos_offset + 1;
             let eff_kv_len = if window > 0 {

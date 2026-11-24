@@ -85,6 +85,22 @@ struct AttnExtArgs {
     n_tok: u32,
     window: u32,
     attn_scale: f32,
+    attn_softcap: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BiasArgs {
+    d_out: u32,
+    n_tok: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HeadGateArgs {
+    n_head: u32,
+    head_dim: u32,
+    n_tok: u32,
     _pad: u32,
 }
 
@@ -112,9 +128,11 @@ pub struct Lfm2MetalConfig {
     pub head_dim: usize,
     pub rope_dim: usize,
     pub rope_freq_base: f32,
+    pub rope_freq_base_swa: f32,
     pub rms_eps: f32,
     pub shortconv_l_cache: usize,
     pub sliding_window: Option<usize>,
+    pub is_swa: Vec<bool>,
     pub vocab_size: usize,
     pub max_ctx: usize,
 }
@@ -129,6 +147,7 @@ struct GpuMat {
     row_bytes: usize,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum GpuLfm2Op {
     ShortConv {
         in_proj: GpuMat,
@@ -144,6 +163,7 @@ enum GpuLfm2Op {
         wq: GpuMat,
         wk: GpuMat,
         wv: GpuMat,
+        w_attn_gate: Option<GpuMat>,
         wo: GpuMat,
         k_cache: MtlBuf,
         v_cache: MtlBuf,
@@ -154,10 +174,12 @@ enum GpuLfm2Op {
 struct GpuLfm2Layer {
     attn_norm: MtlBuf,
     op: GpuLfm2Op,
+    post_attn_norm: Option<MtlBuf>,
     ffn_norm: MtlBuf,
     w_gate: GpuMat,
     w_up: GpuMat,
     w_down: GpuMat,
+    post_ffw_norm: Option<MtlBuf>,
 }
 
 struct Lfm2Pipelines {
@@ -172,6 +194,8 @@ struct Lfm2Pipelines {
     rms_norm: MtlPipe,
     rms_norm_batch: MtlPipe,
     qk_norm_batch: MtlPipe,
+    add_bias: MtlPipe,
+    sigmoid_head_gate: MtlPipe,
     rope_kv: MtlPipe,
     rope_kv_batch: MtlPipe,
     gqa_attn_ext_batch: MtlPipe,
@@ -195,7 +219,7 @@ struct Lfm2Pipelines {
     argmax: MtlPipe,
 }
 
-/// Complete Apple Metal GPU inference runner for `lfm2` hybrid models.
+/// Complete Apple Metal GPU inference runner for `lfm2` / `lfm3` hybrid models.
 pub struct Lfm2MetalRunner {
     pub cfg: Lfm2MetalConfig,
     device: Retained<ProtocolObject<dyn MTLDevice>>,
@@ -204,6 +228,8 @@ pub struct Lfm2MetalRunner {
     token_embd: GpuMat,
     output_separate: Option<GpuMat>,
     output_norm: MtlBuf,
+    has_rope_freqs: bool,
+    rope_freqs: MtlBuf,
     dummy_rope_freqs: MtlBuf,
     layers: Vec<GpuLfm2Layer>,
     token_ids_buf: MtlBuf,
@@ -213,6 +239,7 @@ pub struct Lfm2MetalRunner {
     q_buf: MtlBuf,
     k_buf: MtlBuf,
     v_buf: MtlBuf,
+    gate_buf: MtlBuf,
     attn_out: MtlBuf,
     bcx_buf: MtlBuf,
     conv_out: MtlBuf,
@@ -380,9 +407,10 @@ fn load_gpu_mat(
 impl Lfm2MetalRunner {
     pub fn from_gguf(gguf: Arc<GgufFile>, max_ctx: usize) -> Result<Self, MetalError> {
         let arch = gguf.req_str("general.architecture")?.to_string();
-        if arch != "lfm2" {
+        if arch != "lfm2" && arch != "lfm3" {
             return Err(MetalError::UnsupportedArch(arch));
         }
+        let pfx = arch.clone();
 
         let device = MTLCreateSystemDefaultDevice().ok_or(MetalError::NoDevice)?;
         let queue = device
@@ -406,6 +434,8 @@ impl Lfm2MetalRunner {
             rms_norm: build_pipe(&device, &lib, "rms_norm_f32", 256)?,
             rms_norm_batch: build_pipe(&device, &lib, "rms_norm_f32_batch", 256)?,
             qk_norm_batch: build_pipe(&device, &lib, "qk_norm_f32_batch", 32)?,
+            add_bias: build_pipe(&device, &lib, "add_bias_f32", 256)?,
+            sigmoid_head_gate: build_pipe(&device, &lib, "sigmoid_head_gate_f32", 256)?,
             rope_kv: build_pipe(&device, &lib, "rope_and_kv_store_f16", 256)?,
             rope_kv_batch: build_pipe(&device, &lib, "rope_and_kv_store_f16_batch", 64)?,
             gqa_attn_ext_batch: build_pipe(&device, &lib, "gqa_attn_f16_kv_ext_batch", 128)?,
@@ -430,32 +460,32 @@ impl Lfm2MetalRunner {
         };
         let lora = MetalLoraEngine::new(&device, &lib)?;
 
-        let n_layers = gguf.req_usize("lfm2.block_count")?;
-        let n_embd = gguf.req_usize("lfm2.embedding_length")?;
+        let n_layers = gguf.req_usize(&format!("{pfx}.block_count"))?;
+        let n_embd = gguf.req_usize(&format!("{pfx}.embedding_length"))?;
         let n_ff = if let Some(arr) = gguf
-            .get_meta("lfm2.feed_forward_length")
+            .get_meta(&format!("{pfx}.feed_forward_length"))
             .and_then(|v| v.as_usize_array())
         {
             arr[0]
         } else {
-            gguf.req_usize("lfm2.feed_forward_length")?
+            gguf.req_usize(&format!("{pfx}.feed_forward_length"))?
         };
         let n_head = if let Some(arr) = gguf
-            .get_meta("lfm2.attention.head_count")
+            .get_meta(&format!("{pfx}.attention.head_count"))
             .and_then(|v| v.as_usize_array())
         {
-            arr[0]
+            arr.into_iter().max().unwrap_or(1)
         } else {
-            gguf.req_usize("lfm2.attention.head_count")?
+            gguf.req_usize(&format!("{pfx}.attention.head_count"))?
         };
         let n_head_kv_per_layer = if let Some(arr) = gguf
-            .get_meta("lfm2.attention.head_count_kv")
+            .get_meta(&format!("{pfx}.attention.head_count_kv"))
             .and_then(|v| v.as_usize_array())
         {
             arr
         } else {
             vec![
-                gguf.get_meta("lfm2.attention.head_count_kv")
+                gguf.get_meta(&format!("{pfx}.attention.head_count_kv"))
                     .and_then(|v| v.as_usize())
                     .unwrap_or(n_head);
                 n_layers
@@ -463,31 +493,53 @@ impl Lfm2MetalRunner {
         };
 
         let head_dim = gguf
-            .get_meta("lfm2.attention.key_length")
+            .get_meta(&format!("{pfx}.attention.key_length"))
             .and_then(|v| v.as_usize())
             .unwrap_or(n_embd / n_head);
         let rope_dim = gguf
-            .get_meta("lfm2.rope.dimension_count")
+            .get_meta(&format!("{pfx}.rope.dimension_count"))
             .and_then(|v| v.as_usize())
             .unwrap_or(head_dim);
         let rope_freq_base = gguf
-            .get_meta("lfm2.rope.freq_base")
+            .get_meta(&format!("{pfx}.rope.freq_base"))
             .and_then(|v| v.as_f32())
             .unwrap_or(1_000_000.0);
-        let rms_eps = gguf.req_f32("lfm2.attention.layer_norm_rms_epsilon")?;
-        let shortconv_l_cache = gguf.req_usize("lfm2.shortconv.l_cache")?;
+        let rope_freq_base_swa = gguf
+            .get_meta(&format!("{pfx}.rope.freq_base_swa"))
+            .and_then(|v| v.as_f32())
+            .unwrap_or(if pfx == "lfm3" {
+                10_000.0
+            } else {
+                rope_freq_base
+            });
+        let rms_eps = gguf
+            .get_meta(&format!("{pfx}.attention.layer_norm_rms_epsilon"))
+            .and_then(|v| v.as_f32())
+            .unwrap_or(1e-5);
+        let shortconv_l_cache = gguf.req_usize(&format!("{pfx}.shortconv.l_cache"))?;
         if shortconv_l_cache > 17 {
             return Err(MetalError::InvalidDimensions(format!(
                 "shortconv.l_cache ({shortconv_l_cache}) exceeds Metal kernel max (17)"
             )));
         }
         let sliding_window = gguf
-            .get_meta("lfm2.attention.sliding_window")
+            .get_meta(&format!("{pfx}.attention.sliding_window"))
             .and_then(|v| v.as_usize())
             .filter(|&w| w > 0);
+        let is_swa = if let Some(arr) = gguf
+            .get_meta(&format!("{pfx}.attention.sliding_window_pattern"))
+            .and_then(|v| v.as_bool_array())
+            .filter(|v| v.len() == n_layers)
+        {
+            arr
+        } else {
+            (0..n_layers)
+                .map(|il| sliding_window.is_some() && n_head_kv_per_layer[il] > 0)
+                .collect()
+        };
 
         let file_ctx = gguf
-            .get_meta("lfm2.context_length")
+            .get_meta(&format!("{pfx}.context_length"))
             .and_then(|v| v.as_usize())
             .unwrap_or(max_ctx);
         let max_ctx = max_ctx.min(file_ctx).max(1);
@@ -511,9 +563,11 @@ impl Lfm2MetalRunner {
             head_dim,
             rope_dim,
             rope_freq_base,
+            rope_freq_base_swa,
             rms_eps,
             shortconv_l_cache,
             sliding_window,
+            is_swa: is_swa.clone(),
             vocab_size,
             max_ctx,
         };
@@ -556,6 +610,39 @@ impl Lfm2MetalRunner {
             load_gpu_f32_tensor(&device, &gguf, "output_norm.weight", "global", &[n_embd])?
         };
         let dummy_rope_freqs = upload_f32(&device, &[1.0f32; 256])?;
+        let mut rope_freqs_opt: Option<MtlBuf> = if gguf.tensor_info("rope_freqs.weight").is_some()
+        {
+            Some(load_gpu_f32_tensor(
+                &device,
+                &gguf,
+                "rope_freqs.weight",
+                "global",
+                &[rope_dim / 2],
+            )?)
+        } else {
+            None
+        };
+        if rope_freqs_opt.is_none() {
+            for il in 0..n_layers {
+                if n_head_kv_per_layer[il] > 0 && !is_swa[il] {
+                    let rf_name = format!("blk.{il}.rope_freqs.weight");
+                    if gguf.tensor_info(&rf_name).is_some() {
+                        rope_freqs_opt = Some(load_gpu_f32_tensor(
+                            &device,
+                            &gguf,
+                            &rf_name,
+                            &format!("blk.{il}"),
+                            &[rope_dim / 2],
+                        )?);
+                        break;
+                    }
+                }
+            }
+        }
+        let (has_rope_freqs, rope_freqs) = match rope_freqs_opt {
+            Some(b) => (true, b),
+            None => (false, dummy_rope_freqs.clone()),
+        };
 
         let q_dim = n_head * head_dim;
         let hist_len = shortconv_l_cache.saturating_sub(1);
@@ -576,6 +663,30 @@ impl Lfm2MetalRunner {
                 &ltag,
                 &[n_embd],
             )?;
+            let pan_name = format!("{ltag}.post_attention_norm.weight");
+            let post_attn_norm = if gguf.tensor_info(&pan_name).is_some() {
+                Some(load_gpu_f32_tensor(
+                    &device,
+                    &gguf,
+                    &pan_name,
+                    &ltag,
+                    &[n_embd],
+                )?)
+            } else {
+                None
+            };
+            let pfn_name = format!("{ltag}.post_ffw_norm.weight");
+            let post_ffw_norm = if gguf.tensor_info(&pfn_name).is_some() {
+                Some(load_gpu_f32_tensor(
+                    &device,
+                    &gguf,
+                    &pfn_name,
+                    &ltag,
+                    &[n_embd],
+                )?)
+            } else {
+                None
+            };
 
             let op = if n_head_kv == 0 {
                 let in_proj = load_gpu_mat(
@@ -670,6 +781,22 @@ impl Lfm2MetalRunner {
                         n_embd,
                         kv_dim,
                     )?,
+                    w_attn_gate: if gguf
+                        .tensor_info(&format!("{ltag}.attn_gate.weight"))
+                        .is_some()
+                    {
+                        Some(load_gpu_mat(
+                            &device,
+                            &gguf,
+                            sw,
+                            &format!("{ltag}.attn_gate.weight"),
+                            &ltag,
+                            n_embd,
+                            n_head,
+                        )?)
+                    } else {
+                        None
+                    },
                     wo: load_gpu_mat(
                         &device,
                         &gguf,
@@ -716,10 +843,12 @@ impl Lfm2MetalRunner {
             layers.push(GpuLfm2Layer {
                 attn_norm,
                 op,
+                post_attn_norm,
                 ffn_norm,
                 w_gate,
                 w_up,
                 w_down,
+                post_ffw_norm,
             });
         }
 
@@ -733,6 +862,7 @@ impl Lfm2MetalRunner {
         let q_buf = alloc_buf(&device, MAX_BATCH * q_dim * 4)?;
         let k_buf = alloc_buf(&device, MAX_BATCH * max_kv_dim * 4)?;
         let v_buf = alloc_buf(&device, MAX_BATCH * max_kv_dim * 4)?;
+        let gate_buf = alloc_buf(&device, MAX_BATCH * n_head.max(1) * 4)?;
         let attn_out = alloc_buf(&device, MAX_BATCH * q_dim * 4)?;
         let bcx_buf = alloc_buf(&device, MAX_BATCH * 3 * n_embd * 4)?;
         let conv_out = alloc_buf(&device, MAX_BATCH * n_embd * 4)?;
@@ -748,6 +878,8 @@ impl Lfm2MetalRunner {
             token_embd,
             output_separate,
             output_norm,
+            has_rope_freqs,
+            rope_freqs,
             dummy_rope_freqs,
             layers,
             token_ids_buf,
@@ -757,6 +889,7 @@ impl Lfm2MetalRunner {
             q_buf,
             k_buf,
             v_buf,
+            gate_buf,
             attn_out,
             bcx_buf,
             conv_out,
@@ -980,9 +1113,53 @@ impl Lfm2MetalRunner {
                 3,
             );
         }
+        self.dispatch_threadgroups_rms(enc, n_tok);
+    }
+
+    fn dispatch_threadgroups_rms(
+        &self,
+        enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        n_tok: usize,
+    ) {
         enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize {
                 width: n_tok,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: 256,
+                height: 1,
+                depth: 1,
+            },
+        );
+    }
+
+    fn enc_add_inplace(
+        &self,
+        enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        src: &MtlBuf,
+        dst: &MtlBuf,
+        total_elems: usize,
+    ) {
+        let args = BiasArgs {
+            d_out: total_elems as u32,
+            n_tok: 1,
+        };
+        enc.setComputePipelineState(&self.pipes.add_bias);
+        // SAFETY: Buffers outlive command buffer execution.
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(src), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(dst), 0, 1);
+            enc.setBytes_length_atIndex(
+                NonNull::from(&args).cast::<c_void>(),
+                core::mem::size_of::<BiasArgs>(),
+                2,
+            );
+        }
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: total_elems.div_ceil(256),
                 height: 1,
                 depth: 1,
             },
@@ -1103,7 +1280,9 @@ impl Lfm2MetalRunner {
         }
 
         // 2. Hybrid `ShortConv` / `GQA` + `SwiGLU` layers
-        for layer in &self.layers {
+        for (il, layer) in self.layers.iter().enumerate() {
+            let is_swa = self.cfg.is_swa.get(il).copied().unwrap_or(false);
+            let layer_window = if is_swa { window } else { 0 };
             self.enc_rms_norm_batch(
                 enc,
                 &self.x,
@@ -1155,7 +1334,21 @@ impl Lfm2MetalRunner {
                             depth: 1,
                         },
                     );
-                    self.enc_gemm(enc, out_proj, &self.conv_out, &self.x, n_tok, true);
+                    if let Some(ref pan) = layer.post_attn_norm {
+                        self.enc_gemm(enc, out_proj, &self.conv_out, &self.xb, n_tok, false);
+                        self.enc_rms_norm_batch(
+                            enc,
+                            &self.xb,
+                            pan,
+                            &self.conv_out,
+                            n_embd,
+                            self.cfg.rms_eps,
+                            n_tok,
+                        );
+                        self.enc_add_inplace(enc, &self.conv_out, &self.x, n_tok * n_embd);
+                    } else {
+                        self.enc_gemm(enc, out_proj, &self.conv_out, &self.x, n_tok, true);
+                    }
                 }
                 GpuLfm2Op::Gqa {
                     n_head_kv,
@@ -1164,6 +1357,7 @@ impl Lfm2MetalRunner {
                     wq,
                     wk,
                     wv,
+                    w_attn_gate,
                     wo,
                     k_cache,
                     v_cache,
@@ -1173,6 +1367,9 @@ impl Lfm2MetalRunner {
                     self.enc_gemm(enc, wq, &self.xb, &self.q_buf, n_tok, false);
                     self.enc_gemm(enc, wk, &self.xb, &self.k_buf, n_tok, false);
                     self.enc_gemm(enc, wv, &self.xb, &self.v_buf, n_tok, false);
+                    if let Some(wg) = w_attn_gate {
+                        self.enc_gemm(enc, wg, &self.xb, &self.gate_buf, n_tok, false);
+                    }
 
                     let qn_args = NormArgs {
                         n: hd as u32,
@@ -1226,6 +1423,13 @@ impl Lfm2MetalRunner {
                         },
                     );
 
+                    let (freq_base, has_freq, freq_buf) = if is_swa {
+                        (self.cfg.rope_freq_base_swa, 0u32, &self.dummy_rope_freqs)
+                    } else if self.has_rope_freqs {
+                        (self.cfg.rope_freq_base, 1u32, &self.rope_freqs)
+                    } else {
+                        (self.cfg.rope_freq_base, 0u32, &self.dummy_rope_freqs)
+                    };
                     let rk_args = RopeKvArgs {
                         n_head: self.cfg.n_head as u32,
                         n_head_kv: *n_head_kv as u32,
@@ -1233,8 +1437,8 @@ impl Lfm2MetalRunner {
                         rope_dim: rope_dim as u32,
                         pos: start_pos as u32,
                         rope_type: 2, // NeoX
-                        has_freq_factors: 0,
-                        freq_base: self.cfg.rope_freq_base,
+                        has_freq_factors: has_freq,
+                        freq_base,
                     };
                     let max_threads_x =
                         ((self.cfg.n_head + *n_head_kv) * (rope_dim / 2)).max(kv_dim);
@@ -1247,7 +1451,7 @@ impl Lfm2MetalRunner {
                             enc.setBuffer_offset_atIndex(Some(&self.v_buf), 0, 2);
                             enc.setBuffer_offset_atIndex(Some(k_cache), 0, 3);
                             enc.setBuffer_offset_atIndex(Some(v_cache), 0, 4);
-                            enc.setBuffer_offset_atIndex(Some(&self.dummy_rope_freqs), 0, 5);
+                            enc.setBuffer_offset_atIndex(Some(freq_buf), 0, 5);
                             enc.setBytes_length_atIndex(
                                 NonNull::from(&rk_args).cast::<c_void>(),
                                 core::mem::size_of::<RopeKvArgs>(),
@@ -1275,7 +1479,7 @@ impl Lfm2MetalRunner {
                             enc.setBuffer_offset_atIndex(Some(&self.v_buf), 0, 2);
                             enc.setBuffer_offset_atIndex(Some(k_cache), 0, 3);
                             enc.setBuffer_offset_atIndex(Some(v_cache), 0, 4);
-                            enc.setBuffer_offset_atIndex(Some(&self.dummy_rope_freqs), 0, 5);
+                            enc.setBuffer_offset_atIndex(Some(freq_buf), 0, 5);
                             enc.setBytes_length_atIndex(
                                 NonNull::from(&rk_args).cast::<c_void>(),
                                 core::mem::size_of::<RopeKvArgs>(),
@@ -1302,9 +1506,9 @@ impl Lfm2MetalRunner {
                         head_dim: hd as u32,
                         start_pos: start_pos as u32,
                         n_tok: n_tok as u32,
-                        window,
+                        window: layer_window,
                         attn_scale,
-                        _pad: 0,
+                        attn_softcap: 0.0,
                     };
                     enc.setComputePipelineState(&self.pipes.gqa_attn_ext_batch);
                     // SAFETY: Buffers outlive command buffer execution.
@@ -1332,7 +1536,55 @@ impl Lfm2MetalRunner {
                         },
                     );
 
-                    self.enc_gemm(enc, wo, &self.attn_out, &self.x, n_tok, true);
+                    if w_attn_gate.is_some() {
+                        let q_dim = self.cfg.n_head * hd;
+                        let g_args = HeadGateArgs {
+                            n_head: self.cfg.n_head as u32,
+                            head_dim: hd as u32,
+                            n_tok: n_tok as u32,
+                            _pad: 0,
+                        };
+                        enc.setComputePipelineState(&self.pipes.sigmoid_head_gate);
+                        // SAFETY: Buffers outlive command buffer execution.
+                        unsafe {
+                            enc.setBuffer_offset_atIndex(Some(&self.attn_out), 0, 0);
+                            enc.setBuffer_offset_atIndex(Some(&self.gate_buf), 0, 1);
+                            enc.setBytes_length_atIndex(
+                                NonNull::from(&g_args).cast::<c_void>(),
+                                core::mem::size_of::<HeadGateArgs>(),
+                                2,
+                            );
+                        }
+                        let tg_x = 256usize.min(q_dim.max(1));
+                        enc.dispatchThreadgroups_threadsPerThreadgroup(
+                            MTLSize {
+                                width: q_dim.div_ceil(tg_x),
+                                height: n_tok,
+                                depth: 1,
+                            },
+                            MTLSize {
+                                width: tg_x,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                    }
+
+                    if let Some(ref pan) = layer.post_attn_norm {
+                        self.enc_gemm(enc, wo, &self.attn_out, &self.xb, n_tok, false);
+                        self.enc_rms_norm_batch(
+                            enc,
+                            &self.xb,
+                            pan,
+                            &self.conv_out,
+                            n_embd,
+                            self.cfg.rms_eps,
+                            n_tok,
+                        );
+                        self.enc_add_inplace(enc, &self.conv_out, &self.x, n_tok * n_embd);
+                    } else {
+                        self.enc_gemm(enc, wo, &self.attn_out, &self.x, n_tok, true);
+                    }
                 }
             }
 
@@ -1411,7 +1663,21 @@ impl Lfm2MetalRunner {
                     },
                 );
             }
-            self.enc_gemm(enc, &layer.w_down, &self.hb, &self.x, n_tok, true);
+            if let Some(ref pfn) = layer.post_ffw_norm {
+                self.enc_gemm(enc, &layer.w_down, &self.hb, &self.xb, n_tok, false);
+                self.enc_rms_norm_batch(
+                    enc,
+                    &self.xb,
+                    pfn,
+                    &self.conv_out,
+                    n_embd,
+                    self.cfg.rms_eps,
+                    n_tok,
+                );
+                self.enc_add_inplace(enc, &self.conv_out, &self.x, n_tok * n_embd);
+            } else {
+                self.enc_gemm(enc, &layer.w_down, &self.hb, &self.x, n_tok, true);
+            }
         }
 
         // 3. Final `token_embd_norm` + LM head + optional `argmax`

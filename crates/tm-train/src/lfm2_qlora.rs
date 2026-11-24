@@ -49,15 +49,20 @@ struct Lfm2TrainArena {
     v_full_f32: Vec<f32>,
     k_f16: Vec<u16>,
     v_f16: Vec<u16>,
+    attn_out_pre_gate: Vec<f32>,
+    attn_gate_raw: Vec<f32>,
     attn_out: Vec<f32>,
+    op_raw: Vec<f32>,
     x_mid: Vec<f32>,
     x_ffn_norm: Vec<f32>,
     gate_pre: Vec<f32>,
     up_pre: Vec<f32>,
     swiglu_out: Vec<f32>,
+    ffn_down_raw: Vec<f32>,
 
     // Backward gradient workspaces
     xb2_chunk: Vec<f32>,
+    d_post: Vec<f32>,
     d_swiglu: Vec<f32>,
     d_gate: Vec<f32>,
     d_up: Vec<f32>,
@@ -66,6 +71,7 @@ struct Lfm2TrainArena {
     d_conv_sum: Vec<f32>,
     d_bcx: Vec<f32>,
     d_attn_out: Vec<f32>,
+    d_attn_gate_raw: Vec<f32>,
     dq: Vec<f32>,
     dk: Vec<f32>,
     dv: Vec<f32>,
@@ -131,13 +137,18 @@ impl Lfm2TrainArena {
             v_full_f32: vec![0.0; max_seq * max_kv_dim],
             k_f16: vec![0u16; max_seq * max_kv_dim],
             v_f16: vec![0u16; max_seq * max_kv_dim],
+            attn_out_pre_gate: vec![0.0; max_seq * q_dim.max(1)],
+            attn_gate_raw: vec![0.0; max_seq * c.n_head.max(1)],
             attn_out: vec![0.0; max_seq * q_dim.max(1)],
+            op_raw: vec![0.0; max_seq * d],
             x_mid: vec![0.0; max_seq * d],
             x_ffn_norm: vec![0.0; max_seq * d],
             gate_pre: vec![0.0; max_seq * ff],
             up_pre: vec![0.0; max_seq * ff],
             swiglu_out: vec![0.0; max_seq * ff],
+            ffn_down_raw: vec![0.0; max_seq * d],
             xb2_chunk: vec![0.0; MAX_CPU_BATCH * d.max(q_dim)],
+            d_post: vec![0.0; max_seq * d],
             d_swiglu: vec![0.0; max_seq * ff],
             d_gate: vec![0.0; max_seq * ff],
             d_up: vec![0.0; max_seq * ff],
@@ -146,6 +157,7 @@ impl Lfm2TrainArena {
             d_conv_sum: vec![0.0; max_seq * d],
             d_bcx: vec![0.0; max_seq * 3 * d],
             d_attn_out: vec![0.0; max_seq * q_dim.max(1)],
+            d_attn_gate_raw: vec![0.0; max_seq * c.n_head.max(1)],
             dq: vec![0.0; max_seq * q_dim.max(1)],
             dk: vec![0.0; max_seq * max_kv_dim],
             dv: vec![0.0; max_seq * max_kv_dim],
@@ -234,7 +246,14 @@ pub fn estimate_lfm2_qlora_dirty_bytes(
                     lora_params += rank * (out_proj.cols + out_proj.rows);
                 }
             }
-            Lfm2OpWeights::Gqa { wq, wk, wv, wo, .. } => {
+            Lfm2OpWeights::Gqa {
+                wq,
+                wk,
+                wv,
+                wo,
+                w_attn_gate,
+                ..
+            } => {
                 if targets.q {
                     lora_params += rank * (wq.cols + wq.rows);
                 }
@@ -243,6 +262,12 @@ pub fn estimate_lfm2_qlora_dirty_bytes(
                 }
                 if targets.v {
                     lora_params += rank * (wv.cols + wv.rows);
+                }
+                if targets.ssm_gates
+                    && let Some(wg) = w_attn_gate
+                {
+                    let r_small = rank.min(wg.rows).max(1);
+                    lora_params += r_small * (wg.cols + wg.rows);
                 }
                 if targets.o {
                     lora_params += rank * (wo.cols + wo.rows);
@@ -438,12 +463,19 @@ impl<'a> Lfm2Trainer<'a> {
                     wk,
                     wv,
                     wo,
+                    w_attn_gate,
                 } => {
                     let kv_dim = *n_head_kv * hd;
                     let slot_wq = bound.slot_for(wq.name);
                     let slot_wk = bound.slot_for(wk.name);
                     let slot_wv = bound.slot_for(wv.name);
                     let slot_wo = bound.slot_for(wo.name);
+                    let inv_freqs = if c.is_swa[layer_idx] {
+                        &model.rope_inv_freqs_swa
+                    } else {
+                        &model.rope_inv_freqs
+                    };
+                    let layer_win = c.layer_window(layer_idx);
 
                     if accel.is_some() {
                         linear_fwd_with_accel(
@@ -562,6 +594,24 @@ impl<'a> Lfm2Trainer<'a> {
                         }
                     }
 
+                    if let Some(wg) = w_attn_gate {
+                        let slot_wgate = bound.slot_for(wg.name);
+                        linear_fwd_with_accel(
+                            accel.as_deref_mut(),
+                            pool,
+                            kt,
+                            wg,
+                            bound,
+                            slot_wgate,
+                            xn_chunk,
+                            &mut arena.attn_gate_raw[offset * c.n_head..(offset + b) * c.n_head],
+                            b,
+                            single_tok_mode,
+                            &mut arena.mv_scratch,
+                            &mut arena.lora_scratch,
+                        );
+                    }
+
                     if save_recompute {
                         arena.q_pre_norm[offset * q_dim..(offset + b) * q_dim]
                             .copy_from_slice(&arena.q_rope[offset * q_dim..(offset + b) * q_dim]);
@@ -590,7 +640,7 @@ impl<'a> Lfm2Trainer<'a> {
                         }
 
                         rope_compute_cos_sin(
-                            &model.rope_inv_freqs,
+                            inv_freqs,
                             pos,
                             &mut arena.rope_cos,
                             &mut arena.rope_sin,
@@ -639,7 +689,7 @@ impl<'a> Lfm2Trainer<'a> {
                             offset,
                             b,
                             attn_scale,
-                            c.n_swa,
+                            layer_win,
                         );
                     } else if single_tok_mode {
                         gqa_attention_f16_kv_ext_parallel(
@@ -654,7 +704,7 @@ impl<'a> Lfm2Trainer<'a> {
                             hd,
                             0,
                             attn_scale,
-                            c.n_swa,
+                            layer_win,
                             arena.max_seq,
                             &mut arena.attn_scores,
                         );
@@ -672,10 +722,30 @@ impl<'a> Lfm2Trainer<'a> {
                             offset,
                             b,
                             attn_scale,
-                            c.n_swa,
+                            layer_win,
                             arena.max_seq,
                             &mut arena.attn_scores,
                         );
+                    }
+
+                    if w_attn_gate.is_some() {
+                        if save_recompute {
+                            arena.attn_out_pre_gate[offset * q_dim..(offset + b) * q_dim]
+                                .copy_from_slice(
+                                    &arena.attn_out[offset * q_dim..(offset + b) * q_dim],
+                                );
+                        }
+                        for t in 0..b {
+                            let pos = offset + t;
+                            for h in 0..c.n_head {
+                                let g = arena.attn_gate_raw[pos * c.n_head + h];
+                                let sig = 1.0f32 / (1.0f32 + (-g).exp());
+                                let hs = pos * q_dim + h * hd;
+                                for v in &mut arena.attn_out[hs..hs + hd] {
+                                    *v *= sig;
+                                }
+                            }
+                        }
                     }
 
                     linear_fwd_with_accel(
@@ -691,6 +761,34 @@ impl<'a> Lfm2Trainer<'a> {
                         single_tok_mode,
                         &mut arena.mv_scratch,
                         &mut arena.lora_scratch,
+                    );
+                }
+            }
+
+            if let Some(ref pan) = lw.post_attn_norm {
+                if save_recompute {
+                    arena.op_raw[offset * d..(offset + b) * d]
+                        .copy_from_slice(&arena.xb2_chunk[..b * d]);
+                } else {
+                    arena.op_raw[..b * d].copy_from_slice(&arena.xb2_chunk[..b * d]);
+                }
+                let src = if save_recompute {
+                    &arena.op_raw[offset * d..(offset + b) * d]
+                } else {
+                    &arena.op_raw[..b * d]
+                };
+                if single_tok_mode {
+                    rms_norm(&mut arena.xb2_chunk[..d], src, pan, c.rms_eps);
+                } else {
+                    rms_norm_batch_parallel(
+                        pool,
+                        kt,
+                        &mut arena.xb2_chunk[..b * d],
+                        src,
+                        pan,
+                        c.rms_eps,
+                        d,
+                        b,
                     );
                 }
             }
@@ -835,6 +933,36 @@ impl<'a> Lfm2Trainer<'a> {
                 &mut arena.mv_scratch,
                 &mut arena.lora_scratch,
             );
+
+            if let Some(ref pfn) = lw.post_ffw_norm {
+                if save_recompute {
+                    arena.ffn_down_raw[offset * d..(offset + b) * d]
+                        .copy_from_slice(&arena.xb2_chunk[..b * d]);
+                } else {
+                    arena.ffn_down_raw[..b * d].copy_from_slice(&arena.xb2_chunk[..b * d]);
+                }
+                if !save_recompute {
+                    if single_tok_mode {
+                        rms_norm(
+                            &mut arena.xb2_chunk[..d],
+                            &arena.ffn_down_raw[..d],
+                            pfn,
+                            c.rms_eps,
+                        );
+                    } else {
+                        rms_norm_batch_parallel(
+                            pool,
+                            kt,
+                            &mut arena.xb2_chunk[..b * d],
+                            &arena.ffn_down_raw[..b * d],
+                            pfn,
+                            c.rms_eps,
+                            d,
+                            b,
+                        );
+                    }
+                }
+            }
 
             if !save_recompute {
                 for (i, (&xm_i, &xb2_i)) in xm_chunk
@@ -1036,7 +1164,22 @@ impl<'a> Lfm2Trainer<'a> {
 
             let lw = &self.model.layers[l];
 
-            // 3a. SwiGLU FFN backward
+            // 3a. SwiGLU FFN backward (with optional `post_ffw_norm` sandwich norm)
+            let dy_ffn_down: &[f32] = if let Some(ref pfn) = lw.post_ffw_norm {
+                for t in 0..seq_len {
+                    rms_norm_bwd_f32(
+                        &mut self.arena.d_post[t * d..(t + 1) * d],
+                        None,
+                        &self.arena.ffn_down_raw[t * d..(t + 1) * d],
+                        pfn,
+                        &self.arena.dx[t * d..(t + 1) * d],
+                        c.rms_eps,
+                    );
+                }
+                &self.arena.d_post[..seq_len * d]
+            } else {
+                &self.arena.dx[..seq_len * d]
+            };
             linear_bwd_with_accel(
                 accel.as_deref_mut(),
                 pool,
@@ -1045,7 +1188,7 @@ impl<'a> Lfm2Trainer<'a> {
                 adapter,
                 grads,
                 &self.arena.swiglu_out[..seq_len * ff],
-                &self.arena.dx[..seq_len * d],
+                dy_ffn_down,
                 &mut self.arena.d_swiglu[..seq_len * ff],
                 seq_len,
                 false,
@@ -1108,7 +1251,22 @@ impl<'a> Lfm2Trainer<'a> {
                 );
             }
 
-            // 3b. Operator backward (`ShortConv` or `GQA`)
+            // 3b. Operator backward (`ShortConv` or `GQA`, with optional `post_attn_norm` sandwich norm)
+            let dy_op: &[f32] = if let Some(ref pan) = lw.post_attn_norm {
+                for t in 0..seq_len {
+                    rms_norm_bwd_f32(
+                        &mut self.arena.d_post[t * d..(t + 1) * d],
+                        None,
+                        &self.arena.op_raw[t * d..(t + 1) * d],
+                        pan,
+                        &self.arena.dx[t * d..(t + 1) * d],
+                        c.rms_eps,
+                    );
+                }
+                &self.arena.d_post[..seq_len * d]
+            } else {
+                &self.arena.dx[..seq_len * d]
+            };
             match &lw.op {
                 Lfm2OpWeights::ShortConv {
                     in_proj,
@@ -1123,7 +1281,7 @@ impl<'a> Lfm2Trainer<'a> {
                         adapter,
                         grads,
                         &self.arena.conv_y[..seq_len * d],
-                        &self.arena.dx[..seq_len * d],
+                        dy_op,
                         &mut self.arena.d_conv_y[..seq_len * d],
                         seq_len,
                         false,
@@ -1196,8 +1354,16 @@ impl<'a> Lfm2Trainer<'a> {
                     wk,
                     wv,
                     wo,
+                    w_attn_gate,
                 } => {
                     let kv_dim = *n_head_kv * hd;
+                    let inv_freqs = if c.is_swa[l] {
+                        &self.model.rope_inv_freqs_swa
+                    } else {
+                        &self.model.rope_inv_freqs
+                    };
+                    let layer_win = c.layer_window(l);
+
                     linear_bwd_with_accel(
                         accel.as_deref_mut(),
                         pool,
@@ -1206,7 +1372,7 @@ impl<'a> Lfm2Trainer<'a> {
                         adapter,
                         grads,
                         &self.arena.attn_out[..seq_len * q_dim],
-                        &self.arena.dx[..seq_len * d],
+                        dy_op,
                         &mut self.arena.d_attn_out[..seq_len * q_dim],
                         seq_len,
                         false,
@@ -1214,6 +1380,25 @@ impl<'a> Lfm2Trainer<'a> {
                         &mut self.arena.lora_dh,
                         &mut self.arena.lora_bt,
                     );
+
+                    if w_attn_gate.is_some() {
+                        for t in 0..seq_len {
+                            for h in 0..c.n_head {
+                                let g = self.arena.attn_gate_raw[t * c.n_head + h] as f64;
+                                let sig = 1.0 / (1.0 + (-g).exp());
+                                let dsig = sig * (1.0 - sig);
+                                let hs = t * q_dim + h * hd;
+                                let mut dot = 0.0f64;
+                                for k in 0..hd {
+                                    let dy_v = self.arena.d_attn_out[hs + k] as f64;
+                                    let pre_v = self.arena.attn_out_pre_gate[hs + k] as f64;
+                                    dot += dy_v * pre_v;
+                                    self.arena.d_attn_out[hs + k] = (dy_v * sig) as f32;
+                                }
+                                self.arena.d_attn_gate_raw[t * c.n_head + h] = (dot * dsig) as f32;
+                            }
+                        }
+                    }
 
                     if self.exact_f32_kv_gradcheck {
                         gqa_attn_f32_bwd_ext(
@@ -1230,7 +1415,7 @@ impl<'a> Lfm2Trainer<'a> {
                             hd,
                             seq_len,
                             attn_scale,
-                            c.n_swa,
+                            layer_win,
                         );
                     } else {
                         gqa_attention_f16_kv_bwd_ext_f32(
@@ -1247,13 +1432,13 @@ impl<'a> Lfm2Trainer<'a> {
                             hd,
                             seq_len,
                             attn_scale,
-                            c.n_swa,
+                            layer_win,
                         );
                     }
 
                     for t in 0..seq_len {
                         rope_compute_cos_sin(
-                            &self.model.rope_inv_freqs,
+                            inv_freqs,
                             t,
                             &mut self.arena.rope_cos,
                             &mut self.arena.rope_sin,
@@ -1357,6 +1542,24 @@ impl<'a> Lfm2Trainer<'a> {
                         &mut self.arena.lora_dh,
                         &mut self.arena.lora_bt,
                     );
+                    if let Some(wg) = w_attn_gate {
+                        linear_bwd_with_accel(
+                            accel.as_deref_mut(),
+                            pool,
+                            kt,
+                            wg,
+                            adapter,
+                            grads,
+                            &self.arena.x_attn_norm[..seq_len * d],
+                            &self.arena.d_attn_gate_raw[..seq_len * c.n_head],
+                            &mut self.arena.d_x_norm[..seq_len * d],
+                            seq_len,
+                            true,
+                            &mut self.arena.lora_h,
+                            &mut self.arena.lora_dh,
+                            &mut self.arena.lora_bt,
+                        );
+                    }
                 }
             }
 
@@ -1476,6 +1679,27 @@ pub(crate) fn gqa_attn_f32_ext(
     attn_scale: f32,
     window: Option<usize>,
 ) {
+    gqa_attn_f32_ext_softcap(
+        out, q, k_all, v_all, n_heads, n_kv_heads, head_dim, start_pos, n_tok, attn_scale, window,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gqa_attn_f32_ext_softcap(
+    out: &mut [f32],
+    q: &[f32],
+    k_all: &[f32],
+    v_all: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    start_pos: usize,
+    n_tok: usize,
+    attn_scale: f32,
+    window: Option<usize>,
+    attn_softcap: Option<f32>,
+) {
     let q_dim = n_heads * head_dim;
     let kv_dim = n_kv_heads * head_dim;
     let group = n_heads / n_kv_heads;
@@ -1499,7 +1723,13 @@ pub(crate) fn gqa_attn_f32_ext(
                 for d in 0..head_dim {
                     dot += (qh[d] as f64) * (kh[d] as f64);
                 }
-                let sc = dot * scale;
+                let mut sc = dot * scale;
+                if let Some(cap) = attn_softcap
+                    && cap > 0.0
+                {
+                    let c = cap as f64;
+                    sc = (sc / c).tanh() * c;
+                }
                 if sc > max_s {
                     max_s = sc;
                 }
@@ -1539,6 +1769,30 @@ pub(crate) fn gqa_attn_f32_bwd_ext(
     attn_scale: f32,
     window: Option<usize>,
 ) {
+    gqa_attn_f32_bwd_ext_softcap(
+        kt, dq, dk, dv, q, k_all, v_all, d_out, n_heads, n_kv_heads, head_dim, n_tok, attn_scale,
+        window, None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gqa_attn_f32_bwd_ext_softcap(
+    kt: &KernelTable,
+    dq: &mut [f32],
+    dk: &mut [f32],
+    dv: &mut [f32],
+    q: &[f32],
+    k_all: &[f32],
+    v_all: &[f32],
+    d_out: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    n_tok: usize,
+    attn_scale: f32,
+    window: Option<usize>,
+    attn_softcap: Option<f32>,
+) {
     let q_dim = n_heads * head_dim;
     let kv_dim = n_kv_heads * head_dim;
     dq.fill(0.0);
@@ -1554,6 +1808,7 @@ pub(crate) fn gqa_attn_f32_bwd_ext(
         };
         let win_len = end_pos - start_kv;
         let mut p = vec![0.0f64; win_len];
+        let mut sech2 = vec![1.0f64; win_len];
         let mut d_prob = vec![0.0f64; win_len];
         for h in 0..n_heads {
             let kv_h = h / group;
@@ -1567,7 +1822,18 @@ pub(crate) fn gqa_attn_f32_bwd_ext(
                 for d in 0..head_dim {
                     dot += (qh[d] as f64) * (kh[d] as f64);
                 }
-                p[wi] = dot * scale;
+                let raw = dot * scale;
+                if let Some(cap) = attn_softcap
+                    && cap > 0.0
+                {
+                    let c = cap as f64;
+                    let th = (raw / c).tanh();
+                    p[wi] = th * c;
+                    sech2[wi] = 1.0 - th * th;
+                } else {
+                    p[wi] = raw;
+                    sech2[wi] = 1.0;
+                }
                 if p[wi] > max_s {
                     max_s = p[wi];
                 }
@@ -1598,7 +1864,7 @@ pub(crate) fn gqa_attn_f32_bwd_ext(
             }
             let dqh = &mut dq[t * q_dim + h * head_dim..t * q_dim + (h + 1) * head_dim];
             for (wi, step) in (start_kv..end_pos).enumerate() {
-                let ds = (p[wi] * (d_prob[wi] - sum_p_dp) * scale) as f32;
+                let ds = (p[wi] * (d_prob[wi] - sum_p_dp) * sech2[wi] * scale) as f32;
                 if ds == 0.0 {
                     continue;
                 }

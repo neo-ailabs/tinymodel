@@ -579,7 +579,14 @@ pub fn init_lora_adapter_lfm2(
                     );
                 }
             }
-            Lfm2OpWeights::Gqa { wq, wk, wv, wo, .. } => {
+            Lfm2OpWeights::Gqa {
+                wq,
+                wk,
+                wv,
+                wo,
+                w_attn_gate,
+                ..
+            } => {
                 if targets.q {
                     push_linear_pair(
                         &mut rng, &mut pairs, &mut order, wq.name, wq.cols, wq.rows, rank,
@@ -593,6 +600,14 @@ pub fn init_lora_adapter_lfm2(
                 if targets.v {
                     push_linear_pair(
                         &mut rng, &mut pairs, &mut order, wv.name, wv.cols, wv.rows, rank,
+                    );
+                }
+                if targets.ssm_gates
+                    && let Some(wg) = w_attn_gate
+                {
+                    let r_small = rank.min(wg.rows).max(1);
+                    push_linear_pair(
+                        &mut rng, &mut pairs, &mut order, wg.name, wg.cols, wg.rows, r_small,
                     );
                 }
                 if targets.o {
@@ -717,36 +732,43 @@ pub fn init_lora_adapter(
         );
     };
 
-    for (l, lw) in model.layers.iter().enumerate() {
-        let pfx = format!("blk.{l}");
-        if targets.q {
-            add_linear(&format!("{pfx}.attn_q.weight"), lw.wq.cols, lw.wq.rows);
-        }
-        if targets.k {
-            add_linear(&format!("{pfx}.attn_k.weight"), lw.wk.cols, lw.wk.rows);
-        }
-        if targets.v {
-            add_linear(&format!("{pfx}.attn_v.weight"), lw.wv.cols, lw.wv.rows);
+    for lw in &model.layers {
+        if lw.wq.is_sliced {
+            if targets.q || targets.k || targets.v {
+                add_linear(lw.wq.name, lw.wq.cols, lw.wq.rows + lw.wk.rows + lw.wv.rows);
+            }
+        } else {
+            if targets.q {
+                add_linear(lw.wq.name, lw.wq.cols, lw.wq.rows);
+            }
+            if targets.k {
+                add_linear(lw.wk.name, lw.wk.cols, lw.wk.rows);
+            }
+            if targets.v {
+                add_linear(lw.wv.name, lw.wv.cols, lw.wv.rows);
+            }
         }
         if targets.o {
-            add_linear(&format!("{pfx}.attn_output.weight"), lw.wo.cols, lw.wo.rows);
+            add_linear(lw.wo.name, lw.wo.cols, lw.wo.rows);
         }
-        if targets.gate {
-            add_linear(
-                &format!("{pfx}.ffn_gate.weight"),
-                lw.w_gate.cols,
-                lw.w_gate.rows,
-            );
-        }
-        if targets.up {
-            add_linear(&format!("{pfx}.ffn_up.weight"), lw.w_up.cols, lw.w_up.rows);
+        if lw.w_gate.is_sliced {
+            if targets.gate || targets.up {
+                add_linear(
+                    lw.w_gate.name,
+                    lw.w_gate.cols,
+                    lw.w_gate.rows + lw.w_up.rows,
+                );
+            }
+        } else {
+            if targets.gate {
+                add_linear(lw.w_gate.name, lw.w_gate.cols, lw.w_gate.rows);
+            }
+            if targets.up {
+                add_linear(lw.w_up.name, lw.w_up.cols, lw.w_up.rows);
+            }
         }
         if targets.down {
-            add_linear(
-                &format!("{pfx}.ffn_down.weight"),
-                lw.w_down.cols,
-                lw.w_down.rows,
-            );
+            add_linear(lw.w_down.name, lw.w_down.cols, lw.w_down.rows);
         }
     }
 
