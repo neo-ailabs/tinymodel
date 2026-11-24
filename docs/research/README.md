@@ -14,4 +14,5 @@
 | [08-pixel8.md](08-pixel8.md) | **Google Pixel 8（Tensor G3）设备档案**：固定参考设备，后续分析都要覆盖 |
 | [09-power-efficiency.md](09-power-efficiency.md) | 降低推理功耗：能耗 / token 指标、线程实测、各设备建议、测量方法 |
 | [10-rk3588.md](10-rk3588.md) | **Rockchip RK3588 设备档案**：固定参考设备（4×A76 + 4×A55、Mali-G610、RKNPU2），后续分析都要覆盖 |
+| [15-hf-sub8b-architectures.md](15-hf-sub8b-architectures.md) | **Hugging Face ≤8B 模型架构深度调研（2026-11-24）**：HF Hub 实时下载/热度分布、六大架构谱系、`config.json` 核验与 `tinymodel` 扩展 ROI |
 | [poc/](poc/) | Rust NEON intrinsics 实测源码（`dot.rs` 在 stable 上可用；`mm.rs`、`f16.rs` 不能编译；`asm.rs`、`mmasm.rs` 用 asm! 绕过） |
