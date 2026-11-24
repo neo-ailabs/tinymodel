@@ -8,7 +8,8 @@ use tm_core::{DType, dequantize_row_bytes};
 use tm_gguf::{GgufFile, MetadataValue, NewGgufTensor, write_gguf_file_atomic};
 use tm_lora::{LoraAdapter, LoraWeightPair};
 use tm_models::{
-    Gemma4Model, Lfm2Model, Lfm2OpWeights, LlamaModel, Qwen35AttnWeights, Qwen35Model,
+    Gemma4Model, Lfm2Model, Lfm2OpWeights, LlamaModel, Mamba2AttnWeights, Mamba2Block,
+    Mamba2FfnWeights, Mamba2Model, Mamba2SsmWeights, Qwen35AttnWeights, Qwen35Model,
 };
 use tm_runtime::CpuModel;
 
@@ -216,6 +217,7 @@ pub fn init_lora_adapter_for_cpu_model(
         CpuModel::Qwen35(m) => init_lora_adapter_qwen35(m, rank, alpha, targets, seed),
         CpuModel::Gemma4(m) => init_lora_adapter_gemma4(m, rank, alpha, targets, seed),
         CpuModel::Lfm2(m) => init_lora_adapter_lfm2(m, rank, alpha, targets, seed),
+        CpuModel::Mamba2(m) => init_lora_adapter_mamba2(m, rank, alpha, targets, seed),
         CpuModel::Inkling2(m) => Err(TrainError::InvalidConfig(format!(
             "QLoRA fine-tuning is not yet supported on architecture '{}'",
             m.cfg.arch
@@ -353,6 +355,213 @@ pub fn init_lora_adapter_qwen35(
                 lw.w_down.rows,
                 rank,
             );
+        }
+    }
+
+    if targets.lm_head {
+        push_linear_pair(
+            &mut rng,
+            &mut pairs,
+            &mut order,
+            model.output.name,
+            model.output.cols,
+            model.output.rows,
+            rank,
+        );
+    }
+
+    Ok(LoraAdapter {
+        arch: model.cfg.arch.clone(),
+        alpha,
+        name: Some("tinymodel-qlora".to_string()),
+        pairs,
+        pair_order: order,
+    })
+}
+
+/// Initializes a [`LoraAdapter`] for `Mamba2Model` (`mamba2`, `nemotron_h`, `falcon-h1`, `granitehybrid`).
+pub fn init_lora_adapter_mamba2(
+    model: &Mamba2Model<'_>,
+    rank: usize,
+    alpha: f32,
+    targets: &LoraTargets,
+    seed: u64,
+) -> Result<LoraAdapter, TrainError> {
+    if rank == 0 {
+        return Err(TrainError::InvalidConfig(
+            "LoRA rank must be >= 1".to_string(),
+        ));
+    }
+    let mut rng = SplitMix64::new(seed);
+    let mut pairs = HashMap::new();
+    let mut order = Vec::new();
+
+    if targets.embed {
+        push_embed_pair(
+            &mut rng,
+            &mut pairs,
+            &mut order,
+            model.cfg.vocab_size,
+            model.cfg.n_embd,
+            rank,
+        );
+    }
+
+    let add_ssm = |ssm: &Mamba2SsmWeights<'_>,
+                   rng: &mut SplitMix64,
+                   pairs: &mut HashMap<String, LoraWeightPair>,
+                   order: &mut Vec<String>| {
+        if targets.q || targets.k || targets.v || targets.ssm_gates {
+            push_linear_pair(
+                rng,
+                pairs,
+                order,
+                ssm.ssm_in.name,
+                ssm.ssm_in.cols,
+                ssm.ssm_in.rows,
+                rank,
+            );
+        }
+        if targets.o {
+            push_linear_pair(
+                rng,
+                pairs,
+                order,
+                ssm.ssm_out.name,
+                ssm.ssm_out.cols,
+                ssm.ssm_out.rows,
+                rank,
+            );
+        }
+    };
+    let add_attn = |attn: &Mamba2AttnWeights<'_>,
+                    rng: &mut SplitMix64,
+                    pairs: &mut HashMap<String, LoraWeightPair>,
+                    order: &mut Vec<String>| {
+        if attn.wq.is_sliced {
+            if targets.q || targets.k || targets.v {
+                let d_out = attn.wq.rows + attn.wk.rows + attn.wv.rows;
+                push_linear_pair(rng, pairs, order, attn.wq.name, attn.wq.cols, d_out, rank);
+            }
+        } else {
+            if targets.q {
+                push_linear_pair(
+                    rng,
+                    pairs,
+                    order,
+                    attn.wq.name,
+                    attn.wq.cols,
+                    attn.wq.rows,
+                    rank,
+                );
+            }
+            if targets.k {
+                push_linear_pair(
+                    rng,
+                    pairs,
+                    order,
+                    attn.wk.name,
+                    attn.wk.cols,
+                    attn.wk.rows,
+                    rank,
+                );
+            }
+            if targets.v {
+                push_linear_pair(
+                    rng,
+                    pairs,
+                    order,
+                    attn.wv.name,
+                    attn.wv.cols,
+                    attn.wv.rows,
+                    rank,
+                );
+            }
+        }
+        if targets.o {
+            push_linear_pair(
+                rng,
+                pairs,
+                order,
+                attn.wo.name,
+                attn.wo.cols,
+                attn.wo.rows,
+                rank,
+            );
+        }
+    };
+    let add_ffn = |ffn: &Mamba2FfnWeights<'_>,
+                   rng: &mut SplitMix64,
+                   pairs: &mut HashMap<String, LoraWeightPair>,
+                   order: &mut Vec<String>| match ffn {
+        Mamba2FfnWeights::SwiGlu {
+            w_gate,
+            w_up,
+            w_down,
+            ..
+        } => {
+            if targets.gate {
+                push_linear_pair(
+                    rng,
+                    pairs,
+                    order,
+                    w_gate.name,
+                    w_gate.cols,
+                    w_gate.rows,
+                    rank,
+                );
+            }
+            if targets.up {
+                push_linear_pair(rng, pairs, order, w_up.name, w_up.cols, w_up.rows, rank);
+            }
+            if targets.down {
+                push_linear_pair(
+                    rng,
+                    pairs,
+                    order,
+                    w_down.name,
+                    w_down.cols,
+                    w_down.rows,
+                    rank,
+                );
+            }
+        }
+        Mamba2FfnWeights::Relu2 { w_up, w_down, .. } => {
+            if targets.up || targets.gate {
+                push_linear_pair(rng, pairs, order, w_up.name, w_up.cols, w_up.rows, rank);
+            }
+            if targets.down {
+                push_linear_pair(
+                    rng,
+                    pairs,
+                    order,
+                    w_down.name,
+                    w_down.cols,
+                    w_down.rows,
+                    rank,
+                );
+            }
+        }
+    };
+
+    for lw in &model.layers {
+        match &lw.block {
+            Mamba2Block::SsmOnly { ssm } => add_ssm(ssm, &mut rng, &mut pairs, &mut order),
+            Mamba2Block::AttnOnly { attn } => add_attn(attn, &mut rng, &mut pairs, &mut order),
+            Mamba2Block::FfnOnly { ffn } => add_ffn(ffn, &mut rng, &mut pairs, &mut order),
+            Mamba2Block::SsmAndFfn { ssm, ffn, .. } => {
+                add_ssm(ssm, &mut rng, &mut pairs, &mut order);
+                add_ffn(ffn, &mut rng, &mut pairs, &mut order);
+            }
+            Mamba2Block::AttnAndFfn { attn, ffn, .. } => {
+                add_attn(attn, &mut rng, &mut pairs, &mut order);
+                add_ffn(ffn, &mut rng, &mut pairs, &mut order);
+            }
+            Mamba2Block::ParallelAttnSsmAndFfn { attn, ssm, ffn, .. } => {
+                add_attn(attn, &mut rng, &mut pairs, &mut order);
+                add_ssm(ssm, &mut rng, &mut pairs, &mut order);
+                add_ffn(ffn, &mut rng, &mut pairs, &mut order);
+            }
         }
     }
 

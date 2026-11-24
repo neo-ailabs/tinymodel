@@ -821,3 +821,110 @@ fn parallel_prefill_non_matmul_ops_match_single_token_bit_exact() {
         hist_seq.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn l1_parity_mamba2_scan_and_relu2_bit_exact_all_isas() {
+    let mut rng = Rng(0x2468_ACE0_1357_9BDF);
+    let rand_f32 = |r: &mut Rng| -> f32 { (r.next_u64() & 0xFFFF) as f32 / 32768.0 - 1.0 };
+
+    let isas = supported_isas();
+    let pool1 = ThreadPool::new(1);
+    let pool4 = ThreadPool::new(4);
+
+    // 1. Single-head & multi-head Mamba-2 selective scan across aligned (`d_state = 64`)
+    //    and non-multiple-of-8 tail (`d_state = 20`) state dimensions.
+    for &(head_dim, d_state) in &[(64usize, 64usize), (32usize, 20usize), (17usize, 13usize)] {
+        let n_heads = 8usize;
+        let n_groups = 2usize;
+        let d_inner = n_heads * head_dim;
+        let bc_dim = n_groups * d_state;
+        let n_tok = 7usize;
+
+        let x_all: Vec<f32> = (0..n_tok * d_inner).map(|_| rand_f32(&mut rng)).collect();
+        let b_all: Vec<f32> = (0..n_tok * bc_dim).map(|_| rand_f32(&mut rng)).collect();
+        let c_all: Vec<f32> = (0..n_tok * bc_dim).map(|_| rand_f32(&mut rng)).collect();
+        let dt_raw_all: Vec<f32> = (0..n_tok * n_heads)
+            .map(|_| rand_f32(&mut rng) * 2.0)
+            .collect();
+        let dt_bias: Vec<f32> = (0..n_heads).map(|_| rand_f32(&mut rng) * 0.5).collect();
+        let ssm_a: Vec<f32> = (0..n_heads)
+            .map(|_| -0.1 - rand_f32(&mut rng).abs())
+            .collect();
+        let ssm_d: Vec<f32> = (0..n_heads).map(|_| rand_f32(&mut rng)).collect();
+        let init_state: Vec<f32> = (0..d_inner * d_state)
+            .map(|_| rand_f32(&mut rng) * 0.25)
+            .collect();
+
+        let ref_kt = select_kernels(Isa::Generic);
+        let mut ref_state = init_state.clone();
+        let mut ref_y = vec![0.0f32; n_tok * d_inner];
+        for t in 0..n_tok {
+            tm_cpu::mamba2_scan_parallel(
+                &pool1,
+                ref_kt,
+                &x_all[t * d_inner..(t + 1) * d_inner],
+                &b_all[t * bc_dim..(t + 1) * bc_dim],
+                &c_all[t * bc_dim..(t + 1) * bc_dim],
+                &dt_raw_all[t * n_heads..(t + 1) * n_heads],
+                &dt_bias,
+                &ssm_a,
+                &ssm_d,
+                &mut ref_state,
+                &mut ref_y[t * d_inner..(t + 1) * d_inner],
+                n_heads,
+                n_groups,
+                head_dim,
+                d_state,
+                1,
+            );
+        }
+
+        for &isa in &isas {
+            let kt = select_kernels(isa);
+            let mut got_state = init_state.clone();
+            let mut got_y = vec![0.0f32; n_tok * d_inner];
+            tm_cpu::mamba2_scan_parallel(
+                &pool4,
+                kt,
+                &x_all,
+                &b_all,
+                &c_all,
+                &dt_raw_all,
+                &dt_bias,
+                &ssm_a,
+                &ssm_d,
+                &mut got_state,
+                &mut got_y,
+                n_heads,
+                n_groups,
+                head_dim,
+                d_state,
+                n_tok,
+            );
+            assert_eq!(
+                got_y.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                ref_y.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "mamba2_scan y bit mismatch for isa={} hd={head_dim} ds={d_state}",
+                isa.name()
+            );
+            assert_eq!(
+                got_state.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                ref_state.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "mamba2_scan state bit mismatch for isa={} hd={head_dim} ds={d_state}",
+                isa.name()
+            );
+        }
+    }
+
+    // 2. relu2_inplace_parallel 4T vs 1T bit-exact
+    let n = 4111;
+    let init: Vec<f32> = (0..n).map(|_| rand_f32(&mut rng) * 3.0).collect();
+    let mut r1 = init.clone();
+    let mut r4 = init;
+    tm_cpu::relu2_inplace_parallel(&pool1, &mut r1);
+    tm_cpu::relu2_inplace_parallel(&pool4, &mut r4);
+    assert_eq!(
+        r4.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        r1.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+}

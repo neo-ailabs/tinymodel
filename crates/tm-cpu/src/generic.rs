@@ -470,6 +470,62 @@ pub fn gdn_recurrence_head(
     }
 }
 
+/// Scalar reference single-head Mamba-2 selective state scan (`ADR-017`).
+///
+/// Updates `s_h` (`[head_dim, d_state]` row-major) in-place:
+///   `s_h[j, k] = b_g[k].mul_add(x_h[j] * dt_sp, s_h[j, k] * da)`
+///   `y_h[j]    = x_h[j].mul_add(d_skip, sum_k(s_h[j, k] * c_g[k]))`
+/// Uses an 8-wide pairwise reduction tree identical to `neon_v80` and `avx2` so all CPU ISAs
+/// achieve **0-ULP bit-for-bit parity** (`AGENTS.md` Rule #3 & §9).
+#[allow(clippy::too_many_arguments)]
+pub fn mamba2_scan_head(
+    x_h: &[f32],
+    b_g: &[f32],
+    c_g: &[f32],
+    da: f32,
+    dt_sp: f32,
+    d_skip: f32,
+    s_h: &mut [f32],
+    y_h: &mut [f32],
+    head_dim: usize,
+    d_state: usize,
+) {
+    assert_eq!(x_h.len(), head_dim);
+    assert_eq!(b_g.len(), d_state);
+    assert_eq!(c_g.len(), d_state);
+    assert_eq!(s_h.len(), head_dim * d_state);
+    assert_eq!(y_h.len(), head_dim);
+
+    let chunks8 = d_state / 8;
+    for j in 0..head_dim {
+        let s_row = &mut s_h[j * d_state..(j + 1) * d_state];
+        let x_val = x_h[j];
+        let x_dt = x_val * dt_sp;
+
+        let mut acc0 = [0.0f32; 4];
+        let mut acc1 = [0.0f32; 4];
+        for c in 0..chunks8 {
+            let base = c * 8;
+            for lane in 0..4 {
+                let u0 = b_g[base + lane].mul_add(x_dt, s_row[base + lane] * da);
+                let u1 = b_g[base + 4 + lane].mul_add(x_dt, s_row[base + 4 + lane] * da);
+                s_row[base + lane] = u0;
+                s_row[base + 4 + lane] = u1;
+                acc0[lane] = u0.mul_add(c_g[base + lane], acc0[lane]);
+                acc1[lane] = u1.mul_add(c_g[base + 4 + lane], acc1[lane]);
+            }
+        }
+        let mut sum_y = ((acc0[0] + acc1[0]) + (acc0[1] + acc1[1]))
+            + ((acc0[2] + acc1[2]) + (acc0[3] + acc1[3]));
+        for k in chunks8 * 8..d_state {
+            let u = b_g[k].mul_add(x_dt, s_row[k] * da);
+            s_row[k] = u;
+            sum_y = u.mul_add(c_g[k], sum_y);
+        }
+        y_h[j] = x_val.mul_add(d_skip, sum_y);
+    }
+}
+
 /// Scalar reference 4-row GEMV for `BlockQ4_0x4 x BlockQ8_0`.
 ///
 /// Accumulates exact 32-element `i32` dot products per super-block with `f32::mul_add` so

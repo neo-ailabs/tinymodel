@@ -545,8 +545,8 @@ fn q8_ste_oracle_fp32_peft_cosine_checkpoint_merge_and_mtp() {
             .unwrap_or_else(|| "null".to_string());
         layers_json.push(format!(
             "{{\"attn_norm\":{},\"ffn_norm\":{},\"q_norm\":{},\"k_norm\":{},\"wq\":{},\"wk\":{},\"wv\":{},\"wo\":{},\"w_gate\":{},\"w_up\":{},\"w_down\":{}}}",
-            f32_arr_json(&lw.attn_norm),
-            f32_arr_json(&lw.ffn_norm),
+            f32_arr_json(lw.attn_norm.as_deref().unwrap()),
+            f32_arr_json(lw.ffn_norm.as_deref().unwrap()),
             qn,
             kn,
             f32_arr_json(&decode_mat(&lw.wq)),

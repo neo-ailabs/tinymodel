@@ -56,6 +56,8 @@ pub mod llama_runner;
 #[cfg(target_vendor = "apple")]
 pub mod lora_gpu;
 #[cfg(target_vendor = "apple")]
+pub mod mamba2_runner;
+#[cfg(target_vendor = "apple")]
 pub mod qwen35_runner;
 #[cfg(target_vendor = "apple")]
 pub mod train_accel;
@@ -69,12 +71,13 @@ pub use lfm2_runner::{Lfm2MetalConfig, Lfm2MetalRunner};
 #[cfg(target_vendor = "apple")]
 pub use llama_runner::{LlamaMetalConfig, LlamaMetalRunner, MetalProfileReport, MetalStageStat};
 #[cfg(target_vendor = "apple")]
+pub use mamba2_runner::{Mamba2MetalConfig, Mamba2MetalRunner};
+#[cfg(target_vendor = "apple")]
 pub use qwen35_runner::{Qwen35MetalConfig, Qwen35MetalRunner};
 #[cfg(target_vendor = "apple")]
 pub use train_accel::MetalGpuAccel;
 
-/// Unified Apple Metal GPU runner dispatching across all supported M2 architectures
-/// (`llama`, `qwen3`, `qwen35`, `gemma4`, `lfm2`).
+/// Unified Apple Metal GPU runner dispatching across all supported architectures.
 #[cfg(target_vendor = "apple")]
 #[allow(clippy::large_enum_variant)]
 pub enum MetalRunner {
@@ -82,6 +85,7 @@ pub enum MetalRunner {
     Qwen35(Qwen35MetalRunner),
     Gemma4(Gemma4MetalRunner),
     Lfm2(Lfm2MetalRunner),
+    Mamba2(Mamba2MetalRunner),
 }
 
 #[cfg(target_vendor = "apple")]
@@ -92,9 +96,10 @@ impl MetalRunner {
     ) -> Result<Self, MetalError> {
         let arch = gguf.req_str("general.architecture")?.to_string();
         match arch.as_str() {
-            "llama" | "qwen2" | "qwen3" | "smollm3" | "phi3" | "mistral" | "mistral3" => Ok(
-                MetalRunner::Llama(LlamaMetalRunner::from_gguf(gguf, max_ctx)?),
-            ),
+            "llama" | "qwen2" | "qwen3" | "smollm3" | "phi3" | "mistral" | "mistral3" | "olmo2"
+            | "olmo3" | "granite" => Ok(MetalRunner::Llama(LlamaMetalRunner::from_gguf(
+                gguf, max_ctx,
+            )?)),
             "qwen35" => Ok(MetalRunner::Qwen35(Qwen35MetalRunner::from_gguf(
                 gguf, max_ctx,
             )?)),
@@ -104,6 +109,9 @@ impl MetalRunner {
             "lfm2" | "lfm3" => Ok(MetalRunner::Lfm2(Lfm2MetalRunner::from_gguf(
                 gguf, max_ctx,
             )?)),
+            "mamba2" | "nemotron_h" | "falcon-h1" | "granitehybrid" => Ok(MetalRunner::Mamba2(
+                Mamba2MetalRunner::from_gguf(gguf, max_ctx)?,
+            )),
             _ => Err(MetalError::UnsupportedArch(arch)),
         }
     }
@@ -114,6 +122,7 @@ impl MetalRunner {
             MetalRunner::Qwen35(r) => &r.cfg.arch,
             MetalRunner::Gemma4(r) => &r.cfg.arch,
             MetalRunner::Lfm2(r) => &r.cfg.arch,
+            MetalRunner::Mamba2(r) => &r.cfg.arch,
         }
     }
 
@@ -123,6 +132,7 @@ impl MetalRunner {
             MetalRunner::Qwen35(r) => r.device_name(),
             MetalRunner::Gemma4(r) => r.device_name(),
             MetalRunner::Lfm2(r) => r.device_name(),
+            MetalRunner::Mamba2(r) => r.device_name(),
         }
     }
 
@@ -132,6 +142,7 @@ impl MetalRunner {
             MetalRunner::Qwen35(r) => r.is_zero_copy_weights(),
             MetalRunner::Gemma4(r) => r.is_zero_copy_weights(),
             MetalRunner::Lfm2(r) => r.is_zero_copy_weights(),
+            MetalRunner::Mamba2(r) => r.is_zero_copy_weights(),
         }
     }
 
@@ -141,6 +152,7 @@ impl MetalRunner {
             MetalRunner::Qwen35(r) => r.cfg.vocab_size,
             MetalRunner::Gemma4(r) => r.cfg.vocab_size,
             MetalRunner::Lfm2(r) => r.cfg.vocab_size,
+            MetalRunner::Mamba2(r) => r.cfg.vocab_size,
         }
     }
 
@@ -150,6 +162,7 @@ impl MetalRunner {
             MetalRunner::Qwen35(r) => r.cfg.n_layers,
             MetalRunner::Gemma4(r) => r.cfg.n_layers,
             MetalRunner::Lfm2(r) => r.cfg.n_layers,
+            MetalRunner::Mamba2(r) => r.cfg.n_layers,
         }
     }
 
@@ -159,6 +172,7 @@ impl MetalRunner {
             MetalRunner::Qwen35(r) => r.reset_state(),
             MetalRunner::Gemma4(r) => r.reset_state(),
             MetalRunner::Lfm2(r) => r.reset_state(),
+            MetalRunner::Mamba2(r) => r.reset_state(),
         }
     }
 
@@ -169,6 +183,7 @@ impl MetalRunner {
             MetalRunner::Qwen35(r) => r.bind_lora(loras),
             MetalRunner::Gemma4(r) => r.bind_lora(loras),
             MetalRunner::Lfm2(r) => r.bind_lora(loras),
+            MetalRunner::Mamba2(r) => r.bind_lora(loras),
         }
     }
 
@@ -186,6 +201,7 @@ impl MetalRunner {
             }
             MetalRunner::Gemma4(r) => r.forward_token(token_id, pos, compute_logits),
             MetalRunner::Lfm2(r) => r.forward_token(token_id, pos, compute_logits),
+            MetalRunner::Mamba2(r) => r.forward_token(token_id, pos, compute_logits),
         }
     }
 
@@ -195,6 +211,7 @@ impl MetalRunner {
             MetalRunner::Qwen35(r) => r.forward_token_greedy(token_id, pos),
             MetalRunner::Gemma4(r) => r.forward_token_greedy(token_id, pos),
             MetalRunner::Lfm2(r) => r.forward_token_greedy(token_id, pos),
+            MetalRunner::Mamba2(r) => r.forward_token_greedy(token_id, pos),
         }
     }
 
@@ -212,6 +229,7 @@ impl MetalRunner {
             }
             MetalRunner::Gemma4(r) => r.forward_batch(token_ids, start_pos, compute_last_logits),
             MetalRunner::Lfm2(r) => r.forward_batch(token_ids, start_pos, compute_last_logits),
+            MetalRunner::Mamba2(r) => r.forward_batch(token_ids, start_pos, compute_last_logits),
         }
     }
 
@@ -225,6 +243,7 @@ impl MetalRunner {
             MetalRunner::Qwen35(r) => r.profile(n_runs, ctx_pos),
             MetalRunner::Gemma4(r) => r.profile(n_runs, ctx_pos),
             MetalRunner::Lfm2(r) => r.profile(n_runs, ctx_pos),
+            MetalRunner::Mamba2(r) => r.profile(n_runs, ctx_pos),
         }
     }
 }

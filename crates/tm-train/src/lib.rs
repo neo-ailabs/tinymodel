@@ -13,6 +13,7 @@ pub mod accel;
 pub mod dataset;
 pub mod gemma4_qlora;
 pub mod lfm2_qlora;
+pub mod mamba2_qlora;
 pub mod mtp_trainer;
 pub mod optim;
 pub mod qlora;
@@ -32,11 +33,13 @@ pub use accel::LinearAccel;
 pub use dataset::{TrainDataset, TrainSample, write_tmsft_file};
 pub use gemma4_qlora::{Gemma4Trainer, estimate_gemma4_qlora_dirty_bytes};
 pub use lfm2_qlora::{Lfm2Trainer, estimate_lfm2_qlora_dirty_bytes};
+pub use mamba2_qlora::{Mamba2Trainer, estimate_mamba2_qlora_dirty_bytes};
 pub use mtp_trainer::{MtpTrainConfig, MtpTrainReport, train_mtp_head};
 pub use optim::{
     AdamW, AdamWConfig, LoraGradStore, LoraTargets, SplitMix64, init_lora_adapter,
     init_lora_adapter_for_cpu_model, init_lora_adapter_gemma4, init_lora_adapter_lfm2,
-    init_lora_adapter_qwen35, load_train_checkpoint, lr_at_step, save_train_checkpoint,
+    init_lora_adapter_mamba2, init_lora_adapter_qwen35, load_train_checkpoint, lr_at_step,
+    save_train_checkpoint,
 };
 pub use qlora::{
     CheckpointMode, LlamaTrainer, QloraConfig, QloraStepMetrics, QloraTrainReport,
@@ -115,6 +118,9 @@ pub fn estimate_cpu_qlora_dirty_bytes(
             estimate_gemma4_qlora_dirty_bytes(m, max_seq, rank, targets, ckpt_mode)
         }
         CpuModel::Lfm2(m) => estimate_lfm2_qlora_dirty_bytes(m, max_seq, rank, targets, ckpt_mode),
+        CpuModel::Mamba2(m) => {
+            estimate_mamba2_qlora_dirty_bytes(m, max_seq, rank, targets, ckpt_mode)
+        }
         CpuModel::Inkling2(m) => {
             let c = &m.cfg;
             ((max_seq * c.n_embd * 16 + c.vocab_padded * 2) * 4) as u64
@@ -127,6 +133,7 @@ enum PolyTrainer<'a> {
     Qwen35(Box<Qwen35Trainer<'a>>),
     Gemma4(Box<Gemma4Trainer<'a>>),
     Lfm2(Box<Lfm2Trainer<'a>>),
+    Mamba2(Box<Mamba2Trainer<'a>>),
 }
 
 impl<'a> PolyTrainer<'a> {
@@ -147,6 +154,9 @@ impl<'a> PolyTrainer<'a> {
                 m, max_seq, max_rank, ckpt_mode,
             )))),
             CpuModel::Lfm2(m) => Ok(Self::Lfm2(Box::new(Lfm2Trainer::new(
+                m, max_seq, max_rank, ckpt_mode,
+            )))),
+            CpuModel::Mamba2(m) => Ok(Self::Mamba2(Box::new(Mamba2Trainer::new(
                 m, max_seq, max_rank, ckpt_mode,
             )))),
             CpuModel::Inkling2(m) => Err(TrainError::InvalidConfig(format!(
@@ -178,6 +188,9 @@ impl<'a> PolyTrainer<'a> {
                 accel, pool, adapter, grads, tokens, loss_mask, grad_scale,
             ),
             Self::Lfm2(t) => t.forward_backward_microbatch(
+                accel, pool, adapter, grads, tokens, loss_mask, grad_scale,
+            ),
+            Self::Mamba2(t) => t.forward_backward_microbatch(
                 accel, pool, adapter, grads, tokens, loss_mask, grad_scale,
             ),
         }

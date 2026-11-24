@@ -993,3 +993,61 @@ pub unsafe fn gdn_recurrence_head(
         }
     }
 }
+
+/// AVX2+FMA single-head Mamba-2 selective state scan (`ADR-017`).
+///
+/// Matches `generic::mamba2_scan_head` **bit-for-bit (`0 ULP`)**.
+///
+/// # Safety
+/// Caller must ensure `avx2` and `fma` are available on the current CPU.
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn mamba2_scan_head(
+    x_h: &[f32],
+    b_g: &[f32],
+    c_g: &[f32],
+    da: f32,
+    dt_sp: f32,
+    d_skip: f32,
+    s_h: &mut [f32],
+    y_h: &mut [f32],
+    head_dim: usize,
+    d_state: usize,
+) {
+    assert_eq!(x_h.len(), head_dim);
+    assert_eq!(b_g.len(), d_state);
+    assert_eq!(c_g.len(), d_state);
+    assert_eq!(s_h.len(), head_dim * d_state);
+    assert_eq!(y_h.len(), head_dim);
+
+    if !d_state.is_multiple_of(8) {
+        generic::mamba2_scan_head(
+            x_h, b_g, c_g, da, dt_sp, d_skip, s_h, y_h, head_dim, d_state,
+        );
+        return;
+    }
+
+    let chunks8 = d_state / 8;
+    // SAFETY: `d_state` is a multiple of 8 and all slice lengths are verified above.
+    unsafe {
+        let vda = _mm256_set1_ps(da);
+        for j in 0..head_dim {
+            let s_ptr = s_h.as_mut_ptr().add(j * d_state);
+            let x_val = *x_h.get_unchecked(j);
+            let x_dt = x_val * dt_sp;
+            let vxdt = _mm256_set1_ps(x_dt);
+            let mut acc = _mm256_setzero_ps();
+            for c in 0..chunks8 {
+                let off = c * 8;
+                let s_dec = _mm256_mul_ps(_mm256_loadu_ps(s_ptr.add(off)), vda);
+                let bv = _mm256_loadu_ps(b_g.as_ptr().add(off));
+                let u = _mm256_fmadd_ps(bv, vxdt, s_dec);
+                _mm256_storeu_ps(s_ptr.add(off), u);
+                let cv = _mm256_loadu_ps(c_g.as_ptr().add(off));
+                acc = _mm256_fmadd_ps(u, cv, acc);
+            }
+            let sum_y = hsum_8wide_pairwise_ps(acc);
+            *y_h.get_unchecked_mut(j) = x_val.mul_add(d_skip, sum_y);
+        }
+    }
+}

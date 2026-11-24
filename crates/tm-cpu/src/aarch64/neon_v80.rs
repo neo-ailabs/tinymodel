@@ -1409,6 +1409,76 @@ pub unsafe fn gdn_recurrence_head(
     }
 }
 
+/// ARMv8.0 NEON single-head Mamba-2 selective state scan (`ADR-017`).
+///
+/// Matches `generic::mamba2_scan_head` **bit-for-bit (`0 ULP`)** across all dimensions.
+///
+/// # Safety
+/// Caller must ensure NEON is available.
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn mamba2_scan_head(
+    x_h: &[f32],
+    b_g: &[f32],
+    c_g: &[f32],
+    da: f32,
+    dt_sp: f32,
+    d_skip: f32,
+    s_h: &mut [f32],
+    y_h: &mut [f32],
+    head_dim: usize,
+    d_state: usize,
+) {
+    assert_eq!(x_h.len(), head_dim);
+    assert_eq!(b_g.len(), d_state);
+    assert_eq!(c_g.len(), d_state);
+    assert_eq!(s_h.len(), head_dim * d_state);
+    assert_eq!(y_h.len(), head_dim);
+
+    let chunks8 = d_state / 8;
+    // SAFETY: Slice bounds verified above; `c * 8 + 8 <= d_state` and `j < head_dim`.
+    unsafe {
+        let vda = vdupq_n_f32(da);
+        let xp = x_h.as_ptr();
+        let bp = b_g.as_ptr();
+        let cp = c_g.as_ptr();
+        let sp_base = s_h.as_mut_ptr();
+        let yp = y_h.as_mut_ptr();
+
+        for j in 0..head_dim {
+            let sp = sp_base.add(j * d_state);
+            let x_val = *xp.add(j);
+            let x_dt = x_val * dt_sp;
+            let vxdt = vdupq_n_f32(x_dt);
+
+            let mut acc0 = vdupq_n_f32(0.0);
+            let mut acc1 = vdupq_n_f32(0.0);
+            for c in 0..chunks8 {
+                let off = c * 8;
+                let s0 = vmulq_f32(vld1q_f32(sp.add(off)), vda);
+                let s1 = vmulq_f32(vld1q_f32(sp.add(off + 4)), vda);
+                let b0 = vld1q_f32(bp.add(off));
+                let b1 = vld1q_f32(bp.add(off + 4));
+                let u0 = vfmaq_f32(s0, b0, vxdt);
+                let u1 = vfmaq_f32(s1, b1, vxdt);
+                vst1q_f32(sp.add(off), u0);
+                vst1q_f32(sp.add(off + 4), u1);
+                let c0 = vld1q_f32(cp.add(off));
+                let c1 = vld1q_f32(cp.add(off + 4));
+                acc0 = vfmaq_f32(acc0, u0, c0);
+                acc1 = vfmaq_f32(acc1, u1, c1);
+            }
+            let mut sum_y = hsum_pairwise_8wide_f32(acc0, acc1);
+            for k in chunks8 * 8..d_state {
+                let u = (*bp.add(k)).mul_add(x_dt, *sp.add(k) * da);
+                *sp.add(k) = u;
+                sum_y = u.mul_add(*cp.add(k), sum_y);
+            }
+            *yp.add(j) = x_val.mul_add(d_skip, sum_y);
+        }
+    }
+}
+
 /// Base ARMv8.0 NEON `gemv_q4_0x4_q8_0` (Pi Zero 2W / Pi 4B).
 ///
 /// Matches `generic::gemv_q4_0x4_q8_0` **bit-for-bit** (`to_bits()`) across all scales.

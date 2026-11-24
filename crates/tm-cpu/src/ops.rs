@@ -3902,3 +3902,148 @@ pub fn gqa_attention_f16_kv_bwd_softcap_f32(
         }
     }
 }
+
+/// Softplus matching `ggml_compute_softplus_f32`: `if x > 20.0 { x } else { (1.0 + x.exp()).ln() }`.
+#[inline]
+pub fn softplus_f32(x: f32) -> f32 {
+    if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
+}
+
+/// Squared-ReLU activation (`y = max(x, 0)^2`, used by `Nemotron-H` FFN layers).
+pub fn relu2_inplace_parallel(pool: &ThreadPool, x: &mut [f32]) {
+    if pool.num_threads() == 1 || x.len() < 1024 {
+        for v in x.iter_mut() {
+            let r = v.max(0.0);
+            *v = r * r;
+        }
+        return;
+    }
+    let ptr = x.as_mut_ptr() as usize;
+    let chunk = dynamic_row_chunk(x.len(), pool.num_threads()).max(256);
+    pool.parallel_for(x.len(), chunk, |s, e| {
+        // SAFETY: Disjoint `[s..e)` range in `x`.
+        let sub = unsafe { core::slice::from_raw_parts_mut((ptr as *mut f32).add(s), e - s) };
+        for v in sub {
+            let r = v.max(0.0);
+            *v = r * r;
+        }
+    });
+}
+
+/// Analytical backward for Squared-ReLU (`dx = dy * 2 * max(x_pre, 0)`).
+pub fn relu2_bwd_f32(dx: &mut [f32], x_pre: &[f32], dy: &[f32]) {
+    assert_eq!(dx.len(), x_pre.len());
+    assert_eq!(dx.len(), dy.len());
+    for ((dst, &x), &g) in dx.iter_mut().zip(x_pre.iter()).zip(dy.iter()) {
+        *dst = if x > 0.0 { 2.0 * x * g } else { 0.0 };
+    }
+}
+
+/// Multi-head parallel Mamba-2 selective state scan across `n_tok` sequential steps (`ADR-017`).
+///
+/// Preserves **0-ULP thread-count and batch-width invariance** (`AGENTS.md` §9): each head `h`
+/// owns an independent `[head_dim, d_state]` slice of `ssm_state` and processes `t = 0..n_tok`
+/// sequentially via `(kt.mamba2_scan_head)`.
+#[allow(clippy::too_many_arguments)]
+pub fn mamba2_scan_parallel(
+    pool: &ThreadPool,
+    kt: &KernelTable,
+    x_all: &[f32],
+    b_all: &[f32],
+    c_all: &[f32],
+    dt_raw_all: &[f32],
+    dt_bias: &[f32],
+    ssm_a: &[f32],
+    ssm_d: &[f32],
+    ssm_state: &mut [f32],
+    y_all: &mut [f32],
+    n_heads: usize,
+    n_groups: usize,
+    head_dim: usize,
+    d_state: usize,
+    n_tok: usize,
+) {
+    let d_inner = n_heads * head_dim;
+    let bc_dim = n_groups * d_state;
+    let group_ratio = n_heads / n_groups;
+    assert_eq!(x_all.len(), n_tok * d_inner);
+    assert_eq!(b_all.len(), n_tok * bc_dim);
+    assert_eq!(c_all.len(), n_tok * bc_dim);
+    assert_eq!(dt_raw_all.len(), n_tok * n_heads);
+    assert_eq!(dt_bias.len(), n_heads);
+    assert_eq!(ssm_a.len(), n_heads);
+    assert_eq!(ssm_d.len(), n_heads);
+    assert_eq!(ssm_state.len(), d_inner * d_state);
+    assert_eq!(y_all.len(), n_tok * d_inner);
+
+    let state_per_head = head_dim * d_state;
+    if pool.num_threads() == 1 || n_heads < 4 {
+        for h in 0..n_heads {
+            let g = h / group_ratio;
+            let s_h = &mut ssm_state[h * state_per_head..(h + 1) * state_per_head];
+            let a_h = ssm_a[h];
+            let d_h = ssm_d[h];
+            let dt_b = dt_bias[h];
+            for t in 0..n_tok {
+                let dt_sp = softplus_f32(dt_raw_all[t * n_heads + h] + dt_b);
+                let da = (dt_sp * a_h).exp();
+                let x_off = t * d_inner + h * head_dim;
+                let bc_off = t * bc_dim + g * d_state;
+                (kt.mamba2_scan_head)(
+                    &x_all[x_off..x_off + head_dim],
+                    &b_all[bc_off..bc_off + d_state],
+                    &c_all[bc_off..bc_off + d_state],
+                    da,
+                    dt_sp,
+                    d_h,
+                    s_h,
+                    &mut y_all[x_off..x_off + head_dim],
+                    head_dim,
+                    d_state,
+                );
+            }
+        }
+        return;
+    }
+
+    let s_ptr = ssm_state.as_mut_ptr() as usize;
+    let y_ptr = y_all.as_mut_ptr() as usize;
+    let chunk = n_heads.div_ceil(pool.num_threads()).max(1);
+    pool.parallel_for(n_heads, chunk, |h0, h1| {
+        for h in h0..h1 {
+            let g = h / group_ratio;
+            // SAFETY: Disjoint `[h * state_per_head .. (h + 1) * state_per_head)` per head `h`.
+            let s_h = unsafe {
+                core::slice::from_raw_parts_mut(
+                    (s_ptr as *mut f32).add(h * state_per_head),
+                    state_per_head,
+                )
+            };
+            let a_h = ssm_a[h];
+            let d_h = ssm_d[h];
+            let dt_b = dt_bias[h];
+            for t in 0..n_tok {
+                let dt_sp = softplus_f32(dt_raw_all[t * n_heads + h] + dt_b);
+                let da = (dt_sp * a_h).exp();
+                let x_off = t * d_inner + h * head_dim;
+                let bc_off = t * bc_dim + g * d_state;
+                // SAFETY: Disjoint `[t * d_inner + h * head_dim .. + head_dim)` per `(t, h)`.
+                let y_h = unsafe {
+                    core::slice::from_raw_parts_mut((y_ptr as *mut f32).add(x_off), head_dim)
+                };
+                (kt.mamba2_scan_head)(
+                    &x_all[x_off..x_off + head_dim],
+                    &b_all[bc_off..bc_off + d_state],
+                    &c_all[bc_off..bc_off + d_state],
+                    da,
+                    dt_sp,
+                    d_h,
+                    s_h,
+                    y_h,
+                    head_dim,
+                    d_state,
+                );
+            }
+        }
+    });
+}

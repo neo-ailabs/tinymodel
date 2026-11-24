@@ -17,7 +17,7 @@ use std::time::Instant;
 use tm_core::{f16_to_f32, probe_system_memory};
 use tm_cpu::{
     KernelTable, MAX_CPU_BATCH, MatvecScratch, ThreadPool, active_kernels,
-    gqa_attention_f16_kv_batch_parallel, gqa_attention_f16_kv_bwd_f32,
+    gqa_attention_f16_kv_batch_parallel, gqa_attention_f16_kv_bwd_ext_f32,
     gqa_attention_f16_kv_ext_batch_parallel, gqa_attention_f16_kv_ext_parallel,
     gqa_attention_f16_kv_parallel, matmul_f32, matmul_pair_f32, matmul_triple_f32, matvec_f32,
     matvec_pair_f32, matvec_triple_f32, rms_norm, rms_norm_batch_parallel, rms_norm_bwd_f32,
@@ -134,14 +134,17 @@ struct TrainArena {
     k_f16: Vec<u16>,
     v_f16: Vec<u16>,
     attn_out: Vec<f32>,
+    attn_proj_pre_norm: Vec<f32>,
     x_mid: Vec<f32>,
     x_ffn_norm: Vec<f32>,
     gate_pre: Vec<f32>,
     up_pre: Vec<f32>,
     swiglu_out: Vec<f32>,
+    ffn_proj_pre_norm: Vec<f32>,
 
     // Single-layer backward gradient workspaces
     xb2_chunk: Vec<f32>,
+    d_branch: Vec<f32>,
     d_swiglu: Vec<f32>,
     d_gate: Vec<f32>,
     d_up: Vec<f32>,
@@ -151,7 +154,7 @@ struct TrainArena {
     dk: Vec<f32>,
     dv: Vec<f32>,
     tmp_embd: Vec<f32>,
-    tmp_head: Vec<f32>,
+    tmp_qk: Vec<f32>,
 
     // Masked chunked CE buffers (`CE_CHUNK_TOKENS = 16`)
     ce_pos: Vec<(usize, u32)>,
@@ -187,6 +190,8 @@ impl TrainArena {
         let ff = c.n_ff;
         let has_q_norm = model.layers.iter().any(|l| l.q_norm.is_some());
         let has_k_norm = model.layers.iter().any(|l| l.k_norm.is_some());
+        let has_post_attn_norm = model.layers.iter().any(|l| l.post_attn_norm.is_some());
+        let has_post_ffn_norm = model.layers.iter().any(|l| l.post_ffn_norm.is_some());
         let max_cols = d.max(ff).max(q_dim).max(c.vocab_size);
         let r_cap = max_rank.max(1);
         let max_d_out = d.max(2 * ff).max(q_dim + 2 * kv_dim).max(c.vocab_size);
@@ -221,12 +226,23 @@ impl TrainArena {
             k_f16: vec![0u16; max_seq * kv_dim],
             v_f16: vec![0u16; max_seq * kv_dim],
             attn_out: vec![0.0; max_seq * q_dim],
+            attn_proj_pre_norm: if has_post_attn_norm {
+                vec![0.0; max_seq * d]
+            } else {
+                Vec::new()
+            },
             x_mid: vec![0.0; max_seq * d],
             x_ffn_norm: vec![0.0; max_seq * d],
             gate_pre: vec![0.0; max_seq * ff],
             up_pre: vec![0.0; max_seq * ff],
             swiglu_out: vec![0.0; max_seq * ff],
+            ffn_proj_pre_norm: if has_post_ffn_norm {
+                vec![0.0; max_seq * d]
+            } else {
+                Vec::new()
+            },
             xb2_chunk: vec![0.0; MAX_CPU_BATCH * d.max(q_dim)],
+            d_branch: vec![0.0; max_seq * d],
             d_swiglu: vec![0.0; max_seq * ff],
             d_gate: vec![0.0; max_seq * ff],
             d_up: vec![0.0; max_seq * ff],
@@ -236,7 +252,7 @@ impl TrainArena {
             dk: vec![0.0; max_seq * kv_dim],
             dv: vec![0.0; max_seq * kv_dim],
             tmp_embd: vec![0.0; d],
-            tmp_head: vec![0.0; c.head_dim],
+            tmp_qk: vec![0.0; q_dim.max(kv_dim).max(c.head_dim)],
             ce_pos: Vec::with_capacity(max_seq),
             ce_x_sub: vec![0.0; CE_CHUNK_TOKENS * d],
             ce_x_norm: vec![0.0; CE_CHUNK_TOKENS * d],
@@ -462,25 +478,29 @@ impl<'a> LlamaTrainer<'a> {
                 &arena.x_cur[offset * d..(offset + b) * d]
             };
 
-            // 1. Attention RMSNorm
-            if single_tok_mode {
-                rms_norm(
-                    &mut arena.x_attn_norm[offset * d..(offset + 1) * d],
-                    x_src,
-                    &lw.attn_norm,
-                    c.rms_eps,
-                );
+            // 1. Attention RMSNorm (optional on OLMo 2/3)
+            if let Some(ref an) = lw.attn_norm {
+                if single_tok_mode {
+                    rms_norm(
+                        &mut arena.x_attn_norm[offset * d..(offset + 1) * d],
+                        x_src,
+                        an,
+                        c.rms_eps,
+                    );
+                } else {
+                    rms_norm_batch_parallel(
+                        pool,
+                        kt,
+                        &mut arena.x_attn_norm[offset * d..(offset + b) * d],
+                        x_src,
+                        an,
+                        c.rms_eps,
+                        d,
+                        b,
+                    );
+                }
             } else {
-                rms_norm_batch_parallel(
-                    pool,
-                    kt,
-                    &mut arena.x_attn_norm[offset * d..(offset + b) * d],
-                    x_src,
-                    &lw.attn_norm,
-                    c.rms_eps,
-                    d,
-                    b,
-                );
+                arena.x_attn_norm[offset * d..(offset + b) * d].copy_from_slice(x_src);
             }
 
             // 2. QKV projections + LoRA
@@ -646,7 +666,8 @@ impl<'a> LlamaTrainer<'a> {
                 }
             }
 
-            // 3. Per-token QK-Norm, RoPE, and F16 KV store
+            // 3. Per-token QK-Norm (per-head or full-vector), RoPE, and F16 KV store
+            let rope_freqs_layer = model.rope_inv_freqs_for_layer(layer_idx, arena.max_seq);
             for t in 0..b {
                 let pos = offset + t;
                 let qt = &mut arena.q_rope[pos * q_dim..(pos + 1) * q_dim];
@@ -654,25 +675,40 @@ impl<'a> LlamaTrainer<'a> {
                 let vt_vec = &arena.v_full_f32[pos * kv_dim..(pos + 1) * kv_dim];
 
                 if let Some(ref qn) = lw.q_norm {
-                    for h in 0..c.n_head {
-                        let s = h * c.head_dim;
-                        let e = s + c.head_dim;
-                        rms_norm(&mut arena.tmp_head, &qt[s..e], qn, c.rms_eps);
-                        qt[s..e].copy_from_slice(&arena.tmp_head);
+                    if qn.len() == q_dim {
+                        rms_norm(&mut arena.tmp_qk[..q_dim], qt, qn, c.rms_eps);
+                        qt.copy_from_slice(&arena.tmp_qk[..q_dim]);
+                    } else {
+                        for h in 0..c.n_head {
+                            let s = h * c.head_dim;
+                            let e = s + c.head_dim;
+                            rms_norm(&mut arena.tmp_qk[..c.head_dim], &qt[s..e], qn, c.rms_eps);
+                            qt[s..e].copy_from_slice(&arena.tmp_qk[..c.head_dim]);
+                        }
                     }
                 }
                 if let Some(ref kn) = lw.k_norm {
-                    for h in 0..c.n_head_kv {
-                        let s = h * c.head_dim;
-                        let e = s + c.head_dim;
-                        rms_norm(&mut arena.tmp_head, &kt_vec[s..e], kn, c.rms_eps);
-                        kt_vec[s..e].copy_from_slice(&arena.tmp_head);
+                    if kn.len() == kv_dim {
+                        rms_norm(&mut arena.tmp_qk[..kv_dim], kt_vec, kn, c.rms_eps);
+                        kt_vec.copy_from_slice(&arena.tmp_qk[..kv_dim]);
+                    } else {
+                        for h in 0..c.n_head_kv {
+                            let s = h * c.head_dim;
+                            let e = s + c.head_dim;
+                            rms_norm(
+                                &mut arena.tmp_qk[..c.head_dim],
+                                &kt_vec[s..e],
+                                kn,
+                                c.rms_eps,
+                            );
+                            kt_vec[s..e].copy_from_slice(&arena.tmp_qk[..c.head_dim]);
+                        }
                     }
                 }
 
                 if c.layer_uses_rope(layer_idx) {
                     rope_compute_cos_sin(
-                        model.rope_inv_freqs_for_ctx(arena.max_seq),
+                        rope_freqs_layer,
                         pos,
                         &mut arena.rope_cos,
                         &mut arena.rope_sin,
@@ -705,6 +741,8 @@ impl<'a> LlamaTrainer<'a> {
             }
 
             // 4. Causal GQA attention
+            let win = c.layer_window(layer_idx);
+            let needs_ext = c.layer_needs_ext_attn(layer_idx);
             if exact_f32_kv {
                 gqa_attention_f32_kv_exact(
                     &mut arena.attn_out[offset * q_dim..(offset + b) * q_dim],
@@ -716,10 +754,11 @@ impl<'a> LlamaTrainer<'a> {
                     c.head_dim,
                     offset,
                     b,
-                    c.sliding_window,
+                    c.attn_scale as f64,
+                    win,
                 );
             } else if single_tok_mode {
-                if c.sliding_window.is_some() {
+                if needs_ext {
                     gqa_attention_f16_kv_ext_parallel(
                         pool,
                         kt,
@@ -731,8 +770,8 @@ impl<'a> LlamaTrainer<'a> {
                         c.n_head_kv,
                         c.head_dim,
                         0,
-                        1.0 / (c.head_dim as f32).sqrt(),
-                        c.sliding_window,
+                        c.attn_scale,
+                        win,
                         arena.max_seq,
                         &mut arena.attn_scores,
                     );
@@ -752,7 +791,7 @@ impl<'a> LlamaTrainer<'a> {
                         &mut arena.attn_scores,
                     );
                 }
-            } else if c.sliding_window.is_some() {
+            } else if needs_ext {
                 gqa_attention_f16_kv_ext_batch_parallel(
                     pool,
                     kt,
@@ -765,8 +804,8 @@ impl<'a> LlamaTrainer<'a> {
                     c.head_dim,
                     offset,
                     b,
-                    1.0 / (c.head_dim as f32).sqrt(),
-                    c.sliding_window,
+                    c.attn_scale,
+                    win,
                     arena.max_seq,
                     &mut arena.attn_scores,
                 );
@@ -788,7 +827,7 @@ impl<'a> LlamaTrainer<'a> {
                 );
             }
 
-            // 5. Output projection (`wo`) + residual -> `x_mid`
+            // 5. Output projection (`wo`) + optional bias + optional post-attn norm + residual -> `x_mid`
             let ao_chunk = &arena.attn_out[offset * q_dim..(offset + b) * q_dim];
             linear_fwd_with_accel(
                 accel.as_deref_mut(),
@@ -804,43 +843,70 @@ impl<'a> LlamaTrainer<'a> {
                 &mut arena.mv_scratch,
                 &mut arena.lora_scratch,
             );
+            if let Some(ref bo) = lw.bo {
+                for t in 0..b {
+                    let dst = &mut arena.xb2_chunk[t * d..(t + 1) * d];
+                    for (y, &bi) in dst.iter_mut().zip(bo.iter()) {
+                        *y += bi;
+                    }
+                }
+            }
+            if let Some(ref pan) = lw.post_attn_norm {
+                if save_recompute {
+                    arena.attn_proj_pre_norm[offset * d..(offset + b) * d]
+                        .copy_from_slice(&arena.xb2_chunk[..b * d]);
+                }
+                if single_tok_mode {
+                    rms_norm(&mut arena.tmp_embd, &arena.xb2_chunk[..d], pan, c.rms_eps);
+                    arena.xb2_chunk[..d].copy_from_slice(&arena.tmp_embd);
+                } else {
+                    rms_norm_batch_parallel(
+                        pool,
+                        kt,
+                        &mut arena.d_branch[..b * d],
+                        &arena.xb2_chunk[..b * d],
+                        pan,
+                        c.rms_eps,
+                        d,
+                        b,
+                    );
+                    arena.xb2_chunk[..b * d].copy_from_slice(&arena.d_branch[..b * d]);
+                }
+            }
+            let res_scale = c.residual_scale;
             for i in 0..(b * d) {
                 let xin_i = if from_ckpt_input {
                     arena.x_layer_in[offset * d + i]
                 } else {
                     arena.x_cur[offset * d + i]
                 };
-                arena.x_mid[offset * d + i] = xin_i + arena.xb2_chunk[i];
-            }
-            if let Some(ref bo) = lw.bo {
-                for t in 0..b {
-                    let dst = &mut arena.x_mid[(offset + t) * d..(offset + t + 1) * d];
-                    for (y, &bi) in dst.iter_mut().zip(bo.iter()) {
-                        *y += bi;
-                    }
-                }
+                arena.x_mid[offset * d + i] = xin_i + res_scale * arena.xb2_chunk[i];
             }
 
-            // 6. FFN RMSNorm + SwiGLU FFN + residual
+            // 6. FFN RMSNorm (optional on OLMo 2/3) + SwiGLU FFN + residual
             let xm_chunk = &arena.x_mid[offset * d..(offset + b) * d];
-            if single_tok_mode {
-                rms_norm(
-                    &mut arena.x_ffn_norm[offset * d..(offset + 1) * d],
-                    xm_chunk,
-                    &lw.ffn_norm,
-                    c.rms_eps,
-                );
+            if let Some(ref fn_w) = lw.ffn_norm {
+                if single_tok_mode {
+                    rms_norm(
+                        &mut arena.x_ffn_norm[offset * d..(offset + 1) * d],
+                        xm_chunk,
+                        fn_w,
+                        c.rms_eps,
+                    );
+                } else {
+                    rms_norm_batch_parallel(
+                        pool,
+                        kt,
+                        &mut arena.x_ffn_norm[offset * d..(offset + b) * d],
+                        xm_chunk,
+                        fn_w,
+                        c.rms_eps,
+                        d,
+                        b,
+                    );
+                }
             } else {
-                rms_norm_batch_parallel(
-                    pool,
-                    kt,
-                    &mut arena.x_ffn_norm[offset * d..(offset + b) * d],
-                    xm_chunk,
-                    &lw.ffn_norm,
-                    c.rms_eps,
-                    d,
-                    b,
-                );
+                arena.x_ffn_norm[offset * d..(offset + b) * d].copy_from_slice(xm_chunk);
             }
 
             let xfn_chunk = &arena.x_ffn_norm[offset * d..(offset + b) * d];
@@ -933,6 +999,22 @@ impl<'a> LlamaTrainer<'a> {
                     );
                 }
             }
+            if let Some(ref bg) = lw.b_gate {
+                for t in 0..b {
+                    let dst = &mut arena.gate_pre[(offset + t) * ff..(offset + t + 1) * ff];
+                    for (y, &bi) in dst.iter_mut().zip(bg.iter()) {
+                        *y += bi;
+                    }
+                }
+            }
+            if let Some(ref bu) = lw.b_up {
+                for t in 0..b {
+                    let dst = &mut arena.up_pre[(offset + t) * ff..(offset + t + 1) * ff];
+                    for (y, &bi) in dst.iter_mut().zip(bu.iter()) {
+                        *y += bi;
+                    }
+                }
+            }
 
             arena.swiglu_out[offset * ff..(offset + b) * ff]
                 .copy_from_slice(&arena.gate_pre[offset * ff..(offset + b) * ff]);
@@ -957,6 +1039,38 @@ impl<'a> LlamaTrainer<'a> {
                 &mut arena.mv_scratch,
                 &mut arena.lora_scratch,
             );
+            if let Some(ref bd) = lw.b_down {
+                for t in 0..b {
+                    let dst = &mut arena.xb2_chunk[t * d..(t + 1) * d];
+                    for (y, &bi) in dst.iter_mut().zip(bd.iter()) {
+                        *y += bi;
+                    }
+                }
+            }
+            if let Some(ref pfn) = lw.post_ffn_norm {
+                if save_recompute {
+                    arena.ffn_proj_pre_norm[offset * d..(offset + b) * d]
+                        .copy_from_slice(&arena.xb2_chunk[..b * d]);
+                }
+                if !save_recompute {
+                    if single_tok_mode {
+                        rms_norm(&mut arena.tmp_embd, &arena.xb2_chunk[..d], pfn, c.rms_eps);
+                        arena.xb2_chunk[..d].copy_from_slice(&arena.tmp_embd);
+                    } else {
+                        rms_norm_batch_parallel(
+                            pool,
+                            kt,
+                            &mut arena.d_branch[..b * d],
+                            &arena.xb2_chunk[..b * d],
+                            pfn,
+                            c.rms_eps,
+                            d,
+                            b,
+                        );
+                        arena.xb2_chunk[..b * d].copy_from_slice(&arena.d_branch[..b * d]);
+                    }
+                }
+            }
 
             if !save_recompute {
                 for (i, (&xm_i, &xb2_i)) in xm_chunk
@@ -964,7 +1078,7 @@ impl<'a> LlamaTrainer<'a> {
                     .zip(arena.xb2_chunk[..b * d].iter())
                     .enumerate()
                 {
-                    arena.x_cur[offset * d + i] = xm_i + xb2_i;
+                    arena.x_cur[offset * d + i] = xm_i + res_scale * xb2_i;
                 }
             }
 
@@ -1007,6 +1121,12 @@ impl<'a> LlamaTrainer<'a> {
             );
             self.bound_lora
                 .apply_embed_row(slot_emb, kt, tok as usize, dst);
+            if (self.model.cfg.embedding_scale - 1.0).abs() > 1e-12 {
+                let s = self.model.cfg.embedding_scale;
+                for v in dst.iter_mut() {
+                    *v *= s;
+                }
+            }
         }
 
         for l in 0..self.model.cfg.n_layers {
@@ -1056,6 +1176,12 @@ impl<'a> LlamaTrainer<'a> {
         if let Some(ref ob) = self.model.output_bias {
             for (y, &bi) in out_last_logits.iter_mut().zip(ob.iter()) {
                 *y += bi;
+            }
+        }
+        if (self.model.cfg.inv_logit_scale - 1.0).abs() > 1e-12 {
+            let s = self.model.cfg.inv_logit_scale;
+            for v in out_last_logits.iter_mut() {
+                *v *= s;
             }
         }
     }
@@ -1127,6 +1253,12 @@ impl<'a> LlamaTrainer<'a> {
             );
             self.bound_lora
                 .apply_embed_row(slot_emb, kt, tok as usize, dst);
+            if (c.embedding_scale - 1.0).abs() > 1e-12 {
+                let s = c.embedding_scale;
+                for v in dst.iter_mut() {
+                    *v *= s;
+                }
+            }
         }
 
         for l in 0..c.n_layers {
@@ -1150,7 +1282,8 @@ impl<'a> LlamaTrainer<'a> {
         self.arena.dx[..seq_len * d].fill(0.0);
         let mut loss_sum = 0.0f64;
         let slot_out = self.bound_lora.slot_for(self.model.output.name);
-        let inv_valid = (grad_scale as f64) / (n_valid as f64);
+        let inv_logit = c.inv_logit_scale;
+        let inv_valid = (grad_scale as f64) * (inv_logit as f64) / (n_valid as f64);
 
         let mut c0 = 0usize;
         while c0 < n_valid {
@@ -1187,6 +1320,11 @@ impl<'a> LlamaTrainer<'a> {
                     for (y, &bi) in row.iter_mut().zip(ob.iter()) {
                         *y += bi;
                     }
+                }
+            }
+            if (inv_logit - 1.0).abs() > 1e-12 {
+                for lv in &mut self.arena.ce_logits[..b * vocab] {
+                    *lv *= inv_logit;
                 }
             }
 
@@ -1263,8 +1401,29 @@ impl<'a> LlamaTrainer<'a> {
             );
 
             let lw = &self.model.layers[l];
+            let res_scale = c.residual_scale;
 
-            // 3a. FFN backward (`w_down` -> `swiglu` -> `w_gate`/`w_up` -> `ffn_norm` + residual)
+            // 3a. FFN backward (`post_ffn_norm` -> `w_down` -> `swiglu` -> `w_gate`/`w_up` -> `ffn_norm` + residual)
+            if let Some(ref pfn) = lw.post_ffn_norm {
+                for t in 0..seq_len {
+                    for i in 0..d {
+                        self.arena.tmp_embd[i] = res_scale * self.arena.dx[t * d + i];
+                    }
+                    rms_norm_bwd_f32(
+                        &mut self.arena.d_branch[t * d..(t + 1) * d],
+                        None,
+                        &self.arena.ffn_proj_pre_norm[t * d..(t + 1) * d],
+                        pfn,
+                        &self.arena.tmp_embd,
+                        c.rms_eps,
+                    );
+                }
+            } else {
+                for i in 0..(seq_len * d) {
+                    self.arena.d_branch[i] = res_scale * self.arena.dx[i];
+                }
+            }
+
             linear_bwd_with_accel(
                 accel.as_deref_mut(),
                 pool,
@@ -1273,7 +1432,7 @@ impl<'a> LlamaTrainer<'a> {
                 adapter,
                 grads,
                 &self.arena.swiglu_out[..seq_len * ff],
-                &self.arena.dx[..seq_len * d],
+                &self.arena.d_branch[..seq_len * d],
                 &mut self.arena.d_swiglu[..seq_len * ff],
                 seq_len,
                 false,
@@ -1320,23 +1479,51 @@ impl<'a> LlamaTrainer<'a> {
                 &mut self.arena.lora_dh,
                 &mut self.arena.lora_bt,
             );
-            for t in 0..seq_len {
-                rms_norm_bwd_f32(
-                    &mut self.arena.tmp_embd,
-                    None,
-                    &self.arena.x_mid[t * d..(t + 1) * d],
-                    &lw.ffn_norm,
-                    &self.arena.d_x_norm[t * d..(t + 1) * d],
-                    c.rms_eps,
-                );
+            if let Some(ref fn_w) = lw.ffn_norm {
+                for t in 0..seq_len {
+                    rms_norm_bwd_f32(
+                        &mut self.arena.tmp_embd,
+                        None,
+                        &self.arena.x_mid[t * d..(t + 1) * d],
+                        fn_w,
+                        &self.arena.d_x_norm[t * d..(t + 1) * d],
+                        c.rms_eps,
+                    );
+                    (kt.axpy_f32)(
+                        &mut self.arena.dx[t * d..(t + 1) * d],
+                        1.0,
+                        &self.arena.tmp_embd,
+                    );
+                }
+            } else {
                 (kt.axpy_f32)(
-                    &mut self.arena.dx[t * d..(t + 1) * d],
+                    &mut self.arena.dx[..seq_len * d],
                     1.0,
-                    &self.arena.tmp_embd,
+                    &self.arena.d_x_norm[..seq_len * d],
                 );
             }
 
-            // 3b. GQA Attention backward (`wo` -> `gqa_attn` -> `RoPE` -> `QK-Norm` -> `wq`/`wk`/`wv` -> `attn_norm` + residual)
+            // 3b. GQA Attention backward (`post_attn_norm` -> `wo` -> `gqa_attn` -> `RoPE` -> `QK-Norm` -> `wq`/`wk`/`wv` -> `attn_norm` + residual)
+            if let Some(ref pan) = lw.post_attn_norm {
+                for t in 0..seq_len {
+                    for i in 0..d {
+                        self.arena.tmp_embd[i] = res_scale * self.arena.dx[t * d + i];
+                    }
+                    rms_norm_bwd_f32(
+                        &mut self.arena.d_branch[t * d..(t + 1) * d],
+                        None,
+                        &self.arena.attn_proj_pre_norm[t * d..(t + 1) * d],
+                        pan,
+                        &self.arena.tmp_embd,
+                        c.rms_eps,
+                    );
+                }
+            } else {
+                for i in 0..(seq_len * d) {
+                    self.arena.d_branch[i] = res_scale * self.arena.dx[i];
+                }
+            }
+
             linear_bwd_with_accel(
                 accel.as_deref_mut(),
                 pool,
@@ -1345,7 +1532,7 @@ impl<'a> LlamaTrainer<'a> {
                 adapter,
                 grads,
                 &self.arena.attn_out[..seq_len * q_dim],
-                &self.arena.dx[..seq_len * d],
+                &self.arena.d_branch[..seq_len * d],
                 &mut self.arena.d_attn_out[..seq_len * q_dim],
                 seq_len,
                 false,
@@ -1354,6 +1541,7 @@ impl<'a> LlamaTrainer<'a> {
                 &mut self.arena.lora_bt,
             );
 
+            let win = c.layer_window(l);
             if self.exact_f32_kv_gradcheck {
                 gqa_attention_f32_kv_bwd_exact(
                     kt,
@@ -1368,12 +1556,13 @@ impl<'a> LlamaTrainer<'a> {
                     c.n_head_kv,
                     c.head_dim,
                     seq_len,
-                    c.sliding_window,
+                    c.attn_scale as f64,
+                    win,
                     &mut self.arena.bwd_probs,
                     &mut self.arena.bwd_dp,
                 );
             } else {
-                gqa_attention_f16_kv_bwd_f32(
+                gqa_attention_f16_kv_bwd_ext_f32(
                     kt,
                     &mut self.arena.dq[..seq_len * q_dim],
                     &mut self.arena.dk[..seq_len * kv_dim],
@@ -1386,16 +1575,18 @@ impl<'a> LlamaTrainer<'a> {
                     c.n_head_kv,
                     c.head_dim,
                     seq_len,
-                    c.sliding_window,
+                    c.attn_scale,
+                    win,
                 );
             }
 
+            let rope_freqs_layer = self.model.rope_inv_freqs_for_layer(l, self.arena.max_seq);
             for t in 0..seq_len {
                 let dqt = &mut self.arena.dq[t * q_dim..(t + 1) * q_dim];
                 let dkt = &mut self.arena.dk[t * kv_dim..(t + 1) * kv_dim];
                 if c.layer_uses_rope(l) {
                     rope_compute_cos_sin(
-                        self.model.rope_inv_freqs_for_ctx(self.arena.max_seq),
+                        rope_freqs_layer,
                         t,
                         &mut self.arena.rope_cos,
                         &mut self.arena.rope_sin,
@@ -1422,34 +1613,58 @@ impl<'a> LlamaTrainer<'a> {
 
                 if let Some(ref qn) = lw.q_norm {
                     let q_pre_t = &self.arena.q_pre_norm[t * q_dim..(t + 1) * q_dim];
-                    for h in 0..c.n_head {
-                        let s = h * c.head_dim;
-                        let e = s + c.head_dim;
+                    if qn.len() == q_dim {
                         rms_norm_bwd_f32(
-                            &mut self.arena.tmp_head,
+                            &mut self.arena.tmp_qk[..q_dim],
                             None,
-                            &q_pre_t[s..e],
+                            q_pre_t,
                             qn,
-                            &dqt[s..e],
+                            dqt,
                             c.rms_eps,
                         );
-                        dqt[s..e].copy_from_slice(&self.arena.tmp_head);
+                        dqt.copy_from_slice(&self.arena.tmp_qk[..q_dim]);
+                    } else {
+                        for h in 0..c.n_head {
+                            let s = h * c.head_dim;
+                            let e = s + c.head_dim;
+                            rms_norm_bwd_f32(
+                                &mut self.arena.tmp_qk[..c.head_dim],
+                                None,
+                                &q_pre_t[s..e],
+                                qn,
+                                &dqt[s..e],
+                                c.rms_eps,
+                            );
+                            dqt[s..e].copy_from_slice(&self.arena.tmp_qk[..c.head_dim]);
+                        }
                     }
                 }
                 if let Some(ref kn) = lw.k_norm {
                     let k_pre_t = &self.arena.k_pre_norm[t * kv_dim..(t + 1) * kv_dim];
-                    for h in 0..c.n_head_kv {
-                        let s = h * c.head_dim;
-                        let e = s + c.head_dim;
+                    if kn.len() == kv_dim {
                         rms_norm_bwd_f32(
-                            &mut self.arena.tmp_head,
+                            &mut self.arena.tmp_qk[..kv_dim],
                             None,
-                            &k_pre_t[s..e],
+                            k_pre_t,
                             kn,
-                            &dkt[s..e],
+                            dkt,
                             c.rms_eps,
                         );
-                        dkt[s..e].copy_from_slice(&self.arena.tmp_head);
+                        dkt.copy_from_slice(&self.arena.tmp_qk[..kv_dim]);
+                    } else {
+                        for h in 0..c.n_head_kv {
+                            let s = h * c.head_dim;
+                            let e = s + c.head_dim;
+                            rms_norm_bwd_f32(
+                                &mut self.arena.tmp_qk[..c.head_dim],
+                                None,
+                                &k_pre_t[s..e],
+                                kn,
+                                &dkt[s..e],
+                                c.rms_eps,
+                            );
+                            dkt[s..e].copy_from_slice(&self.arena.tmp_qk[..c.head_dim]);
+                        }
                     }
                 }
             }
@@ -1503,19 +1718,27 @@ impl<'a> LlamaTrainer<'a> {
                 &mut self.arena.lora_bt,
             );
 
-            for t in 0..seq_len {
-                rms_norm_bwd_f32(
-                    &mut self.arena.tmp_embd,
-                    None,
-                    &self.arena.x_layer_in[t * d..(t + 1) * d],
-                    &lw.attn_norm,
-                    &self.arena.d_x_norm[t * d..(t + 1) * d],
-                    c.rms_eps,
-                );
+            if let Some(ref an) = lw.attn_norm {
+                for t in 0..seq_len {
+                    rms_norm_bwd_f32(
+                        &mut self.arena.tmp_embd,
+                        None,
+                        &self.arena.x_layer_in[t * d..(t + 1) * d],
+                        an,
+                        &self.arena.d_x_norm[t * d..(t + 1) * d],
+                        c.rms_eps,
+                    );
+                    (kt.axpy_f32)(
+                        &mut self.arena.dx[t * d..(t + 1) * d],
+                        1.0,
+                        &self.arena.tmp_embd,
+                    );
+                }
+            } else {
                 (kt.axpy_f32)(
-                    &mut self.arena.dx[t * d..(t + 1) * d],
+                    &mut self.arena.dx[..seq_len * d],
                     1.0,
-                    &self.arena.tmp_embd,
+                    &self.arena.d_x_norm[..seq_len * d],
                 );
             }
         }
@@ -1524,7 +1747,7 @@ impl<'a> LlamaTrainer<'a> {
         if let Some(pair) = adapter.pairs.get(self.model.token_embd.name)
             && pair.is_token_embd
         {
-            let scale = pair.effective_scale(adapter.alpha, 1.0);
+            let scale = pair.effective_scale(adapter.alpha, 1.0) * c.embedding_scale;
             if scale != 0.0 {
                 let r = pair.rank;
                 let g = grads
@@ -1592,6 +1815,12 @@ impl<'a> LlamaTrainer<'a> {
             );
             self.bound_lora
                 .apply_embed_row(slot_emb, kt, tok as usize, dst);
+            if (c.embedding_scale - 1.0).abs() > 1e-12 {
+                let s = c.embedding_scale;
+                for v in dst.iter_mut() {
+                    *v *= s;
+                }
+            }
         }
         for l in 0..c.n_layers {
             Self::run_layer_forward(
@@ -1611,6 +1840,7 @@ impl<'a> LlamaTrainer<'a> {
 
         let mut loss_sum = 0.0f64;
         let slot_out = self.bound_lora.slot_for(self.model.output.name);
+        let inv_logit = c.inv_logit_scale;
         let mut c0 = 0usize;
         while c0 < n_valid {
             let b = (n_valid - c0).min(CE_CHUNK_TOKENS);
@@ -1644,6 +1874,19 @@ impl<'a> LlamaTrainer<'a> {
                 b,
                 &mut self.arena.lora_scratch,
             );
+            if let Some(ref ob) = self.model.output_bias {
+                for k in 0..b {
+                    let row = &mut self.arena.ce_logits[k * vocab..(k + 1) * vocab];
+                    for (y, &bi) in row.iter_mut().zip(ob.iter()) {
+                        *y += bi;
+                    }
+                }
+            }
+            if (inv_logit - 1.0).abs() > 1e-12 {
+                for lv in &mut self.arena.ce_logits[..b * vocab] {
+                    *lv *= inv_logit;
+                }
+            }
             for k in 0..b {
                 let target = self.arena.ce_pos[c0 + k].1 as usize;
                 let row = &self.arena.ce_logits[k * vocab..(k + 1) * vocab];
@@ -1669,12 +1912,12 @@ fn gqa_attention_f32_kv_exact(
     head_dim: usize,
     start_pos: usize,
     n_tok: usize,
+    scale: f64,
     window: Option<usize>,
 ) {
     let q_dim = n_heads * head_dim;
     let kv_dim = n_kv_heads * head_dim;
     let group = n_heads / n_kv_heads;
-    let scale = 1.0f64 / (head_dim as f64).sqrt();
 
     for t in 0..n_tok {
         let end_pos = start_pos + t + 1;
@@ -1734,6 +1977,7 @@ fn gqa_attention_f32_kv_bwd_exact(
     n_kv_heads: usize,
     head_dim: usize,
     n_tok: usize,
+    scale: f64,
     window: Option<usize>,
     probs: &mut [f64],
     dp: &mut [f64],
@@ -1744,7 +1988,6 @@ fn gqa_attention_f32_kv_bwd_exact(
     dk.fill(0.0);
     dv.fill(0.0);
     let group = n_heads / n_kv_heads;
-    let scale = 1.0f64 / (head_dim as f64).sqrt();
 
     for t in 0..n_tok {
         let end_pos = t + 1;

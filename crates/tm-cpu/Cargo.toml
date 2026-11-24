@@ -19,3 +19,7 @@ i8mm = ["dotprod"]
 
 [dependencies]
 tm-core = { path = "../tm-core" }
+
+[[bench]]
+name = "kernels"
+harness = false

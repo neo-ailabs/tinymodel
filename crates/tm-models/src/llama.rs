@@ -24,7 +24,7 @@ pub enum ModelError {
     #[error(transparent)]
     Gguf(#[from] GgufError),
     #[error(
-        "unsupported model architecture '{0}' (supports 'llama', 'qwen2', 'qwen3', 'smollm3', 'phi3', 'mistral', 'mistral3', 'qwen35', 'gemma2', 'gemma3', 'gemma4', 'lfm2', 'lfm3', 'inkling2', and 'inkling2_loop')"
+        "unsupported model architecture '{0}' (supports 'llama', 'qwen2', 'qwen3', 'smollm3', 'phi3', 'mistral', 'mistral3', 'olmo2', 'olmo3', 'granite', 'qwen35', 'gemma2', 'gemma3', 'gemma4', 'lfm2', 'lfm3', 'mamba2', 'nemotron_h', 'falcon-h1', 'granitehybrid', 'inkling2', and 'inkling2_loop')"
     )]
     UnsupportedArch(String),
     #[error("invalid model configuration: {0}")]
@@ -49,20 +49,52 @@ pub struct LlamaConfig {
     pub vocab_size: usize,
     pub max_ctx_train: usize,
     pub rope_freq_base: f32,
+    pub rope_freq_base_swa: f32,
     pub rms_eps: f32,
     pub rope_type: RopeType,
     /// Optional standard sliding-window size (`None` = full causal attention).
     pub sliding_window: Option<usize>,
-    /// Per-layer RoPE mask (`false` = NoPE layer, e.g. `smollm3` every 4th layer).
+    /// Per-layer SWA mask (`true` = layer uses `sliding_window`; e.g. OLMo 3 3:1 pattern).
+    pub is_swa: Vec<bool>,
+    /// Per-layer RoPE mask (`false` = NoPE layer, e.g. `smollm3` every 4th layer, or `granite` `rope.scaling.finetuned = false`).
     pub use_rope: Vec<bool>,
-    /// Original context length for LongRoPE (`phi3` selects `rope_factors_long` when `max_ctx > rope_orig_ctx`).
+    /// Original context length for LongRoPE (`phi3` / `granite` selects `rope_factors_long` when `max_ctx > rope_orig_ctx`).
     pub rope_orig_ctx: usize,
+    /// Optional muP embedding multiplier (`granite.embedding_scale`, default `1.0`).
+    pub embedding_scale: f32,
+    /// Attention score multiplier (`granite.attention.scale`, default `1.0 / sqrt(head_dim)`).
+    pub attn_scale: f32,
+    /// True when `attn_scale` differs from `1.0 / sqrt(head_dim)`.
+    pub custom_attn_scale: bool,
+    /// Residual branch multiplier (`granite.residual_scale`, default `1.0`).
+    pub residual_scale: f32,
+    /// Inverse logit scale (`1.0 / granite.logit_scale`, default `1.0`).
+    pub inv_logit_scale: f32,
 }
 
 impl LlamaConfig {
     #[inline]
     pub fn layer_uses_rope(&self, layer: usize) -> bool {
         self.use_rope.get(layer).copied().unwrap_or(true)
+    }
+
+    #[inline]
+    pub fn layer_window(&self, layer: usize) -> Option<usize> {
+        if self.is_swa.get(layer).copied().unwrap_or(false) {
+            self.sliding_window
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn layer_needs_ext_attn(&self, layer: usize) -> bool {
+        self.custom_attn_scale || self.layer_window(layer).is_some()
+    }
+
+    #[inline]
+    pub fn has_dual_rope_swa(&self) -> bool {
+        (self.rope_freq_base_swa - self.rope_freq_base).abs() > 1e-6
     }
 }
 
@@ -82,16 +114,21 @@ pub struct RawMatView<'a> {
 
 type MatView<'a> = RawMatView<'a>;
 
-/// Per-layer weights for `LlamaModel` (`llama` / `qwen2` / `qwen3` / `SmolLM2`).
+/// Per-layer weights for `LlamaModel` (`llama` / `qwen2` / `qwen3` / `smollm3` / `phi3` / `mistral` / `olmo2` / `granite`).
 pub struct LlamaLayerWeights<'a> {
-    pub attn_norm: Vec<f32>,
-    pub ffn_norm: Vec<f32>,
+    pub attn_norm: Option<Vec<f32>>,
+    pub ffn_norm: Option<Vec<f32>>,
+    pub post_attn_norm: Option<Vec<f32>>,
+    pub post_ffn_norm: Option<Vec<f32>>,
     pub q_norm: Option<Vec<f32>>,
     pub k_norm: Option<Vec<f32>>,
     pub bq: Option<Vec<f32>>,
     pub bk: Option<Vec<f32>>,
     pub bv: Option<Vec<f32>>,
     pub bo: Option<Vec<f32>>,
+    pub b_gate: Option<Vec<f32>>,
+    pub b_up: Option<Vec<f32>>,
+    pub b_down: Option<Vec<f32>>,
     pub wq: RawMatView<'a>,
     pub wk: RawMatView<'a>,
     pub wv: RawMatView<'a>,
@@ -103,7 +140,7 @@ pub struct LlamaLayerWeights<'a> {
 
 type LayerWeights<'a> = LlamaLayerWeights<'a>;
 
-/// Loaded Llama / Qwen2 / Qwen2.5 / Qwen3 / SmolLM3 / Phi-3 & Phi-4-mini / Mistral model
+/// Loaded Llama / Qwen2 / Qwen2.5 / Qwen3 / SmolLM3 / Phi-3 & Phi-4-mini / Mistral / OLMo 2 & 3 / Granite model
 /// borrowing quantized weight slices directly from `GgufFile`.
 pub struct LlamaModel<'a> {
     pub cfg: LlamaConfig,
@@ -113,7 +150,9 @@ pub struct LlamaModel<'a> {
     pub output_norm: Vec<f32>,
     /// Precomputed `freq_base^(-2i / rope_dim) / rope_freqs[i]` for `i in 0..rope_dim/2`.
     pub rope_inv_freqs: Vec<f64>,
-    /// Optional LongRoPE long-context inverse frequencies (`phi3` when `max_ctx > rope_orig_ctx`).
+    /// Precomputed SWA inverse frequencies (`olmo3` `rope.freq_base_swa`).
+    pub rope_inv_freqs_swa: Vec<f64>,
+    /// Optional LongRoPE long-context inverse frequencies (`phi3` / `granite` when `max_ctx > rope_orig_ctx`).
     pub rope_inv_freqs_long: Option<Vec<f64>>,
     pub layers: Vec<LlamaLayerWeights<'a>>,
     pub lora: BoundLora,
@@ -143,6 +182,8 @@ pub struct LlamaState {
     hb2: Vec<f32>,
     rope_cos: Vec<f32>,
     rope_sin: Vec<f32>,
+    rope_cos_swa: Vec<f32>,
+    rope_sin_swa: Vec<f32>,
     scores: Vec<f32>,
     logits: Vec<f32>,
     last_hidden: Vec<f32>,
@@ -206,6 +247,8 @@ impl LlamaState {
             hb2: vec![0.0; MAX_CPU_BATCH * cfg.n_ff],
             rope_cos: vec![0.0; cfg.rope_dim / 2],
             rope_sin: vec![0.0; cfg.rope_dim / 2],
+            rope_cos_swa: vec![0.0; cfg.rope_dim / 2],
+            rope_sin_swa: vec![0.0; cfg.rope_dim / 2],
             scores: vec![0.0; cfg.n_head * max_ctx],
             logits: vec![0.0; cfg.vocab_size],
             last_hidden: vec![0.0; cfg.n_embd],
@@ -329,6 +372,55 @@ fn load_opt_f32_vec(
     }
 }
 
+fn load_opt_qk_norm(
+    gguf: &GgufFile,
+    name: &str,
+    layer: &str,
+    head_dim: usize,
+    full_dim: usize,
+) -> Result<Option<Vec<f32>>, ModelError> {
+    let Some(info) = gguf.tensor_info(name) else {
+        return Ok(None);
+    };
+    if info.dims == [full_dim] && full_dim != head_dim {
+        Ok(Some(load_f32_vec(gguf, name, layer, full_dim)?))
+    } else {
+        Ok(Some(load_f32_vec(gguf, name, layer, head_dim)?))
+    }
+}
+
+#[inline]
+fn apply_qk_norm_vec(
+    vec: &mut [f32],
+    scratch: &mut [f32],
+    norm: &[f32],
+    n_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) {
+    let full_dim = n_heads * head_dim;
+    if norm.len() == full_dim {
+        rms_norm(&mut scratch[..full_dim], &vec[..full_dim], norm, eps);
+        vec[..full_dim].copy_from_slice(&scratch[..full_dim]);
+    } else {
+        for h in 0..n_heads {
+            let s = h * head_dim;
+            let e = s + head_dim;
+            rms_norm(&mut scratch[s..e], &vec[s..e], norm, eps);
+            vec[s..e].copy_from_slice(&scratch[s..e]);
+        }
+    }
+}
+
+#[inline]
+fn scale_slice_inplace(dst: &mut [f32], scale: f32) {
+    if (scale - 1.0).abs() > 1e-12 {
+        for v in dst.iter_mut() {
+            *v *= scale;
+        }
+    }
+}
+
 #[inline]
 fn add_bias_slice(dst: &mut [f32], bias: &[f32]) {
     for (y, &b) in dst.iter_mut().zip(bias.iter()) {
@@ -346,20 +438,30 @@ fn add_bias_rows(dst: &mut [f32], bias: &[f32], rows: usize) {
 
 impl<'a> LlamaModel<'a> {
     /// Loads and strictly validates a `llama`, `qwen2` (Qwen2 & Qwen2.5), `qwen3`,
-    /// `smollm3`, `phi3` (Phi-3 / Phi-3.5 / Phi-4-mini), `mistral`, or `mistral3` GGUF model
-    /// using zero-copy weight views.
+    /// `smollm3`, `phi3` (Phi-3 / Phi-3.5 / Phi-4-mini), `mistral` / `mistral3`,
+    /// `olmo2` / `olmo3`, or `granite` GGUF model using zero-copy weight views.
     pub fn from_gguf(gguf: &'a GgufFile) -> Result<Self, ModelError> {
         let arch = gguf.req_str("general.architecture")?.to_string();
         if !matches!(
             arch.as_str(),
-            "llama" | "qwen2" | "qwen3" | "smollm3" | "phi3" | "mistral" | "mistral3"
+            "llama"
+                | "qwen2"
+                | "qwen3"
+                | "smollm3"
+                | "phi3"
+                | "mistral"
+                | "mistral3"
+                | "olmo2"
+                | "olmo3"
+                | "granite"
         ) {
             return Err(ModelError::UnsupportedArch(arch));
         }
 
         let pfx = arch.as_str();
         let is_qwen = matches!(pfx, "qwen2" | "qwen3");
-        let is_neox = matches!(pfx, "qwen2" | "qwen3" | "phi3");
+        let is_olmo = matches!(pfx, "olmo2" | "olmo3");
+        let is_neox = matches!(pfx, "qwen2" | "qwen3" | "phi3" | "olmo2" | "olmo3");
         let n_layers = gguf.req_usize(&format!("{pfx}.block_count"))?;
         let n_embd = gguf.req_usize(&format!("{pfx}.embedding_length"))?;
         let n_ff = gguf.req_usize(&format!("{pfx}.feed_forward_length"))?;
@@ -384,6 +486,8 @@ impl<'a> LlamaModel<'a> {
             1_000_000.0
         } else if pfx == "smollm3" {
             5_000_000.0
+        } else if is_olmo {
+            500_000.0
         } else {
             10_000.0
         };
@@ -391,10 +495,14 @@ impl<'a> LlamaModel<'a> {
             .get_meta(&format!("{pfx}.rope.freq_base"))
             .and_then(|v| v.as_f32())
             .unwrap_or(default_freq_base);
+        let rope_freq_base_swa = gguf
+            .get_meta(&format!("{pfx}.rope.freq_base_swa"))
+            .and_then(|v| v.as_f32())
+            .unwrap_or(rope_freq_base);
         let rms_eps = gguf
             .get_meta(&format!("{pfx}.attention.layer_norm_rms_epsilon"))
             .and_then(|v| v.as_f32())
-            .unwrap_or(if is_qwen || pfx == "smollm3" {
+            .unwrap_or(if is_qwen || pfx == "smollm3" || is_olmo {
                 1e-6
             } else {
                 1e-5
@@ -405,8 +513,14 @@ impl<'a> LlamaModel<'a> {
             RopeType::Norm
         };
 
-        // Per-layer RoPE mask (SmolLM3 NoPE every 4th layer by default, or explicit GGUF metadata).
-        let use_rope = if let Some(pat) = gguf
+        // Per-layer RoPE mask (SmolLM3 NoPE every 4th layer, Granite `rope.scaling.finetuned = false`, or explicit metadata).
+        let rope_finetuned = gguf
+            .get_meta(&format!("{pfx}.rope.scaling.finetuned"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let use_rope = if !rope_finetuned {
+            vec![false; n_layers]
+        } else if let Some(pat) = gguf
             .get_meta(&format!("{pfx}.rope.pattern"))
             .and_then(|v| v.as_bool_array())
             && pat.len() == n_layers
@@ -424,8 +538,7 @@ impl<'a> LlamaModel<'a> {
             vec![true; n_layers]
         };
 
-        // Optional sliding-window attention. Matches `llama.cpp/src/models/phi3.cpp`:
-        // `phi3` ignores `phi3.attention.sliding_window` because historic GGUFs wrote bogus values.
+        // Optional sliding-window attention + per-layer SWA pattern (OLMo 3 defaults to 3:1 pattern `4`).
         let sliding_window = if pfx == "phi3" {
             None
         } else {
@@ -433,11 +546,51 @@ impl<'a> LlamaModel<'a> {
                 .and_then(|v| v.as_usize())
                 .filter(|&w| w > 0)
         };
+        let is_swa = if sliding_window.is_none() {
+            vec![false; n_layers]
+        } else if let Some(pat) = gguf
+            .get_meta(&format!("{pfx}.attention.sliding_window_pattern"))
+            .and_then(|v| v.as_usize())
+            && pat > 0
+        {
+            (0..n_layers).map(|l| (l + 1) % pat != 0).collect()
+        } else if is_olmo {
+            (0..n_layers).map(|l| (l + 1) % 4 != 0).collect()
+        } else {
+            vec![true; n_layers]
+        };
 
         let rope_orig_ctx = gguf
             .get_meta(&format!("{pfx}.rope.scaling.original_context_length"))
             .and_then(|v| v.as_usize())
             .unwrap_or(max_ctx_train);
+
+        // Optional muP scaling multipliers (`granite`).
+        let embedding_scale = gguf
+            .get_meta(&format!("{pfx}.embedding_scale"))
+            .and_then(|v| v.as_f32())
+            .filter(|&s| s != 0.0)
+            .unwrap_or(1.0);
+        let default_attn_scale = 1.0 / (head_dim as f32).sqrt();
+        let (attn_scale, custom_attn_scale) = if let Some(s) = gguf
+            .get_meta(&format!("{pfx}.attention.scale"))
+            .and_then(|v| v.as_f32())
+            .filter(|&s| s != 0.0)
+        {
+            (s, (s - default_attn_scale).abs() > 1e-12)
+        } else {
+            (default_attn_scale, false)
+        };
+        let residual_scale = gguf
+            .get_meta(&format!("{pfx}.residual_scale"))
+            .and_then(|v| v.as_f32())
+            .filter(|&s| s != 0.0)
+            .unwrap_or(1.0);
+        let inv_logit_scale = gguf
+            .get_meta(&format!("{pfx}.logit_scale"))
+            .and_then(|v| v.as_f32())
+            .filter(|&s| s != 0.0)
+            .map_or(1.0, |s| 1.0 / s);
 
         let embd_info =
             gguf.tensor_info("token_embd.weight")
@@ -463,11 +616,18 @@ impl<'a> LlamaModel<'a> {
             vocab_size,
             max_ctx_train,
             rope_freq_base,
+            rope_freq_base_swa,
             rms_eps,
             rope_type,
             sliding_window,
+            is_swa,
             use_rope,
             rope_orig_ctx,
+            embedding_scale,
+            attn_scale,
+            custom_attn_scale,
+            residual_scale,
+            inv_logit_scale,
         };
 
         let token_embd = load_mat(gguf, "token_embd.weight", "global", n_embd, vocab_size)?;
@@ -500,12 +660,11 @@ impl<'a> LlamaModel<'a> {
         )?;
 
         // Precompute RoPE inverse frequencies once at load time (eliminates powf() per token).
-        let base_f = rope_freq_base as f64;
         let dim_f = rope_dim as f64;
-        let build_inv_freqs = |factors: Option<&[f32]>| -> Vec<f64> {
+        let build_inv_freqs = |base: f64, factors: Option<&[f32]>| -> Vec<f64> {
             let mut out = Vec::with_capacity(half);
             for i in 0..half {
-                let mut freq = base_f.powf(-2.0 * (i as f64) / dim_f);
+                let mut freq = base.powf(-2.0 * (i as f64) / dim_f);
                 if let Some(f) = factors {
                     freq /= f[i] as f64;
                 }
@@ -513,8 +672,12 @@ impl<'a> LlamaModel<'a> {
             }
             out
         };
-        let rope_inv_freqs = build_inv_freqs(rope_freqs_short.as_deref());
-        let rope_inv_freqs_long = rope_freqs_long.as_deref().map(|f| build_inv_freqs(Some(f)));
+        let rope_inv_freqs = build_inv_freqs(rope_freq_base as f64, rope_freqs_short.as_deref());
+        let rope_inv_freqs_swa =
+            build_inv_freqs(rope_freq_base_swa as f64, rope_freqs_short.as_deref());
+        let rope_inv_freqs_long = rope_freqs_long
+            .as_deref()
+            .map(|f| build_inv_freqs(rope_freq_base as f64, Some(f)));
 
         let q_dim = n_head * head_dim;
         let kv_dim = n_head_kv * head_dim;
@@ -522,10 +685,20 @@ impl<'a> LlamaModel<'a> {
 
         for l in 0..n_layers {
             let ltag = format!("blk.{l}");
-            let q_norm =
-                load_opt_f32_vec(gguf, &format!("{ltag}.attn_q_norm.weight"), &ltag, head_dim)?;
-            let k_norm =
-                load_opt_f32_vec(gguf, &format!("{ltag}.attn_k_norm.weight"), &ltag, head_dim)?;
+            let q_norm = load_opt_qk_norm(
+                gguf,
+                &format!("{ltag}.attn_q_norm.weight"),
+                &ltag,
+                head_dim,
+                q_dim,
+            )?;
+            let k_norm = load_opt_qk_norm(
+                gguf,
+                &format!("{ltag}.attn_k_norm.weight"),
+                &ltag,
+                head_dim,
+                kv_dim,
+            )?;
             let qkv_bias_name = format!("{ltag}.attn_qkv.bias");
             let (bq, bk, bv) = if gguf.tensor_info(&qkv_bias_name).is_some() {
                 let full = load_f32_vec(gguf, &qkv_bias_name, &ltag, q_dim + 2 * kv_dim)?;
@@ -584,27 +757,80 @@ impl<'a> LlamaModel<'a> {
             // Support both separate `ffn_gate.weight` + `ffn_up.weight` and fused `ffn_up.weight` (`[n_embd, 2*n_ff]`, gate then up).
             let gate_name = format!("{ltag}.ffn_gate.weight");
             let up_name = format!("{ltag}.ffn_up.weight");
-            let (w_gate, w_up) = if gguf.tensor_info(&gate_name).is_some() {
+            let (w_gate, w_up, b_gate, b_up) = if gguf.tensor_info(&gate_name).is_some() {
                 (
                     load_mat(gguf, &gate_name, &ltag, n_embd, n_ff)?,
                     load_mat(gguf, &up_name, &ltag, n_embd, n_ff)?,
+                    load_opt_f32_vec(gguf, &format!("{ltag}.ffn_gate.bias"), &ltag, n_ff)?,
+                    load_opt_f32_vec(gguf, &format!("{ltag}.ffn_up.bias"), &ltag, n_ff)?,
                 )
             } else {
+                let fused_b_up =
+                    load_opt_f32_vec(gguf, &format!("{ltag}.ffn_up.bias"), &ltag, 2 * n_ff)?;
+                let (bg, bu) = match fused_b_up {
+                    Some(full) => (Some(full[..n_ff].to_vec()), Some(full[n_ff..].to_vec())),
+                    None => (None, None),
+                };
                 (
                     load_mat_slice(gguf, &up_name, &ltag, n_embd, 2 * n_ff, 0, n_ff)?,
                     load_mat_slice(gguf, &up_name, &ltag, n_embd, 2 * n_ff, n_ff, n_ff)?,
+                    bg,
+                    bu,
                 )
             };
+            let b_down = load_opt_f32_vec(gguf, &format!("{ltag}.ffn_down.bias"), &ltag, n_embd)?;
+
+            let attn_norm_name = format!("{ltag}.attn_norm.weight");
+            let ffn_norm_name = format!("{ltag}.ffn_norm.weight");
+            let attn_norm = if is_olmo {
+                load_opt_f32_vec(gguf, &attn_norm_name, &ltag, n_embd)?
+            } else {
+                Some(load_f32_vec(gguf, &attn_norm_name, &ltag, n_embd)?)
+            };
+            let ffn_norm = if is_olmo {
+                load_opt_f32_vec(gguf, &ffn_norm_name, &ltag, n_embd)?
+            } else {
+                Some(load_f32_vec(gguf, &ffn_norm_name, &ltag, n_embd)?)
+            };
+            let post_attn_norm = load_opt_f32_vec(
+                gguf,
+                &format!("{ltag}.post_attention_norm.weight"),
+                &ltag,
+                n_embd,
+            )?;
+            let post_ffn_norm =
+                load_opt_f32_vec(gguf, &format!("{ltag}.post_ffw_norm.weight"), &ltag, n_embd)?;
+            if attn_norm.is_none() && post_attn_norm.is_none() {
+                return Err(GgufError::MissingTensor {
+                    path: gguf.path().display().to_string(),
+                    tensor: format!("{ltag}.post_attention_norm.weight"),
+                    layer: ltag,
+                }
+                .into());
+            }
+            if ffn_norm.is_none() && post_ffn_norm.is_none() {
+                return Err(GgufError::MissingTensor {
+                    path: gguf.path().display().to_string(),
+                    tensor: format!("{ltag}.post_ffw_norm.weight"),
+                    layer: ltag,
+                }
+                .into());
+            }
 
             layers.push(LayerWeights {
-                attn_norm: load_f32_vec(gguf, &format!("{ltag}.attn_norm.weight"), &ltag, n_embd)?,
-                ffn_norm: load_f32_vec(gguf, &format!("{ltag}.ffn_norm.weight"), &ltag, n_embd)?,
+                attn_norm,
+                ffn_norm,
+                post_attn_norm,
+                post_ffn_norm,
                 q_norm,
                 k_norm,
                 bq,
                 bk,
                 bv,
                 bo,
+                b_gate,
+                b_up,
+                b_down,
                 wq,
                 wk,
                 wv,
@@ -634,6 +860,7 @@ impl<'a> LlamaModel<'a> {
             output_bias,
             output_norm,
             rope_inv_freqs,
+            rope_inv_freqs_swa,
             rope_inv_freqs_long,
             layers,
             lora: BoundLora::default(),
@@ -650,6 +877,15 @@ impl<'a> LlamaModel<'a> {
             return long.as_slice();
         }
         self.rope_inv_freqs.as_slice()
+    }
+
+    /// Selects per-layer RoPE inverse frequencies (SWA `rope_freq_base_swa` when active on layer `l`).
+    #[inline]
+    pub fn rope_inv_freqs_for_layer(&self, layer: usize, max_ctx: usize) -> &[f64] {
+        if self.cfg.is_swa.get(layer).copied().unwrap_or(false) && self.cfg.has_dual_rope_swa() {
+            return self.rope_inv_freqs_swa.as_slice();
+        }
+        self.rope_inv_freqs_for_ctx(max_ctx)
     }
 
     /// Binds one or more LoRA adapters to matching base tensors (`O(1)` slot lookup at runtime).
@@ -708,6 +944,14 @@ impl<'a> LlamaModel<'a> {
             &mut state.rope_cos,
             &mut state.rope_sin,
         );
+        if self.cfg.has_dual_rope_swa() {
+            rope_compute_cos_sin(
+                &self.rope_inv_freqs_swa,
+                pos,
+                &mut state.rope_cos_swa,
+                &mut state.rope_sin_swa,
+            );
+        }
 
         // 1. Token embedding lookup (zero-copy row slice -> f32; supports both standard and Q4_0x4!)
         decode_embedding_row(
@@ -719,15 +963,22 @@ impl<'a> LlamaModel<'a> {
         );
         self.lora
             .apply_embed_row(self.token_embd.lora_slot, kt, tid, &mut state.x[..n_embd]);
+        scale_slice_inplace(&mut state.x[..n_embd], self.cfg.embedding_scale);
+
+        let res_scale = self.cfg.residual_scale;
 
         // 2. Transformer layers
         for (l, layer) in self.layers.iter().enumerate() {
-            rms_norm(
-                &mut state.xb[..n_embd],
-                &state.x[..n_embd],
-                &layer.attn_norm,
-                self.cfg.rms_eps,
-            );
+            if let Some(ref an) = layer.attn_norm {
+                rms_norm(
+                    &mut state.xb[..n_embd],
+                    &state.x[..n_embd],
+                    an,
+                    self.cfg.rms_eps,
+                );
+            } else {
+                state.xb[..n_embd].copy_from_slice(&state.x[..n_embd]);
+            }
 
             matvec_triple_f32(
                 pool,
@@ -793,32 +1044,41 @@ impl<'a> LlamaModel<'a> {
                 add_bias_slice(&mut state.v[..kv_dim], bv);
             }
 
-            // Optional per-head QK-Norm (Qwen3) applied before RoPE
+            // Optional per-head (Qwen3) or full-vector (OLMo 2/3) QK-Norm applied before RoPE
             if let Some(ref qn) = layer.q_norm {
-                for h in 0..self.cfg.n_head {
-                    let s = h * self.cfg.head_dim;
-                    let e = s + self.cfg.head_dim;
-                    rms_norm(&mut state.xb[s..e], &state.q[s..e], qn, self.cfg.rms_eps);
-                    state.q[s..e].copy_from_slice(&state.xb[s..e]);
-                }
+                apply_qk_norm_vec(
+                    &mut state.q[..q_dim],
+                    &mut state.xb[..q_dim],
+                    qn,
+                    self.cfg.n_head,
+                    self.cfg.head_dim,
+                    self.cfg.rms_eps,
+                );
             }
             if let Some(ref kn) = layer.k_norm {
-                for h in 0..self.cfg.n_head_kv {
-                    let s = h * self.cfg.head_dim;
-                    let e = s + self.cfg.head_dim;
-                    rms_norm(&mut state.xb[s..e], &state.k[s..e], kn, self.cfg.rms_eps);
-                    state.k[s..e].copy_from_slice(&state.xb[s..e]);
-                }
+                apply_qk_norm_vec(
+                    &mut state.k[..kv_dim],
+                    &mut state.xb[..kv_dim],
+                    kn,
+                    self.cfg.n_head_kv,
+                    self.cfg.head_dim,
+                    self.cfg.rms_eps,
+                );
             }
 
             if self.cfg.layer_uses_rope(l) {
+                let (rcos, rsin) = if self.cfg.is_swa[l] && self.cfg.has_dual_rope_swa() {
+                    (&state.rope_cos_swa[..], &state.rope_sin_swa[..])
+                } else {
+                    (&state.rope_cos[..], &state.rope_sin[..])
+                };
                 rope_inplace_tables(
                     &mut state.q[..q_dim],
                     self.cfg.n_head,
                     self.cfg.head_dim,
                     self.cfg.rope_dim,
-                    &state.rope_cos,
-                    &state.rope_sin,
+                    rcos,
+                    rsin,
                     self.cfg.rope_type,
                 );
                 rope_inplace_tables(
@@ -826,12 +1086,13 @@ impl<'a> LlamaModel<'a> {
                     self.cfg.n_head_kv,
                     self.cfg.head_dim,
                     self.cfg.rope_dim,
-                    &state.rope_cos,
-                    &state.rope_sin,
+                    rcos,
+                    rsin,
                     self.cfg.rope_type,
                 );
             }
 
+            let win = self.cfg.layer_window(l);
             // Store K, V into KV cache (`F16` or `Q8_0`) at position `pos` and run GQA attention
             match state.kv_type {
                 KvType::F16 => {
@@ -844,7 +1105,7 @@ impl<'a> LlamaModel<'a> {
                         &state.v[..kv_dim],
                         &mut state.v_cache[l][kv_off..kv_off + kv_dim],
                     );
-                    if self.cfg.sliding_window.is_some() {
+                    if self.cfg.layer_needs_ext_attn(l) {
                         gqa_attention_f16_kv_ext_parallel(
                             pool,
                             kt,
@@ -856,8 +1117,8 @@ impl<'a> LlamaModel<'a> {
                             self.cfg.n_head_kv,
                             self.cfg.head_dim,
                             pos,
-                            1.0 / (self.cfg.head_dim as f32).sqrt(),
-                            self.cfg.sliding_window,
+                            self.cfg.attn_scale,
+                            win,
                             state.max_ctx,
                             &mut state.scores,
                         );
@@ -900,15 +1161,15 @@ impl<'a> LlamaModel<'a> {
                         self.cfg.n_head_kv,
                         self.cfg.head_dim,
                         pos,
-                        1.0 / (self.cfg.head_dim as f32).sqrt(),
-                        self.cfg.sliding_window,
+                        self.cfg.attn_scale,
+                        win,
                         state.max_ctx,
                         &mut state.scores,
                     );
                 }
             }
 
-            // Output projection + residual
+            // Output projection + optional bias + optional post-attention norm + residual
             matvec_f32(
                 pool,
                 kt,
@@ -929,20 +1190,33 @@ impl<'a> LlamaModel<'a> {
                 1,
                 &mut state.lora_scratch,
             );
-            for i in 0..n_embd {
-                state.x[i] += state.xb2[i];
-            }
             if let Some(ref bo) = layer.bo {
-                add_bias_slice(&mut state.x[..n_embd], bo);
+                add_bias_slice(&mut state.xb2[..n_embd], bo);
+            }
+            if let Some(ref pan) = layer.post_attn_norm {
+                rms_norm(
+                    &mut state.xb[..n_embd],
+                    &state.xb2[..n_embd],
+                    pan,
+                    self.cfg.rms_eps,
+                );
+                state.xb2[..n_embd].copy_from_slice(&state.xb[..n_embd]);
+            }
+            for i in 0..n_embd {
+                state.x[i] += res_scale * state.xb2[i];
             }
 
             // FFN (SwiGLU)
-            rms_norm(
-                &mut state.xb[..n_embd],
-                &state.x[..n_embd],
-                &layer.ffn_norm,
-                self.cfg.rms_eps,
-            );
+            if let Some(ref fn_w) = layer.ffn_norm {
+                rms_norm(
+                    &mut state.xb[..n_embd],
+                    &state.x[..n_embd],
+                    fn_w,
+                    self.cfg.rms_eps,
+                );
+            } else {
+                state.xb[..n_embd].copy_from_slice(&state.x[..n_embd]);
+            }
             matvec_pair_f32(
                 pool,
                 kt,
@@ -982,6 +1256,12 @@ impl<'a> LlamaModel<'a> {
                     &mut state.lora_scratch,
                 );
             }
+            if let Some(ref bg) = layer.b_gate {
+                add_bias_slice(&mut state.hb[..n_ff], bg);
+            }
+            if let Some(ref bu) = layer.b_up {
+                add_bias_slice(&mut state.hb2[..n_ff], bu);
+            }
             swiglu_inplace_parallel(pool, &mut state.hb[..n_ff], &state.hb2[..n_ff]);
             matvec_f32(
                 pool,
@@ -1003,8 +1283,20 @@ impl<'a> LlamaModel<'a> {
                 1,
                 &mut state.lora_scratch,
             );
+            if let Some(ref bd) = layer.b_down {
+                add_bias_slice(&mut state.xb2[..n_embd], bd);
+            }
+            if let Some(ref pfn) = layer.post_ffn_norm {
+                rms_norm(
+                    &mut state.xb[..n_embd],
+                    &state.xb2[..n_embd],
+                    pfn,
+                    self.cfg.rms_eps,
+                );
+                state.xb2[..n_embd].copy_from_slice(&state.xb[..n_embd]);
+            }
             for i in 0..n_embd {
-                state.x[i] += state.xb2[i];
+                state.x[i] += res_scale * state.xb2[i];
             }
         }
 
@@ -1040,6 +1332,7 @@ impl<'a> LlamaModel<'a> {
             if let Some(ref ob) = self.output_bias {
                 add_bias_slice(&mut state.logits, ob);
             }
+            scale_slice_inplace(&mut state.logits, self.cfg.inv_logit_scale);
         }
 
         Ok(())
@@ -1177,23 +1470,30 @@ impl<'a> LlamaModel<'a> {
                     &mut state.x[t * n_embd..(t + 1) * n_embd],
                 );
             }
+            scale_slice_inplace(&mut state.x[..b * n_embd], self.cfg.embedding_scale);
             if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
                 p.embed_ns += ts.elapsed().as_nanos() as u64;
             }
 
+            let res_scale = self.cfg.residual_scale;
+
             // 2. Transformer layers with fused multi-token GEMM
             for (l, layer) in self.layers.iter().enumerate() {
                 let t0 = prof.as_ref().map(|_| Instant::now());
-                rms_norm_batch_parallel(
-                    pool,
-                    kt,
-                    &mut state.xb[..b * n_embd],
-                    &state.x[..b * n_embd],
-                    &layer.attn_norm,
-                    self.cfg.rms_eps,
-                    n_embd,
-                    b,
-                );
+                if let Some(ref an) = layer.attn_norm {
+                    rms_norm_batch_parallel(
+                        pool,
+                        kt,
+                        &mut state.xb[..b * n_embd],
+                        &state.x[..b * n_embd],
+                        an,
+                        self.cfg.rms_eps,
+                        n_embd,
+                        b,
+                    );
+                } else {
+                    state.xb[..b * n_embd].copy_from_slice(&state.x[..b * n_embd]);
+                }
                 if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
                     p.attn_norm_ns += ts.elapsed().as_nanos() as u64;
                 }
@@ -1269,6 +1569,7 @@ impl<'a> LlamaModel<'a> {
 
                 // Per-token QK-Norm, RoPE, and F16 KV store (so all `b` keys/values are in cache)
                 let t0 = prof.as_ref().map(|_| Instant::now());
+                let rope_freqs_layer = self.rope_inv_freqs_for_layer(l, state.max_ctx);
                 for t in 0..b {
                     let pos = chunk_pos + t;
                     let qt = &mut state.q[t * q_dim..(t + 1) * q_dim];
@@ -1276,25 +1577,29 @@ impl<'a> LlamaModel<'a> {
                     let vt_vec = &state.v[t * kv_dim..(t + 1) * kv_dim];
 
                     if let Some(ref qn) = layer.q_norm {
-                        for h in 0..self.cfg.n_head {
-                            let s = h * self.cfg.head_dim;
-                            let e = s + self.cfg.head_dim;
-                            rms_norm(&mut state.xb[s..e], &qt[s..e], qn, self.cfg.rms_eps);
-                            qt[s..e].copy_from_slice(&state.xb[s..e]);
-                        }
+                        apply_qk_norm_vec(
+                            qt,
+                            &mut state.xb[..q_dim],
+                            qn,
+                            self.cfg.n_head,
+                            self.cfg.head_dim,
+                            self.cfg.rms_eps,
+                        );
                     }
                     if let Some(ref kn) = layer.k_norm {
-                        for h in 0..self.cfg.n_head_kv {
-                            let s = h * self.cfg.head_dim;
-                            let e = s + self.cfg.head_dim;
-                            rms_norm(&mut state.xb[s..e], &kt_vec[s..e], kn, self.cfg.rms_eps);
-                            kt_vec[s..e].copy_from_slice(&state.xb[s..e]);
-                        }
+                        apply_qk_norm_vec(
+                            kt_vec,
+                            &mut state.xb[..kv_dim],
+                            kn,
+                            self.cfg.n_head_kv,
+                            self.cfg.head_dim,
+                            self.cfg.rms_eps,
+                        );
                     }
 
                     if self.cfg.layer_uses_rope(l) {
                         rope_compute_cos_sin(
-                            self.rope_inv_freqs_for_ctx(state.max_ctx),
+                            rope_freqs_layer,
                             pos,
                             &mut state.rope_cos,
                             &mut state.rope_sin,
@@ -1345,9 +1650,10 @@ impl<'a> LlamaModel<'a> {
 
                 // Causal GQA attention for all `b` tokens in a single parallel dispatch
                 let t0 = prof.as_ref().map(|_| Instant::now());
+                let win = self.cfg.layer_window(l);
                 match state.kv_type {
                     KvType::F16 => {
-                        if self.cfg.sliding_window.is_some() {
+                        if self.cfg.layer_needs_ext_attn(l) {
                             gqa_attention_f16_kv_ext_batch_parallel(
                                 pool,
                                 kt,
@@ -1360,8 +1666,8 @@ impl<'a> LlamaModel<'a> {
                                 self.cfg.head_dim,
                                 chunk_pos,
                                 b,
-                                1.0 / (self.cfg.head_dim as f32).sqrt(),
-                                self.cfg.sliding_window,
+                                self.cfg.attn_scale,
+                                win,
                                 state.max_ctx,
                                 &mut state.scores,
                             );
@@ -1396,8 +1702,8 @@ impl<'a> LlamaModel<'a> {
                             self.cfg.head_dim,
                             chunk_pos,
                             b,
-                            1.0 / (self.cfg.head_dim as f32).sqrt(),
-                            self.cfg.sliding_window,
+                            self.cfg.attn_scale,
+                            win,
                             state.max_ctx,
                             &mut state.scores,
                         );
@@ -1407,7 +1713,7 @@ impl<'a> LlamaModel<'a> {
                     p.gqa_attn_ns += ts.elapsed().as_nanos() as u64;
                 }
 
-                // Batched Wo + residual
+                // Batched Wo + optional bias + optional post-attn norm + residual
                 let t0 = prof.as_ref().map(|_| Instant::now());
                 matmul_f32(
                     pool,
@@ -1430,11 +1736,24 @@ impl<'a> LlamaModel<'a> {
                     b,
                     &mut state.lora_scratch,
                 );
-                for i in 0..(b * n_embd) {
-                    state.x[i] += state.xb2[i];
-                }
                 if let Some(ref bo) = layer.bo {
-                    add_bias_rows(&mut state.x[..b * n_embd], bo, b);
+                    add_bias_rows(&mut state.xb2[..b * n_embd], bo, b);
+                }
+                if let Some(ref pan) = layer.post_attn_norm {
+                    rms_norm_batch_parallel(
+                        pool,
+                        kt,
+                        &mut state.xb[..b * n_embd],
+                        &state.xb2[..b * n_embd],
+                        pan,
+                        self.cfg.rms_eps,
+                        n_embd,
+                        b,
+                    );
+                    state.xb2[..b * n_embd].copy_from_slice(&state.xb[..b * n_embd]);
+                }
+                for i in 0..(b * n_embd) {
+                    state.x[i] += res_scale * state.xb2[i];
                 }
                 if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
                     p.attn_wo_ns += ts.elapsed().as_nanos() as u64;
@@ -1442,16 +1761,20 @@ impl<'a> LlamaModel<'a> {
 
                 // Batched FFN
                 let t0 = prof.as_ref().map(|_| Instant::now());
-                rms_norm_batch_parallel(
-                    pool,
-                    kt,
-                    &mut state.xb[..b * n_embd],
-                    &state.x[..b * n_embd],
-                    &layer.ffn_norm,
-                    self.cfg.rms_eps,
-                    n_embd,
-                    b,
-                );
+                if let Some(ref fn_w) = layer.ffn_norm {
+                    rms_norm_batch_parallel(
+                        pool,
+                        kt,
+                        &mut state.xb[..b * n_embd],
+                        &state.x[..b * n_embd],
+                        fn_w,
+                        self.cfg.rms_eps,
+                        n_embd,
+                        b,
+                    );
+                } else {
+                    state.xb[..b * n_embd].copy_from_slice(&state.x[..b * n_embd]);
+                }
                 if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
                     p.ffn_norm_ns += ts.elapsed().as_nanos() as u64;
                 }
@@ -1497,6 +1820,12 @@ impl<'a> LlamaModel<'a> {
                         &mut state.lora_scratch,
                     );
                 }
+                if let Some(ref bg) = layer.b_gate {
+                    add_bias_rows(&mut state.hb[..b * n_ff], bg, b);
+                }
+                if let Some(ref bu) = layer.b_up {
+                    add_bias_rows(&mut state.hb2[..b * n_ff], bu, b);
+                }
                 if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
                     p.ffn_gate_up_ns += ts.elapsed().as_nanos() as u64;
                 }
@@ -1529,8 +1858,24 @@ impl<'a> LlamaModel<'a> {
                     b,
                     &mut state.lora_scratch,
                 );
+                if let Some(ref bd) = layer.b_down {
+                    add_bias_rows(&mut state.xb2[..b * n_embd], bd, b);
+                }
+                if let Some(ref pfn) = layer.post_ffn_norm {
+                    rms_norm_batch_parallel(
+                        pool,
+                        kt,
+                        &mut state.xb[..b * n_embd],
+                        &state.xb2[..b * n_embd],
+                        pfn,
+                        self.cfg.rms_eps,
+                        n_embd,
+                        b,
+                    );
+                    state.xb2[..b * n_embd].copy_from_slice(&state.xb[..b * n_embd]);
+                }
                 for i in 0..(b * n_embd) {
-                    state.x[i] += state.xb2[i];
+                    state.x[i] += res_scale * state.xb2[i];
                 }
                 if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
                     p.ffn_down_ns += ts.elapsed().as_nanos() as u64;
@@ -1577,6 +1922,7 @@ impl<'a> LlamaModel<'a> {
                 if let Some(ref ob) = self.output_bias {
                     add_bias_slice(&mut state.logits, ob);
                 }
+                scale_slice_inplace(&mut state.logits, self.cfg.inv_logit_scale);
                 if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
                     p.lm_head_ns += ts.elapsed().as_nanos() as u64;
                 }
@@ -1635,6 +1981,14 @@ impl<'a> LlamaModel<'a> {
             &mut state.rope_cos,
             &mut state.rope_sin,
         );
+        if self.cfg.has_dual_rope_swa() {
+            rope_compute_cos_sin(
+                &self.rope_inv_freqs_swa,
+                pos,
+                &mut state.rope_cos_swa,
+                &mut state.rope_sin_swa,
+            );
+        }
         decode_embedding_row(
             self.token_embd.dtype,
             self.token_embd.bytes,
@@ -1644,17 +1998,24 @@ impl<'a> LlamaModel<'a> {
         );
         self.lora
             .apply_embed_row(self.token_embd.lora_slot, kt, tid, &mut state.x[..n_embd]);
+        scale_slice_inplace(&mut state.x[..n_embd], self.cfg.embedding_scale);
         prof.embed_ns += t0.elapsed().as_nanos() as u64;
         prof.embed_bytes += (self.token_embd.dtype.row_bytes(n_embd) + n_embd * 4) as u64;
 
+        let res_scale = self.cfg.residual_scale;
+
         for (l, layer) in self.layers.iter().enumerate() {
             let t0 = Instant::now();
-            rms_norm(
-                &mut state.xb[..n_embd],
-                &state.x[..n_embd],
-                &layer.attn_norm,
-                self.cfg.rms_eps,
-            );
+            if let Some(ref an) = layer.attn_norm {
+                rms_norm(
+                    &mut state.xb[..n_embd],
+                    &state.x[..n_embd],
+                    an,
+                    self.cfg.rms_eps,
+                );
+            } else {
+                state.xb[..n_embd].copy_from_slice(&state.x[..n_embd]);
+            }
             prof.attn_norm_ns += t0.elapsed().as_nanos() as u64;
 
             let t0 = Instant::now();
@@ -1728,33 +2089,42 @@ impl<'a> LlamaModel<'a> {
             if layer.q_norm.is_some() || layer.k_norm.is_some() {
                 let t0 = Instant::now();
                 if let Some(ref qn) = layer.q_norm {
-                    for h in 0..self.cfg.n_head {
-                        let s = h * self.cfg.head_dim;
-                        let e = s + self.cfg.head_dim;
-                        rms_norm(&mut state.xb[s..e], &state.q[s..e], qn, self.cfg.rms_eps);
-                        state.q[s..e].copy_from_slice(&state.xb[s..e]);
-                    }
+                    apply_qk_norm_vec(
+                        &mut state.q[..q_dim],
+                        &mut state.xb[..q_dim],
+                        qn,
+                        self.cfg.n_head,
+                        self.cfg.head_dim,
+                        self.cfg.rms_eps,
+                    );
                 }
                 if let Some(ref kn) = layer.k_norm {
-                    for h in 0..self.cfg.n_head_kv {
-                        let s = h * self.cfg.head_dim;
-                        let e = s + self.cfg.head_dim;
-                        rms_norm(&mut state.xb[s..e], &state.k[s..e], kn, self.cfg.rms_eps);
-                        state.k[s..e].copy_from_slice(&state.xb[s..e]);
-                    }
+                    apply_qk_norm_vec(
+                        &mut state.k[..kv_dim],
+                        &mut state.xb[..kv_dim],
+                        kn,
+                        self.cfg.n_head_kv,
+                        self.cfg.head_dim,
+                        self.cfg.rms_eps,
+                    );
                 }
                 prof.qk_norm_ns += t0.elapsed().as_nanos() as u64;
             }
 
             let t0 = Instant::now();
             if self.cfg.layer_uses_rope(l) {
+                let (rcos, rsin) = if self.cfg.is_swa[l] && self.cfg.has_dual_rope_swa() {
+                    (&state.rope_cos_swa[..], &state.rope_sin_swa[..])
+                } else {
+                    (&state.rope_cos[..], &state.rope_sin[..])
+                };
                 rope_inplace_tables(
                     &mut state.q[..q_dim],
                     self.cfg.n_head,
                     self.cfg.head_dim,
                     self.cfg.rope_dim,
-                    &state.rope_cos,
-                    &state.rope_sin,
+                    rcos,
+                    rsin,
                     self.cfg.rope_type,
                 );
                 rope_inplace_tables(
@@ -1762,8 +2132,8 @@ impl<'a> LlamaModel<'a> {
                     self.cfg.n_head_kv,
                     self.cfg.head_dim,
                     self.cfg.rope_dim,
-                    &state.rope_cos,
-                    &state.rope_sin,
+                    rcos,
+                    rsin,
                     self.cfg.rope_type,
                 );
             }
@@ -1795,9 +2165,10 @@ impl<'a> LlamaModel<'a> {
             prof.rope_kv_ns += t0.elapsed().as_nanos() as u64;
 
             let t0 = Instant::now();
+            let win = self.cfg.layer_window(l);
             match state.kv_type {
                 KvType::F16 => {
-                    if self.cfg.sliding_window.is_some() {
+                    if self.cfg.layer_needs_ext_attn(l) {
                         gqa_attention_f16_kv_ext_parallel(
                             pool,
                             kt,
@@ -1809,8 +2180,8 @@ impl<'a> LlamaModel<'a> {
                             self.cfg.n_head_kv,
                             self.cfg.head_dim,
                             pos,
-                            1.0 / (self.cfg.head_dim as f32).sqrt(),
-                            self.cfg.sliding_window,
+                            self.cfg.attn_scale,
+                            win,
                             state.max_ctx,
                             &mut state.scores,
                         );
@@ -1844,8 +2215,8 @@ impl<'a> LlamaModel<'a> {
                         self.cfg.n_head_kv,
                         self.cfg.head_dim,
                         pos,
-                        1.0 / (self.cfg.head_dim as f32).sqrt(),
-                        self.cfg.sliding_window,
+                        self.cfg.attn_scale,
+                        win,
                         state.max_ctx,
                         &mut state.scores,
                     );
@@ -1875,22 +2246,35 @@ impl<'a> LlamaModel<'a> {
                 1,
                 &mut state.lora_scratch,
             );
-            for i in 0..n_embd {
-                state.x[i] += state.xb2[i];
-            }
             if let Some(ref bo) = layer.bo {
-                add_bias_slice(&mut state.x[..n_embd], bo);
+                add_bias_slice(&mut state.xb2[..n_embd], bo);
+            }
+            if let Some(ref pan) = layer.post_attn_norm {
+                rms_norm(
+                    &mut state.xb[..n_embd],
+                    &state.xb2[..n_embd],
+                    pan,
+                    self.cfg.rms_eps,
+                );
+                state.xb2[..n_embd].copy_from_slice(&state.xb[..n_embd]);
+            }
+            for i in 0..n_embd {
+                state.x[i] += res_scale * state.xb2[i];
             }
             prof.attn_wo_ns += t0.elapsed().as_nanos() as u64;
             prof.attn_wo_bytes += layer.wo.bytes.len() as u64;
 
             let t0 = Instant::now();
-            rms_norm(
-                &mut state.xb[..n_embd],
-                &state.x[..n_embd],
-                &layer.ffn_norm,
-                self.cfg.rms_eps,
-            );
+            if let Some(ref fn_w) = layer.ffn_norm {
+                rms_norm(
+                    &mut state.xb[..n_embd],
+                    &state.x[..n_embd],
+                    fn_w,
+                    self.cfg.rms_eps,
+                );
+            } else {
+                state.xb[..n_embd].copy_from_slice(&state.x[..n_embd]);
+            }
             prof.ffn_norm_ns += t0.elapsed().as_nanos() as u64;
 
             let t0 = Instant::now();
@@ -1933,6 +2317,12 @@ impl<'a> LlamaModel<'a> {
                     &mut state.lora_scratch,
                 );
             }
+            if let Some(ref bg) = layer.b_gate {
+                add_bias_slice(&mut state.hb[..n_ff], bg);
+            }
+            if let Some(ref bu) = layer.b_up {
+                add_bias_slice(&mut state.hb2[..n_ff], bu);
+            }
             prof.ffn_gate_up_ns += t0.elapsed().as_nanos() as u64;
             prof.ffn_gate_up_bytes += (layer.w_gate.bytes.len() + layer.w_up.bytes.len()) as u64;
 
@@ -1961,8 +2351,20 @@ impl<'a> LlamaModel<'a> {
                 1,
                 &mut state.lora_scratch,
             );
+            if let Some(ref bd) = layer.b_down {
+                add_bias_slice(&mut state.xb2[..n_embd], bd);
+            }
+            if let Some(ref pfn) = layer.post_ffn_norm {
+                rms_norm(
+                    &mut state.xb[..n_embd],
+                    &state.xb2[..n_embd],
+                    pfn,
+                    self.cfg.rms_eps,
+                );
+                state.xb2[..n_embd].copy_from_slice(&state.xb[..n_embd]);
+            }
             for i in 0..n_embd {
-                state.x[i] += state.xb2[i];
+                state.x[i] += res_scale * state.xb2[i];
             }
             prof.ffn_down_ns += t0.elapsed().as_nanos() as u64;
             prof.ffn_down_bytes += layer.w_down.bytes.len() as u64;
@@ -2004,6 +2406,7 @@ impl<'a> LlamaModel<'a> {
             if let Some(ref ob) = self.output_bias {
                 add_bias_slice(&mut state.logits, ob);
             }
+            scale_slice_inplace(&mut state.logits, self.cfg.inv_logit_scale);
             prof.lm_head_ns += t0.elapsed().as_nanos() as u64;
             prof.lm_head_bytes += self.output.bytes.len() as u64;
         }
@@ -2088,6 +2491,10 @@ impl<'a> LlamaModel<'a> {
         if let Some(ref ob) = self.output_bias {
             add_bias_rows(&mut spec_buf.logits_win[..w * vocab], ob, w);
         }
+        scale_slice_inplace(
+            &mut spec_buf.logits_win[..w * vocab],
+            self.cfg.inv_logit_scale,
+        );
         Ok(())
     }
 
@@ -2149,6 +2556,7 @@ impl<'a> LlamaModel<'a> {
         if let Some(ref ob) = self.output_bias {
             add_bias_slice(out_logits, ob);
         }
+        scale_slice_inplace(out_logits, self.cfg.inv_logit_scale);
     }
 
     /// Decodes a single token's input embedding `[n_embd]` (used by MTP cells).
@@ -2165,6 +2573,7 @@ impl<'a> LlamaModel<'a> {
             self.lora
                 .apply_embed_row(self.token_embd.lora_slot, kt, token_id as usize, out_emb);
         }
+        scale_slice_inplace(out_emb, self.cfg.embedding_scale);
     }
 }
 

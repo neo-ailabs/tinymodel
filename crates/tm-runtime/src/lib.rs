@@ -15,8 +15,8 @@ use tm_gguf::GgufFile;
 pub use tm_lora::{LoraAdapter, LoraError, LoraMergeOptions, LoraMergeReport, LoraSet};
 use tm_models::{
     Gemma4Model, Gemma4State, Inkling2Model, Inkling2State, LayerState, Lfm2Model, Lfm2State,
-    LlamaModel, LlamaState, MAX_SPEC_WINDOW, ModelError, Qwen35Model, Qwen35State, SpecVerifyBuf,
-    argmax,
+    LlamaModel, LlamaState, MAX_SPEC_WINDOW, Mamba2Model, Mamba2State, ModelError, Qwen35Model,
+    Qwen35State, SpecVerifyBuf, argmax,
 };
 
 pub use prefix_cache::{CachedLayer, PrefixCache};
@@ -32,6 +32,7 @@ pub enum CpuModel<'a> {
     Qwen35(Qwen35Model<'a>),
     Gemma4(Gemma4Model<'a>),
     Lfm2(Lfm2Model<'a>),
+    Mamba2(Mamba2Model<'a>),
     Inkling2(Box<Inkling2Model<'a>>),
 }
 
@@ -42,20 +43,23 @@ pub enum CpuState {
     Qwen35(Qwen35State),
     Gemma4(Gemma4State),
     Lfm2(Lfm2State),
+    Mamba2(Mamba2State),
     Inkling2(Box<Inkling2State>),
 }
 
 impl<'a> CpuModel<'a> {
-    /// Loads and validates any supported GGUF model (`llama`, `qwen2`, `qwen3`, `smollm3`, `phi3`, `mistral`, `mistral3`, `qwen35`, `gemma2`, `gemma3`, `gemma4`, `lfm2`, `lfm3`, `inkling2`, `inkling2_loop`).
+    /// Loads and validates any supported GGUF model (`llama`, `qwen2`, `qwen3`, `smollm3`, `phi3`, `mistral`, `mistral3`, `olmo2`, `olmo3`, `granite`, `qwen35`, `gemma2`, `gemma3`, `gemma4`, `lfm2`, `lfm3`, `mamba2`, `nemotron_h`, `falcon-h1`, `granitehybrid`, `inkling2`, `inkling2_loop`).
     pub fn from_gguf(gguf: &'a GgufFile) -> Result<Self, ModelError> {
         let arch = gguf.req_str("general.architecture")?;
         match arch {
-            "llama" | "qwen2" | "qwen3" | "smollm3" | "phi3" | "mistral" | "mistral3" => {
-                Ok(CpuModel::Llama(LlamaModel::from_gguf(gguf)?))
-            }
+            "llama" | "qwen2" | "qwen3" | "smollm3" | "phi3" | "mistral" | "mistral3" | "olmo2"
+            | "olmo3" | "granite" => Ok(CpuModel::Llama(LlamaModel::from_gguf(gguf)?)),
             "qwen35" => Ok(CpuModel::Qwen35(Qwen35Model::from_gguf(gguf)?)),
             "gemma2" | "gemma3" | "gemma4" => Ok(CpuModel::Gemma4(Gemma4Model::from_gguf(gguf)?)),
             "lfm2" | "lfm3" => Ok(CpuModel::Lfm2(Lfm2Model::from_gguf(gguf)?)),
+            "mamba2" | "nemotron_h" | "falcon-h1" | "granitehybrid" => {
+                Ok(CpuModel::Mamba2(Mamba2Model::from_gguf(gguf)?))
+            }
             "inkling2" | "inkling2_loop" => Ok(CpuModel::Inkling2(Box::new(
                 Inkling2Model::from_gguf(gguf)?,
             ))),
@@ -69,6 +73,7 @@ impl<'a> CpuModel<'a> {
             CpuModel::Qwen35(m) => &m.cfg.arch,
             CpuModel::Gemma4(m) => &m.cfg.arch,
             CpuModel::Lfm2(m) => &m.cfg.arch,
+            CpuModel::Mamba2(m) => &m.cfg.arch,
             CpuModel::Inkling2(m) => &m.cfg.arch,
         }
     }
@@ -79,6 +84,7 @@ impl<'a> CpuModel<'a> {
             CpuModel::Qwen35(m) => m.cfg.vocab_size,
             CpuModel::Gemma4(m) => m.cfg.vocab_size,
             CpuModel::Lfm2(m) => m.cfg.vocab_size,
+            CpuModel::Mamba2(m) => m.cfg.vocab_size,
             CpuModel::Inkling2(m) => m.cfg.vocab_size,
         }
     }
@@ -89,6 +95,7 @@ impl<'a> CpuModel<'a> {
             CpuModel::Qwen35(m) => m.cfg.n_embd,
             CpuModel::Gemma4(m) => m.cfg.n_embd,
             CpuModel::Lfm2(m) => m.cfg.n_embd,
+            CpuModel::Mamba2(m) => m.cfg.n_embd,
             CpuModel::Inkling2(m) => m.cfg.n_embd,
         }
     }
@@ -99,6 +106,7 @@ impl<'a> CpuModel<'a> {
             CpuModel::Qwen35(m) => m.cfg.n_layers,
             CpuModel::Gemma4(m) => m.cfg.n_layers,
             CpuModel::Lfm2(m) => m.cfg.n_layers,
+            CpuModel::Mamba2(m) => m.cfg.n_layers,
             CpuModel::Inkling2(m) => m.cfg.n_layers,
         }
     }
@@ -156,6 +164,29 @@ impl<'a> CpuModel<'a> {
                 let sc = ((c.vocab_size + 36 * (c.n_embd + c.n_ff)) * 4) as u64;
                 kv + conv + sc
             }
+            CpuModel::Mamba2(m) => {
+                let c = &m.cfg;
+                let mut kv = 0u64;
+                for lw in &m.layers {
+                    if lw.kv_slot.is_some() {
+                        let n_kv = match &lw.block {
+                            tm_models::Mamba2Block::AttnOnly { attn }
+                            | tm_models::Mamba2Block::AttnAndFfn { attn, .. }
+                            | tm_models::Mamba2Block::ParallelAttnSsmAndFfn { attn, .. } => {
+                                attn.n_head_kv
+                            }
+                            _ => 0,
+                        };
+                        kv += kv_bytes_for(1, n_kv * c.head_dim);
+                    }
+                }
+                let ssm = (m.n_ssm_layers
+                    * (c.ssm_inner_size * c.ssm_state_size + c.conv_dim() * c.ssm_conv_kernel)
+                    * 4) as u64;
+                let sc =
+                    ((c.vocab_size + 40 * (c.n_embd + c.max_n_ff() + c.d_in_proj())) * 4) as u64;
+                kv + ssm + sc
+            }
             CpuModel::Inkling2(m) => {
                 let c = &m.cfg;
                 let mut kv = 0u64;
@@ -191,6 +222,9 @@ impl<'a> CpuModel<'a> {
                 CpuState::Gemma4(Gemma4State::new_with_kv_type(m, max_ctx, kv_type))
             }
             CpuModel::Lfm2(m) => CpuState::Lfm2(Lfm2State::new_with_kv_type(m, max_ctx, kv_type)),
+            CpuModel::Mamba2(m) => {
+                CpuState::Mamba2(Mamba2State::new_with_kv_type(m, max_ctx, kv_type))
+            }
             CpuModel::Inkling2(m) => CpuState::Inkling2(Box::new(Inkling2State::new_with_kv_type(
                 m, max_ctx, kv_type,
             ))),
@@ -211,6 +245,7 @@ impl<'a> CpuModel<'a> {
             CpuModel::Qwen35(m) => m.bind_lora(loras),
             CpuModel::Gemma4(m) => m.bind_lora(loras),
             CpuModel::Lfm2(m) => m.bind_lora(loras),
+            CpuModel::Mamba2(m) => m.bind_lora(loras),
             CpuModel::Inkling2(_) => unreachable!(),
         }
         Ok(())
@@ -222,6 +257,7 @@ impl<'a> CpuModel<'a> {
             CpuModel::Qwen35(m) => m.lora.max_rank,
             CpuModel::Gemma4(m) => m.lora.max_rank,
             CpuModel::Lfm2(m) => m.lora.max_rank,
+            CpuModel::Mamba2(m) => m.lora.max_rank,
             CpuModel::Inkling2(_) => 0,
         }
     }
@@ -246,6 +282,16 @@ impl<'a> CpuModel<'a> {
                 m.cfg.n_embd,
                 m.num_shortconv_layers(),
                 m.cfg.shortconv_l_cache,
+            ),
+            CpuModel::Mamba2(m) => SpecVerifyBuf::new_mamba2(
+                m.cfg.vocab_size,
+                m.cfg.n_embd,
+                m.n_ssm_layers,
+                m.cfg.ssm_inner_size,
+                m.cfg.bc_dim(),
+                m.cfg.ssm_n_head,
+                m.cfg.ssm_state_size,
+                m.cfg.ssm_conv_kernel,
             ),
             CpuModel::Inkling2(m) => SpecVerifyBuf::new_inkling2(
                 m.cfg.vocab_size,
@@ -277,6 +323,9 @@ impl<'a> CpuModel<'a> {
             (CpuModel::Lfm2(m), CpuState::Lfm2(s)) => {
                 m.forward_token(s, pool, kt, token_id, pos, compute_logits)
             }
+            (CpuModel::Mamba2(m), CpuState::Mamba2(s)) => {
+                m.forward_token(s, pool, kt, token_id, pos, compute_logits)
+            }
             (CpuModel::Inkling2(m), CpuState::Inkling2(s)) => {
                 m.forward_token(s, pool, kt, token_id, pos, compute_logits)
             }
@@ -304,6 +353,9 @@ impl<'a> CpuModel<'a> {
                 m.forward_batch(s, pool, kt, token_ids, start_pos, compute_last_logits)
             }
             (CpuModel::Lfm2(m), CpuState::Lfm2(s)) => {
+                m.forward_batch(s, pool, kt, token_ids, start_pos, compute_last_logits)
+            }
+            (CpuModel::Mamba2(m), CpuState::Mamba2(s)) => {
                 m.forward_batch(s, pool, kt, token_ids, start_pos, compute_last_logits)
             }
             (CpuModel::Inkling2(m), CpuState::Inkling2(s)) => {
@@ -335,6 +387,9 @@ impl<'a> CpuModel<'a> {
             (CpuModel::Lfm2(m), CpuState::Lfm2(s)) => {
                 m.verify_speculative(s, spec_buf, pool, kt, window_tokens, start_pos)
             }
+            (CpuModel::Mamba2(m), CpuState::Mamba2(s)) => {
+                m.verify_speculative(s, spec_buf, pool, kt, window_tokens, start_pos)
+            }
             (CpuModel::Inkling2(m), CpuState::Inkling2(s)) => {
                 m.verify_speculative(s, spec_buf, pool, kt, window_tokens, start_pos)
             }
@@ -363,6 +418,9 @@ impl<'a> CpuModel<'a> {
             (CpuModel::Lfm2(m), CpuState::Lfm2(s)) => {
                 m.commit_speculative(s, spec_buf, committed);
             }
+            (CpuModel::Mamba2(m), CpuState::Mamba2(s)) => {
+                m.commit_speculative(s, spec_buf, pool, kt, committed);
+            }
             (CpuModel::Inkling2(m), CpuState::Inkling2(s)) => {
                 m.commit_speculative(s, spec_buf, committed);
             }
@@ -376,6 +434,7 @@ impl<'a> CpuModel<'a> {
             CpuModel::Qwen35(m) => m.embed_token(token_id, out_emb),
             CpuModel::Gemma4(m) => m.embed_token(token_id, out_emb),
             CpuModel::Lfm2(m) => m.embed_token(token_id, out_emb),
+            CpuModel::Mamba2(m) => m.embed_token(token_id, out_emb),
             CpuModel::Inkling2(m) => m.embed_token(token_id, out_emb),
         }
     }
@@ -394,6 +453,7 @@ impl<'a> CpuModel<'a> {
             CpuModel::Qwen35(m) => m.output_head_raw(),
             CpuModel::Gemma4(m) => m.output_head_raw(),
             CpuModel::Lfm2(m) => m.output_head_raw(),
+            CpuModel::Mamba2(m) => m.output_head_raw(),
             CpuModel::Inkling2(m) => (
                 &m.output_norm,
                 m.cfg.rms_eps,
@@ -425,6 +485,9 @@ impl<'a> CpuModel<'a> {
             (CpuModel::Lfm2(m), CpuState::Lfm2(s)) => {
                 m.project_logits_from_hidden(s, pool, kt, hidden, out_logits);
             }
+            (CpuModel::Mamba2(m), CpuState::Mamba2(s)) => {
+                m.project_logits_from_hidden(s, pool, kt, hidden, out_logits);
+            }
             (CpuModel::Inkling2(m), CpuState::Inkling2(s)) => {
                 m.project_logits_from_hidden(s, pool, kt, hidden, out_logits);
             }
@@ -440,6 +503,7 @@ impl CpuState {
             CpuState::Qwen35(s) => s.max_ctx,
             CpuState::Gemma4(s) => s.max_ctx,
             CpuState::Lfm2(s) => s.max_ctx,
+            CpuState::Mamba2(s) => s.max_ctx,
             CpuState::Inkling2(s) => s.max_ctx,
         }
     }
@@ -450,6 +514,7 @@ impl CpuState {
             CpuState::Qwen35(s) => s.reset(),
             CpuState::Gemma4(s) => s.reset(),
             CpuState::Lfm2(s) => s.reset(),
+            CpuState::Mamba2(s) => s.reset(),
             CpuState::Inkling2(s) => s.reset(),
         }
     }
@@ -460,6 +525,7 @@ impl CpuState {
             CpuState::Qwen35(s) => s.lora_scratch.ensure_rank(max_rank),
             CpuState::Gemma4(s) => s.lora_scratch.ensure_rank(max_rank),
             CpuState::Lfm2(s) => s.lora_scratch.ensure_rank(max_rank),
+            CpuState::Mamba2(s) => s.lora_scratch.ensure_rank(max_rank),
             CpuState::Inkling2(_) => {}
         }
     }
@@ -470,6 +536,7 @@ impl CpuState {
             CpuState::Qwen35(s) => s.logits(),
             CpuState::Gemma4(s) => s.logits(),
             CpuState::Lfm2(s) => s.logits(),
+            CpuState::Mamba2(s) => s.logits(),
             CpuState::Inkling2(s) => s.logits(),
         }
     }
@@ -480,6 +547,7 @@ impl CpuState {
             CpuState::Qwen35(s) => &s.last_hidden,
             CpuState::Gemma4(s) => &s.last_hidden,
             CpuState::Lfm2(s) => &s.last_hidden,
+            CpuState::Mamba2(s) => &s.last_hidden,
             CpuState::Inkling2(s) => &s.last_hidden,
         }
     }
@@ -490,6 +558,7 @@ impl CpuState {
             CpuState::Qwen35(s) => Some(&s.layers),
             CpuState::Gemma4(s) => Some(&s.layers),
             CpuState::Lfm2(s) => Some(&s.layers),
+            CpuState::Mamba2(s) => Some(&s.layers),
             CpuState::Inkling2(s) => Some(&s.layers),
         }
     }
@@ -500,6 +569,7 @@ impl CpuState {
             CpuState::Qwen35(s) => Some(&mut s.layers),
             CpuState::Gemma4(s) => Some(&mut s.layers),
             CpuState::Lfm2(s) => Some(&mut s.layers),
+            CpuState::Mamba2(s) => Some(&mut s.layers),
             CpuState::Inkling2(s) => Some(&mut s.layers),
         }
     }

@@ -125,6 +125,13 @@ struct BiasArgs {
     n_tok: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ScaleVecArgs {
+    n: u32,
+    scale: f32,
+}
+
 type MtlBuf = Retained<ProtocolObject<dyn MTLBuffer>>;
 type MtlPipe = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 
@@ -142,16 +149,46 @@ pub struct LlamaMetalConfig {
     pub vocab_size: usize,
     pub max_ctx: usize,
     pub rope_freq_base: f32,
+    pub rope_freq_base_swa: f32,
     pub rms_eps: f32,
     pub rope_type: u32, // 0 = Norm, 1 = Neox
     pub sliding_window: Option<usize>,
+    pub is_swa: Vec<bool>,
     pub use_rope: Vec<bool>,
+    pub embedding_scale: f32,
+    pub attn_scale: f32,
+    pub custom_attn_scale: bool,
+    pub residual_scale: f32,
+    pub inv_logit_scale: f32,
 }
 
 impl LlamaMetalConfig {
     #[inline]
     pub fn layer_uses_rope(&self, layer: usize) -> bool {
         self.use_rope.get(layer).copied().unwrap_or(true)
+    }
+
+    #[inline]
+    pub fn layer_window(&self, layer: usize) -> Option<usize> {
+        if self.is_swa.get(layer).copied().unwrap_or(false) {
+            self.sliding_window
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn layer_needs_ext_attn(&self, layer: usize) -> bool {
+        self.custom_attn_scale || self.layer_window(layer).is_some()
+    }
+
+    #[inline]
+    pub fn layer_rope_freq_base(&self, layer: usize) -> f32 {
+        if self.is_swa.get(layer).copied().unwrap_or(false) {
+            self.rope_freq_base_swa
+        } else {
+            self.rope_freq_base
+        }
     }
 }
 
@@ -166,14 +203,19 @@ struct GpuMat {
 }
 
 struct GpuLayer {
-    attn_norm: MtlBuf,
-    ffn_norm: MtlBuf,
-    q_norm: Option<MtlBuf>,
-    k_norm: Option<MtlBuf>,
+    attn_norm: Option<MtlBuf>,
+    ffn_norm: Option<MtlBuf>,
+    post_attn_norm: Option<MtlBuf>,
+    post_ffn_norm: Option<MtlBuf>,
+    q_norm: Option<(MtlBuf, usize)>,
+    k_norm: Option<(MtlBuf, usize)>,
     bq: Option<MtlBuf>,
     bk: Option<MtlBuf>,
     bv: Option<MtlBuf>,
     bo: Option<MtlBuf>,
+    b_gate: Option<MtlBuf>,
+    b_up: Option<MtlBuf>,
+    b_down: Option<MtlBuf>,
     wq: GpuMat,
     wk: GpuMat,
     wv: GpuMat,
@@ -194,6 +236,9 @@ struct Pipelines {
     rms_norm: MtlPipe,
     qk_norm: MtlPipe,
     add_bias: MtlPipe,
+    copy_f32: MtlPipe,
+    scale_inplace: MtlPipe,
+    scale_axpy: MtlPipe,
     rope_kv: MtlPipe,
     gqa_attn: MtlPipe,
     gemv_q4_0: MtlPipe,
@@ -228,7 +273,7 @@ struct Pipelines {
     gemm_f32: MtlPipe,
 }
 
-/// Complete Apple Metal GPU inference runner for `llama` and `qwen3` models.
+/// Complete Apple Metal GPU inference runner for `llama`, `qwen2`/`qwen3`, `smollm3`, `phi3`, `mistral`, `olmo2`/`olmo3`, and `granite` models.
 pub struct LlamaMetalRunner {
     pub cfg: LlamaMetalConfig,
     device: Retained<ProtocolObject<dyn MTLDevice>>,
@@ -247,6 +292,7 @@ pub struct LlamaMetalRunner {
     argmax_buf: MtlBuf,
     x: MtlBuf,
     xb: MtlBuf,
+    xb2: MtlBuf,
     q: MtlBuf,
     k: MtlBuf,
     v: MtlBuf,
@@ -482,8 +528,32 @@ fn load_opt_gpu_f32_vec(
     }
 }
 
+fn load_opt_gpu_qk_norm(
+    device: &ProtocolObject<dyn MTLDevice>,
+    gguf: &GgufFile,
+    name: &str,
+    layer: &str,
+    head_dim: usize,
+    full_dim: usize,
+) -> Result<Option<(MtlBuf, usize)>, MetalError> {
+    let Some(info) = gguf.tensor_info(name) else {
+        return Ok(None);
+    };
+    if info.dims == [full_dim] && full_dim != head_dim {
+        Ok(Some((
+            load_gpu_f32_vec(device, gguf, name, layer, full_dim)?,
+            full_dim,
+        )))
+    } else {
+        Ok(Some((
+            load_gpu_f32_vec(device, gguf, name, layer, head_dim)?,
+            head_dim,
+        )))
+    }
+}
+
 impl LlamaMetalRunner {
-    /// Loads a `llama`, `qwen2` (Qwen2 & Qwen2.5), or `qwen3` GGUF model onto the default Apple Metal GPU.
+    /// Loads a `llama`, `qwen2`/`qwen3`, `smollm3`, `phi3`, `mistral`/`mistral3`, `olmo2`/`olmo3`, or `granite` GGUF model onto the default Apple Metal GPU.
     ///
     /// Uses zero-copy `newBufferWithBytesNoCopy` over `gguf`'s memory map whenever
     /// the mapping is page-aligned (standard for all `GgufFile::open` files on Apple Silicon).
@@ -492,14 +562,24 @@ impl LlamaMetalRunner {
         let arch = gguf_ref.req_str("general.architecture")?.to_string();
         if !matches!(
             arch.as_str(),
-            "llama" | "qwen2" | "qwen3" | "smollm3" | "phi3" | "mistral" | "mistral3"
+            "llama"
+                | "qwen2"
+                | "qwen3"
+                | "smollm3"
+                | "phi3"
+                | "mistral"
+                | "mistral3"
+                | "olmo2"
+                | "olmo3"
+                | "granite"
         ) {
             return Err(MetalError::UnsupportedArch(arch));
         }
 
         let pfx = arch.as_str();
         let is_qwen = matches!(pfx, "qwen2" | "qwen3");
-        let is_neox = matches!(pfx, "qwen2" | "qwen3" | "phi3");
+        let is_olmo = matches!(pfx, "olmo2" | "olmo3");
+        let is_neox = matches!(pfx, "qwen2" | "qwen3" | "phi3" | "olmo2" | "olmo3");
         let n_layers = gguf_ref.req_usize(&format!("{pfx}.block_count"))?;
         let n_embd = gguf_ref.req_usize(&format!("{pfx}.embedding_length"))?;
         let n_ff = gguf_ref.req_usize(&format!("{pfx}.feed_forward_length"))?;
@@ -524,6 +604,8 @@ impl LlamaMetalRunner {
             1_000_000.0
         } else if pfx == "smollm3" {
             5_000_000.0
+        } else if is_olmo {
+            500_000.0
         } else {
             10_000.0
         };
@@ -531,16 +613,26 @@ impl LlamaMetalRunner {
             .get_meta(&format!("{pfx}.rope.freq_base"))
             .and_then(|v| v.as_f32())
             .unwrap_or(default_freq_base);
+        let rope_freq_base_swa = gguf_ref
+            .get_meta(&format!("{pfx}.rope.freq_base_swa"))
+            .and_then(|v| v.as_f32())
+            .unwrap_or(rope_freq_base);
         let rms_eps = gguf_ref
             .get_meta(&format!("{pfx}.attention.layer_norm_rms_epsilon"))
             .and_then(|v| v.as_f32())
-            .unwrap_or(if is_qwen || pfx == "smollm3" {
+            .unwrap_or(if is_qwen || pfx == "smollm3" || is_olmo {
                 1e-6
             } else {
                 1e-5
             });
         let rope_type = if is_neox { 1 } else { 0 };
-        let use_rope = if let Some(pat) = gguf_ref
+        let rope_finetuned = gguf_ref
+            .get_meta(&format!("{pfx}.rope.scaling.finetuned"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let use_rope = if !rope_finetuned {
+            vec![false; n_layers]
+        } else if let Some(pat) = gguf_ref
             .get_meta(&format!("{pfx}.rope.pattern"))
             .and_then(|v| v.as_bool_array())
             && pat.len() == n_layers
@@ -565,10 +657,48 @@ impl LlamaMetalRunner {
                 .and_then(|v| v.as_usize())
                 .filter(|&w| w > 0)
         };
+        let is_swa = if sliding_window.is_none() {
+            vec![false; n_layers]
+        } else if let Some(pat) = gguf_ref
+            .get_meta(&format!("{pfx}.attention.sliding_window_pattern"))
+            .and_then(|v| v.as_usize())
+            && pat > 0
+        {
+            (0..n_layers).map(|l| (l + 1) % pat != 0).collect()
+        } else if is_olmo {
+            (0..n_layers).map(|l| (l + 1) % 4 != 0).collect()
+        } else {
+            vec![true; n_layers]
+        };
         let rope_orig_ctx = gguf_ref
             .get_meta(&format!("{pfx}.rope.scaling.original_context_length"))
             .and_then(|v| v.as_usize())
             .unwrap_or(max_ctx_train);
+        let embedding_scale = gguf_ref
+            .get_meta(&format!("{pfx}.embedding_scale"))
+            .and_then(|v| v.as_f32())
+            .filter(|&s| s != 0.0)
+            .unwrap_or(1.0);
+        let default_attn_scale = 1.0 / (head_dim as f32).sqrt();
+        let (attn_scale, custom_attn_scale) = if let Some(s) = gguf_ref
+            .get_meta(&format!("{pfx}.attention.scale"))
+            .and_then(|v| v.as_f32())
+            .filter(|&s| s != 0.0)
+        {
+            (s, (s - default_attn_scale).abs() > 1e-12)
+        } else {
+            (default_attn_scale, false)
+        };
+        let residual_scale = gguf_ref
+            .get_meta(&format!("{pfx}.residual_scale"))
+            .and_then(|v| v.as_f32())
+            .filter(|&s| s != 0.0)
+            .unwrap_or(1.0);
+        let inv_logit_scale = gguf_ref
+            .get_meta(&format!("{pfx}.logit_scale"))
+            .and_then(|v| v.as_f32())
+            .filter(|&s| s != 0.0)
+            .map_or(1.0, |s| 1.0 / s);
 
         let embd_info =
             gguf_ref
@@ -601,6 +731,9 @@ impl LlamaMetalRunner {
             rms_norm: build_pipe(&device, &lib, "rms_norm_f32", 256)?,
             qk_norm: build_pipe(&device, &lib, "qk_norm_f32", 32)?,
             add_bias: build_pipe(&device, &lib, "add_bias_f32", 256)?,
+            copy_f32: build_pipe(&device, &lib, "copy_f32", 256)?,
+            scale_inplace: build_pipe(&device, &lib, "scale_inplace_f32", 256)?,
+            scale_axpy: build_pipe(&device, &lib, "scale_axpy_f32", 256)?,
             rope_kv: build_pipe(&device, &lib, "rope_and_kv_store_f16", 64)?,
             gqa_attn: build_pipe(&device, &lib, "gqa_attn_f16_kv", 128)?,
             gemv_q4_0: build_pipe(&device, &lib, "gemv_q4_0_res", 128)?,
@@ -707,19 +840,21 @@ impl LlamaMetalRunner {
         let mut layers = Vec::with_capacity(n_layers);
         for l in 0..n_layers {
             let ltag = format!("blk.{l}");
-            let q_norm = load_opt_gpu_f32_vec(
+            let q_norm = load_opt_gpu_qk_norm(
                 &device,
                 gguf_ref,
                 &format!("{ltag}.attn_q_norm.weight"),
                 &ltag,
                 head_dim,
+                q_dim,
             )?;
-            let k_norm = load_opt_gpu_f32_vec(
+            let k_norm = load_opt_gpu_qk_norm(
                 &device,
                 gguf_ref,
                 &format!("{ltag}.attn_k_norm.weight"),
                 &ltag,
                 head_dim,
+                kv_dim,
             )?;
             let qkv_bias_name = format!("{ltag}.attn_qkv.bias");
             let (bq, bk, bv) = if gguf_ref.tensor_info(&qkv_bias_name).is_some() {
@@ -828,12 +963,38 @@ impl LlamaMetalRunner {
 
             let gate_name = format!("{ltag}.ffn_gate.weight");
             let up_name = format!("{ltag}.ffn_up.weight");
-            let (w_gate, w_up) = if gguf_ref.tensor_info(&gate_name).is_some() {
+            let (w_gate, w_up, b_gate, b_up) = if gguf_ref.tensor_info(&gate_name).is_some() {
                 (
                     load_gpu_mat(&device, gguf_ref, sw, &gate_name, &ltag, n_embd, n_ff)?,
                     load_gpu_mat(&device, gguf_ref, sw, &up_name, &ltag, n_embd, n_ff)?,
+                    load_opt_gpu_f32_vec(
+                        &device,
+                        gguf_ref,
+                        &format!("{ltag}.ffn_gate.bias"),
+                        &ltag,
+                        n_ff,
+                    )?,
+                    load_opt_gpu_f32_vec(
+                        &device,
+                        gguf_ref,
+                        &format!("{ltag}.ffn_up.bias"),
+                        &ltag,
+                        n_ff,
+                    )?,
                 )
             } else {
+                let up_bias_name = format!("{ltag}.ffn_up.bias");
+                let (bg, bu) = if gguf_ref.tensor_info(&up_bias_name).is_some() {
+                    let (info, bytes) = gguf_ref.req_tensor(&up_bias_name, &ltag, &[2 * n_ff])?;
+                    let mut full = vec![0.0f32; 2 * n_ff];
+                    dequantize_row_bytes(info.dtype, bytes, &mut full);
+                    (
+                        Some(upload_f32(&device, &full[..n_ff])?),
+                        Some(upload_f32(&device, &full[n_ff..])?),
+                    )
+                } else {
+                    (None, None)
+                };
                 (
                     load_gpu_mat_slice(
                         &device,
@@ -859,30 +1020,81 @@ impl LlamaMetalRunner {
                         n_ff,
                         n_ff,
                     )?,
+                    bg,
+                    bu,
                 )
             };
+            let b_down = load_opt_gpu_f32_vec(
+                &device,
+                gguf_ref,
+                &format!("{ltag}.ffn_down.bias"),
+                &ltag,
+                n_embd,
+            )?;
 
-            layers.push(GpuLayer {
-                attn_norm: load_gpu_f32_vec(
+            let attn_norm = if is_olmo {
+                load_opt_gpu_f32_vec(
                     &device,
                     gguf_ref,
                     &format!("{ltag}.attn_norm.weight"),
                     &ltag,
                     n_embd,
-                )?,
-                ffn_norm: load_gpu_f32_vec(
+                )?
+            } else {
+                Some(load_gpu_f32_vec(
+                    &device,
+                    gguf_ref,
+                    &format!("{ltag}.attn_norm.weight"),
+                    &ltag,
+                    n_embd,
+                )?)
+            };
+            let ffn_norm = if is_olmo {
+                load_opt_gpu_f32_vec(
                     &device,
                     gguf_ref,
                     &format!("{ltag}.ffn_norm.weight"),
                     &ltag,
                     n_embd,
-                )?,
+                )?
+            } else {
+                Some(load_gpu_f32_vec(
+                    &device,
+                    gguf_ref,
+                    &format!("{ltag}.ffn_norm.weight"),
+                    &ltag,
+                    n_embd,
+                )?)
+            };
+            let post_attn_norm = load_opt_gpu_f32_vec(
+                &device,
+                gguf_ref,
+                &format!("{ltag}.post_attention_norm.weight"),
+                &ltag,
+                n_embd,
+            )?;
+            let post_ffn_norm = load_opt_gpu_f32_vec(
+                &device,
+                gguf_ref,
+                &format!("{ltag}.post_ffw_norm.weight"),
+                &ltag,
+                n_embd,
+            )?;
+
+            layers.push(GpuLayer {
+                attn_norm,
+                ffn_norm,
+                post_attn_norm,
+                post_ffn_norm,
                 q_norm,
                 k_norm,
                 bq,
                 bk,
                 bv,
                 bo,
+                b_gate,
+                b_up,
+                b_down,
                 wq,
                 wk,
                 wv,
@@ -916,6 +1128,7 @@ impl LlamaMetalRunner {
         let argmax_buf = alloc_buf(&device, 16)?;
         let x = alloc_buf(&device, MAX_BATCH * n_embd * f32_sz)?;
         let xb = alloc_buf(&device, MAX_BATCH * n_embd.max(q_dim) * f32_sz)?;
+        let xb2 = alloc_buf(&device, MAX_BATCH * n_embd * f32_sz)?;
         let q = alloc_buf(&device, MAX_BATCH * q_dim * f32_sz)?;
         let k = alloc_buf(&device, MAX_BATCH * kv_dim * f32_sz)?;
         let v = alloc_buf(&device, MAX_BATCH * kv_dim * f32_sz)?;
@@ -936,10 +1149,17 @@ impl LlamaMetalRunner {
                 vocab_size,
                 max_ctx,
                 rope_freq_base,
+                rope_freq_base_swa,
                 rms_eps,
                 rope_type,
                 sliding_window,
+                is_swa,
                 use_rope,
+                embedding_scale,
+                attn_scale,
+                custom_attn_scale,
+                residual_scale,
+                inv_logit_scale,
             },
             device,
             queue,
@@ -956,6 +1176,7 @@ impl LlamaMetalRunner {
             argmax_buf,
             x,
             xb,
+            xb2,
             q,
             k,
             v,
@@ -1163,21 +1384,133 @@ impl LlamaMetalRunner {
         Ok(())
     }
 
+    fn encode_copy_f32(
+        &self,
+        enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        src_buf: &ProtocolObject<dyn MTLBuffer>,
+        dst_buf: &ProtocolObject<dyn MTLBuffer>,
+        n: usize,
+    ) -> Result<(), MetalError> {
+        const TG: usize = 256;
+        require_fit(&self.pipes.copy_f32, "copy_f32", TG)?;
+        let n_u32 = n as u32;
+        enc.setComputePipelineState(&self.pipes.copy_f32);
+        // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(src_buf), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(dst_buf), 0, 1);
+            enc.setBytes_length_atIndex(
+                NonNull::from(&n_u32).cast::<c_void>(),
+                core::mem::size_of::<u32>(),
+                2,
+            );
+        }
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: n.div_ceil(TG),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: TG,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+
+    fn encode_scale_inplace(
+        &self,
+        enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        y_buf: &ProtocolObject<dyn MTLBuffer>,
+        n: usize,
+        scale: f32,
+    ) -> Result<(), MetalError> {
+        if (scale - 1.0).abs() <= 1e-12 {
+            return Ok(());
+        }
+        const TG: usize = 256;
+        require_fit(&self.pipes.scale_inplace, "scale_inplace_f32", TG)?;
+        let sargs = ScaleVecArgs { n: n as u32, scale };
+        enc.setComputePipelineState(&self.pipes.scale_inplace);
+        // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(y_buf), 0, 0);
+            enc.setBytes_length_atIndex(
+                NonNull::from(&sargs).cast::<c_void>(),
+                core::mem::size_of::<ScaleVecArgs>(),
+                1,
+            );
+        }
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: n.div_ceil(TG),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: TG,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+
+    fn encode_scale_axpy(
+        &self,
+        enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        src_buf: &ProtocolObject<dyn MTLBuffer>,
+        dst_buf: &ProtocolObject<dyn MTLBuffer>,
+        n: usize,
+        scale: f32,
+    ) -> Result<(), MetalError> {
+        const TG: usize = 256;
+        require_fit(&self.pipes.scale_axpy, "scale_axpy_f32", TG)?;
+        let sargs = ScaleVecArgs { n: n as u32, scale };
+        enc.setComputePipelineState(&self.pipes.scale_axpy);
+        // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(src_buf), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(dst_buf), 0, 1);
+            enc.setBytes_length_atIndex(
+                NonNull::from(&sargs).cast::<c_void>(),
+                core::mem::size_of::<ScaleVecArgs>(),
+                2,
+            );
+        }
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: n.div_ceil(TG),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: TG,
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+
     fn encode_decode_attn(
         &self,
         enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        li: usize,
         layer: &GpuLayer,
         seq_len: usize,
     ) {
-        if let Some(w) = self.cfg.sliding_window {
+        if self.cfg.layer_needs_ext_attn(li) {
             let aargs = AttnExtArgs {
                 n_head: self.cfg.n_head as u32,
                 n_head_kv: self.cfg.n_head_kv as u32,
                 head_dim: self.cfg.head_dim as u32,
                 start_pos: (seq_len - 1) as u32,
                 n_tok: 1,
-                window: w as u32,
-                attn_scale: 1.0 / (self.cfg.head_dim as f32).sqrt(),
+                window: self.cfg.layer_window(li).unwrap_or(0) as u32,
+                attn_scale: self.cfg.attn_scale,
                 attn_softcap: 0.0,
             };
             enc.setComputePipelineState(&self.pipes.gqa_attn_ext_batch);
@@ -1243,20 +1576,21 @@ impl LlamaMetalRunner {
     fn encode_prefill_attn(
         &self,
         enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        li: usize,
         layer: &GpuLayer,
         chunk_pos: usize,
         b: usize,
     ) {
         const TG: usize = 128;
-        if let Some(w) = self.cfg.sliding_window {
+        if self.cfg.layer_needs_ext_attn(li) {
             let aargs = AttnExtArgs {
                 n_head: self.cfg.n_head as u32,
                 n_head_kv: self.cfg.n_head_kv as u32,
                 head_dim: self.cfg.head_dim as u32,
                 start_pos: chunk_pos as u32,
                 n_tok: b as u32,
-                window: w as u32,
-                attn_scale: 1.0 / (self.cfg.head_dim as f32).sqrt(),
+                window: self.cfg.layer_window(li).unwrap_or(0) as u32,
+                attn_scale: self.cfg.attn_scale,
                 attn_softcap: 0.0,
             };
             enc.setComputePipelineState(&self.pipes.gqa_attn_ext_batch);
@@ -1753,18 +2087,24 @@ impl LlamaMetalRunner {
                     &self.x,
                     b,
                 );
+                self.encode_scale_inplace(
+                    &enc,
+                    &self.x,
+                    b * self.cfg.n_embd,
+                    self.cfg.embedding_scale,
+                )?;
             }
+
+            let q_dim = self.cfg.n_head * self.cfg.head_dim;
+            let need_separate_res = (self.cfg.residual_scale - 1.0).abs() > 1e-12;
 
             // 2. Transformer layers for all `b` tokens in ONE command buffer
             for (li, layer) in self.layers.iter().enumerate() {
-                self.encode_rms_norm_batch(
-                    &enc,
-                    &self.x,
-                    &layer.attn_norm,
-                    &self.xb,
-                    self.cfg.n_embd,
-                    b,
-                )?;
+                if let Some(ref an) = layer.attn_norm {
+                    self.encode_rms_norm_batch(&enc, &self.x, an, &self.xb, self.cfg.n_embd, b)?;
+                } else {
+                    self.encode_copy_f32(&enc, &self.x, &self.xb, b * self.cfg.n_embd)?;
+                }
 
                 self.encode_gemm(&enc, &layer.wq, &self.xb, &self.q, b, false)?;
                 self.encode_gemm(&enc, &layer.wk, &self.xb, &self.k, b, false)?;
@@ -1779,10 +2119,10 @@ impl LlamaMetalRunner {
                     self.encode_add_bias(&enc, bv, &self.v, layer.wv.rows, b)?;
                 }
 
-                if let Some(ref qn) = layer.q_norm {
+                if let Some((ref qn, qn_len)) = layer.q_norm {
                     require_fit(&self.pipes.qk_norm_batch, "qk_norm_f32_batch", 32)?;
                     let na = NormArgs {
-                        n: self.cfg.head_dim as u32,
+                        n: qn_len as u32,
                         eps: self.cfg.rms_eps,
                     };
                     enc.setComputePipelineState(&self.pipes.qk_norm_batch);
@@ -1798,7 +2138,7 @@ impl LlamaMetalRunner {
                     }
                     enc.dispatchThreadgroups_threadsPerThreadgroup(
                         MTLSize {
-                            width: self.cfg.n_head,
+                            width: q_dim / qn_len,
                             height: b,
                             depth: 1,
                         },
@@ -1809,10 +2149,10 @@ impl LlamaMetalRunner {
                         },
                     );
                 }
-                if let Some(ref kn) = layer.k_norm {
+                if let Some((ref kn, kn_len)) = layer.k_norm {
                     require_fit(&self.pipes.qk_norm_batch, "qk_norm_f32_batch", 32)?;
                     let na = NormArgs {
-                        n: self.cfg.head_dim as u32,
+                        n: kn_len as u32,
                         eps: self.cfg.rms_eps,
                     };
                     enc.setComputePipelineState(&self.pipes.qk_norm_batch);
@@ -1828,7 +2168,7 @@ impl LlamaMetalRunner {
                     }
                     enc.dispatchThreadgroups_threadsPerThreadgroup(
                         MTLSize {
-                            width: self.cfg.n_head_kv,
+                            width: kv_dim / kn_len,
                             height: b,
                             depth: 1,
                         },
@@ -1856,7 +2196,7 @@ impl LlamaMetalRunner {
                         pos: chunk_pos as u32,
                         rope_type: self.cfg.rope_type,
                         has_freq_factors: u32::from(self.has_rope_freqs),
-                        freq_base: self.cfg.rope_freq_base,
+                        freq_base: self.cfg.layer_rope_freq_base(li),
                     };
                     enc.setComputePipelineState(&self.pipes.rope_kv_batch);
                     // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
@@ -1888,27 +2228,62 @@ impl LlamaMetalRunner {
                 }
 
                 // Batched causal FlashAttention (`simdgroup_mma` tiled)
-                self.encode_prefill_attn(&enc, layer, chunk_pos, b);
+                self.encode_prefill_attn(&enc, li, layer, chunk_pos, b);
 
-                // Wo + residual add
-                self.encode_gemm(&enc, &layer.wo, &self.xb, &self.x, b, true)?;
-                if let Some(ref bo) = layer.bo {
-                    self.encode_add_bias(&enc, bo, &self.x, self.cfg.n_embd, b)?;
+                // Wo + optional bias + optional post-attn norm + residual add
+                if need_separate_res || layer.post_attn_norm.is_some() {
+                    self.encode_gemm(&enc, &layer.wo, &self.xb, &self.xb2, b, false)?;
+                    if let Some(ref bo) = layer.bo {
+                        self.encode_add_bias(&enc, bo, &self.xb2, self.cfg.n_embd, b)?;
+                    }
+                    if let Some(ref pan) = layer.post_attn_norm {
+                        self.encode_rms_norm_batch(
+                            &enc,
+                            &self.xb2,
+                            pan,
+                            &self.xb,
+                            self.cfg.n_embd,
+                            b,
+                        )?;
+                        self.encode_scale_axpy(
+                            &enc,
+                            &self.xb,
+                            &self.x,
+                            b * self.cfg.n_embd,
+                            self.cfg.residual_scale,
+                        )?;
+                    } else {
+                        self.encode_scale_axpy(
+                            &enc,
+                            &self.xb2,
+                            &self.x,
+                            b * self.cfg.n_embd,
+                            self.cfg.residual_scale,
+                        )?;
+                    }
+                } else {
+                    self.encode_gemm(&enc, &layer.wo, &self.xb, &self.x, b, true)?;
+                    if let Some(ref bo) = layer.bo {
+                        self.encode_add_bias(&enc, bo, &self.x, self.cfg.n_embd, b)?;
+                    }
                 }
 
-                // FFN RMSNorm
-                self.encode_rms_norm_batch(
-                    &enc,
-                    &self.x,
-                    &layer.ffn_norm,
-                    &self.xb,
-                    self.cfg.n_embd,
-                    b,
-                )?;
+                // FFN RMSNorm (optional on OLMo 2/3)
+                if let Some(ref fn_w) = layer.ffn_norm {
+                    self.encode_rms_norm_batch(&enc, &self.x, fn_w, &self.xb, self.cfg.n_embd, b)?;
+                } else {
+                    self.encode_copy_f32(&enc, &self.x, &self.xb, b * self.cfg.n_embd)?;
+                }
 
                 // Batched Gate + Up via hardware simdgroup_float8x8 GEMM + SwiGLU
                 self.encode_gemm(&enc, &layer.w_gate, &self.xb, &self.hb, b, false)?;
                 self.encode_gemm(&enc, &layer.w_up, &self.xb, &self.hb2, b, false)?;
+                if let Some(ref bg) = layer.b_gate {
+                    self.encode_add_bias(&enc, bg, &self.hb, self.cfg.n_ff, b)?;
+                }
+                if let Some(ref bu) = layer.b_up {
+                    self.encode_add_bias(&enc, bu, &self.hb2, self.cfg.n_ff, b)?;
+                }
                 {
                     const TG: usize = 256;
                     let total_ff = (b * self.cfg.n_ff) as u32;
@@ -1937,8 +2312,40 @@ impl LlamaMetalRunner {
                     );
                 }
 
-                // W_down + residual add
-                self.encode_gemm(&enc, &layer.w_down, &self.hb, &self.x, b, true)?;
+                // W_down + optional bias + optional post-ffn norm + residual add
+                if need_separate_res || layer.post_ffn_norm.is_some() || layer.b_down.is_some() {
+                    self.encode_gemm(&enc, &layer.w_down, &self.hb, &self.xb2, b, false)?;
+                    if let Some(ref bd) = layer.b_down {
+                        self.encode_add_bias(&enc, bd, &self.xb2, self.cfg.n_embd, b)?;
+                    }
+                    if let Some(ref pfn) = layer.post_ffn_norm {
+                        self.encode_rms_norm_batch(
+                            &enc,
+                            &self.xb2,
+                            pfn,
+                            &self.xb,
+                            self.cfg.n_embd,
+                            b,
+                        )?;
+                        self.encode_scale_axpy(
+                            &enc,
+                            &self.xb,
+                            &self.x,
+                            b * self.cfg.n_embd,
+                            self.cfg.residual_scale,
+                        )?;
+                    } else {
+                        self.encode_scale_axpy(
+                            &enc,
+                            &self.xb2,
+                            &self.x,
+                            b * self.cfg.n_embd,
+                            self.cfg.residual_scale,
+                        )?;
+                    }
+                } else {
+                    self.encode_gemm(&enc, &layer.w_down, &self.hb, &self.x, b, true)?;
+                }
             }
 
             // 3. Output norm + LM head only for the final token of the final chunk
@@ -1968,6 +2375,12 @@ impl LlamaMetalRunner {
                 if let Some(ref ob) = self.output_bias {
                     self.encode_add_bias(&enc, ob, &self.logits, self.cfg.vocab_size, 1)?;
                 }
+                self.encode_scale_inplace(
+                    &enc,
+                    &self.logits,
+                    self.cfg.vocab_size,
+                    self.cfg.inv_logit_scale,
+                )?;
             }
 
             enc.endEncoding();
@@ -2058,20 +2471,27 @@ impl LlamaMetalRunner {
                 token_id,
                 &self.x,
             );
+            self.encode_scale_inplace(enc, &self.x, self.cfg.n_embd, self.cfg.embedding_scale)?;
         }
 
         let half_rope = self.cfg.rope_dim / 2;
         let rope_threads = (self.cfg.n_head + self.cfg.n_head_kv) * half_rope;
+        let q_dim = self.cfg.n_head * self.cfg.head_dim;
         let kv_dim = self.cfg.n_head_kv * self.cfg.head_dim;
         let rope_total = rope_threads.max(kv_dim);
+        let need_separate_res = (self.cfg.residual_scale - 1.0).abs() > 1e-12;
 
         for (li, layer) in self.layers.iter().enumerate() {
-            self.encode_rms_norm(enc, &self.x, &layer.attn_norm, &self.xb, self.cfg.n_embd)?;
+            if let Some(ref an) = layer.attn_norm {
+                self.encode_rms_norm(enc, &self.x, an, &self.xb, self.cfg.n_embd)?;
+            } else {
+                self.encode_copy_f32(enc, &self.x, &self.xb, self.cfg.n_embd)?;
+            }
             self.encode_qkv_gemv(enc, layer)?;
 
-            if let Some(ref qn) = layer.q_norm {
+            if let Some((ref qn, qn_len)) = layer.q_norm {
                 let na = NormArgs {
-                    n: self.cfg.head_dim as u32,
+                    n: qn_len as u32,
                     eps: self.cfg.rms_eps,
                 };
                 enc.setComputePipelineState(&self.pipes.qk_norm);
@@ -2087,7 +2507,7 @@ impl LlamaMetalRunner {
                 }
                 enc.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
-                        width: self.cfg.n_head,
+                        width: q_dim / qn_len,
                         height: 1,
                         depth: 1,
                     },
@@ -2098,9 +2518,9 @@ impl LlamaMetalRunner {
                     },
                 );
             }
-            if let Some(ref kn) = layer.k_norm {
+            if let Some((ref kn, kn_len)) = layer.k_norm {
                 let na = NormArgs {
-                    n: self.cfg.head_dim as u32,
+                    n: kn_len as u32,
                     eps: self.cfg.rms_eps,
                 };
                 enc.setComputePipelineState(&self.pipes.qk_norm);
@@ -2116,7 +2536,7 @@ impl LlamaMetalRunner {
                 }
                 enc.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
-                        width: self.cfg.n_head_kv,
+                        width: kv_dim / kn_len,
                         height: 1,
                         depth: 1,
                     },
@@ -2142,7 +2562,7 @@ impl LlamaMetalRunner {
                     pos: pos as u32,
                     rope_type: self.cfg.rope_type,
                     has_freq_factors: u32::from(self.has_rope_freqs),
-                    freq_base: self.cfg.rope_freq_base,
+                    freq_base: self.cfg.layer_rope_freq_base(li),
                 };
                 enc.setComputePipelineState(&self.pipes.rope_kv);
                 // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
@@ -2173,16 +2593,48 @@ impl LlamaMetalRunner {
                 );
             }
 
-            self.encode_decode_attn(enc, layer, pos + 1);
+            self.encode_decode_attn(enc, li, layer, pos + 1);
 
-            self.encode_gemv(enc, &layer.wo, &self.xb, &self.x, true)?;
-            if let Some(ref bo) = layer.bo {
-                self.encode_add_bias(enc, bo, &self.x, self.cfg.n_embd, 1)?;
+            if need_separate_res || layer.post_attn_norm.is_some() {
+                self.encode_gemv(enc, &layer.wo, &self.xb, &self.xb2, false)?;
+                if let Some(ref bo) = layer.bo {
+                    self.encode_add_bias(enc, bo, &self.xb2, self.cfg.n_embd, 1)?;
+                }
+                if let Some(ref pan) = layer.post_attn_norm {
+                    self.encode_rms_norm(enc, &self.xb2, pan, &self.xb, self.cfg.n_embd)?;
+                    self.encode_scale_axpy(
+                        enc,
+                        &self.xb,
+                        &self.x,
+                        self.cfg.n_embd,
+                        self.cfg.residual_scale,
+                    )?;
+                } else {
+                    self.encode_scale_axpy(
+                        enc,
+                        &self.xb2,
+                        &self.x,
+                        self.cfg.n_embd,
+                        self.cfg.residual_scale,
+                    )?;
+                }
+            } else {
+                self.encode_gemv(enc, &layer.wo, &self.xb, &self.x, true)?;
+                if let Some(ref bo) = layer.bo {
+                    self.encode_add_bias(enc, bo, &self.x, self.cfg.n_embd, 1)?;
+                }
             }
-            self.encode_rms_norm(enc, &self.x, &layer.ffn_norm, &self.xb, self.cfg.n_embd)?;
+
+            if let Some(ref fn_w) = layer.ffn_norm {
+                self.encode_rms_norm(enc, &self.x, fn_w, &self.xb, self.cfg.n_embd)?;
+            } else {
+                self.encode_copy_f32(enc, &self.x, &self.xb, self.cfg.n_embd)?;
+            }
 
             if layer.w_gate.dtype == DType::Q4_0
                 && layer.w_up.dtype == DType::Q4_0
+                && layer.b_gate.is_none()
+                && layer.b_up.is_none()
                 && !self.lora.has(&layer.w_gate.name)
                 && !self.lora.has(&layer.w_up.name)
             {
@@ -2222,6 +2674,12 @@ impl LlamaMetalRunner {
             } else {
                 self.encode_gemv(enc, &layer.w_gate, &self.xb, &self.hb, false)?;
                 self.encode_gemv(enc, &layer.w_up, &self.xb, &self.hb2, false)?;
+                if let Some(ref bg) = layer.b_gate {
+                    self.encode_add_bias(enc, bg, &self.hb, self.cfg.n_ff, 1)?;
+                }
+                if let Some(ref bu) = layer.b_up {
+                    self.encode_add_bias(enc, bu, &self.hb2, self.cfg.n_ff, 1)?;
+                }
                 const TG: usize = 256;
                 let total_ff = self.cfg.n_ff as u32;
                 require_fit(&self.pipes.silu_mul, "silu_mul", TG)?;
@@ -2250,7 +2708,32 @@ impl LlamaMetalRunner {
                 );
             }
 
-            self.encode_gemv(enc, &layer.w_down, &self.hb, &self.x, true)?;
+            if need_separate_res || layer.post_ffn_norm.is_some() || layer.b_down.is_some() {
+                self.encode_gemv(enc, &layer.w_down, &self.hb, &self.xb2, false)?;
+                if let Some(ref bd) = layer.b_down {
+                    self.encode_add_bias(enc, bd, &self.xb2, self.cfg.n_embd, 1)?;
+                }
+                if let Some(ref pfn) = layer.post_ffn_norm {
+                    self.encode_rms_norm(enc, &self.xb2, pfn, &self.xb, self.cfg.n_embd)?;
+                    self.encode_scale_axpy(
+                        enc,
+                        &self.xb,
+                        &self.x,
+                        self.cfg.n_embd,
+                        self.cfg.residual_scale,
+                    )?;
+                } else {
+                    self.encode_scale_axpy(
+                        enc,
+                        &self.xb2,
+                        &self.x,
+                        self.cfg.n_embd,
+                        self.cfg.residual_scale,
+                    )?;
+                }
+            } else {
+                self.encode_gemv(enc, &layer.w_down, &self.hb, &self.x, true)?;
+            }
         }
 
         if compute_logits {
@@ -2264,6 +2747,12 @@ impl LlamaMetalRunner {
             if let Some(ref ob) = self.output_bias {
                 self.encode_add_bias(enc, ob, &self.logits, self.cfg.vocab_size, 1)?;
             }
+            self.encode_scale_inplace(
+                enc,
+                &self.logits,
+                self.cfg.vocab_size,
+                self.cfg.inv_logit_scale,
+            )?;
         }
         Ok(())
     }
@@ -2427,6 +2916,7 @@ impl LlamaMetalRunner {
             }
 
             for (li, layer) in self.layers.iter().enumerate() {
+                let q_dim = self.cfg.n_head * self.cfg.head_dim;
                 // 1: attn_norm
                 {
                     let cb = pqueue
@@ -2435,7 +2925,11 @@ impl LlamaMetalRunner {
                     let enc = cb
                         .computeCommandEncoder()
                         .ok_or(MetalError::CommandEncodeFailed)?;
-                    self.encode_rms_norm(&enc, &self.x, &layer.attn_norm, &self.xb, n_embd)?;
+                    if let Some(ref an) = layer.attn_norm {
+                        self.encode_rms_norm(&enc, &self.x, an, &self.xb, n_embd)?;
+                    } else {
+                        self.encode_copy_f32(&enc, &self.x, &self.xb, n_embd)?;
+                    }
                     enc.endEncoding();
                     cb.commit();
                     pending.push((1, cb));
@@ -2461,11 +2955,11 @@ impl LlamaMetalRunner {
                     let enc = cb
                         .computeCommandEncoder()
                         .ok_or(MetalError::CommandEncodeFailed)?;
-                    let na = NormArgs {
-                        n: self.cfg.head_dim as u32,
-                        eps: self.cfg.rms_eps,
-                    };
-                    if let Some(ref qn) = layer.q_norm {
+                    if let Some((ref qn, qn_len)) = layer.q_norm {
+                        let na = NormArgs {
+                            n: qn_len as u32,
+                            eps: self.cfg.rms_eps,
+                        };
                         enc.setComputePipelineState(&self.pipes.qk_norm);
                         // SAFETY: Buffers live until `drain`.
                         unsafe {
@@ -2479,7 +2973,7 @@ impl LlamaMetalRunner {
                         }
                         enc.dispatchThreadgroups_threadsPerThreadgroup(
                             MTLSize {
-                                width: self.cfg.n_head,
+                                width: q_dim / qn_len,
                                 height: 1,
                                 depth: 1,
                             },
@@ -2490,7 +2984,11 @@ impl LlamaMetalRunner {
                             },
                         );
                     }
-                    if let Some(ref kn) = layer.k_norm {
+                    if let Some((ref kn, kn_len)) = layer.k_norm {
+                        let na = NormArgs {
+                            n: kn_len as u32,
+                            eps: self.cfg.rms_eps,
+                        };
                         enc.setComputePipelineState(&self.pipes.qk_norm);
                         // SAFETY: Buffers live until `drain`.
                         unsafe {
@@ -2504,7 +3002,7 @@ impl LlamaMetalRunner {
                         }
                         enc.dispatchThreadgroups_threadsPerThreadgroup(
                             MTLSize {
-                                width: self.cfg.n_head_kv,
+                                width: kv_dim / kn_len,
                                 height: 1,
                                 depth: 1,
                             },
@@ -2540,7 +3038,7 @@ impl LlamaMetalRunner {
                         pos: pos as u32,
                         rope_type: self.cfg.rope_type,
                         has_freq_factors: u32::from(self.has_rope_freqs),
-                        freq_base: self.cfg.rope_freq_base,
+                        freq_base: self.cfg.layer_rope_freq_base(li),
                     };
                     enc.setComputePipelineState(&self.pipes.rope_kv);
                     // SAFETY: Buffers live until `drain`.
@@ -2581,7 +3079,7 @@ impl LlamaMetalRunner {
                     let enc = cb
                         .computeCommandEncoder()
                         .ok_or(MetalError::CommandEncodeFailed)?;
-                    self.encode_decode_attn(&enc, layer, pos + 1);
+                    self.encode_decode_attn(&enc, li, layer, pos + 1);
                     enc.endEncoding();
                     cb.commit();
                     pending.push((7, cb));
@@ -2607,7 +3105,11 @@ impl LlamaMetalRunner {
                     let enc = cb
                         .computeCommandEncoder()
                         .ok_or(MetalError::CommandEncodeFailed)?;
-                    self.encode_rms_norm(&enc, &self.x, &layer.ffn_norm, &self.xb, n_embd)?;
+                    if let Some(ref fn_w) = layer.ffn_norm {
+                        self.encode_rms_norm(&enc, &self.x, fn_w, &self.xb, n_embd)?;
+                    } else {
+                        self.encode_copy_f32(&enc, &self.x, &self.xb, n_embd)?;
+                    }
                     enc.endEncoding();
                     cb.commit();
                     pending.push((9, cb));
@@ -2866,14 +3368,11 @@ impl LlamaMetalRunner {
                     let enc = cb
                         .computeCommandEncoder()
                         .ok_or(MetalError::CommandEncodeFailed)?;
-                    self.encode_rms_norm_batch(
-                        &enc,
-                        &self.x,
-                        &layer.attn_norm,
-                        &self.xb,
-                        n_embd,
-                        b,
-                    )?;
+                    if let Some(ref an) = layer.attn_norm {
+                        self.encode_rms_norm_batch(&enc, &self.x, an, &self.xb, n_embd, b)?;
+                    } else {
+                        self.encode_copy_f32(&enc, &self.x, &self.xb, b * n_embd)?;
+                    }
                     enc.endEncoding();
                     cb.commit();
                     pp_pending.push((1, cb));
@@ -2916,7 +3415,7 @@ impl LlamaMetalRunner {
                         pos: chunk_pos as u32,
                         rope_type: self.cfg.rope_type,
                         has_freq_factors: u32::from(self.has_rope_freqs),
-                        freq_base: self.cfg.rope_freq_base,
+                        freq_base: self.cfg.layer_rope_freq_base(li),
                     };
                     enc.setComputePipelineState(&self.pipes.rope_kv_batch);
                     // SAFETY: Buffers live until `drain_pp`.
@@ -2957,7 +3456,7 @@ impl LlamaMetalRunner {
                     let enc = cb
                         .computeCommandEncoder()
                         .ok_or(MetalError::CommandEncodeFailed)?;
-                    self.encode_prefill_attn(&enc, layer, chunk_pos, b);
+                    self.encode_prefill_attn(&enc, li, layer, chunk_pos, b);
                     enc.endEncoding();
                     cb.commit();
                     pp_pending.push((6, cb));
@@ -2983,14 +3482,11 @@ impl LlamaMetalRunner {
                     let enc = cb
                         .computeCommandEncoder()
                         .ok_or(MetalError::CommandEncodeFailed)?;
-                    self.encode_rms_norm_batch(
-                        &enc,
-                        &self.x,
-                        &layer.ffn_norm,
-                        &self.xb,
-                        n_embd,
-                        b,
-                    )?;
+                    if let Some(ref fn_w) = layer.ffn_norm {
+                        self.encode_rms_norm_batch(&enc, &self.x, fn_w, &self.xb, n_embd, b)?;
+                    } else {
+                        self.encode_copy_f32(&enc, &self.x, &self.xb, b * n_embd)?;
+                    }
                     enc.endEncoding();
                     cb.commit();
                     pp_pending.push((8, cb));

@@ -45,6 +45,8 @@ pub struct SpecVerifyBuf {
     pub gdn_qkv_win: Vec<f32>,
     pub gdn_g_win: Vec<f32>,
     pub gdn_beta_win: Vec<f32>,
+    pub ssm_xbc_win: Vec<f32>,
+    pub ssm_dt_win: Vec<f32>,
     pub sc_bx_win: Vec<f32>,
     pub tmp_ssm_state: Vec<f32>,
     pub tmp_conv_hist: Vec<f32>,
@@ -64,6 +66,8 @@ impl SpecVerifyBuf {
             gdn_qkv_win: Vec::new(),
             gdn_g_win: Vec::new(),
             gdn_beta_win: Vec::new(),
+            ssm_xbc_win: Vec::new(),
+            ssm_dt_win: Vec::new(),
             sc_bx_win: Vec::new(),
             tmp_ssm_state: Vec::new(),
             tmp_conv_hist: Vec::new(),
@@ -96,6 +100,8 @@ impl SpecVerifyBuf {
             gdn_qkv_win: vec![0.0; n_gdn_layers * MAX_SPEC_WINDOW * conv_dim],
             gdn_g_win: vec![0.0; n_gdn_layers * MAX_SPEC_WINDOW * hv],
             gdn_beta_win: vec![0.0; n_gdn_layers * MAX_SPEC_WINDOW * hv],
+            ssm_xbc_win: Vec::new(),
+            ssm_dt_win: Vec::new(),
             sc_bx_win: Vec::new(),
             tmp_ssm_state: vec![0.0; hv * s_dim * s_dim],
             tmp_conv_hist: vec![0.0; conv_dim * hist_len],
@@ -103,6 +109,39 @@ impl SpecVerifyBuf {
             replay_k: vec![0.0; MAX_SPEC_WINDOW * k_dim],
             replay_v: vec![0.0; MAX_SPEC_WINDOW * v_dim],
             replay_out: vec![0.0; MAX_SPEC_WINDOW * v_dim],
+            last_window_len: 0,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_mamba2(
+        vocab_size: usize,
+        n_embd: usize,
+        n_ssm_layers: usize,
+        d_inner: usize,
+        bc_dim: usize,
+        n_ssm_heads: usize,
+        d_state: usize,
+        d_conv: usize,
+    ) -> Self {
+        let conv_dim = d_inner + 2 * bc_dim;
+        let hist_len = d_conv.saturating_sub(1);
+        Self {
+            logits_win: vec![0.0; MAX_SPEC_WINDOW * vocab_size],
+            hidden_win: vec![0.0; MAX_SPEC_WINDOW * n_embd],
+            norm_win: vec![0.0; MAX_SPEC_WINDOW * n_embd],
+            gdn_qkv_win: Vec::new(),
+            gdn_g_win: Vec::new(),
+            gdn_beta_win: Vec::new(),
+            ssm_xbc_win: vec![0.0; n_ssm_layers * MAX_SPEC_WINDOW * conv_dim],
+            ssm_dt_win: vec![0.0; n_ssm_layers * MAX_SPEC_WINDOW * n_ssm_heads],
+            sc_bx_win: Vec::new(),
+            tmp_ssm_state: vec![0.0; d_inner * d_state],
+            tmp_conv_hist: vec![0.0; conv_dim * hist_len],
+            replay_q: vec![0.0; MAX_SPEC_WINDOW * d_inner],
+            replay_k: vec![0.0; MAX_SPEC_WINDOW * bc_dim],
+            replay_v: vec![0.0; MAX_SPEC_WINDOW * bc_dim],
+            replay_out: vec![0.0; MAX_SPEC_WINDOW * d_inner],
             last_window_len: 0,
         }
     }
@@ -116,6 +155,8 @@ impl SpecVerifyBuf {
             gdn_qkv_win: Vec::new(),
             gdn_g_win: Vec::new(),
             gdn_beta_win: Vec::new(),
+            ssm_xbc_win: Vec::new(),
+            ssm_dt_win: Vec::new(),
             sc_bx_win: vec![0.0; n_sc_layers * MAX_SPEC_WINDOW * n_embd],
             tmp_ssm_state: Vec::new(),
             tmp_conv_hist: vec![0.0; n_embd * hist_len],
@@ -135,6 +176,8 @@ impl SpecVerifyBuf {
             gdn_qkv_win: Vec::new(),
             gdn_g_win: Vec::new(),
             gdn_beta_win: Vec::new(),
+            ssm_xbc_win: Vec::new(),
+            ssm_dt_win: Vec::new(),
             sc_bx_win: vec![0.0; MAX_SPEC_WINDOW * total_conv_floats],
             tmp_ssm_state: Vec::new(),
             tmp_conv_hist: vec![0.0; total_conv_floats],
@@ -180,7 +223,12 @@ pub enum LayerState {
         state: Vec<f32>,
         conv_hist: Vec<f32>,
     },
-    /// LFM2 gated short convolution history (`[n_embd, l_cache - 1]`).
+    /// Mamba-2 selective state space (`[n_ssm_heads, head_dim, d_state]` + causal Conv1d history `[conv_dim, d_conv - 1]`).
+    Ssm {
+        state: Vec<f32>,
+        conv_hist: Vec<f32>,
+    },
+    /// LFM2 / LFM3 gated short convolution history (`[n_embd, l_cache - 1]`).
     ShortConv { conv_hist: Vec<f32> },
 }
 
@@ -230,7 +278,7 @@ impl LayerState {
                 v_q8.fill(BlockQ8_0 { d: 0, qs: [0; 32] });
             }
             LayerState::SharedKv { .. } => {}
-            LayerState::DeltaNet { state, conv_hist } => {
+            LayerState::DeltaNet { state, conv_hist } | LayerState::Ssm { state, conv_hist } => {
                 state.fill(0.0);
                 conv_hist.fill(0.0);
             }
@@ -246,7 +294,7 @@ impl LayerState {
     pub fn is_recurrent(&self) -> bool {
         matches!(
             self,
-            LayerState::DeltaNet { .. } | LayerState::ShortConv { .. }
+            LayerState::DeltaNet { .. } | LayerState::Ssm { .. } | LayerState::ShortConv { .. }
         )
     }
 

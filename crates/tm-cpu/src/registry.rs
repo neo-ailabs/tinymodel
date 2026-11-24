@@ -58,6 +58,8 @@ pub type RmsNormF32Fn = fn(&mut [f32], &[f32], &[f32], f32);
 pub type L2NormF32Fn = fn(&mut [f32], f32);
 pub type GdnRecurrenceHeadFn =
     fn(&[f32], &[f32], &[f32], f32, f32, f32, &mut [f32], &mut [f32], usize);
+pub type Mamba2ScanHeadFn =
+    fn(&[f32], &[f32], &[f32], f32, f32, f32, &mut [f32], &mut [f32], usize, usize);
 
 /// Function-pointer table for CPU compute kernels at a given ISA tier.
 #[derive(Clone, Copy)]
@@ -107,6 +109,7 @@ pub struct KernelTable {
     pub rms_norm_f32: RmsNormF32Fn,
     pub l2_norm_f32: L2NormF32Fn,
     pub gdn_recurrence_head: GdnRecurrenceHeadFn,
+    pub mamba2_scan_head: Mamba2ScanHeadFn,
 }
 
 const GENERIC_TABLE: KernelTable = KernelTable {
@@ -155,6 +158,7 @@ const GENERIC_TABLE: KernelTable = KernelTable {
     rms_norm_f32: generic::rms_norm_f32,
     l2_norm_f32: generic::l2_norm_f32,
     gdn_recurrence_head: generic::gdn_recurrence_head,
+    mamba2_scan_head: generic::mamba2_scan_head,
 };
 
 #[cfg(target_arch = "aarch64")]
@@ -466,6 +470,25 @@ mod aarch64_wrappers {
     ) {
         // SAFETY: NEON is always available on aarch64.
         unsafe { neon_v80::gdn_recurrence_head(q_h, k_h, v_h, g, beta, scale, s_vh, o_h, head_dim) }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn neon_mamba2_scan_head(
+        x_h: &[f32],
+        b_g: &[f32],
+        c_g: &[f32],
+        da: f32,
+        dt: f32,
+        d_h: f32,
+        s_h: &mut [f32],
+        y_h: &mut [f32],
+        head_dim: usize,
+        d_state: usize,
+    ) {
+        // SAFETY: NEON is always available on aarch64.
+        unsafe {
+            neon_v80::mamba2_scan_head(x_h, b_g, c_g, da, dt, d_h, s_h, y_h, head_dim, d_state)
+        }
     }
 
     fn neon_v80_gemv_q4_0x4(
@@ -930,6 +953,7 @@ mod aarch64_wrappers {
         rms_norm_f32: neon_rms_norm_f32,
         l2_norm_f32: neon_l2_norm_f32,
         gdn_recurrence_head: neon_gdn_recurrence_head,
+        mamba2_scan_head: neon_mamba2_scan_head,
     };
 
     #[cfg(feature = "dotprod")]
@@ -979,6 +1003,7 @@ mod aarch64_wrappers {
         rms_norm_f32: neon_rms_norm_f32,
         l2_norm_f32: neon_l2_norm_f32,
         gdn_recurrence_head: neon_gdn_recurrence_head,
+        mamba2_scan_head: neon_mamba2_scan_head,
     };
 
     #[cfg(feature = "i8mm")]
@@ -1028,6 +1053,7 @@ mod aarch64_wrappers {
         rms_norm_f32: neon_rms_norm_f32,
         l2_norm_f32: neon_l2_norm_f32,
         gdn_recurrence_head: neon_gdn_recurrence_head,
+        mamba2_scan_head: neon_mamba2_scan_head,
     };
 }
 
@@ -1145,6 +1171,23 @@ mod x86_64_wrappers {
         unsafe { avx2::gdn_recurrence_head(q_h, k_h, v_h, g, beta, scale, s_vh, o_h, head_dim) }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn avx2_mamba2_scan_head(
+        x_h: &[f32],
+        b_g: &[f32],
+        c_g: &[f32],
+        da: f32,
+        dt: f32,
+        d_h: f32,
+        s_h: &mut [f32],
+        y_h: &mut [f32],
+        head_dim: usize,
+        d_state: usize,
+    ) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::mamba2_scan_head(x_h, b_g, c_g, da, dt, d_h, s_h, y_h, head_dim, d_state) }
+    }
+
     pub const AVX2_TABLE: KernelTable = KernelTable {
         isa: Isa::Avx2,
         vec_dot_q4_0_q8_0: avx2_vec_dot_q4_0,
@@ -1180,8 +1223,10 @@ mod x86_64_wrappers {
         dot_f32_f16: generic::dot_f32_f16,
         dot_f32_bf16: avx2_dot_f32_bf16,
         dot_f32_q8_0: avx2_dot_f32_q8_0,
+        axpy_f32: generic::axpy_f32,
         axpy_f32_f16: generic::axpy_f32_f16,
         axpy_f32_q8_0: avx2_axpy_f32_q8_0,
+        gemm_q4_0_transposed_tile: generic::gemm_q4_0_transposed_tile,
         f32_to_f16_slice: generic::f32_to_f16_slice,
         quantize_q8_0: generic::quantize_q8_0,
         quantize_q8_1: generic::quantize_q8_1,
@@ -1189,6 +1234,7 @@ mod x86_64_wrappers {
         rms_norm_f32: avx2_rms_norm_f32,
         l2_norm_f32: avx2_l2_norm_f32,
         gdn_recurrence_head: avx2_gdn_recurrence_head,
+        mamba2_scan_head: avx2_mamba2_scan_head,
     };
 }
 

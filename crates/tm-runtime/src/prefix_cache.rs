@@ -27,6 +27,10 @@ pub enum CachedLayer {
         state: Vec<f32>,
         conv_hist: Vec<f32>,
     },
+    Ssm {
+        state: Vec<f32>,
+        conv_hist: Vec<f32>,
+    },
     ShortConv {
         conv_hist: Vec<f32>,
     },
@@ -46,7 +50,7 @@ impl CachedLayer {
                     + (k_q8_prefix.len() + v_q8_prefix.len()) * core::mem::size_of::<BlockQ8_0>()
             }
             CachedLayer::SharedKv => 0,
-            CachedLayer::DeltaNet { state, conv_hist } => {
+            CachedLayer::DeltaNet { state, conv_hist } | CachedLayer::Ssm { state, conv_hist } => {
                 (state.len() + conv_hist.len()) * core::mem::size_of::<f32>()
             }
             CachedLayer::ShortConv { conv_hist } => conv_hist.len() * core::mem::size_of::<f32>(),
@@ -199,6 +203,10 @@ impl PrefixCache {
                     state: state.clone(),
                     conv_hist: conv_hist.clone(),
                 },
+                LayerState::Ssm { state, conv_hist } => CachedLayer::Ssm {
+                    state: state.clone(),
+                    conv_hist: conv_hist.clone(),
+                },
                 LayerState::ShortConv { conv_hist } => CachedLayer::ShortConv {
                     conv_hist: conv_hist.clone(),
                 },
@@ -316,6 +324,13 @@ impl PrefixCache {
                 (
                     LayerState::DeltaNet { state, conv_hist },
                     CachedLayer::DeltaNet {
+                        state: cs,
+                        conv_hist: ch,
+                    },
+                )
+                | (
+                    LayerState::Ssm { state, conv_hist },
+                    CachedLayer::Ssm {
                         state: cs,
                         conv_hist: ch,
                     },

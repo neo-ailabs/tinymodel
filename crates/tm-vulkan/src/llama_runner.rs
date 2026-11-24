@@ -550,14 +550,44 @@ impl LlamaVkRunner {
         let arch = gguf_ref.req_str("general.architecture")?.to_string();
         if !matches!(
             arch.as_str(),
-            "llama" | "qwen2" | "qwen3" | "smollm3" | "phi3" | "mistral" | "mistral3"
+            "llama"
+                | "qwen2"
+                | "qwen3"
+                | "smollm3"
+                | "phi3"
+                | "mistral"
+                | "mistral3"
+                | "olmo2"
+                | "olmo3"
+                | "granite"
         ) {
             return Err(VulkanError::UnsupportedArch(arch));
         }
 
         let pfx = arch.as_str();
+        if matches!(pfx, "olmo2" | "olmo3") {
+            return Err(VulkanError::InvalidDimensions(
+                "olmo2/olmo3 pure Post-Norm + full-vector QK-Norm requires dedicated shaders on Vulkan LlamaVkRunner"
+                    .to_string(),
+            ));
+        }
+        for key in [
+            format!("{pfx}.embedding_scale"),
+            format!("{pfx}.attention.scale"),
+            format!("{pfx}.residual_scale"),
+            format!("{pfx}.logit_scale"),
+        ] {
+            if let Some(s) = gguf_ref.get_meta(&key).and_then(|v| v.as_f32())
+                && s != 0.0
+                && (s - 1.0).abs() > 1e-6
+            {
+                return Err(VulkanError::InvalidDimensions(format!(
+                    "non-unit muP multiplier '{key}' = {s} requires scale shader on Vulkan LlamaVkRunner"
+                )));
+            }
+        }
         let is_qwen = matches!(pfx, "qwen2" | "qwen3");
-        let is_neox = matches!(pfx, "qwen2" | "qwen3" | "phi3");
+        let is_neox = matches!(pfx, "qwen2" | "qwen3" | "phi3" | "olmo2" | "olmo3");
         let n_layers = gguf_ref.req_usize(&format!("{pfx}.block_count"))?;
         let n_embd = gguf_ref.req_usize(&format!("{pfx}.embedding_length"))?;
         let n_ff = gguf_ref.req_usize(&format!("{pfx}.feed_forward_length"))?;

@@ -8,6 +8,7 @@ pub mod gemma4;
 pub mod inkling2;
 pub mod lfm2;
 pub mod llama;
+pub mod mamba2;
 pub mod qwen35;
 pub mod sampler;
 pub mod state;
@@ -27,6 +28,11 @@ pub use lfm2::{Lfm2Config, Lfm2LayerWeights, Lfm2Model, Lfm2OpWeights, Lfm2State
 pub use llama::{
     CpuDecodeProfile, LlamaConfig, LlamaLayerWeights, LlamaModel, LlamaState, ModelError,
     RawMatView,
+};
+pub use mamba2::{
+    Mamba2AttnWeights, Mamba2Block, Mamba2Config, Mamba2FfnWeights, Mamba2LayerWeights,
+    Mamba2Model, Mamba2SsmWeights, Mamba2State, mamba2_conv1d_silu_split,
+    mamba2_gate_and_grouped_norm,
 };
 pub use qwen35::{
     Qwen35AttnWeights, Qwen35Config, Qwen35DecodeProfile, Qwen35LayerWeights, Qwen35Model,

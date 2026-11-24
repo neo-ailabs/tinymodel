@@ -116,3 +116,12 @@
   2. **严格遵守 48 逻辑层独立状态与填充词表截断契约**：24 层物理权重展开为 48 个独立逻辑层状态槽（40 层 `SWA=1024` 环形 KV + 8 层全局 KV + 48 份 4 路 `ShortConv` 历史）；采样前严格将 `201,024` 行填充 logits 截断至 `vocab_size_unpadded = 200,058`。
   3. **补齐 `tm-cpu::x86_64::avx2` 0-ULP 内核并隔离 `micro` 边界**：在 `tm-cpu` 实装 `x86_64` `AVX2+FMA` 向量化内核（与 `generic` 逐位一致），同时保持 `micro` 档 `aarch64-musl` 静态构建零体积膨胀。
 - **后果**：在不破坏 `micro`/`edge` 零拷贝精简架构的前提下，使 `tinymodel` 能够在 16GB RAM + 8GB VRAM 主机上无 OOM、无 Swap 抖动地全量运行 `25.91 GiB` `Inkling-2-Mini-Q8_0` + `DSpark`，并在 32GB+ 主机上自动退化为纯内存+显存零读盘运行。
+
+### ADR-017 P1 架构扩展：`olmo2`/`granite` 稠密路径增强与统一 Mamba-2 SSM 混合架构（`mamba2` / `nemotron_h` / `falcon-h1` / `granitehybrid`）
+- **状态**：Accepted（2026-11-24，用户确认）
+- **背景**：完成 Hugging Face ≤8B 模型全量普查与 P0 架构合入（见 `research/15-hf-sub8b-architectures.md`）后，剩余高价值 ≤8B 生态集中在两类 P1 需求：① AI2 全开源基线 `OLMo 2 / OLMo 3`（纯 Post-Norm、无 Pre-Norm、全向量 `[q_dim]`/`[kv_dim]` QK-Norm 及 3:1 SWA）与 IBM 企业级 `Granite 3.x / 4.0`（四重 muP 缩放系数：`embedding_scale`、`attention.scale`、`residual_scale`、`1 / logit_scale`）；② 新一代 **Mamba-2 选择性状态空间模型（SSM）** 及其三大端侧混合变体——NVIDIA `Nemotron-H`（按层分离的 Mamba-2 / 无 RoPE GQA / ReLU² FFN）、TII `Falcon-H1`（同层并行的 GQA + Mamba-2 + 串行 SwiGLU）和 IBM `Granite-4.0-Hybrid`（按层交替的 Mamba-2 / Norm-RoPE GQA + muP 缩放 SwiGLU）。上游 `llama.cpp` 对这四类 SSM 模型共享完全一致的 `build_mamba2_layer` 张量契约（`ssm_in` / `ssm_conv1d` / `ssm_dt.bias` / `ssm_a` / `ssm_d` / 分组 `ssm_norm` / `ssm_out`）。
+- **决策**：
+  1. **稠密路径零分叉复用**：在 `LlamaModel` / `LlamaMetalRunner` / `LlamaTrainer` 中支持可选 Pre-Norm（`olmo2` 为 `None`）、Post-Norm（`post_attention_norm` / `post_ffw_norm`）、按张量维度自动判别逐头 `[head_dim]` 或全向量 `[q_dim]`/`[kv_dim]` QK-Norm、逐层 `is_swa` 掩码，以及 Granite 的四重 muP 缩放系数与可选 MLP 偏置，统一承载 `olmo2`（含 OLMo 3）与 `granite`。
+  2. **落地 `LayerState::Ssm { state, conv_hist }` 与 0-ULP `mamba2_scan_head` 内核三件套**：按 `ARCHITECTURE.md` §5.2 补齐 `LayerState::Ssm`（支持 `PrefixCache` 检查点恢复与 `ADR-005` 投机验证只读扫描 + 重放提交）；在 `tm-cpu` 实现 `generic`、`aarch64::neon_v80` 与 `x86_64::avx2` 三档 `mamba2_scan_head`（统一 8 路成对树形 FMA 归约，达成全 CPU ISA **0-ULP** 逐位一致），并在 `tm-metal` 实现 `mamba2_conv_scan_f32` GPU 内核。
+  3. **单一 `Mamba2Model` 统一驱动四类 SSM/混合架构（`mamba2`、`nemotron_h`、`falcon-h1`、`granitehybrid`）**：将每层建模为可组合的算子序列（纯 `Mamba2Mixer`、按层异构 `Ssm | Attn | Relu2Ffn`、或同层并行 `Attn + Ssm -> SwiGLU`），严格遵守分组 RMSNorm（`n_group` 组独立归一化）与 `ssm_d` 按头广播契约，并配套 `Mamba2Trainer` 支持 `O(1)` 块边界状态检查点的精确 QLoRA 反向传播。
+- **后果**：新增一套 Mamba-2 核心算子即可一举打通 `mamba2`、`nemotron_h`、`falcon-h1`、`granitehybrid` 四大架构（连同 `olmo2`/`granite` 共 6 类架构标识），使 `tinymodel` 对 Hugging Face 现代 ≤8B 文本与混合架构实现近乎全量覆盖，且保持推理热路径零堆分配与 `micro` 档静态体积预算。

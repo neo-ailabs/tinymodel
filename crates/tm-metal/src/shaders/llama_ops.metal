@@ -4015,3 +4015,253 @@ kernel void sigmoid_head_gate_f32(
     const float g = 1.0f / (1.0f + exp(-gate_raw[ulong(t) * ulong(a.n_head) + h]));
     attn_out[ulong(t) * ulong(q_dim) + idx] *= g;
 }
+
+// ============================================================================
+// 13. P1a & P1b Kernels: muP Scaling, Post-Norm Residual, ReLU^2, and Mamba-2 SSM
+// ============================================================================
+
+struct ScaleVecArgs {
+    uint n;
+    float scale;
+};
+
+kernel void copy_f32(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= n) return;
+    dst[tid] = src[tid];
+}
+
+kernel void scale_axpy_f32(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant ScaleVecArgs& a [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= a.n) return;
+    dst[tid] = fma(a.scale, src[tid], dst[tid]);
+}
+
+kernel void relu2_inplace_f32(
+    device float* x [[buffer(0)]],
+    constant uint& n [[buffer(1)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= n) return;
+    const float r = max(x[tid], 0.0f);
+    x[tid] = r * r;
+}
+
+struct Split3RowsArgs {
+    uint d0;
+    uint d1;
+    uint d2;
+    uint n_tok;
+};
+
+kernel void split3_rows_f32(
+    device const float* src [[buffer(0)]],
+    device float* out0      [[buffer(1)]],
+    device float* out1      [[buffer(2)]],
+    device float* out2      [[buffer(3)]],
+    constant Split3RowsArgs& a [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint total = a.d0 + a.d1 + a.d2;
+    const uint col = gid.x;
+    const uint t = gid.y;
+    if (col >= total || t >= a.n_tok) return;
+    const float v = src[ulong(t) * ulong(total) + col];
+    if (col < a.d0) {
+        out0[ulong(t) * ulong(a.d0) + col] = v;
+    } else if (col < a.d0 + a.d1) {
+        out1[ulong(t) * ulong(a.d1) + (col - a.d0)] = v;
+    } else {
+        out2[ulong(t) * ulong(a.d2) + (col - a.d0 - a.d1)] = v;
+    }
+}
+
+struct Mamba2ConvArgs {
+    uint d_inner;
+    uint bc_dim;
+    uint d_conv;
+    uint n_tok;
+    uint has_bias;
+};
+
+// Causal depthwise Conv1d + optional bias + SiLU + split into `x_out`, `b_out`, `c_out`.
+// 1 thread per channel `ch in 0..(d_inner + 2 * bc_dim)`.
+kernel void mamba2_conv1d_silu_f32(
+    device const float* xbc_in [[buffer(0)]],
+    device const float* conv_w [[buffer(1)]],
+    device const float* conv_b [[buffer(2)]],
+    device float* conv_hist    [[buffer(3)]],
+    device float* x_out        [[buffer(4)]],
+    device float* b_out        [[buffer(5)]],
+    device float* c_out        [[buffer(6)]],
+    constant Mamba2ConvArgs& a [[buffer(7)]],
+    uint ch [[thread_position_in_grid]]
+) {
+    const uint conv_dim = a.d_inner + 2 * a.bc_dim;
+    if (ch >= conv_dim) return;
+
+    const uint hist_len = (a.d_conv > 0) ? (a.d_conv - 1) : 0;
+    device const float* w_ch = conv_w + ulong(ch) * ulong(a.d_conv);
+    device float* h_ch = conv_hist + ulong(ch) * ulong(hist_len);
+    const float bias = (a.has_bias != 0) ? conv_b[ch] : 0.0f;
+
+    for (uint t = 0; t < a.n_tok; ++t) {
+        const float cur = xbc_in[ulong(t) * ulong(conv_dim) + ch];
+        float acc = bias;
+        for (uint k = 0; k < hist_len; ++k) {
+            acc = fma(h_ch[k], w_ch[k], acc);
+        }
+        if (a.d_conv > 0) {
+            acc = fma(cur, w_ch[hist_len], acc);
+        }
+        for (uint k = 0; k + 1 < hist_len; ++k) {
+            h_ch[k] = h_ch[k + 1];
+        }
+        if (hist_len > 0) {
+            h_ch[hist_len - 1] = cur;
+        }
+
+        const float val = acc / (1.0f + exp(-acc));
+        if (ch < a.d_inner) {
+            x_out[ulong(t) * ulong(a.d_inner) + ch] = val;
+        } else if (ch < a.d_inner + a.bc_dim) {
+            b_out[ulong(t) * ulong(a.bc_dim) + (ch - a.d_inner)] = val;
+        } else {
+            c_out[ulong(t) * ulong(a.bc_dim) + (ch - a.d_inner - a.bc_dim)] = val;
+        }
+    }
+}
+
+struct Mamba2ScanArgs {
+    uint n_heads;
+    uint n_groups;
+    uint head_dim;
+    uint d_state;
+    uint n_tok;
+};
+
+// Mamba-2 selective state scan (`ADR-017`, matching `ggml_ssm_scan_f32`):
+// 1 simdgroup (32 lanes) owns 1 `(h, j)` state row `[d_state]`; 4 simdgroups (128 threads) per TG.
+// Sequential over `t = 0..n_tok` -> 0-ULP batch-width invariance on GPU!
+kernel void mamba2_scan_f32(
+    device const float* x_in   [[buffer(0)]],
+    device const float* b_in   [[buffer(1)]],
+    device const float* c_in   [[buffer(2)]],
+    device const float* dt_raw [[buffer(3)]],
+    device const float* dt_b   [[buffer(4)]],
+    device const float* ssm_a  [[buffer(5)]],
+    device const float* ssm_d  [[buffer(6)]],
+    device float* state        [[buffer(7)]],
+    device float* y_out        [[buffer(8)]],
+    constant Mamba2ScanArgs& a [[buffer(9)]],
+    uint tg_id [[threadgroup_position_in_grid]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    const uint row = tg_id * 4 + uint(sg);
+    const uint d_inner = a.n_heads * a.head_dim;
+    if (row >= d_inner) return;
+
+    const uint h = row / a.head_dim;
+    const uint group_ratio = a.n_heads / a.n_groups;
+    const uint g = h / group_ratio;
+    const uint bc_dim = a.n_groups * a.d_state;
+
+    const float a_h = ssm_a[h];
+    const float d_h = ssm_d[h];
+    const float bias_h = dt_b[h];
+    device float* s_row = state + ulong(row) * ulong(a.d_state);
+
+    for (uint t = 0; t < a.n_tok; ++t) {
+        const float raw = dt_raw[ulong(t) * ulong(a.n_heads) + h] + bias_h;
+        const float dt_sp = (raw > 20.0f) ? raw : log(1.0f + exp(raw));
+        const float da = exp(dt_sp * a_h);
+        const float x_val = x_in[ulong(t) * ulong(d_inner) + row];
+        const float x_dt = x_val * dt_sp;
+
+        device const float* b_g = b_in + ulong(t) * ulong(bc_dim) + ulong(g) * ulong(a.d_state);
+        device const float* c_g = c_in + ulong(t) * ulong(bc_dim) + ulong(g) * ulong(a.d_state);
+
+        float acc = 0.0f;
+        for (uint k = lane; k < a.d_state; k += 32) {
+            const float s_new = fma(s_row[k], da, b_g[k] * x_dt);
+            s_row[k] = s_new;
+            acc = fma(s_new, c_g[k], acc);
+        }
+        acc = simd_sum(acc);
+        if (lane == 0) {
+            y_out[ulong(t) * ulong(d_inner) + row] = fma(x_val, d_h, acc);
+        }
+    }
+}
+
+struct Mamba2GateNormArgs {
+    uint d_inner;
+    uint n_groups;
+    uint has_norm;
+    float eps;
+};
+
+// Applies `v = silu(z) * y` followed by optional per-group RMSNorm (`group_dim = d_inner / n_groups`).
+// Grid: `(n_groups, n_tok, 1)`, `threadsPerThreadgroup = (256, 1, 1)`.
+kernel void mamba2_gate_grouped_norm_f32(
+    device float* y           [[buffer(0)]],
+    device const float* z     [[buffer(1)]],
+    device const float* norm_w [[buffer(2)]],
+    constant Mamba2GateNormArgs& a [[buffer(3)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NT = 256;
+    const uint g = tg.x;
+    const uint t = tg.y;
+    if (g >= a.n_groups) return;
+
+    const uint group_dim = a.d_inner / a.n_groups;
+    const ulong off = ulong(t) * ulong(a.d_inner) + ulong(g) * ulong(group_dim);
+    device float* yg = y + off;
+    device const float* zg = z + off;
+
+    if (a.has_norm == 0) {
+        for (uint i = tid; i < group_dim; i += NT) {
+            const float zv = zg[i];
+            yg[i] *= zv / (1.0f + exp(-zv));
+        }
+        return;
+    }
+
+    threadgroup float partial[8];
+    float ss = 0.0f;
+    for (uint i = tid; i < group_dim; i += NT) {
+        const float zv = zg[i];
+        const float gated = yg[i] * (zv / (1.0f + exp(-zv)));
+        yg[i] = gated;
+        ss = fma(gated, gated, ss);
+    }
+    ss = simd_sum(ss);
+    if (lane == 0) partial[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sg == 0) {
+        const float v = (lane < 8) ? partial[lane] : 0.0f;
+        const float tot = simd_sum(v);
+        if (lane == 0) partial[0] = rsqrt(tot / float(group_dim) + a.eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float scale = partial[0];
+    device const float* wg = norm_w + ulong(g) * ulong(group_dim);
+    for (uint i = tid; i < group_dim; i += NT) {
+        yg[i] = yg[i] * scale * wg[i];
+    }
+}
