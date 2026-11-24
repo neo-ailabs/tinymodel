@@ -283,7 +283,7 @@ function init() {
   });
 
   document.getElementById("copy-hero-cmd")?.addEventListener("click", () => {
-    copyText("git clone https://github.com/fromztoa/tinymodel && cd tinymodel && cargo build --release");
+    copyText("git clone https://github.com/neo-ailabs/tinymodel && cd tinymodel && cargo build --release");
   });
 
   document.getElementById("copy-cli-cmd")?.addEventListener("click", () => {
