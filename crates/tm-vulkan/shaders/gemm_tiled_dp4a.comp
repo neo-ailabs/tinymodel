@@ -1,0 +1,221 @@
+#version 450
+// LDS-tiled 32x64x32 INT8 DP4A (`OpSDotKHR` / `SPV_KHR_integer_dot_product`) batched GEMM for
+// non-CoopMat GPUs with hardware 4x8-bit packed signed dot product (e.g. NVIDIA Turing TU117/T1000,
+// GTX 16-series, Arm Mali-G715+, Adreno).
+//
+// Inputs:
+//   W  (binding 0): quantized weights (DTYPE: 0 = Q4_0, 1 = Q4_1, 2 = Q8_0)
+//   XQ (binding 1): Q8_1 packed activations from `quantize_q8_1.comp` (8 int32s per 32-elem block)
+//   XD (binding 2): Q8_1 per-block `vec2(d_x, sum_x)` from `quantize_q8_1.comp`
+//   Y  (binding 3): FP32 output `[n_tok, n_out]`
+//
+// Shared memory footprint: 3.875 KB (`X_sh` 1.125 KB + `XD_sh` 0.25 KB + `W_sh` 2.25 KB + `WD_sh` 0.25 KB),
+// enabling high SM occupancy while exploiting 4x INT8 DP4A throughput (8 inner iterations per K=32 block).
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_spirv_intrinsics : require
+
+// SPIR-V OpSDotKHR (opcode 4450) with DotProductKHR (6018) + DotProductInput4x8BitPackedKHR (6019).
+// PackedVectorFormat4x8BitKHR = 0.
+spirv_instruction(extensions = ["SPV_KHR_integer_dot_product"], capabilities = [6018, 6019], id = 4450)
+int sdot4x8(int a, int b, spirv_literal int packed_fmt);
+
+layout(constant_id = 0) const uint WG = 128;
+layout(constant_id = 1) const uint DTYPE = 0;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer W  { uint16_t w16[]; };
+layout(std430, binding = 1) readonly buffer XQ { int xq[]; };
+layout(std430, binding = 2) readonly buffer XD { vec2 xd[]; };
+layout(std430, binding = 3) buffer Y           { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint n_in;
+    uint n_out;
+    uint n_tok;
+    uint add_residual;
+    uint row_u16s;
+} pc;
+
+// +1 stride padding eliminates shared-memory bank conflicts.
+shared int  X_sh[32][9];
+shared vec2 XD_sh[32];
+shared int  W_sh[64][9];
+shared vec2 WDM_sh[64]; // (d_w, m_w) where m_w = -8.0 * d_w for Q4_0, m for Q4_1, 0 for Q8_0
+
+void store_row4(uint gm, uint gn0, vec4 c) {
+    if (gm >= pc.n_tok) return;
+    const uint yb = gm * pc.n_out + gn0;
+    if (pc.add_residual != 0u) {
+        if (gn0 + 0u < pc.n_out) y[yb + 0u] += c.x;
+        if (gn0 + 1u < pc.n_out) y[yb + 1u] += c.y;
+        if (gn0 + 2u < pc.n_out) y[yb + 2u] += c.z;
+        if (gn0 + 3u < pc.n_out) y[yb + 3u] += c.w;
+    } else {
+        if (gn0 + 0u < pc.n_out) y[yb + 0u] = c.x;
+        if (gn0 + 1u < pc.n_out) y[yb + 1u] = c.y;
+        if (gn0 + 2u < pc.n_out) y[yb + 2u] = c.z;
+        if (gn0 + 3u < pc.n_out) y[yb + 3u] = c.w;
+    }
+}
+
+void main() {
+    // Group-8 L2 cache tile swizzle so weight strips stay hot across M tiles.
+    const uint num_n = gl_NumWorkGroups.x;
+    const uint num_m = gl_NumWorkGroups.y;
+    const uint wg_linear = gl_WorkGroupID.y * num_n + gl_WorkGroupID.x;
+    const uint group_sz = num_m * 8u;
+    const uint group_id = wg_linear / group_sz;
+    const uint first_n = group_id * 8u;
+    const uint group_n = min(num_n - first_n, 8u);
+    const uint in_group = wg_linear % group_sz;
+    const uint pid_n = first_n + (in_group % group_n);
+    const uint pid_m = in_group / group_n;
+
+    const uint r0 = pid_n * 64u;
+    const uint t0 = pid_m * 32u;
+    if (r0 >= pc.n_out || t0 >= pc.n_tok) return;
+
+    const uint tid = gl_LocalInvocationID.x;
+    // 128 threads -> 32 rows x 4 sub-lanes (each sub-lane loads 2 int32s = 8 elements).
+    const uint x_row = tid >> 2u;   // 0..31
+    const uint sub = tid & 3u;      // 0..3
+    const bool valid_x = (t0 + x_row) < pc.n_tok;
+
+    // 8 x 16 compute tile -> each thread computes 4 tokens x 4 output rows = 16 outputs.
+    const uint tm = (tid >> 4u) * 4u; // 0..28
+    const uint rn = (tid & 15u) * 4u; // 0..60
+
+    vec4 c0 = vec4(0.0);
+    vec4 c1 = vec4(0.0);
+    vec4 c2 = vec4(0.0);
+    vec4 c3 = vec4(0.0);
+
+    const uint nb = pc.n_in >> 5u;
+
+    for (uint ib = 0u; ib < nb; ++ib) {
+        // 1. Load 32x32 Q8_1 activation tile (packed int32x8 + vec2(d_x, sum_x)).
+        if (valid_x) {
+            const uint blk_idx = (t0 + x_row) * nb + ib;
+            const uint q_base = blk_idx * 8u + sub * 2u;
+            X_sh[x_row][sub * 2u + 0u] = xq[q_base + 0u];
+            X_sh[x_row][sub * 2u + 1u] = xq[q_base + 1u];
+            if (sub == 0u) {
+                XD_sh[x_row] = xd[blk_idx];
+            }
+        } else {
+            X_sh[x_row][sub * 2u + 0u] = 0;
+            X_sh[x_row][sub * 2u + 1u] = 0;
+            if (sub == 0u) {
+                XD_sh[x_row] = vec2(0.0);
+            }
+        }
+
+        // 2. Load 64x32 quantized weight tile directly into packed int8x4 words (zero float unpack).
+        [[unroll]] for (uint rp = 0u; rp < 2u; ++rp) {
+            const uint lr = rp * 32u + x_row;
+            if (r0 + lr < pc.n_out) {
+                const uint w_row_base = (r0 + lr) * pc.row_u16s;
+                if (DTYPE == 0u) {
+                    // Q4_0: unsigned nibbles in [0..15] are valid signed int8 values;
+                    // subtract 8.0 * d_w * sum_x once per block via WDM_sh[lr].y.
+                    const uint b = w_row_base + ib * 9u;
+                    if (sub == 0u) {
+                        const float dw = unpackHalf2x16(uint(w16[b])).x;
+                        WDM_sh[lr] = vec2(dw, -8.0 * dw);
+                    }
+                    const uint u = uint(w16[b + 1u + sub * 2u]) | (uint(w16[b + 2u + sub * 2u]) << 16u);
+                    W_sh[lr][sub]      = int(u & 0x0F0F0F0Fu);
+                    W_sh[lr][4u + sub] = int((u >> 4u) & 0x0F0F0F0Fu);
+                } else if (DTYPE == 1u) {
+                    const uint b = w_row_base + ib * 10u;
+                    if (sub == 0u) {
+                        const float dw = unpackHalf2x16(uint(w16[b])).x;
+                        const float mw = unpackHalf2x16(uint(w16[b + 1u])).x;
+                        WDM_sh[lr] = vec2(dw, mw);
+                    }
+                    const uint u = uint(w16[b + 2u + sub * 2u]) | (uint(w16[b + 3u + sub * 2u]) << 16u);
+                    W_sh[lr][sub]      = int(u & 0x0F0F0F0Fu);
+                    W_sh[lr][4u + sub] = int((u >> 4u) & 0x0F0F0F0Fu);
+                } else {
+                    // Q8_0
+                    const uint b = w_row_base + ib * 17u;
+                    if (sub == 0u) {
+                        const float dw = unpackHalf2x16(uint(w16[b])).x;
+                        WDM_sh[lr] = vec2(dw, 0.0);
+                    }
+                    const uint j0 = sub * 2u;
+                    const uint j1 = j0 + 1u;
+                    W_sh[lr][j0] = int(uint(w16[b + 1u + 2u * j0]) | (uint(w16[b + 2u + 2u * j0]) << 16u));
+                    W_sh[lr][j1] = int(uint(w16[b + 1u + 2u * j1]) | (uint(w16[b + 2u + 2u * j1]) << 16u));
+                }
+            } else {
+                W_sh[lr][sub] = 0;
+                W_sh[lr][4u + sub] = 0;
+                if (sub == 0u) {
+                    WDM_sh[lr] = vec2(0.0);
+                }
+            }
+        }
+
+        barrier();
+
+        // 3. Hardware INT8 DP4A inner product: 8 iterations x 16 OpSDotKHR = 512 MACs/thread.
+        ivec4 ic0 = ivec4(0);
+        ivec4 ic1 = ivec4(0);
+        ivec4 ic2 = ivec4(0);
+        ivec4 ic3 = ivec4(0);
+
+        [[unroll]] for (uint k = 0u; k < 8u; ++k) {
+            const int x0 = X_sh[tm + 0u][k];
+            const int x1 = X_sh[tm + 1u][k];
+            const int x2 = X_sh[tm + 2u][k];
+            const int x3 = X_sh[tm + 3u][k];
+            const int w0 = W_sh[rn + 0u][k];
+            const int w1 = W_sh[rn + 1u][k];
+            const int w2 = W_sh[rn + 2u][k];
+            const int w3 = W_sh[rn + 3u][k];
+
+            ic0.x += sdot4x8(x0, w0, 0);
+            ic0.y += sdot4x8(x0, w1, 0);
+            ic0.z += sdot4x8(x0, w2, 0);
+            ic0.w += sdot4x8(x0, w3, 0);
+
+            ic1.x += sdot4x8(x1, w0, 0);
+            ic1.y += sdot4x8(x1, w1, 0);
+            ic1.z += sdot4x8(x1, w2, 0);
+            ic1.w += sdot4x8(x1, w3, 0);
+
+            ic2.x += sdot4x8(x2, w0, 0);
+            ic2.y += sdot4x8(x2, w1, 0);
+            ic2.z += sdot4x8(x2, w2, 0);
+            ic2.w += sdot4x8(x2, w3, 0);
+
+            ic3.x += sdot4x8(x3, w0, 0);
+            ic3.y += sdot4x8(x3, w1, 0);
+            ic3.z += sdot4x8(x3, w2, 0);
+            ic3.w += sdot4x8(x3, w3, 0);
+        }
+
+        const vec4 dw = vec4(WDM_sh[rn + 0u].x, WDM_sh[rn + 1u].x, WDM_sh[rn + 2u].x, WDM_sh[rn + 3u].x);
+        const vec4 mw = vec4(WDM_sh[rn + 0u].y, WDM_sh[rn + 1u].y, WDM_sh[rn + 2u].y, WDM_sh[rn + 3u].y);
+
+        const vec2 xd0 = XD_sh[tm + 0u];
+        const vec2 xd1 = XD_sh[tm + 1u];
+        const vec2 xd2 = XD_sh[tm + 2u];
+        const vec2 xd3 = XD_sh[tm + 3u];
+
+        c0 = fma(dw * xd0.x, vec4(ic0), fma(mw, vec4(xd0.y), c0));
+        c1 = fma(dw * xd1.x, vec4(ic1), fma(mw, vec4(xd1.y), c1));
+        c2 = fma(dw * xd2.x, vec4(ic2), fma(mw, vec4(xd2.y), c2));
+        c3 = fma(dw * xd3.x, vec4(ic3), fma(mw, vec4(xd3.y), c3));
+
+        barrier();
+    }
+
+    store_row4(t0 + tm + 0u, r0 + rn, c0);
+    store_row4(t0 + tm + 1u, r0 + rn, c1);
+    store_row4(t0 + tm + 2u, r0 + rn, c2);
+    store_row4(t0 + tm + 3u, r0 + rn, c3);
+}
