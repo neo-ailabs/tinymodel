@@ -36,10 +36,18 @@ const SPV_GQA_ATTN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gqa_attn.s
 const SPV_FA_COOPMAT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_coopmat.spv"));
 const SPV_FA_GQA_TILED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_gqa_tiled.spv"));
 const SPV_GEMV_RES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_res.spv"));
+const SPV_GEMV_RES_Q4_0_SOA: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemv_res_q4_0_soa.spv"));
 const SPV_GEMV_PAIR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_pair.spv"));
+const SPV_GEMV_PAIR_Q4_0_SOA: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemv_pair_q4_0_soa.spv"));
 const SPV_GEMV_QKV_Q4_0: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_qkv_q4_0.spv"));
+const SPV_GEMV_QKV_Q4_0_SOA: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemv_qkv_q4_0_soa.spv"));
 const SPV_GEMV_PAIR_SILU_Q4_0: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemv_pair_silu_q4_0.spv"));
+const SPV_GEMV_PAIR_SILU_Q4_0_SOA: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemv_pair_silu_q4_0_soa.spv"));
 const SPV_SILU_MUL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silu_mul.spv"));
 const SPV_GDN_GATES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gdn_gates.spv"));
 const SPV_GDN_CONV_SILU_L2: &[u8] =
@@ -51,6 +59,8 @@ const SPV_GDN_NORM_GATED_SILU: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gdn_norm_gated_silu.spv"));
 const SPV_GEMM_TILED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_tiled.spv"));
 const SPV_GEMM_TILED_DP4A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_tiled_dp4a.spv"));
+const SPV_GEMM_TILED_DP4A_Q4_SOA: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_tiled_dp4a_q4_soa.spv"));
 const SPV_GEMM_KQUANT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_kquant.spv"));
 const SPV_GEMM_COOPMAT_F16: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_f16.spv"));
@@ -128,10 +138,18 @@ struct VkSlice {
 #[derive(Clone, Copy)]
 struct VkMat {
     slice: VkSlice,
+    soa_d: Option<VkSlice>,
     dtype: DType,
     rows: usize,
     cols: usize,
     row_bytes: usize,
+}
+
+impl VkMat {
+    #[inline]
+    fn byte_len(&self) -> u64 {
+        self.slice.len + self.soa_d.map_or(0, |d| d.len)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -157,6 +175,7 @@ struct BatchGemmEntry {
     flavor: GemmFlavor,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum BatchFfnPlan {
     FusedPairSiluCoopMat {
         pipe: Arc<Pipeline>,
@@ -462,6 +481,18 @@ fn plan_f32_tensor(
     Ok(PendingF32 { slice, vals })
 }
 
+fn repack_q4_0_to_soa(raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let n_blocks = raw.len() / 18;
+    let mut wq = Vec::with_capacity(n_blocks * 16);
+    let mut wd = Vec::with_capacity(n_blocks * 2);
+    for blk in raw.as_chunks::<18>().0 {
+        wd.extend_from_slice(&blk[0..2]);
+        wq.extend_from_slice(&blk[2..18]);
+    }
+    (wq, wd)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn plan_mat<'a>(
     planner: &mut ArenaPlanner,
     gguf: &'a GgufFile,
@@ -469,6 +500,7 @@ fn plan_mat<'a>(
     layer: &str,
     cols: usize,
     rows: usize,
+    repack_q4_soa: bool,
 ) -> Result<PendingMat<'a>, VulkanError> {
     let (info, raw_bytes) = gguf.req_tensor(name, layer, &[cols, rows])?;
     let (eff_dtype, bytes) = normalize_vk_mat_bytes(info.dtype, raw_bytes, rows, cols)?;
@@ -476,20 +508,24 @@ fn plan_mat<'a>(
     let row_bytes = eff_dtype.row_bytes(cols);
     let file_off = gguf.tensor_file_offset(info) as u64;
     let can_import = matches!(&bytes, std::borrow::Cow::Borrowed(_));
-    let (slice, imported) = if can_import {
-        match planner.try_import_slice(file_off, bytes.len() as u64) {
-            Some(s) => (s, true),
-            None => (planner.reserve(bytes.len() as u64)?, false),
-        }
-    } else {
-        (planner.reserve(bytes.len() as u64)?, false)
-    };
+    let (slice, soa_d, imported) =
+        if can_import && let Some(s) = planner.try_import_slice(file_off, bytes.len() as u64) {
+            (s, None, true)
+        } else if repack_q4_soa && eff_dtype == DType::Q4_0 {
+            let n_blocks = bytes.len() / 18;
+            let sq = planner.reserve((n_blocks * 16) as u64)?;
+            let sd = planner.reserve((n_blocks * 2) as u64)?;
+            (sq, Some(sd), false)
+        } else {
+            (planner.reserve(bytes.len() as u64)?, None, false)
+        };
     Ok(PendingMat {
         slice,
         bytes,
         imported,
         mat: VkMat {
             slice,
+            soa_d,
             dtype: eff_dtype,
             rows,
             cols,
@@ -637,6 +673,7 @@ impl Qwen35VkRunner {
         );
 
         // 1. Plan every device allocation up front BEFORE mutating state (`AGENTS.md` MUST #4 & #6).
+        let use_q4_soa = prefill_kind == ResolvedPrefill::TiledDp4a;
         let p_token_embd = plan_mat(
             &mut planner,
             gguf_ref,
@@ -644,6 +681,7 @@ impl Qwen35VkRunner {
             "global",
             n_embd,
             vocab_size,
+            false,
         )?;
         let p_output = if gguf_ref.tensor_info("output.weight").is_some() {
             Some(plan_mat(
@@ -653,6 +691,7 @@ impl Qwen35VkRunner {
                 "global",
                 n_embd,
                 vocab_size,
+                use_q4_soa,
             )?)
         } else {
             None
@@ -752,6 +791,7 @@ impl Qwen35VkRunner {
                         &ltag,
                         n_embd,
                         conv_dim,
+                        use_q4_soa,
                     )?,
                     wz: plan_mat(
                         &mut planner,
@@ -760,6 +800,7 @@ impl Qwen35VkRunner {
                         &ltag,
                         n_embd,
                         v_gdn_dim,
+                        use_q4_soa,
                     )?,
                     w_alpha: plan_mat(
                         &mut planner,
@@ -768,6 +809,7 @@ impl Qwen35VkRunner {
                         &ltag,
                         n_embd,
                         ssm_dt_rank,
+                        use_q4_soa,
                     )?,
                     w_beta: plan_mat(
                         &mut planner,
@@ -776,6 +818,7 @@ impl Qwen35VkRunner {
                         &ltag,
                         n_embd,
                         ssm_dt_rank,
+                        use_q4_soa,
                     )?,
                     conv1d: plan_f32_tensor(
                         &mut planner,
@@ -812,6 +855,7 @@ impl Qwen35VkRunner {
                         &ltag,
                         v_gdn_dim,
                         n_embd,
+                        use_q4_soa,
                     )?,
                     state_slice: planner.reserve(state_bytes)?,
                     conv_hist_slice: planner.reserve(conv_hist_bytes)?,
@@ -840,6 +884,7 @@ impl Qwen35VkRunner {
                         &ltag,
                         n_embd,
                         qg_dim,
+                        use_q4_soa,
                     )?,
                     wk: plan_mat(
                         &mut planner,
@@ -848,6 +893,7 @@ impl Qwen35VkRunner {
                         &ltag,
                         n_embd,
                         kv_dim,
+                        use_q4_soa,
                     )?,
                     wv: plan_mat(
                         &mut planner,
@@ -856,6 +902,7 @@ impl Qwen35VkRunner {
                         &ltag,
                         n_embd,
                         kv_dim,
+                        use_q4_soa,
                     )?,
                     wo: plan_mat(
                         &mut planner,
@@ -864,6 +911,7 @@ impl Qwen35VkRunner {
                         &ltag,
                         q_dim,
                         n_embd,
+                        use_q4_soa,
                     )?,
                     k_cache: planner.reserve(kv_bytes)?,
                     v_cache: planner.reserve(kv_bytes)?,
@@ -881,6 +929,7 @@ impl Qwen35VkRunner {
                     &ltag,
                     n_embd,
                     n_ff,
+                    use_q4_soa,
                 )?,
                 w_up: plan_mat(
                     &mut planner,
@@ -889,6 +938,7 @@ impl Qwen35VkRunner {
                     &ltag,
                     n_embd,
                     n_ff,
+                    use_q4_soa,
                 )?,
                 w_down: plan_mat(
                     &mut planner,
@@ -897,6 +947,7 @@ impl Qwen35VkRunner {
                     &ltag,
                     n_ff,
                     n_embd,
+                    use_q4_soa,
                 )?,
             });
         }
@@ -1007,7 +1058,13 @@ impl Qwen35VkRunner {
             if pm.imported {
                 return Ok(());
             }
-            ctx.write_bytes(&slabs[pm.slice.slab], pm.slice.offset, &pm.bytes)
+            if let Some(d_slice) = pm.mat.soa_d {
+                let (wq, wd) = repack_q4_0_to_soa(&pm.bytes);
+                ctx.write_bytes(&slabs[pm.slice.slab], pm.slice.offset, &wq)?;
+                ctx.write_bytes(&slabs[d_slice.slab], d_slice.offset, &wd)
+            } else {
+                ctx.write_bytes(&slabs[pm.slice.slab], pm.slice.offset, &pm.bytes)
+            }
         };
 
         write_mat(&p_token_embd)?;
@@ -1213,7 +1270,7 @@ impl Qwen35VkRunner {
 
         // 4. Allocate static descriptor pool, command pool, pre-bound descriptor sets.
         let max_sets = (n_layers as u32) * 40 + 32;
-        let max_desc = max_sets * 8;
+        let max_desc = max_sets * 10;
         let d = &ctx.inner.device;
         // SAFETY: valid device handle; pools and fence destroyed in `Drop` after `device_wait_idle`.
         let (desc_pool, cmd_pool, cbs, fence) = unsafe {
@@ -1299,12 +1356,94 @@ impl Qwen35VkRunner {
                 }
             };
 
+        let alloc_gemv_call = |mat: &VkMat,
+                               x_slice: VkSlice,
+                               y_slice: VkSlice,
+                               add_residual: bool|
+         -> Result<GemvCall, VulkanError> {
+            if let Some(d_slice) = mat.soa_d {
+                let wg = 128u32;
+                let nr = 4u32;
+                let p = ctx.pipeline(
+                    "gemv_res_q4_0_soa",
+                    wg | (nr << 16),
+                    SPV_GEMV_RES_Q4_0_SOA,
+                    4,
+                    16,
+                    &[wg, nr],
+                )?;
+                let set = alloc_set(
+                    &p,
+                    &[
+                        Binding::Arena(mat.slice),
+                        Binding::Arena(d_slice),
+                        Binding::Arena(x_slice),
+                        Binding::Arena(y_slice),
+                    ],
+                )?;
+                let rows_per_wg = (wg / sg).max(1) * nr;
+                let groups = (mat.rows as u32).div_ceil(rows_per_wg);
+                let push = [mat.cols as u32, mat.rows as u32, u32::from(add_residual), 0];
+                Ok((p, set, groups, push))
+            } else {
+                let (p, g, mut push) = gemv_pipe_for(mat)?;
+                push[2] = u32::from(add_residual);
+                let set = alloc_set(
+                    &p,
+                    &[
+                        Binding::Arena(mat.slice),
+                        Binding::Arena(x_slice),
+                        Binding::Arena(y_slice),
+                    ],
+                )?;
+                Ok((p, set, g, push))
+            }
+        };
+
         let make_pair_dec = |ma: VkMat,
                              mb: VkMat,
                              x_slice: VkSlice,
                              ya_slice: VkSlice,
                              yb_slice: VkSlice|
          -> Result<DecodePairSets, VulkanError> {
+            if let (Some(ad), Some(bd)) = (ma.soa_d, mb.soa_d) {
+                let nr = if ma.rows.is_multiple_of(4) {
+                    4u32
+                } else {
+                    2u32
+                };
+                if ma.rows.is_multiple_of(nr as usize) {
+                    let wg = 128u32;
+                    let pipe = ctx.pipeline(
+                        "gemv_pair_q4_0_soa",
+                        wg | (nr << 16),
+                        SPV_GEMV_PAIR_Q4_0_SOA,
+                        7,
+                        16,
+                        &[wg, nr],
+                    )?;
+                    let set = alloc_set(
+                        &pipe,
+                        &[
+                            Binding::Arena(ma.slice),
+                            Binding::Arena(ad),
+                            Binding::Arena(mb.slice),
+                            Binding::Arena(bd),
+                            Binding::Arena(x_slice),
+                            Binding::Arena(ya_slice),
+                            Binding::Arena(yb_slice),
+                        ],
+                    )?;
+                    let rows_per_wg = (wg / sg).max(1) * nr;
+                    let total_rows = (ma.rows + mb.rows) as u32;
+                    return Ok(DecodePairSets::Fused {
+                        pipe,
+                        set,
+                        groups_x: total_rows.div_ceil(rows_per_wg),
+                        push: [ma.cols as u32, ma.rows as u32, mb.rows as u32, 0],
+                    });
+                }
+            }
             if ma.dtype == mb.dtype && matches!(ma.dtype, DType::Q4_0 | DType::Q8_0) {
                 let dt = dtype_code(ma.dtype)?;
                 let nr = if ma.dtype == DType::Q4_0 {
@@ -1346,27 +1485,9 @@ impl Qwen35VkRunner {
                     });
                 }
             }
-            let (pa, ga, push_a) = gemv_pipe_for(&ma)?;
-            let sa = alloc_set(
-                &pa,
-                &[
-                    Binding::Arena(ma.slice),
-                    Binding::Arena(x_slice),
-                    Binding::Arena(ya_slice),
-                ],
-            )?;
-            let (pb, gb, push_b) = gemv_pipe_for(&mb)?;
-            let sb = alloc_set(
-                &pb,
-                &[
-                    Binding::Arena(mb.slice),
-                    Binding::Arena(x_slice),
-                    Binding::Arena(yb_slice),
-                ],
-            )?;
             Ok(DecodePairSets::Separate {
-                a: (pa, sa, ga, push_a),
-                b: (pb, sb, gb, push_b),
+                a: alloc_gemv_call(&ma, x_slice, ya_slice, false)?,
+                b: alloc_gemv_call(&mb, x_slice, yb_slice, false)?,
             })
         };
 
@@ -1402,6 +1523,36 @@ impl Qwen35VkRunner {
                     set,
                     mat,
                     flavor: GemmFlavor::CoopMatI8,
+                });
+            }
+
+            if prefill_kind == ResolvedPrefill::TiledDp4a
+                && let Some(d_slice) = mat.soa_d
+                && let (Some(xq), Some(xd)) = (s_xq, s_xd)
+            {
+                let pipe = ctx.pipeline(
+                    "gemm_tiled_dp4a_q4_soa",
+                    0,
+                    SPV_GEMM_TILED_DP4A_Q4_SOA,
+                    5,
+                    20,
+                    &[128],
+                )?;
+                let set = alloc_set(
+                    &pipe,
+                    &[
+                        Binding::Arena(mat.slice),
+                        Binding::Arena(d_slice),
+                        Binding::Arena(xq),
+                        Binding::Arena(xd),
+                        Binding::Arena(y_slice),
+                    ],
+                )?;
+                return Ok(BatchGemmEntry {
+                    pipe,
+                    set,
+                    mat,
+                    flavor: GemmFlavor::TiledDp4a,
                 });
             }
 
@@ -1560,16 +1711,7 @@ impl Qwen35VkRunner {
                 Binding::Arena(s_xb),
             ],
         )?;
-        let (lm_pipe, lm_groups, lm_push) = gemv_pipe_for(&out_mat)?;
-        let lm_set = alloc_set(
-            &lm_pipe,
-            &[
-                Binding::Arena(out_mat.slice),
-                Binding::Arena(s_xb),
-                Binding::Arena(logits_dev),
-            ],
-        )?;
-        let lm_head_dec = (lm_pipe, lm_set, lm_groups, lm_push);
+        let lm_head_dec = alloc_gemv_call(&out_mat, s_xb, logits_dev, false)?;
         let argmax_set = alloc_set(
             &pipes.argmax,
             &[Binding::Arena(logits_dev), Binding::Raw(&argmax_buf)],
@@ -1707,16 +1849,8 @@ impl Qwen35VkRunner {
                         ],
                     )?;
 
-                    let (p_out, g_out, mut push_out) = gemv_pipe_for(&w_out.mat)?;
-                    push_out[2] = 1; // fused residual add into `s_x`
-                    let s_out = alloc_set(
-                        &p_out,
-                        &[
-                            Binding::Arena(w_out.slice),
-                            Binding::Arena(s_attn_out),
-                            Binding::Arena(s_x),
-                        ],
-                    )?;
+                    let (p_out, s_out, g_out, push_out) =
+                        alloc_gemv_call(&w_out.mat, s_attn_out, s_x, true)?;
                     let w_out_batch = make_batch_gemm(w_out.mat, s_attn_out, s_x)?;
 
                     AttnLayerPlan::Gdn {
@@ -1734,11 +1868,11 @@ impl Qwen35VkRunner {
                         w_out_batch,
                         state_slice: *state_slice,
                         conv_hist_slice: *conv_hist_slice,
-                        proj_weight_bytes: wqkv.slice.len
-                            + wz.slice.len
-                            + w_alpha.slice.len
-                            + w_beta.slice.len,
-                        out_weight_bytes: w_out.slice.len,
+                        proj_weight_bytes: wqkv.mat.byte_len()
+                            + wz.mat.byte_len()
+                            + w_alpha.mat.byte_len()
+                            + w_beta.mat.byte_len(),
+                        out_weight_bytes: w_out.mat.byte_len(),
                     }
                 }
                 PendingAttn::FullAttn {
@@ -1751,7 +1885,55 @@ impl Qwen35VkRunner {
                     k_cache,
                     v_cache,
                 } => {
-                    let qkv_dec = if wqg.mat.dtype == DType::Q4_0
+                    let qkv_dec = if let (Some(qd), Some(kd), Some(vd)) =
+                        (wqg.mat.soa_d, wk.mat.soa_d, wv.mat.soa_d)
+                        && wqg.mat.rows.is_multiple_of(2)
+                        && wk.mat.rows.is_multiple_of(2)
+                    {
+                        let wg = 128u32;
+                        let nr = if wqg.mat.rows.is_multiple_of(4) && wk.mat.rows.is_multiple_of(4)
+                        {
+                            4u32
+                        } else {
+                            2u32
+                        };
+                        let pipe = ctx.pipeline(
+                            "gemv_qkv_q4_0_soa",
+                            wg | (nr << 16),
+                            SPV_GEMV_QKV_Q4_0_SOA,
+                            10,
+                            16,
+                            &[wg, nr],
+                        )?;
+                        let set = alloc_set(
+                            &pipe,
+                            &[
+                                Binding::Arena(wqg.slice),
+                                Binding::Arena(qd),
+                                Binding::Arena(wk.slice),
+                                Binding::Arena(kd),
+                                Binding::Arena(wv.slice),
+                                Binding::Arena(vd),
+                                Binding::Arena(s_xb),
+                                Binding::Arena(s_qkv),
+                                Binding::Arena(s_k),
+                                Binding::Arena(s_v),
+                            ],
+                        )?;
+                        let total_rows = (wqg.mat.rows + wk.mat.rows + wv.mat.rows) as u32;
+                        let rows_per_wg = (wg / sg).max(1) * nr;
+                        DecodeQkvSets::Fused {
+                            pipe,
+                            set,
+                            groups_x: total_rows.div_ceil(rows_per_wg),
+                            push: [
+                                wqg.mat.cols as u32,
+                                wqg.mat.rows as u32,
+                                wk.mat.rows as u32,
+                                wv.mat.rows as u32,
+                            ],
+                        }
+                    } else if wqg.mat.dtype == DType::Q4_0
                         && wk.mat.dtype == DType::Q4_0
                         && wv.mat.dtype == DType::Q4_0
                         && wqg.mat.rows.is_multiple_of(2)
@@ -1787,37 +1969,10 @@ impl Qwen35VkRunner {
                             ],
                         }
                     } else {
-                        let (pq, gq, push_q) = gemv_pipe_for(&wqg.mat)?;
-                        let sq = alloc_set(
-                            &pq,
-                            &[
-                                Binding::Arena(wqg.slice),
-                                Binding::Arena(s_xb),
-                                Binding::Arena(s_qkv),
-                            ],
-                        )?;
-                        let (pk, gk, push_k) = gemv_pipe_for(&wk.mat)?;
-                        let sk = alloc_set(
-                            &pk,
-                            &[
-                                Binding::Arena(wk.slice),
-                                Binding::Arena(s_xb),
-                                Binding::Arena(s_k),
-                            ],
-                        )?;
-                        let (pv, gv, push_v) = gemv_pipe_for(&wv.mat)?;
-                        let sv = alloc_set(
-                            &pv,
-                            &[
-                                Binding::Arena(wv.slice),
-                                Binding::Arena(s_xb),
-                                Binding::Arena(s_v),
-                            ],
-                        )?;
                         DecodeQkvSets::Separate {
-                            wqg: (pq, sq, gq, push_q),
-                            wk: (pk, sk, gk, push_k),
-                            wv: (pv, sv, gv, push_v),
+                            wqg: alloc_gemv_call(&wqg.mat, s_xb, s_qkv, false)?,
+                            wk: alloc_gemv_call(&wk.mat, s_xb, s_k, false)?,
+                            wv: alloc_gemv_call(&wv.mat, s_xb, s_v, false)?,
                         }
                     };
 
@@ -1888,16 +2043,8 @@ impl Qwen35VkRunner {
                         &[Binding::Arena(s_attn_out), Binding::Arena(s_gate)],
                     )?;
 
-                    let (p_wo, g_wo, mut push_wo) = gemv_pipe_for(&wo.mat)?;
-                    push_wo[2] = 1;
-                    let s_wo = alloc_set(
-                        &p_wo,
-                        &[
-                            Binding::Arena(wo.slice),
-                            Binding::Arena(s_attn_out),
-                            Binding::Arena(s_x),
-                        ],
-                    )?;
+                    let (p_wo, s_wo, g_wo, push_wo) =
+                        alloc_gemv_call(&wo.mat, s_attn_out, s_x, true)?;
                     let wo_batch = make_batch_gemm(wo.mat, s_attn_out, s_x)?;
 
                     AttnLayerPlan::FullAttn {
@@ -1932,33 +2079,45 @@ impl Qwen35VkRunner {
             )?;
 
             let ffn_dec_sep = {
-                let (pg, gg, push_g) = gemv_pipe_for(&pl.w_gate.mat)?;
-                let sg_set = alloc_set(
-                    &pg,
-                    &[
-                        Binding::Arena(pl.w_gate.slice),
-                        Binding::Arena(s_xb),
-                        Binding::Arena(s_hb),
-                    ],
-                )?;
-                let (pu, gu, push_u) = gemv_pipe_for(&pl.w_up.mat)?;
-                let su_set = alloc_set(
-                    &pu,
-                    &[
-                        Binding::Arena(pl.w_up.slice),
-                        Binding::Arena(s_xb),
-                        Binding::Arena(s_hb2),
-                    ],
-                )?;
+                let g_call = alloc_gemv_call(&pl.w_gate.mat, s_xb, s_hb, false)?;
+                let u_call = alloc_gemv_call(&pl.w_up.mat, s_xb, s_hb2, false)?;
                 let silu_set = alloc_set(
                     &pipes.silu_mul,
                     &[Binding::Arena(s_hb), Binding::Arena(s_hb2)],
                 )?;
-                ((pg, sg_set, gg, push_g), (pu, su_set, gu, push_u), silu_set)
+                (g_call, u_call, silu_set)
             };
 
-            let ffn_dec = if pl.w_gate.mat.dtype == DType::Q4_0 && pl.w_up.mat.dtype == DType::Q4_0
-            {
+            let ffn_dec = if let (Some(gd), Some(ud)) = (pl.w_gate.mat.soa_d, pl.w_up.mat.soa_d) {
+                let wg = 128u32;
+                let nr = 2u32;
+                let pipe = ctx.pipeline(
+                    "gemv_pair_silu_q4_0_soa",
+                    wg | (nr << 16),
+                    SPV_GEMV_PAIR_SILU_Q4_0_SOA,
+                    6,
+                    8,
+                    &[wg, nr],
+                )?;
+                let set = alloc_set(
+                    &pipe,
+                    &[
+                        Binding::Arena(pl.w_gate.slice),
+                        Binding::Arena(gd),
+                        Binding::Arena(pl.w_up.slice),
+                        Binding::Arena(ud),
+                        Binding::Arena(s_xb),
+                        Binding::Arena(s_hb),
+                    ],
+                )?;
+                let rows_per_wg = (wg / sg).max(1) * nr;
+                DecodeFfnSets::FusedPairSilu {
+                    pipe,
+                    set,
+                    groups_x: (pl.w_gate.mat.rows as u32).div_ceil(rows_per_wg),
+                    push: [pl.w_gate.mat.cols as u32, pl.w_gate.mat.rows as u32],
+                }
+            } else if pl.w_gate.mat.dtype == DType::Q4_0 && pl.w_up.mat.dtype == DType::Q4_0 {
                 let wg = 128u32;
                 let nr = 2u32;
                 let pipe = ctx.pipeline(
@@ -2044,16 +2203,7 @@ impl Qwen35VkRunner {
                 }
             };
 
-            let (p_dn, g_dn, mut push_dn) = gemv_pipe_for(&pl.w_down.mat)?;
-            push_dn[2] = 1;
-            let s_dn = alloc_set(
-                &p_dn,
-                &[
-                    Binding::Arena(pl.w_down.slice),
-                    Binding::Arena(s_hb),
-                    Binding::Arena(s_x),
-                ],
-            )?;
+            let (p_dn, s_dn, g_dn, push_dn) = alloc_gemv_call(&pl.w_down.mat, s_hb, s_x, true)?;
             let down_batch = make_batch_gemm(pl.w_down.mat, s_hb, s_x)?;
 
             layers.push(Qwen35LayerPlan {
@@ -2067,8 +2217,8 @@ impl Qwen35VkRunner {
                 ffn_batch_sep,
                 down_dec: (p_dn, s_dn, g_dn, push_dn),
                 down_batch,
-                gate_up_weight_bytes: pl.w_gate.slice.len + pl.w_up.slice.len,
-                down_weight_bytes: pl.w_down.slice.len,
+                gate_up_weight_bytes: pl.w_gate.mat.byte_len() + pl.w_up.mat.byte_len(),
+                down_weight_bytes: pl.w_down.mat.byte_len(),
             });
         }
 

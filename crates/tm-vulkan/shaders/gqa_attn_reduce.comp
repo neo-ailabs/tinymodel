@@ -1,0 +1,47 @@
+#version 450
+// GQA Split-K FlashDecoding (Pass 2): merges `n_splits` partials per query head into final `out4`.
+
+layout(constant_id = 0) const uint WG = 64;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer SplitML { vec2 split_ml[]; };
+layout(std430, binding = 1) readonly buffer SplitO  { vec4 split_o4[]; };
+layout(std430, binding = 2) writeonly buffer OutBuf { vec4 out4[]; };
+
+layout(push_constant) uniform PC {
+    uint n_head;
+    uint head_dim;
+    uint n_splits;
+    uint _pad;
+} pc;
+
+void main() {
+    const uint head = gl_WorkGroupID.x;
+    if (head >= pc.n_head) return;
+
+    const uint hd4 = pc.head_dim >> 2u;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base_slot = head * pc.n_splits;
+
+    float m_all = -1.0e30;
+    for (uint sp = 0u; sp < pc.n_splits; ++sp) {
+        const vec2 ml = split_ml[base_slot + sp];
+        if (ml.y > 0.0) {
+            m_all = max(m_all, ml.x);
+        }
+    }
+
+    for (uint d4 = tid; d4 < hd4; d4 += WG) {
+        float denom = 0.0;
+        vec4 acc = vec4(0.0);
+        for (uint sp = 0u; sp < pc.n_splits; ++sp) {
+            const vec2 ml = split_ml[base_slot + sp];
+            if (ml.y > 0.0) {
+                const float w = exp(ml.x - m_all);
+                denom += ml.y * w;
+                acc += split_o4[(base_slot + sp) * hd4 + d4] * w;
+            }
+        }
+        out4[head * hd4 + d4] = acc / denom;
+    }
+}

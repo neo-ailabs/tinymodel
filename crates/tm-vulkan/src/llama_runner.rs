@@ -33,6 +33,8 @@ const SPV_RMS_NORM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm.s
 const SPV_QK_NORM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qk_norm.spv"));
 const SPV_ROPE_KV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_kv.spv"));
 const SPV_GQA_ATTN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gqa_attn.spv"));
+const SPV_GQA_ATTN_SPLITK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gqa_attn_splitk.spv"));
+const SPV_GQA_ATTN_REDUCE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gqa_attn_reduce.spv"));
 const SPV_FA_COOPMAT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_coopmat.spv"));
 const SPV_FA_GQA_TILED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_gqa_tiled.spv"));
 const SPV_GEMV_RES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_res.spv"));
@@ -376,6 +378,9 @@ struct RunnerPipes {
     rope_dec: Arc<Pipeline>,
     rope_batch: Arc<Pipeline>,
     attn_dec: Arc<Pipeline>,
+    attn_dec_splitk: Option<Arc<Pipeline>>,
+    attn_dec_reduce: Option<Arc<Pipeline>>,
+    attn_splits: u32,
     attn_batch: Arc<Pipeline>,
     attn_batch_kind: BatchAttnKind,
     silu_mul: Arc<Pipeline>,
@@ -405,6 +410,7 @@ pub struct LlamaVkRunner {
     quant_xb_set: Option<vk::DescriptorSet>,
     quant_hb_set: Option<vk::DescriptorSet>,
     output_norm_set: vk::DescriptorSet,
+    attn_reduce_set: Option<vk::DescriptorSet>,
     lm_head_dec: (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
     output_bias_set: Option<vk::DescriptorSet>,
     argmax_set: vk::DescriptorSet,
@@ -1171,6 +1177,24 @@ impl LlamaVkRunner {
         let s_v = planner.reserve((max_batch * kv_dim * 4) as u64)?;
         let s_hb = planner.reserve((max_batch * n_ff * 4) as u64)?;
         let s_hb2 = planner.reserve((max_batch * n_ff * 4) as u64)?;
+        let gqa_group = n_head / n_head_kv;
+        let attn_splits: u32 = if (1..=8).contains(&gqa_group)
+            && head_dim <= 256
+            && (head_dim >= 128 || max_ctx >= 2048)
+            && (4 * sg) <= info.max_workgroup_invocations
+        {
+            (64 / n_head_kv as u32).clamp(4, 16)
+        } else {
+            0
+        };
+        let (s_attn_split_ml, s_attn_split_o) = if attn_splits > 0 {
+            (
+                Some(planner.reserve((n_head * attn_splits as usize * 8) as u64)?),
+                Some(planner.reserve((n_head * attn_splits as usize * head_dim * 4) as u64)?),
+            )
+        } else {
+            (None, None)
+        };
         let (s_xq, s_xd) = if prefill_kind.uses_q8_1() {
             let max_blocks = (max_batch * max_dim) / 32;
             (
@@ -1357,6 +1381,26 @@ impl LlamaVkRunner {
                 16,
                 &[attn_wg, 0, attn_n_vec],
             )?,
+            attn_dec_splitk: if attn_splits > 0 {
+                let sk_wg = 4 * sg;
+                let key = sk_wg | ((gqa_group as u32) << 12) | (attn_n_vec << 20);
+                Some(ctx.pipeline(
+                    "gqa_attn_splitk",
+                    key,
+                    SPV_GQA_ATTN_SPLITK,
+                    6,
+                    16,
+                    &[sk_wg, gqa_group as u32, attn_n_vec],
+                )?)
+            } else {
+                None
+            },
+            attn_dec_reduce: if attn_splits > 0 {
+                Some(ctx.pipeline("gqa_attn_reduce", 64, SPV_GQA_ATTN_REDUCE, 3, 16, &[64])?)
+            } else {
+                None
+            },
+            attn_splits,
             attn_batch,
             attn_batch_kind,
             silu_mul: ctx.pipeline("silu_mul", 0, SPV_SILU_MUL, 2, 4, &[256])?,
@@ -1726,6 +1770,20 @@ impl LlamaVkRunner {
                 }
             };
 
+        let attn_reduce_set = if let (Some(p_red), Some(s_ml), Some(s_o)) =
+            (&pipes.attn_dec_reduce, s_attn_split_ml, s_attn_split_o)
+        {
+            Some(alloc_set(
+                p_red,
+                &[
+                    Binding::Arena(s_ml),
+                    Binding::Arena(s_o),
+                    Binding::Arena(s_xb),
+                ],
+            )?)
+        } else {
+            None
+        };
         let lm_head_dec = alloc_gemv_call(&out_mat, s_xb, logits_dev, false)?;
         let output_bias_set = match p_output_bias {
             Some(ref pob) => Some(alloc_set(
@@ -1935,16 +1993,32 @@ impl LlamaVkRunner {
             let rope_dec_set = alloc_set(&pipes.rope_dec, &rope_binds)?;
             let rope_batch_set = alloc_set(&pipes.rope_batch, &rope_binds)?;
 
-            let attn_dec_set = alloc_set(
-                &pipes.attn_dec,
-                &[
-                    Binding::Arena(s_q),
-                    Binding::Arena(pl.k_cache),
-                    Binding::Arena(pl.v_cache),
-                    Binding::Arena(s_xb),
-                    Binding::Raw(&step_buf),
-                ],
-            )?;
+            let attn_dec_set = if let (Some(p_sk), Some(s_ml), Some(s_o)) =
+                (&pipes.attn_dec_splitk, s_attn_split_ml, s_attn_split_o)
+            {
+                alloc_set(
+                    p_sk,
+                    &[
+                        Binding::Arena(s_q),
+                        Binding::Arena(pl.k_cache),
+                        Binding::Arena(pl.v_cache),
+                        Binding::Arena(s_ml),
+                        Binding::Arena(s_o),
+                        Binding::Raw(&step_buf),
+                    ],
+                )?
+            } else {
+                alloc_set(
+                    &pipes.attn_dec,
+                    &[
+                        Binding::Arena(s_q),
+                        Binding::Arena(pl.k_cache),
+                        Binding::Arena(pl.v_cache),
+                        Binding::Arena(s_xb),
+                        Binding::Raw(&step_buf),
+                    ],
+                )?
+            };
             let attn_batch_set = match pipes.attn_batch_kind {
                 BatchAttnKind::CoopMat64 | BatchAttnKind::Tiled8 => alloc_set(
                     &pipes.attn_batch,
@@ -2181,6 +2255,7 @@ impl LlamaVkRunner {
             quant_xb_set,
             quant_hb_set,
             output_norm_set,
+            attn_reduce_set,
             lm_head_dec,
             output_bias_set,
             argmax_set,
@@ -2532,15 +2607,52 @@ impl LlamaVkRunner {
                 true,
             )?;
 
-            self.cmd_dispatch_set(
-                cb,
-                &self.pipes.attn_dec,
-                layer.attn_dec_set,
-                &attn_push,
-                self.cfg.n_head as u32,
-                1,
-                true,
-            )?;
+            if let (Some(p_sk), Some(p_red), Some(red_set)) = (
+                &self.pipes.attn_dec_splitk,
+                &self.pipes.attn_dec_reduce,
+                self.attn_reduce_set,
+            ) {
+                let sk_push = [
+                    self.cfg.n_head as u32,
+                    self.cfg.n_head_kv as u32,
+                    self.cfg.head_dim as u32,
+                    self.pipes.attn_splits,
+                ];
+                self.cmd_dispatch_set(
+                    cb,
+                    p_sk,
+                    layer.attn_dec_set,
+                    &sk_push,
+                    self.cfg.n_head_kv as u32,
+                    self.pipes.attn_splits,
+                    true,
+                )?;
+                let red_push = [
+                    self.cfg.n_head as u32,
+                    self.cfg.head_dim as u32,
+                    self.pipes.attn_splits,
+                    0,
+                ];
+                self.cmd_dispatch_set(
+                    cb,
+                    p_red,
+                    red_set,
+                    &red_push,
+                    self.cfg.n_head as u32,
+                    1,
+                    true,
+                )?;
+            } else {
+                self.cmd_dispatch_set(
+                    cb,
+                    &self.pipes.attn_dec,
+                    layer.attn_dec_set,
+                    &attn_push,
+                    self.cfg.n_head as u32,
+                    1,
+                    true,
+                )?;
+            }
 
             self.cmd_dispatch_set(
                 cb,
@@ -3591,15 +3703,52 @@ impl LlamaVkRunner {
                     spans.push((4, prev, cur));
                     prev = cur;
 
-                    self.cmd_dispatch_set(
-                        cb,
-                        &self.pipes.attn_dec,
-                        layer.attn_dec_set,
-                        &attn_push,
-                        self.cfg.n_head as u32,
-                        1,
-                        true,
-                    )?;
+                    if let (Some(p_sk), Some(p_red), Some(red_set)) = (
+                        &self.pipes.attn_dec_splitk,
+                        &self.pipes.attn_dec_reduce,
+                        self.attn_reduce_set,
+                    ) {
+                        let sk_push = [
+                            self.cfg.n_head as u32,
+                            self.cfg.n_head_kv as u32,
+                            self.cfg.head_dim as u32,
+                            self.pipes.attn_splits,
+                        ];
+                        self.cmd_dispatch_set(
+                            cb,
+                            p_sk,
+                            layer.attn_dec_set,
+                            &sk_push,
+                            self.cfg.n_head_kv as u32,
+                            self.pipes.attn_splits,
+                            true,
+                        )?;
+                        let red_push = [
+                            self.cfg.n_head as u32,
+                            self.cfg.head_dim as u32,
+                            self.pipes.attn_splits,
+                            0,
+                        ];
+                        self.cmd_dispatch_set(
+                            cb,
+                            p_red,
+                            red_set,
+                            &red_push,
+                            self.cfg.n_head as u32,
+                            1,
+                            true,
+                        )?;
+                    } else {
+                        self.cmd_dispatch_set(
+                            cb,
+                            &self.pipes.attn_dec,
+                            layer.attn_dec_set,
+                            &attn_push,
+                            self.cfg.n_head as u32,
+                            1,
+                            true,
+                        )?;
+                    }
                     let cur = mark(cb);
                     spans.push((5, prev, cur));
                     prev = cur;
