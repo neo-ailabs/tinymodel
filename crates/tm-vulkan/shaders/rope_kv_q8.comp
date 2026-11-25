@@ -1,0 +1,139 @@
+#version 450
+// Fused RoPE (Norm interleaved or NeoX split-half, optional freq_factors) + Q8_0 KV cache store.
+// Q8_0 GPU KV layout per (pos, kv_h), 100% 4-byte aligned, zero 16-bit storage extension required:
+//   - Words [0 .. hd4):             packed int8x4 via `packSnorm4x8(x / max_abs)` (hd4 = head_dim / 4)
+//   - Words [hd4 .. hd4+sc_words):  packed fp16 `max_abs` scales (2 per u32 via `packHalf2x16`)
+//   Block size is 32 when head_dim >= 32 && (head_dim % 32 == 0), else head_dim (synthetic tests).
+//   For head_dim=128: 32 + 2 = 34 u32 words = 136 B (1.88x smaller VRAM & DRAM traffic than F16).
+// Dispatch: gl_NumWorkGroups.x = n_head + n_head_kv, gl_NumWorkGroups.y = (BATCH == 0 ? 1 : n_tok).
+
+layout(constant_id = 0) const uint WG = 64;
+layout(constant_id = 1) const uint BATCH = 0;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) buffer QBuf { float q[]; };
+layout(std430, binding = 1) buffer KBuf { float k[]; };
+layout(std430, binding = 2) readonly buffer VBuf { float v[]; };
+layout(std430, binding = 3) writeonly buffer KCache { uint k_cache[]; };
+layout(std430, binding = 4) writeonly buffer VCache { uint v_cache[]; };
+layout(std430, binding = 5) readonly buffer Freqs { float freq_factors[]; };
+layout(std430, binding = 6) readonly buffer Step { uint step[]; };
+
+layout(push_constant) uniform PC {
+    uint n_head;
+    uint n_head_kv;
+    uint head_dim;
+    uint rope_dim;
+    uint base_pos;
+    uint rope_type;        // 0 = Norm (interleaved), 1 = NeoX (split-half)
+    uint has_freq_factors; // 0 or 1
+    float freq_base;
+} pc;
+
+shared float sk[256];
+shared float sv[256];
+shared float sk_max[8];
+shared float sv_max[8];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint h = gl_WorkGroupID.x;
+    const uint t = (BATCH == 0u) ? 0u : gl_WorkGroupID.y;
+    const uint pos = ((BATCH == 0u) ? step[1] : pc.base_pos) + t;
+
+    const uint half_rope = pc.rope_dim >> 1u;
+    const uint q_dim = pc.n_head * pc.head_dim;
+    const uint kv_dim = pc.n_head_kv * pc.head_dim;
+
+    if (h < pc.n_head) {
+        const uint hb = t * q_dim + h * pc.head_dim;
+        for (uint i = tid; i < half_rope; i += WG) {
+            float freq = pow(pc.freq_base, -2.0 * float(i) / float(pc.rope_dim));
+            if (pc.has_freq_factors != 0u) {
+                freq /= freq_factors[i];
+            }
+            const float theta = float(pos) * freq;
+            const float c = cos(theta);
+            const float s = sin(theta);
+            const uint i0 = (pc.rope_type == 0u) ? (2u * i) : i;
+            const uint i1 = (pc.rope_type == 0u) ? (2u * i + 1u) : (i + half_rope);
+            const float x0 = q[hb + i0];
+            const float x1 = q[hb + i1];
+            q[hb + i0] = x0 * c - x1 * s;
+            q[hb + i1] = x0 * s + x1 * c;
+        }
+        return;
+    }
+
+    const uint kv_h = h - pc.n_head;
+    if (kv_h >= pc.n_head_kv) return;
+
+    const uint kb = t * kv_dim + kv_h * pc.head_dim;
+    for (uint d = tid; d < pc.head_dim; d += WG) {
+        sk[d] = k[kb + d];
+        sv[d] = v[kb + d];
+    }
+    barrier();
+
+    for (uint i = tid; i < half_rope; i += WG) {
+        float freq = pow(pc.freq_base, -2.0 * float(i) / float(pc.rope_dim));
+        if (pc.has_freq_factors != 0u) {
+            freq /= freq_factors[i];
+        }
+        const float theta = float(pos) * freq;
+        const float c = cos(theta);
+        const float s = sin(theta);
+        const uint i0 = (pc.rope_type == 0u) ? (2u * i) : i;
+        const uint i1 = (pc.rope_type == 0u) ? (2u * i + 1u) : (i + half_rope);
+        const float x0 = sk[i0];
+        const float x1 = sk[i1];
+        sk[i0] = x0 * c - x1 * s;
+        sk[i1] = x0 * s + x1 * c;
+    }
+    barrier();
+
+    const uint hd4 = pc.head_dim >> 2u;
+    const bool use_blk32 = (pc.head_dim >= 32u) && ((pc.head_dim & 31u) == 0u);
+    const uint blk_sz = use_blk32 ? 32u : pc.head_dim;
+    const uint n_blocks = use_blk32 ? (pc.head_dim >> 5u) : 1u;
+    const uint scale_words = (n_blocks + 1u) >> 1u;
+    const uint head_stride = hd4 + scale_words;
+    const uint base = (pos * pc.n_head_kv + kv_h) * head_stride;
+
+    if (tid < n_blocks) {
+        float mk = 0.0;
+        float mv = 0.0;
+        const uint b0 = tid * blk_sz;
+        for (uint j = 0u; j < blk_sz; ++j) {
+            mk = max(mk, abs(sk[b0 + j]));
+            mv = max(mv, abs(sv[b0 + j]));
+        }
+        // Round scale to exact stored fp16 value to eliminate scale-rounding bias.
+        mk = unpackHalf2x16(packHalf2x16(vec2(min(mk, 65504.0), 0.0))).x;
+        mv = unpackHalf2x16(packHalf2x16(vec2(min(mv, 65504.0), 0.0))).x;
+        sk_max[tid] = mk;
+        sv_max[tid] = mv;
+    }
+    barrier();
+
+    if (tid < scale_words) {
+        const uint b0 = tid << 1u;
+        const float k0 = sk_max[b0];
+        const float k1 = (b0 + 1u < n_blocks) ? sk_max[b0 + 1u] : 0.0;
+        const float v0 = sv_max[b0];
+        const float v1 = (b0 + 1u < n_blocks) ? sv_max[b0 + 1u] : 0.0;
+        k_cache[base + hd4 + tid] = packHalf2x16(vec2(k0, k1));
+        v_cache[base + hd4 + tid] = packHalf2x16(vec2(v0, v1));
+    }
+
+    for (uint d4 = tid; d4 < hd4; d4 += WG) {
+        const uint blk = use_blk32 ? (d4 >> 3u) : 0u;
+        const float inv_k = (sk_max[blk] > 0.0) ? (1.0 / sk_max[blk]) : 0.0;
+        const float inv_v = (sv_max[blk] > 0.0) ? (1.0 / sv_max[blk]) : 0.0;
+        const uint d = d4 << 2u;
+        const vec4 vk = vec4(sk[d], sk[d + 1u], sk[d + 2u], sk[d + 3u]) * inv_k;
+        const vec4 vv = vec4(sv[d], sv[d + 1u], sv[d + 2u], sv[d + 3u]) * inv_v;
+        k_cache[base + d4] = packSnorm4x8(vk);
+        v_cache[base + d4] = packSnorm4x8(vv);
+    }
+}

@@ -1,0 +1,172 @@
+#version 450
+// GQA-grouped Split-K FlashDecoding (Pass 1) over Q8_0 KV cache.
+// Loads each Q8_0 K/V token once across all `GROUP` query heads sharing `kv_h` (~1.88x less KV DRAM
+// bandwidth vs F16, and up to 7x less vs per-head GQA). Zero subgroupShuffle; portable across {8,16,32,64}.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(constant_id = 0) const uint WG = 128;      // 4 * subgroup_size
+layout(constant_id = 1) const uint GROUP = 4;     // n_head / n_head_kv (1..8)
+layout(constant_id = 2) const uint N_VEC = 1;     // ceil((head_dim / 4) / subgroup_size)
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer QBuf     { vec4 q4[]; };
+layout(std430, binding = 1) readonly buffer KCache   { uint k_cache[]; };
+layout(std430, binding = 2) readonly buffer VCache   { uint v_cache[]; };
+layout(std430, binding = 3) writeonly buffer SplitML { vec2 split_ml[]; };
+layout(std430, binding = 4) writeonly buffer SplitO  { vec4 split_o4[]; };
+layout(std430, binding = 5) readonly buffer Step     { uint step[]; };
+
+layout(push_constant) uniform PC {
+    uint n_head;
+    uint n_head_kv;
+    uint head_dim;
+    uint n_splits;
+} pc;
+
+const uint MAX_SG = 4u;
+const uint MAX_HD4 = 64u;
+
+shared vec4 q_shared[8u * MAX_HD4];
+shared float tg_m[MAX_SG];
+shared float tg_l[MAX_SG];
+shared vec4 tg_o[MAX_SG * MAX_HD4];
+
+vec4 dequant_q8_4(uint packed, uint scale_word, uint blk) {
+    const vec2 sc = unpackHalf2x16(scale_word);
+    const float s = ((blk & 1u) == 0u) ? sc.x : sc.y;
+    return unpackSnorm4x8(packed) * s;
+}
+
+void main() {
+    const uint kv_h = gl_WorkGroupID.x;
+    const uint sp = gl_WorkGroupID.y;
+    const uint seq_len = step[2];
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sg = gl_SubgroupID;
+    const uint num_sg = gl_NumSubgroups;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg_size = gl_SubgroupSize;
+
+    const uint hd4 = pc.head_dim >> 2u;
+    const bool use_blk32 = (pc.head_dim >= 32u) && ((pc.head_dim & 31u) == 0u);
+    const uint n_blocks = use_blk32 ? (pc.head_dim >> 5u) : 1u;
+    const uint scale_words = (n_blocks + 1u) >> 1u;
+    const uint head_stride = hd4 + scale_words;
+    const uint head0 = kv_h * GROUP;
+
+    const uint t_start = (sp * seq_len) / pc.n_splits;
+    const uint t_end = ((sp + 1u) * seq_len) / pc.n_splits;
+
+    if (t_start >= t_end) {
+        if (tid < GROUP) {
+            const uint h = head0 + tid;
+            split_ml[h * pc.n_splits + sp] = vec2(-1.0e30, 0.0);
+        }
+        return;
+    }
+
+    const float scale = inversesqrt(float(pc.head_dim));
+    const uint total_q = GROUP * hd4;
+    for (uint i = tid; i < total_q; i += WG) {
+        const uint g = i / hd4;
+        const uint d4 = i - g * hd4;
+        q_shared[g * MAX_HD4 + d4] = q4[(head0 + g) * hd4 + d4] * scale;
+    }
+    barrier();
+
+    float m_loc[GROUP];
+    float l_loc[GROUP];
+    vec4 o_loc[GROUP * N_VEC];
+    [[unroll]] for (uint g = 0u; g < GROUP; ++g) {
+        m_loc[g] = -1.0e30;
+        l_loc[g] = 0.0;
+        [[unroll]] for (uint k = 0u; k < N_VEC; ++k) {
+            o_loc[g * N_VEC + k] = vec4(0.0);
+        }
+    }
+
+    for (uint t = t_start + sg; t < t_end; t += num_sg) {
+        const uint kv_base = (t * pc.n_head_kv + kv_h) * head_stride;
+        vec4 kv_k[N_VEC];
+        vec4 kv_v[N_VEC];
+        [[unroll]] for (uint k = 0u; k < N_VEC; ++k) {
+            const uint d4 = k * sg_size + lane;
+            if (d4 < hd4) {
+                const uint blk = use_blk32 ? (d4 >> 3u) : 0u;
+                const uint sw = blk >> 1u;
+                kv_k[k] = dequant_q8_4(k_cache[kv_base + d4], k_cache[kv_base + hd4 + sw], blk);
+                kv_v[k] = dequant_q8_4(v_cache[kv_base + d4], v_cache[kv_base + hd4 + sw], blk);
+            } else {
+                kv_k[k] = vec4(0.0);
+                kv_v[k] = vec4(0.0);
+            }
+        }
+
+        [[unroll]] for (uint g = 0u; g < GROUP; ++g) {
+            float dot_val = 0.0;
+            [[unroll]] for (uint k = 0u; k < N_VEC; ++k) {
+                const uint d4 = k * sg_size + lane;
+                if (d4 < hd4) {
+                    dot_val += dot(q_shared[g * MAX_HD4 + d4], kv_k[k]);
+                }
+            }
+            dot_val = subgroupAdd(dot_val);
+
+            const float m_new = max(m_loc[g], dot_val);
+            const float alpha = (l_loc[g] == 0.0) ? 0.0 : exp(m_loc[g] - m_new);
+            const float p = exp(dot_val - m_new);
+            l_loc[g] = l_loc[g] * alpha + p;
+            m_loc[g] = m_new;
+
+            [[unroll]] for (uint k = 0u; k < N_VEC; ++k) {
+                o_loc[g * N_VEC + k] = o_loc[g * N_VEC + k] * alpha + p * kv_v[k];
+            }
+        }
+    }
+
+    [[unroll]] for (uint g = 0u; g < GROUP; ++g) {
+        if (subgroupElect()) {
+            tg_m[sg] = m_loc[g];
+            tg_l[sg] = l_loc[g];
+        }
+        [[unroll]] for (uint k = 0u; k < N_VEC; ++k) {
+            const uint d4 = k * sg_size + lane;
+            if (d4 < hd4) {
+                tg_o[sg * MAX_HD4 + d4] = o_loc[g * N_VEC + k];
+            }
+        }
+        barrier();
+
+        const uint h = head0 + g;
+        const uint slot = h * pc.n_splits + sp;
+        float m_all = -1.0e30;
+        for (uint s = 0u; s < num_sg; ++s) {
+            if (tg_l[s] > 0.0) {
+                m_all = max(m_all, tg_m[s]);
+            }
+        }
+        float l_all = 0.0;
+        for (uint s = 0u; s < num_sg; ++s) {
+            if (tg_l[s] > 0.0) {
+                l_all += tg_l[s] * exp(tg_m[s] - m_all);
+            }
+        }
+        if (tid == 0u) {
+            split_ml[slot] = vec2(m_all, l_all);
+        }
+        for (uint d4 = tid; d4 < hd4; d4 += WG) {
+            vec4 acc = vec4(0.0);
+            for (uint s = 0u; s < num_sg; ++s) {
+                if (tg_l[s] > 0.0) {
+                    acc += tg_o[s * MAX_HD4 + d4] * exp(tg_m[s] - m_all);
+                }
+            }
+            split_o4[slot * hd4 + d4] = acc;
+        }
+        barrier();
+    }
+}

@@ -1,0 +1,144 @@
+#version 450
+// Subgroup-portable vectorized online-softmax GQA over Q8_0 KV cache (head_dim <= 256, multiple of 4).
+// Single-instruction `unpackSnorm4x8(word) * scale` dequantization with 4-byte aligned coalesced loads.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(constant_id = 0) const uint WG = 256;
+layout(constant_id = 1) const uint BATCH = 0;
+layout(constant_id = 2) const uint N_VEC = 8;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer QBuf { vec4 q4[]; };
+layout(std430, binding = 1) readonly buffer KCache { uint k_cache[]; };
+layout(std430, binding = 2) readonly buffer VCache { uint v_cache[]; };
+layout(std430, binding = 3) writeonly buffer OutBuf { vec4 out4[]; };
+layout(std430, binding = 4) readonly buffer Step { uint step[]; };
+
+layout(push_constant) uniform PC {
+    uint n_head;
+    uint n_head_kv;
+    uint head_dim;
+    uint base_seq_len;
+} pc;
+
+const uint SG = 8u;
+const uint MAX_HD4 = 64u; // 256 / 4 vec4s
+
+shared vec4 q_shared[MAX_HD4];
+shared float tg_m[SG];
+shared float tg_l[SG];
+shared vec4 tg_o[SG * MAX_HD4];
+
+vec4 dequant_q8_4(uint packed, uint scale_word, uint blk) {
+    const vec2 sc = unpackHalf2x16(scale_word);
+    const float s = ((blk & 1u) == 0u) ? sc.x : sc.y;
+    return unpackSnorm4x8(packed) * s;
+}
+
+void main() {
+    const uint head = gl_WorkGroupID.x;
+    const uint tok = (BATCH == 0u) ? 0u : gl_WorkGroupID.y;
+    const uint seq_len = (BATCH == 0u) ? step[2] : (pc.base_seq_len + tok);
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sg = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg_size = gl_SubgroupSize;
+
+    const uint hd4 = pc.head_dim >> 2u;
+    const bool use_blk32 = (pc.head_dim >= 32u) && ((pc.head_dim & 31u) == 0u);
+    const uint n_blocks = use_blk32 ? (pc.head_dim >> 5u) : 1u;
+    const uint scale_words = (n_blocks + 1u) >> 1u;
+    const uint head_stride = hd4 + scale_words;
+
+    const uint q_dim4 = pc.n_head * hd4;
+    const uint group = pc.n_head / pc.n_head_kv;
+    const uint kv_h = head / group;
+    const float scale = inversesqrt(float(pc.head_dim));
+
+    const uint q_base4 = tok * q_dim4 + head * hd4;
+    for (uint d4 = tid; d4 < hd4; d4 += WG) {
+        q_shared[d4] = q4[q_base4 + d4] * scale;
+    }
+    barrier();
+
+    float m_local = -1.0e30;
+    float l_local = 0.0;
+    vec4 o_local[N_VEC];
+    [[unroll]] for (uint k = 0u; k < N_VEC; ++k) {
+        o_local[k] = vec4(0.0);
+    }
+
+    for (uint t = sg; t < seq_len; t += SG) {
+        const uint kv_base = (t * pc.n_head_kv + kv_h) * head_stride;
+        float dot_val = 0.0;
+        [[unroll]] for (uint k = 0u; k < N_VEC; ++k) {
+            const uint d4 = k * sg_size + lane;
+            if (d4 < hd4) {
+                const uint blk = use_blk32 ? (d4 >> 3u) : 0u;
+                const vec4 kv_k = dequant_q8_4(
+                    k_cache[kv_base + d4],
+                    k_cache[kv_base + hd4 + (blk >> 1u)],
+                    blk
+                );
+                dot_val += dot(q_shared[d4], kv_k);
+            }
+        }
+        dot_val = subgroupAdd(dot_val);
+
+        const float m_new = max(m_local, dot_val);
+        const float alpha = (l_local == 0.0) ? 0.0 : exp(m_local - m_new);
+        const float p = exp(dot_val - m_new);
+        l_local = l_local * alpha + p;
+        m_local = m_new;
+
+        [[unroll]] for (uint k = 0u; k < N_VEC; ++k) {
+            const uint d4 = k * sg_size + lane;
+            if (d4 < hd4) {
+                const uint blk = use_blk32 ? (d4 >> 3u) : 0u;
+                const vec4 kv_v = dequant_q8_4(
+                    v_cache[kv_base + d4],
+                    v_cache[kv_base + hd4 + (blk >> 1u)],
+                    blk
+                );
+                o_local[k] = o_local[k] * alpha + p * kv_v;
+            }
+        }
+    }
+
+    if (subgroupElect()) {
+        tg_m[sg] = m_local;
+        tg_l[sg] = l_local;
+    }
+    [[unroll]] for (uint k = 0u; k < N_VEC; ++k) {
+        const uint d4 = k * sg_size + lane;
+        if (d4 < hd4) {
+            tg_o[sg * MAX_HD4 + d4] = o_local[k];
+        }
+    }
+    barrier();
+
+    float m_all = -1.0e30;
+    for (uint s = 0u; s < SG; ++s) {
+        if (tg_l[s] > 0.0) {
+            m_all = max(m_all, tg_m[s]);
+        }
+    }
+
+    const uint out_base4 = tok * q_dim4 + head * hd4;
+    for (uint d4 = tid; d4 < hd4; d4 += WG) {
+        float denom = 0.0;
+        vec4 acc = vec4(0.0);
+        for (uint s = 0u; s < SG; ++s) {
+            if (tg_l[s] > 0.0) {
+                const float w = exp(tg_m[s] - m_all);
+                denom += tg_l[s] * w;
+                acc += tg_o[s * MAX_HD4 + d4] * w;
+            }
+        }
+        out4[out_base4 + d4] = acc / denom;
+    }
+}

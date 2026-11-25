@@ -1724,7 +1724,8 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
         } else {
             Vec::new()
         };
-        let mut runner = tm_vulkan::Qwen35VkRunner::from_gguf(gguf, opts.max_ctx)?;
+        let mut runner =
+            tm_vulkan::Qwen35VkRunner::from_gguf_with_kv(gguf, opts.max_ctx, opts.kv_type)?;
         if let Some(ref ls) = loras {
             runner.bind_lora(ls)?;
         }
@@ -1808,7 +1809,7 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
     } else {
         Vec::new()
     };
-    let mut runner = tm_vulkan::LlamaVkRunner::from_gguf(gguf, opts.max_ctx)?;
+    let mut runner = tm_vulkan::LlamaVkRunner::from_gguf_with_kv(gguf, opts.max_ctx, opts.kv_type)?;
     if let Some(ref ls) = loras {
         runner.bind_lora(ls)?;
     }
@@ -2171,7 +2172,8 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
     }
 
     if arch == "qwen35" {
-        let mut runner = tm_vulkan::Qwen35VkRunner::from_gguf(gguf, opts.max_ctx)?;
+        let mut runner =
+            tm_vulkan::Qwen35VkRunner::from_gguf_with_kv(gguf, opts.max_ctx, opts.kv_type)?;
         if let Some(ref ls) = loras {
             runner.bind_lora(ls)?;
         }
@@ -2254,7 +2256,7 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
         return Ok(());
     }
 
-    let mut runner = tm_vulkan::LlamaVkRunner::from_gguf(gguf, opts.max_ctx)?;
+    let mut runner = tm_vulkan::LlamaVkRunner::from_gguf_with_kv(gguf, opts.max_ctx, opts.kv_type)?;
     if let Some(ref ls) = loras {
         runner.bind_lora(ls)?;
     }
@@ -2353,7 +2355,8 @@ fn cmd_profile_vulkan(opts: RunOpts) -> Result<()> {
     };
     let n_runs = opts.n_predict.max(16);
     if arch == "qwen35" {
-        let mut runner = tm_vulkan::Qwen35VkRunner::from_gguf(gguf, opts.max_ctx)?;
+        let mut runner =
+            tm_vulkan::Qwen35VkRunner::from_gguf_with_kv(gguf, opts.max_ctx, opts.kv_type)?;
         if let Some(ref ls) = loras {
             runner.bind_lora(ls)?;
         }
@@ -2363,7 +2366,7 @@ fn cmd_profile_vulkan(opts: RunOpts) -> Result<()> {
         print_vulkan_profile_report(&model_name, &dev, &drv, &rep);
         return Ok(());
     }
-    let mut runner = tm_vulkan::LlamaVkRunner::from_gguf(gguf, opts.max_ctx)?;
+    let mut runner = tm_vulkan::LlamaVkRunner::from_gguf_with_kv(gguf, opts.max_ctx, opts.kv_type)?;
     if let Some(ref ls) = loras {
         runner.bind_lora(ls)?;
     }
@@ -3055,7 +3058,8 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
                 return Ok(());
             }
             if arch == "qwen35" {
-                let mut runner = tm_vulkan::Qwen35VkRunner::from_gguf(gguf, opts.max_ctx)?;
+                let mut runner =
+                    tm_vulkan::Qwen35VkRunner::from_gguf_with_kv(gguf, opts.max_ctx, opts.kv_type)?;
                 if let Some(ref ls) = loras {
                     runner.bind_lora(ls)?;
                 }
@@ -3081,7 +3085,8 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
                 );
                 return Ok(());
             }
-            let mut runner = tm_vulkan::LlamaVkRunner::from_gguf(gguf, opts.max_ctx)?;
+            let mut runner =
+                tm_vulkan::LlamaVkRunner::from_gguf_with_kv(gguf, opts.max_ctx, opts.kv_type)?;
             if let Some(ref ls) = loras {
                 runner.bind_lora(ls)?;
             }

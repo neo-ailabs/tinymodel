@@ -17,12 +17,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ash::vk;
-use tm_core::{DType, dequantize_row_bytes};
+use tm_core::{DType, KvType, dequantize_row_bytes};
 use tm_gguf::{GgufError, GgufFile};
 
 use crate::context::{Pipeline, VkBuffer, VkPrefillMode, VulkanContext};
 use crate::kernels::{dtype_code, normalize_vk_mat_bytes};
-use crate::llama_runner::{VkProfileReport, VkStageStat};
+use crate::llama_runner::{VkProfileReport, VkStageStat, kv_cache_bytes_per_layer};
 use crate::lora_gpu::{VkEmbedSlot, VkLinearSlot, VkLoraEngine};
 use crate::{VkResultExt, VulkanError};
 
@@ -32,9 +32,12 @@ const SPV_QK_NORM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qk_norm.spv
 const SPV_SPLIT_QG_QNORM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/split_qg_qnorm.spv"));
 const SPV_SIGMOID_MUL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sigmoid_mul.spv"));
 const SPV_ROPE_KV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_kv.spv"));
+const SPV_ROPE_KV_Q8: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_kv_q8.spv"));
 const SPV_GQA_ATTN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gqa_attn.spv"));
+const SPV_GQA_ATTN_Q8: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gqa_attn_q8.spv"));
 const SPV_FA_COOPMAT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_coopmat.spv"));
 const SPV_FA_GQA_TILED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_gqa_tiled.spv"));
+const SPV_FA_GQA_TILED_Q8: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_gqa_tiled_q8.spv"));
 const SPV_GEMV_RES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_res.spv"));
 const SPV_GEMV_RES_Q4_0_SOA: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemv_res_q4_0_soa.spv"));
@@ -416,6 +419,7 @@ struct RunnerPipes {
 pub struct Qwen35VkRunner {
     pub cfg: Qwen35VkConfig,
     ctx: VulkanContext,
+    kv_type: KvType,
     prefill_kind: ResolvedPrefill,
     max_batch: usize,
     slabs: Vec<VkBuffer>,
@@ -535,16 +539,35 @@ fn plan_mat<'a>(
 }
 
 impl Qwen35VkRunner {
-    /// Loads a `qwen35` GGUF model onto the selected Vulkan device.
+    /// Loads a `qwen35` GGUF model onto the selected Vulkan device (F16 KV cache).
     pub fn from_gguf(gguf: Arc<GgufFile>, max_ctx: usize) -> Result<Self, VulkanError> {
-        Self::from_gguf_with_context(VulkanContext::new()?, gguf, max_ctx)
+        Self::from_gguf_with_context_and_kv(VulkanContext::new()?, gguf, max_ctx, KvType::F16)
     }
 
-    /// Loads a `qwen35` GGUF model onto an explicit [`VulkanContext`].
+    /// Loads a `qwen35` GGUF model onto the selected Vulkan device with the requested KV cache type (`F16` or `Q8_0`).
+    pub fn from_gguf_with_kv(
+        gguf: Arc<GgufFile>,
+        max_ctx: usize,
+        kv_type: KvType,
+    ) -> Result<Self, VulkanError> {
+        Self::from_gguf_with_context_and_kv(VulkanContext::new()?, gguf, max_ctx, kv_type)
+    }
+
+    /// Loads a `qwen35` GGUF model onto an explicit [`VulkanContext`] (F16 KV cache).
     pub fn from_gguf_with_context(
         ctx: VulkanContext,
         gguf: Arc<GgufFile>,
         max_ctx: usize,
+    ) -> Result<Self, VulkanError> {
+        Self::from_gguf_with_context_and_kv(ctx, gguf, max_ctx, KvType::F16)
+    }
+
+    /// Loads a `qwen35` GGUF model onto an explicit [`VulkanContext`] with the requested KV cache type (`F16` or `Q8_0`).
+    pub fn from_gguf_with_context_and_kv(
+        ctx: VulkanContext,
+        gguf: Arc<GgufFile>,
+        max_ctx: usize,
+        kv_type: KvType,
     ) -> Result<Self, VulkanError> {
         if max_ctx == 0 {
             return Err(VulkanError::InvalidDimensions(
@@ -715,7 +738,12 @@ impl Qwen35VkRunner {
         let k_gdn_dim = ssm_n_group * ssm_state_size;
         let v_gdn_dim = ssm_d_inner;
         let hist_len = ssm_conv_kernel - 1;
-        let kv_bytes = (max_ctx * kv_dim * 2) as u64;
+        if kv_type == KvType::Q8_0 && !head_dim.is_multiple_of(4) {
+            return Err(VulkanError::InvalidDimensions(format!(
+                "Q8_0 KV cache requires head_dim ({head_dim}) to be a multiple of 4"
+            )));
+        }
+        let kv_bytes = kv_cache_bytes_per_layer(max_ctx, n_head_kv, head_dim, kv_type);
         let state_bytes = (ssm_dt_rank * ssm_state_size * ssm_state_size * 4) as u64;
         let conv_hist_bytes = (conv_dim * hist_len * 4) as u64;
 
@@ -1131,7 +1159,19 @@ impl Qwen35VkRunner {
         let emb_dt = dtype_code(p_token_embd.mat.dtype)?;
         let attn_wg = 8 * sg;
         let attn_n_vec = ((head_dim / 4).div_ceil(sg as usize)).max(1) as u32;
-        let (attn_batch, attn_batch_kind) = if prefill_kind != ResolvedPrefill::Fallback
+        let (attn_batch, attn_batch_kind) = if kv_type == KvType::Q8_0 {
+            (
+                ctx.pipeline(
+                    "fa_gqa_tiled_q8",
+                    attn_wg | (attn_n_vec << 16),
+                    SPV_FA_GQA_TILED_Q8,
+                    4,
+                    20,
+                    &[attn_wg, attn_n_vec],
+                )?,
+                BatchAttnKind::Tiled8,
+            )
+        } else if prefill_kind != ResolvedPrefill::Fallback
             && info.coopmat_f16_f32acc
             && sg == 32
             && head_dim.is_multiple_of(16)
@@ -1167,6 +1207,24 @@ impl Qwen35VkRunner {
             )
         };
 
+        let (rope_spv, rope_dec_name, rope_batch_name, attn_dec_spv, attn_dec_name) = match kv_type
+        {
+            KvType::F16 => (
+                SPV_ROPE_KV,
+                "rope_dec",
+                "rope_batch",
+                SPV_GQA_ATTN,
+                "attn_dec",
+            ),
+            KvType::Q8_0 => (
+                SPV_ROPE_KV_Q8,
+                "rope_q8_dec",
+                "rope_q8_batch",
+                SPV_GQA_ATTN_Q8,
+                "attn_dec_q8",
+            ),
+        };
+
         let quant_q8_1 = if prefill_kind.uses_q8_1() {
             Some(ctx.pipeline("quantize_q8_1", 256, SPV_QUANTIZE_Q8_1, 3, 4, &[256])?)
         } else {
@@ -1200,12 +1258,12 @@ impl Qwen35VkRunner {
             qk_norm: ctx.pipeline("qk_norm", 0, SPV_QK_NORM, 2, 8, &[64])?,
             split_qg_qnorm: ctx.pipeline("split_qg_qnorm", 64, SPV_SPLIT_QG_QNORM, 4, 12, &[64])?,
             sigmoid_mul: ctx.pipeline("sigmoid_mul", 256, SPV_SIGMOID_MUL, 2, 4, &[256])?,
-            rope_dec: ctx.pipeline("rope_dec", 0, SPV_ROPE_KV, 7, 32, &[64, 0])?,
-            rope_batch: ctx.pipeline("rope_batch", 1, SPV_ROPE_KV, 7, 32, &[64, 1])?,
+            rope_dec: ctx.pipeline(rope_dec_name, 0, rope_spv, 7, 32, &[64, 0])?,
+            rope_batch: ctx.pipeline(rope_batch_name, 1, rope_spv, 7, 32, &[64, 1])?,
             attn_dec: ctx.pipeline(
-                "attn_dec",
+                attn_dec_name,
                 attn_wg | (attn_n_vec << 16),
-                SPV_GQA_ATTN,
+                attn_dec_spv,
                 5,
                 16,
                 &[attn_wg, 0, attn_n_vec],
@@ -2248,6 +2306,7 @@ impl Qwen35VkRunner {
                 max_ctx,
             },
             ctx,
+            kv_type,
             prefill_kind,
             max_batch,
             slabs,
@@ -2592,7 +2651,11 @@ impl Qwen35VkRunner {
         let kv_dim = self.cfg.n_head_kv * self.cfg.head_dim;
         let q_dim = self.cfg.n_head * self.cfg.head_dim;
         let rope_total = ((self.cfg.n_head + self.cfg.n_head_kv) * half_rope).max(kv_dim);
-        let rope_groups = (rope_total as u32).div_ceil(64);
+        let rope_groups = if self.kv_type == KvType::Q8_0 {
+            (self.cfg.n_head + self.cfg.n_head_kv) as u32
+        } else {
+            (rope_total as u32).div_ceil(64)
+        };
         let rope_push = [
             self.cfg.n_head as u32,
             self.cfg.n_head_kv as u32,
@@ -3260,7 +3323,11 @@ impl Qwen35VkRunner {
         let kv_dim = self.cfg.n_head_kv * self.cfg.head_dim;
         let q_dim = self.cfg.n_head * self.cfg.head_dim;
         let rope_total = ((self.cfg.n_head + self.cfg.n_head_kv) * half_rope).max(kv_dim);
-        let rope_groups_x = (rope_total as u32).div_ceil(64);
+        let rope_groups_x = if self.kv_type == KvType::Q8_0 {
+            (self.cfg.n_head + self.cfg.n_head_kv) as u32
+        } else {
+            (rope_total as u32).div_ceil(64)
+        };
         let hk = self.cfg.ssm_n_group as u32;
         let hv = self.cfg.ssm_dt_rank as u32;
         let s_dim = self.cfg.ssm_state_size as u32;
@@ -3868,7 +3935,11 @@ impl Qwen35VkRunner {
             let qk_push = [self.cfg.head_dim as u32, eps_bits];
             let half_rope = self.cfg.rope_dim / 2;
             let rope_total = ((self.cfg.n_head + self.cfg.n_head_kv) * half_rope).max(kv_dim);
-            let rope_groups = (rope_total as u32).div_ceil(64);
+            let rope_groups = if self.kv_type == KvType::Q8_0 {
+                (self.cfg.n_head + self.cfg.n_head_kv) as u32
+            } else {
+                (rope_total as u32).div_ceil(64)
+            };
             let rope_push = [
                 self.cfg.n_head as u32,
                 self.cfg.n_head_kv as u32,

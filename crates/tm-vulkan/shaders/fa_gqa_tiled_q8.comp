@@ -1,0 +1,142 @@
+#version 450
+// Subgroup-portable LDS-tiled Causal GQA FlashAttention over Q8_0 KV cache (subgroup_size in {8,16,32,64}).
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(constant_id = 0) const uint WG = 256;
+layout(constant_id = 1) const uint N_VEC = 8;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer QBuf   { vec4 q4[]; };
+layout(std430, binding = 1) readonly buffer KCache { uint k_cache[]; };
+layout(std430, binding = 2) readonly buffer VCache { uint v_cache[]; };
+layout(std430, binding = 3) writeonly buffer OutBuf { vec4 out4[]; };
+
+layout(push_constant) uniform PC {
+    uint n_head;
+    uint n_head_kv;
+    uint head_dim;
+    uint base_pos;
+    uint n_tok;
+} pc;
+
+const uint BR = 8u;
+const uint BC = 8u;
+const uint MAX_HD4 = 64u; // head_dim <= 256
+
+shared vec4 k_sh[BC * MAX_HD4];
+shared vec4 v_sh[BC * MAX_HD4];
+
+vec4 dequant_q8_4(uint packed, uint scale_word, uint blk) {
+    const vec2 sc = unpackHalf2x16(scale_word);
+    const float s = ((blk & 1u) == 0u) ? sc.x : sc.y;
+    return unpackSnorm4x8(packed) * s;
+}
+
+void main() {
+    const uint head = gl_WorkGroupID.x;
+    const uint tile_q0 = gl_WorkGroupID.y * BR;
+    if (head >= pc.n_head || tile_q0 >= pc.n_tok) return;
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sg = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg_size = gl_SubgroupSize;
+
+    const uint hd4 = pc.head_dim >> 2u;
+    const bool use_blk32 = (pc.head_dim >= 32u) && ((pc.head_dim & 31u) == 0u);
+    const uint n_blocks = use_blk32 ? (pc.head_dim >> 5u) : 1u;
+    const uint scale_words = (n_blocks + 1u) >> 1u;
+    const uint head_stride = hd4 + scale_words;
+
+    const uint q_dim4 = pc.n_head * hd4;
+    const uint kv_h = head / (pc.n_head / pc.n_head_kv);
+    const float scale = inversesqrt(float(pc.head_dim));
+
+    const uint q_tok = tile_q0 + sg;
+    const bool valid_q = (q_tok < pc.n_tok);
+
+    vec4 q_local[N_VEC];
+    vec4 o_local[N_VEC];
+    [[unroll]] for (uint k = 0u; k < N_VEC; ++k) {
+        const uint d4 = k * sg_size + lane;
+        q_local[k] = (valid_q && d4 < hd4) ? (q4[q_tok * q_dim4 + head * hd4 + d4] * scale) : vec4(0.0);
+        o_local[k] = vec4(0.0);
+    }
+
+    float m_local = -1.0e30;
+    float l_local = 0.0;
+
+    const uint max_q_in_wg = min(tile_q0 + BR, pc.n_tok) - 1u;
+    const uint max_kv_len = pc.base_pos + max_q_in_wg + 1u;
+    const uint q_seq_len = pc.base_pos + q_tok + 1u;
+    const uint total_kv4 = BC * hd4;
+
+    for (uint kv_t0 = 0u; kv_t0 < max_kv_len; kv_t0 += BC) {
+        for (uint idx = tid; idx < total_kv4; idx += WG) {
+            const uint kc = idx / hd4;
+            const uint d4 = idx % hd4;
+            const uint kv_pos = kv_t0 + kc;
+            if (kv_pos < max_kv_len) {
+                const uint kv_base = (kv_pos * pc.n_head_kv + kv_h) * head_stride;
+                const uint blk = use_blk32 ? (d4 >> 3u) : 0u;
+                const uint sw = blk >> 1u;
+                k_sh[kc * MAX_HD4 + d4] = dequant_q8_4(
+                    k_cache[kv_base + d4],
+                    k_cache[kv_base + hd4 + sw],
+                    blk
+                );
+                v_sh[kc * MAX_HD4 + d4] = dequant_q8_4(
+                    v_cache[kv_base + d4],
+                    v_cache[kv_base + hd4 + sw],
+                    blk
+                );
+            } else {
+                k_sh[kc * MAX_HD4 + d4] = vec4(0.0);
+                v_sh[kc * MAX_HD4 + d4] = vec4(0.0);
+            }
+        }
+        barrier();
+
+        const uint kc_end = (valid_q && q_seq_len > kv_t0) ? min(BC, q_seq_len - kv_t0) : 0u;
+        for (uint kc = 0u; kc < kc_end; ++kc) {
+            const uint sh_row = kc * MAX_HD4;
+            float dot_val = 0.0;
+            [[unroll]] for (uint k = 0u; k < N_VEC; ++k) {
+                const uint d4 = k * sg_size + lane;
+                if (d4 < hd4) {
+                    dot_val += dot(q_local[k], k_sh[sh_row + d4]);
+                }
+            }
+            dot_val = subgroupAdd(dot_val);
+
+            const float m_new = max(m_local, dot_val);
+            const float alpha = (l_local == 0.0) ? 0.0 : exp(m_local - m_new);
+            const float p = exp(dot_val - m_new);
+            l_local = l_local * alpha + p;
+            m_local = m_new;
+
+            [[unroll]] for (uint k = 0u; k < N_VEC; ++k) {
+                const uint d4 = k * sg_size + lane;
+                if (d4 < hd4) {
+                    o_local[k] = fma(vec4(p), v_sh[sh_row + d4], o_local[k] * alpha);
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    if (valid_q) {
+        const float inv_l = (l_local > 0.0) ? (1.0 / l_local) : 0.0;
+        const uint ob = q_tok * q_dim4 + head * hd4;
+        [[unroll]] for (uint k = 0u; k < N_VEC; ++k) {
+            const uint d4 = k * sg_size + lane;
+            if (d4 < hd4) {
+                out4[ob + d4] = o_local[k] * inv_l;
+            }
+        }
+    }
+}
