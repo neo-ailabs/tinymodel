@@ -1,0 +1,134 @@
+#version 450
+// General Sparse MoE Top-K router (`ADR-018`) supporting all 4 gating functions:
+//   0 = Softmax, 1 = Sigmoid, 2 = SoftmaxWeight (top-k then softmax), 3 = SqrtSoftplus
+// Plus optional `exp_probs_b` selection bias, `norm_weights` + `norm_eps`, and `weights_scale`.
+// 1 thread per token (`gl_GlobalInvocationID.x < n_tok`) for exact deterministic tie-breaking.
+
+layout(constant_id = 0) const uint WG = 64;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer LogitsBuf  { float logits[]; };
+layout(std430, binding = 1) readonly buffer BiasBuf    { float exp_probs_b[]; };
+layout(std430, binding = 2) buffer          ProbsBuf   { float probs_scratch[]; };
+layout(std430, binding = 3) buffer          SelBuf     { float sel_scratch[]; };
+layout(std430, binding = 4) buffer          TopIdBuf   { uint  top_ids[]; };
+layout(std430, binding = 5) buffer          TopWBuf    { float top_weights[]; };
+
+layout(push_constant) uniform PC {
+    uint n_expert;
+    uint n_expert_used;
+    uint n_tok;
+    uint gating_func;
+    uint norm_weights;
+    uint has_exp_probs_b;
+    uint norm_eps_bits;
+    uint weights_scale_bits;
+} pc;
+
+void main() {
+    const uint t = gl_GlobalInvocationID.x;
+    if (t >= pc.n_tok) return;
+
+    const uint n_exp = pc.n_expert;
+    const uint k = pc.n_expert_used;
+    const uint l_off = t * n_exp;
+    const uint tk_off = t * k;
+
+    if (pc.gating_func == 0u) {
+        float max_l = -3.402823466e+38;
+        for (uint e = 0u; e < n_exp; ++e) {
+            max_l = max(max_l, logits[l_off + e]);
+        }
+        float sum = 0.0;
+        for (uint e = 0u; e < n_exp; ++e) {
+            const float ev = exp(logits[l_off + e] - max_l);
+            probs_scratch[l_off + e] = ev;
+            sum += ev;
+        }
+        const float inv = 1.0 / sum;
+        for (uint e = 0u; e < n_exp; ++e) {
+            probs_scratch[l_off + e] *= inv;
+        }
+    } else if (pc.gating_func == 1u) {
+        for (uint e = 0u; e < n_exp; ++e) {
+            probs_scratch[l_off + e] = 1.0 / (1.0 + exp(-logits[l_off + e]));
+        }
+    } else if (pc.gating_func == 2u) {
+        for (uint e = 0u; e < n_exp; ++e) {
+            probs_scratch[l_off + e] = logits[l_off + e];
+        }
+    } else {
+        for (uint e = 0u; e < n_exp; ++e) {
+            const float lv = logits[l_off + e];
+            const float sp = (lv > 20.0) ? lv : ((lv < -20.0) ? exp(lv) : log(1.0 + exp(lv)));
+            probs_scratch[l_off + e] = sqrt(sp);
+        }
+    }
+
+    if (pc.has_exp_probs_b != 0u) {
+        for (uint e = 0u; e < n_exp; ++e) {
+            sel_scratch[l_off + e] = probs_scratch[l_off + e] + exp_probs_b[e];
+        }
+    } else {
+        for (uint e = 0u; e < n_exp; ++e) {
+            sel_scratch[l_off + e] = probs_scratch[l_off + e];
+        }
+    }
+
+    for (uint slot = 0u; slot < k; ++slot) {
+        uint best_idx = 0u;
+        float best_val = -3.402823466e+38;
+        for (uint e = 0u; e < n_exp; ++e) {
+            bool already = false;
+            for (uint prev = 0u; prev < slot; ++prev) {
+                if (top_ids[tk_off + prev] == e) {
+                    already = true;
+                    break;
+                }
+            }
+            if (!already && sel_scratch[l_off + e] > best_val) {
+                best_val = sel_scratch[l_off + e];
+                best_idx = e;
+            }
+        }
+        top_ids[tk_off + slot] = best_idx;
+        top_weights[tk_off + slot] = probs_scratch[l_off + best_idx];
+    }
+
+    if (pc.gating_func == 2u) {
+        float max_w = -3.402823466e+38;
+        for (uint slot = 0u; slot < k; ++slot) {
+            max_w = max(max_w, top_weights[tk_off + slot]);
+        }
+        float sum = 0.0;
+        for (uint slot = 0u; slot < k; ++slot) {
+            const float ev = exp(top_weights[tk_off + slot] - max_w);
+            top_weights[tk_off + slot] = ev;
+            sum += ev;
+        }
+        const float inv = 1.0 / sum;
+        for (uint slot = 0u; slot < k; ++slot) {
+            top_weights[tk_off + slot] *= inv;
+        }
+    }
+
+    if (pc.norm_weights != 0u) {
+        float sum_w = 0.0;
+        for (uint slot = 0u; slot < k; ++slot) {
+            sum_w += top_weights[tk_off + slot];
+        }
+        const float norm_eps = uintBitsToFloat(pc.norm_eps_bits);
+        const float denom = (norm_eps > 0.0) ? (sum_w + norm_eps) : max(sum_w, 6.103515625e-5);
+        const float inv = 1.0 / denom;
+        for (uint slot = 0u; slot < k; ++slot) {
+            top_weights[tk_off + slot] *= inv;
+        }
+    }
+
+    const float w_scale = uintBitsToFloat(pc.weights_scale_bits);
+    if (w_scale != 0.0 && abs(w_scale - 1.0) > 1e-12) {
+        for (uint slot = 0u; slot < k; ++slot) {
+            top_weights[tk_off + slot] *= w_scale;
+        }
+    }
+}

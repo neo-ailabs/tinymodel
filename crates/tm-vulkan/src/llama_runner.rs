@@ -61,6 +61,10 @@ const SPV_QUANTIZE_Q8_1: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quant
 const SPV_GEMM_COOPMAT_I8: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_i8.spv"));
 const SPV_ARGMAX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/argmax.spv"));
 const SPV_ADD_BIAS_AXPY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/lora_up_axpy.spv"));
+const SPV_MOE_ROUTER_TOPK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_router_topk.spv"));
+const SPV_MOE_INDEXED_GEMV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/moe_indexed_gemv.spv"));
+const SPV_MOE_REDUCE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_reduce.spv"));
 
 /// Preferred maximum tokens per batched prefill submission (`pp512` executes in a single pass!).
 const PREFERRED_MAX_BATCH: usize = 512;
@@ -331,6 +335,76 @@ enum DecodeFfnSets {
     },
 }
 
+enum QkNormPlan {
+    PerHead(vk::DescriptorSet),
+    FullVec(vk::DescriptorSet),
+}
+
+struct MoeSharedExpertPlan {
+    n_ff_shexp: usize,
+    gate_dec: (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
+    up_dec: (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
+    down_dec: (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
+    gate_batch: BatchGemmEntry,
+    up_batch: BatchGemmEntry,
+    down_batch: BatchGemmEntry,
+    silu_set: vk::DescriptorSet,
+    #[allow(clippy::type_complexity)]
+    gate_inp_1d: Option<(
+        (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
+        BatchGemmEntry,
+        vk::DescriptorSet, // moe_reduce mode=1 set
+    )>,
+}
+
+struct MoeLayerPlan {
+    n_expert: u32,
+    n_expert_used: u32,
+    n_ff_exp: u32,
+    gating_func: u32,
+    norm_weights: u32,
+    has_exp_probs_b: u32,
+    norm_eps_bits: u32,
+    weights_scale_bits: u32,
+    router_dec: (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
+    router_batch: BatchGemmEntry,
+    router_bias_set: Option<vk::DescriptorSet>,
+    router_topk_set: vk::DescriptorSet,
+    gate_pipe: Arc<Pipeline>,
+    gate_set: vk::DescriptorSet,
+    gate_gx: u32,
+    gate_push: [u32; 9],
+    up_pipe: Arc<Pipeline>,
+    up_set: vk::DescriptorSet,
+    up_gx: u32,
+    up_push: [u32; 9],
+    silu_set: vk::DescriptorSet,
+    down_pipe: Arc<Pipeline>,
+    down_set: vk::DescriptorSet,
+    down_gx: u32,
+    down_push: [u32; 9],
+    reduce_set: vk::DescriptorSet,
+    shared_expert: Option<Box<MoeSharedExpertPlan>>,
+}
+
+#[allow(clippy::large_enum_variant)]
+enum LayerFfnPlan {
+    Dense {
+        ffn_dec: DecodeFfnSets,
+        #[allow(clippy::type_complexity)]
+        ffn_dec_sep: (
+            (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
+            (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
+            vk::DescriptorSet,
+        ),
+        ffn_batch: BatchFfnPlan,
+        ffn_batch_sep: (BatchGemmEntry, BatchGemmEntry, vk::DescriptorSet),
+        down_dec: (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
+        down_batch: BatchGemmEntry,
+    },
+    Moe(Box<MoeLayerPlan>),
+}
+
 struct LayerPlan {
     idx: usize,
     attn_norm_set: vk::DescriptorSet,
@@ -342,8 +416,8 @@ struct LayerPlan {
     bk_set: Option<vk::DescriptorSet>,
     bv_set: Option<vk::DescriptorSet>,
     bo_set: Option<vk::DescriptorSet>,
-    q_norm_set: Option<vk::DescriptorSet>,
-    k_norm_set: Option<vk::DescriptorSet>,
+    q_norm_set: Option<QkNormPlan>,
+    k_norm_set: Option<QkNormPlan>,
     rope_dec_set: vk::DescriptorSet,
     rope_batch_set: vk::DescriptorSet,
     attn_dec_set: vk::DescriptorSet,
@@ -351,17 +425,7 @@ struct LayerPlan {
     wo_dec: (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
     wo_batch: BatchGemmEntry,
     ffn_norm_set: vk::DescriptorSet,
-    ffn_dec: DecodeFfnSets,
-    #[allow(clippy::type_complexity)]
-    ffn_dec_sep: (
-        (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
-        (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
-        vk::DescriptorSet,
-    ),
-    ffn_batch: BatchFfnPlan,
-    ffn_batch_sep: (BatchGemmEntry, BatchGemmEntry, vk::DescriptorSet),
-    down_dec: (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
-    down_batch: BatchGemmEntry,
+    ffn: LayerFfnPlan,
     // Byte sizes for stage bandwidth accounting in `profile`
     qkv_weight_bytes: u64,
     wo_weight_bytes: u64,
@@ -386,6 +450,8 @@ struct RunnerPipes {
     silu_mul: Arc<Pipeline>,
     quant_q8_1: Option<Arc<Pipeline>>,
     argmax: Arc<Pipeline>,
+    moe_router: Arc<Pipeline>,
+    moe_reduce: Arc<Pipeline>,
 }
 
 /// Complete Vulkan GPU inference runner for `llama`, `SmolLM2`, and `qwen3` GGUF models.
@@ -564,6 +630,159 @@ fn plan_mat_slice<'a>(
     })
 }
 
+struct PendingMat3D<'a> {
+    slice: VkSlice,
+    bytes: std::borrow::Cow<'a, [u8]>,
+    imported: bool,
+    dtype: DType,
+    cols: usize,
+    row_bytes: usize,
+    exp_stride_bytes: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_mat_3d<'a>(
+    planner: &mut ArenaPlanner,
+    gguf: &'a GgufFile,
+    name: &str,
+    layer: &str,
+    cols: usize,
+    rows: usize,
+    n_expert: usize,
+) -> Result<PendingMat3D<'a>, VulkanError> {
+    let (info, raw_bytes) = gguf.req_tensor(name, layer, &[cols, rows, n_expert])?;
+    let (eff_dtype, bytes) = if info.dtype == DType::Q4_0x4 {
+        let raw_exp_bytes = rows * info.dtype.row_bytes(cols);
+        let out_exp_bytes = rows * DType::Q4_0.row_bytes(cols);
+        let mut out = Vec::with_capacity(n_expert * out_exp_bytes);
+        for e in 0..n_expert {
+            let sub = &raw_bytes[e * raw_exp_bytes..(e + 1) * raw_exp_bytes];
+            let (_, conv) = normalize_vk_mat_bytes(DType::Q4_0x4, sub, rows, cols)?;
+            out.extend_from_slice(&conv);
+        }
+        (DType::Q4_0, std::borrow::Cow::Owned(out))
+    } else {
+        let _ = dtype_code(info.dtype)?;
+        (info.dtype, std::borrow::Cow::Borrowed(raw_bytes))
+    };
+    let row_bytes = eff_dtype.row_bytes(cols);
+    let exp_stride_bytes = rows * row_bytes;
+    let file_off = gguf.tensor_file_offset(info) as u64;
+    let can_import = matches!(&bytes, std::borrow::Cow::Borrowed(_));
+    let (slice, imported) =
+        if can_import && let Some(s) = planner.try_import_slice(file_off, bytes.len() as u64) {
+            (s, true)
+        } else {
+            (planner.reserve(bytes.len() as u64)?, false)
+        };
+    Ok(PendingMat3D {
+        slice,
+        bytes,
+        imported,
+        dtype: eff_dtype,
+        cols,
+        row_bytes,
+        exp_stride_bytes,
+    })
+}
+
+struct MoeArchParams {
+    n_expert: usize,
+    n_expert_used: usize,
+    n_layer_dense_lead: usize,
+    n_ff_exp_per_layer: Vec<usize>,
+    gating_func: u32,
+    norm_weights: bool,
+    norm_weights_eps: f32,
+    weights_scale: f32,
+}
+
+fn parse_moe_arch_params(
+    gguf: &GgufFile,
+    pfx: &str,
+    arch: &str,
+    n_layers: usize,
+    n_ff_default: usize,
+) -> Result<Option<MoeArchParams>, VulkanError> {
+    let n_expert = gguf
+        .get_meta(&format!("{pfx}.expert_count"))
+        .and_then(|v| v.as_usize())
+        .unwrap_or(0);
+    if n_expert == 0 {
+        return Ok(None);
+    }
+    let n_expert_used = gguf.req_usize(&format!("{pfx}.expert_used_count"))?;
+    if n_expert_used == 0 || n_expert_used > n_expert {
+        return Err(VulkanError::InvalidDimensions(format!(
+            "invalid expert_used_count={n_expert_used} for expert_count={n_expert}"
+        )));
+    }
+    let n_layer_dense_lead = gguf
+        .get_meta(&format!("{pfx}.leading_dense_block_count"))
+        .and_then(|v| v.as_usize())
+        .unwrap_or(0);
+    let fallback_ff_exp =
+        if matches!(arch, "qwen2moe" | "qwen3moe") && n_ff_default >= n_expert_used {
+            n_ff_default / n_expert_used
+        } else {
+            n_ff_default
+        };
+    let mut n_ff_exp_per_layer = vec![fallback_ff_exp; n_layers];
+    if let Some(mv) = gguf.get_meta(&format!("{pfx}.expert_feed_forward_length")) {
+        if let Some(arr) = mv.as_usize_array()
+            && arr.len() >= n_layers
+        {
+            for (l, &v) in arr[..n_layers].iter().enumerate() {
+                if v > 0 {
+                    n_ff_exp_per_layer[l] = v;
+                }
+            }
+        } else if let Some(sc) = mv.as_usize()
+            && sc > 0
+        {
+            n_ff_exp_per_layer.fill(sc);
+        }
+    }
+    let gating_raw = gguf
+        .get_meta(&format!("{pfx}.expert_gating_func"))
+        .and_then(|v| v.as_usize())
+        .unwrap_or(1) as u32;
+    let gating_func = match gating_raw {
+        0 | 1 => 0u32, // Softmax
+        2 => 1u32,     // Sigmoid
+        3 => 2u32,     // SoftmaxWeight
+        4 => 3u32,     // SqrtSoftplus
+        other => {
+            return Err(VulkanError::InvalidDimensions(format!(
+                "unsupported expert_gating_func = {other}"
+            )));
+        }
+    };
+    let default_norm_w = matches!(arch, "granite" | "granitemoe" | "qwen3moe");
+    let norm_weights = gguf
+        .get_meta(&format!("{pfx}.expert_weights_norm"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(default_norm_w);
+    let norm_weights_eps = gguf
+        .get_meta(&format!("{pfx}.expert_weights_norm_eps"))
+        .and_then(|v| v.as_f32())
+        .unwrap_or(0.0);
+    let weights_scale = gguf
+        .get_meta(&format!("{pfx}.expert_weights_scale"))
+        .and_then(|v| v.as_f32())
+        .unwrap_or(0.0);
+    Ok(Some(MoeArchParams {
+        n_expert,
+        n_expert_used,
+        n_layer_dense_lead,
+        n_ff_exp_per_layer,
+        gating_func,
+        norm_weights,
+        norm_weights_eps,
+        weights_scale,
+    }))
+}
+
 fn plan_opt_f32_vec_any(
     planner: &mut ArenaPlanner,
     gguf: &GgufFile,
@@ -625,21 +844,15 @@ impl LlamaVkRunner {
                 | "olmo3"
                 | "granite"
                 | "exaone"
+                | "olmoe"
+                | "qwen2moe"
+                | "qwen3moe"
+                | "bailingmoe2"
         ) {
             return Err(VulkanError::UnsupportedArch(arch));
         }
 
         let pfx = arch.as_str();
-        if gguf_ref
-            .get_meta(&format!("{pfx}.expert_count"))
-            .and_then(|v| v.as_usize())
-            .unwrap_or(0)
-            > 0
-        {
-            return Err(VulkanError::InvalidDimensions(format!(
-                "sparse MoE variant of '{arch}' requires MoE shader path on Vulkan LlamaVkRunner"
-            )));
-        }
         if matches!(pfx, "olmo2" | "olmo3") {
             return Err(VulkanError::InvalidDimensions(
                 "olmo2/olmo3 pure Post-Norm + full-vector QK-Norm requires dedicated shaders on Vulkan LlamaVkRunner"
@@ -661,14 +874,39 @@ impl LlamaVkRunner {
                 )));
             }
         }
-        let is_qwen = matches!(pfx, "qwen2" | "qwen3");
+        let is_qwen = matches!(pfx, "qwen2" | "qwen3" | "qwen2moe" | "qwen3moe");
         let is_neox = matches!(
             pfx,
-            "qwen2" | "qwen3" | "phi3" | "olmo2" | "olmo3" | "exaone"
+            "qwen2"
+                | "qwen3"
+                | "phi3"
+                | "olmo2"
+                | "olmo3"
+                | "exaone"
+                | "olmoe"
+                | "qwen2moe"
+                | "qwen3moe"
+                | "bailingmoe2"
         );
         let n_layers = gguf_ref.req_usize(&format!("{pfx}.block_count"))?;
         let n_embd = gguf_ref.req_usize(&format!("{pfx}.embedding_length"))?;
-        let n_ff = gguf_ref.req_usize(&format!("{pfx}.feed_forward_length"))?;
+        let n_ff_meta = gguf_ref
+            .get_meta(&format!("{pfx}.feed_forward_length"))
+            .and_then(|v| v.as_usize())
+            .unwrap_or(0);
+        let moe_params = parse_moe_arch_params(gguf_ref, pfx, &arch, n_layers, n_ff_meta)?;
+        let n_ff = if n_ff_meta > 0 {
+            n_ff_meta
+        } else if let Some(ref mp) = moe_params {
+            mp.n_ff_exp_per_layer
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(n_embd)
+                .max(1)
+        } else {
+            gguf_ref.req_usize(&format!("{pfx}.feed_forward_length"))?
+        };
         let n_head = gguf_ref.req_usize(&format!("{pfx}.attention.head_count"))?;
         let n_head_kv = gguf_ref
             .get_meta(&format!("{pfx}.attention.head_count_kv"))
@@ -886,11 +1124,61 @@ impl LlamaVkRunner {
         let kv_dim = n_head_kv * head_dim;
         let kv_bytes = (max_ctx * kv_dim * 2) as u64;
 
+        enum PendingQkNorm {
+            PerHead(PendingF32),
+            FullVec(PendingF32),
+        }
+
+        struct PendingSharedExpert<'a> {
+            n_ff_shexp: usize,
+            w_gate: PendingMat<'a>,
+            w_up: PendingMat<'a>,
+            w_down: PendingMat<'a>,
+            w_gate_inp_1d: Option<PendingMat<'a>>,
+        }
+
+        enum PendingMoeExperts<'a> {
+            Separate {
+                gate: PendingMat3D<'a>,
+                up: PendingMat3D<'a>,
+                down: PendingMat3D<'a>,
+            },
+            FusedGateUp {
+                gate_up: PendingMat3D<'a>,
+                down: PendingMat3D<'a>,
+            },
+        }
+
+        struct PendingMoeFfn<'a> {
+            n_expert: usize,
+            n_expert_used: usize,
+            n_ff_exp: usize,
+            gating_func: u32,
+            norm_weights: bool,
+            norm_weights_eps: f32,
+            weights_scale: f32,
+            gate_inp: PendingMat<'a>,
+            gate_inp_bias: Option<PendingF32>,
+            exp_probs_b: Option<PendingF32>,
+            experts: PendingMoeExperts<'a>,
+            shared_expert: Option<Box<PendingSharedExpert<'a>>>,
+        }
+
+        #[allow(clippy::large_enum_variant)]
+        enum PendingLayerFfn<'a> {
+            Dense {
+                w_gate: PendingMat<'a>,
+                w_up: PendingMat<'a>,
+                w_down: PendingMat<'a>,
+            },
+            Moe(Box<PendingMoeFfn<'a>>),
+        }
+
         struct PendingLayer<'a> {
             attn_norm: PendingF32,
             ffn_norm: PendingF32,
-            q_norm: Option<PendingF32>,
-            k_norm: Option<PendingF32>,
+            q_norm: Option<PendingQkNorm>,
+            k_norm: Option<PendingQkNorm>,
             bq: Option<PendingF32>,
             bk: Option<PendingF32>,
             bv: Option<PendingF32>,
@@ -899,30 +1187,61 @@ impl LlamaVkRunner {
             wk: PendingMat<'a>,
             wv: PendingMat<'a>,
             wo: PendingMat<'a>,
-            w_gate: PendingMat<'a>,
-            w_up: PendingMat<'a>,
-            w_down: PendingMat<'a>,
+            ffn: PendingLayerFfn<'a>,
             k_cache: VkSlice,
             v_cache: VkSlice,
         }
 
+        let mut max_n_ff_exp_seen = 0usize;
+        let mut max_n_ff_shexp_seen = 0usize;
+        let mut any_moe_shexp_1d_gate = false;
         let mut p_layers = Vec::with_capacity(n_layers);
         for l in 0..n_layers {
             let ltag = format!("blk.{l}");
-            let q_norm = plan_opt_f32_vec(
-                &mut planner,
-                gguf_ref,
-                &format!("{ltag}.attn_q_norm.weight"),
-                &ltag,
-                head_dim,
-            )?;
-            let k_norm = plan_opt_f32_vec(
-                &mut planner,
-                gguf_ref,
-                &format!("{ltag}.attn_k_norm.weight"),
-                &ltag,
-                head_dim,
-            )?;
+            let qn_name = format!("{ltag}.attn_q_norm.weight");
+            let q_norm = if let Some(ti) = gguf_ref.tensor_info(&qn_name) {
+                if ti.dims.as_slice() == [q_dim] && q_dim != head_dim {
+                    Some(PendingQkNorm::FullVec(plan_f32_vec(
+                        &mut planner,
+                        gguf_ref,
+                        &qn_name,
+                        &ltag,
+                        q_dim,
+                    )?))
+                } else {
+                    Some(PendingQkNorm::PerHead(plan_f32_vec(
+                        &mut planner,
+                        gguf_ref,
+                        &qn_name,
+                        &ltag,
+                        head_dim,
+                    )?))
+                }
+            } else {
+                None
+            };
+            let kn_name = format!("{ltag}.attn_k_norm.weight");
+            let k_norm = if let Some(ti) = gguf_ref.tensor_info(&kn_name) {
+                if ti.dims.as_slice() == [kv_dim] && kv_dim != head_dim {
+                    Some(PendingQkNorm::FullVec(plan_f32_vec(
+                        &mut planner,
+                        gguf_ref,
+                        &kn_name,
+                        &ltag,
+                        kv_dim,
+                    )?))
+                } else {
+                    Some(PendingQkNorm::PerHead(plan_f32_vec(
+                        &mut planner,
+                        gguf_ref,
+                        &kn_name,
+                        &ltag,
+                        head_dim,
+                    )?))
+                }
+            } else {
+                None
+            };
             let qkv_bias_name = format!("{ltag}.attn_qkv.bias");
             let (bq, bk, bv) = if gguf_ref.tensor_info(&qkv_bias_name).is_some() {
                 let (info, bytes) =
@@ -1048,54 +1367,241 @@ impl LlamaVkRunner {
                     )?,
                 )
             };
-            let gate_name = format!("{ltag}.ffn_gate.weight");
-            let up_name = format!("{ltag}.ffn_up.weight");
-            let (w_gate, w_up) = if gguf_ref.tensor_info(&gate_name).is_some() {
-                (
-                    plan_mat(
+            let gate_inp_name = format!("{ltag}.ffn_gate_inp.weight");
+            let p_ffn = if let Some(ref mp) = moe_params
+                && l >= mp.n_layer_dense_lead
+                && gguf_ref.tensor_info(&gate_inp_name).is_some()
+            {
+                let n_exp = mp.n_expert;
+                let k_used = mp.n_expert_used;
+                let down_exps_name = format!("{ltag}.ffn_down_exps.weight");
+                let down_ti = gguf_ref.tensor_info(&down_exps_name).ok_or_else(|| {
+                    VulkanError::InvalidDimensions(format!("missing {down_exps_name}"))
+                })?;
+                let n_ff_exp = if mp.n_ff_exp_per_layer[l] > 0 {
+                    mp.n_ff_exp_per_layer[l]
+                } else {
+                    down_ti.dims[0]
+                };
+                max_n_ff_exp_seen = max_n_ff_exp_seen.max(n_ff_exp);
+                let gate_inp = plan_mat(
+                    &mut planner,
+                    gguf_ref,
+                    &gate_inp_name,
+                    &ltag,
+                    n_embd,
+                    n_exp,
+                    false,
+                )?;
+                let gate_inp_bias = plan_opt_f32_vec(
+                    &mut planner,
+                    gguf_ref,
+                    &format!("{ltag}.ffn_gate_inp.bias"),
+                    &ltag,
+                    n_exp,
+                )?;
+                let exp_probs_b = plan_opt_f32_vec(
+                    &mut planner,
+                    gguf_ref,
+                    &format!("{ltag}.exp_probs_b.bias"),
+                    &ltag,
+                    n_exp,
+                )?;
+                let fused_gu_name = format!("{ltag}.ffn_gate_up_exps.weight");
+                let experts = if gguf_ref.tensor_info(&fused_gu_name).is_some() {
+                    let gate_up = plan_mat_3d(
                         &mut planner,
                         gguf_ref,
-                        &gate_name,
+                        &fused_gu_name,
                         &ltag,
                         n_embd,
-                        n_ff,
-                        use_q4_soa,
-                    )?,
-                    plan_mat(
+                        2 * n_ff_exp,
+                        n_exp,
+                    )?;
+                    let down = plan_mat_3d(
                         &mut planner,
                         gguf_ref,
-                        &up_name,
+                        &down_exps_name,
+                        &ltag,
+                        n_ff_exp,
+                        n_embd,
+                        n_exp,
+                    )?;
+                    PendingMoeExperts::FusedGateUp { gate_up, down }
+                } else {
+                    let gate = plan_mat_3d(
+                        &mut planner,
+                        gguf_ref,
+                        &format!("{ltag}.ffn_gate_exps.weight"),
                         &ltag,
                         n_embd,
-                        n_ff,
+                        n_ff_exp,
+                        n_exp,
+                    )?;
+                    let up = plan_mat_3d(
+                        &mut planner,
+                        gguf_ref,
+                        &format!("{ltag}.ffn_up_exps.weight"),
+                        &ltag,
+                        n_embd,
+                        n_ff_exp,
+                        n_exp,
+                    )?;
+                    let down = plan_mat_3d(
+                        &mut planner,
+                        gguf_ref,
+                        &down_exps_name,
+                        &ltag,
+                        n_ff_exp,
+                        n_embd,
+                        n_exp,
+                    )?;
+                    PendingMoeExperts::Separate { gate, up, down }
+                };
+                let shexp_gate_name = format!("{ltag}.ffn_gate_shexp.weight");
+                let shared_expert = if let Some(sh_ti) = gguf_ref.tensor_info(&shexp_gate_name) {
+                    let ff_sh = sh_ti.dims[1];
+                    max_n_ff_shexp_seen = max_n_ff_shexp_seen.max(ff_sh);
+                    let w_gate = plan_mat(
+                        &mut planner,
+                        gguf_ref,
+                        &shexp_gate_name,
+                        &ltag,
+                        n_embd,
+                        ff_sh,
                         use_q4_soa,
-                    )?,
-                )
+                    )?;
+                    let w_up = plan_mat(
+                        &mut planner,
+                        gguf_ref,
+                        &format!("{ltag}.ffn_up_shexp.weight"),
+                        &ltag,
+                        n_embd,
+                        ff_sh,
+                        use_q4_soa,
+                    )?;
+                    let w_down = plan_mat(
+                        &mut planner,
+                        gguf_ref,
+                        &format!("{ltag}.ffn_down_shexp.weight"),
+                        &ltag,
+                        ff_sh,
+                        n_embd,
+                        use_q4_soa,
+                    )?;
+                    let gi_name = format!("{ltag}.ffn_gate_inp_shexp.weight");
+                    let w_gate_inp_1d = if gguf_ref.tensor_info(&gi_name).is_some() {
+                        any_moe_shexp_1d_gate = true;
+                        let (gi_info, gi_raw) = gguf_ref.req_tensor(&gi_name, &ltag, &[n_embd])?;
+                        let (eff_dt, gi_bytes) =
+                            normalize_vk_mat_bytes(gi_info.dtype, gi_raw, 1, n_embd)?;
+                        let _ = dtype_code(eff_dt)?;
+                        let row_bytes = eff_dt.row_bytes(n_embd);
+                        let slice = planner.reserve(gi_bytes.len() as u64)?;
+                        Some(PendingMat {
+                            slice,
+                            bytes: gi_bytes,
+                            imported: false,
+                            mat: VkMat {
+                                slice,
+                                soa_d: None,
+                                dtype: eff_dt,
+                                rows: 1,
+                                cols: n_embd,
+                                row_bytes,
+                            },
+                        })
+                    } else {
+                        None
+                    };
+                    Some(Box::new(PendingSharedExpert {
+                        n_ff_shexp: ff_sh,
+                        w_gate,
+                        w_up,
+                        w_down,
+                        w_gate_inp_1d,
+                    }))
+                } else {
+                    None
+                };
+                PendingLayerFfn::Moe(Box::new(PendingMoeFfn {
+                    n_expert: n_exp,
+                    n_expert_used: k_used,
+                    n_ff_exp,
+                    gating_func: mp.gating_func,
+                    norm_weights: mp.norm_weights,
+                    norm_weights_eps: mp.norm_weights_eps,
+                    weights_scale: mp.weights_scale,
+                    gate_inp,
+                    gate_inp_bias,
+                    exp_probs_b,
+                    experts,
+                    shared_expert,
+                }))
             } else {
-                (
-                    plan_mat_slice(
-                        &mut planner,
-                        gguf_ref,
-                        &up_name,
-                        &ltag,
-                        n_embd,
-                        2 * n_ff,
-                        0,
-                        n_ff,
-                        use_q4_soa,
-                    )?,
-                    plan_mat_slice(
-                        &mut planner,
-                        gguf_ref,
-                        &up_name,
-                        &ltag,
-                        n_embd,
-                        2 * n_ff,
-                        n_ff,
-                        n_ff,
-                        use_q4_soa,
-                    )?,
-                )
+                let gate_name = format!("{ltag}.ffn_gate.weight");
+                let up_name = format!("{ltag}.ffn_up.weight");
+                let (w_gate, w_up) = if gguf_ref.tensor_info(&gate_name).is_some() {
+                    (
+                        plan_mat(
+                            &mut planner,
+                            gguf_ref,
+                            &gate_name,
+                            &ltag,
+                            n_embd,
+                            n_ff,
+                            use_q4_soa,
+                        )?,
+                        plan_mat(
+                            &mut planner,
+                            gguf_ref,
+                            &up_name,
+                            &ltag,
+                            n_embd,
+                            n_ff,
+                            use_q4_soa,
+                        )?,
+                    )
+                } else {
+                    (
+                        plan_mat_slice(
+                            &mut planner,
+                            gguf_ref,
+                            &up_name,
+                            &ltag,
+                            n_embd,
+                            2 * n_ff,
+                            0,
+                            n_ff,
+                            use_q4_soa,
+                        )?,
+                        plan_mat_slice(
+                            &mut planner,
+                            gguf_ref,
+                            &up_name,
+                            &ltag,
+                            n_embd,
+                            2 * n_ff,
+                            n_ff,
+                            n_ff,
+                            use_q4_soa,
+                        )?,
+                    )
+                };
+                let w_down = plan_mat(
+                    &mut planner,
+                    gguf_ref,
+                    &format!("{ltag}.ffn_down.weight"),
+                    &ltag,
+                    n_ff,
+                    n_embd,
+                    use_q4_soa,
+                )?;
+                PendingLayerFfn::Dense {
+                    w_gate,
+                    w_up,
+                    w_down,
+                }
             };
             p_layers.push(PendingLayer {
                 attn_norm: plan_f32_vec(
@@ -1130,17 +1636,7 @@ impl LlamaVkRunner {
                     n_embd,
                     use_q4_soa,
                 )?,
-                w_gate,
-                w_up,
-                w_down: plan_mat(
-                    &mut planner,
-                    gguf_ref,
-                    &format!("{ltag}.ffn_down.weight"),
-                    &ltag,
-                    n_ff,
-                    n_embd,
-                    use_q4_soa,
-                )?,
+                ffn: p_ffn,
                 k_cache: planner.reserve(kv_bytes)?,
                 v_cache: planner.reserve(kv_bytes)?,
             });
@@ -1175,8 +1671,48 @@ impl LlamaVkRunner {
         let s_q = planner.reserve((max_batch * q_dim * 4) as u64)?;
         let s_k = planner.reserve((max_batch * kv_dim * 4) as u64)?;
         let s_v = planner.reserve((max_batch * kv_dim * 4) as u64)?;
-        let s_hb = planner.reserve((max_batch * n_ff * 4) as u64)?;
-        let s_hb2 = planner.reserve((max_batch * n_ff * 4) as u64)?;
+        let hb_dim = n_ff.max(max_n_ff_shexp_seen).max(1);
+        let s_hb = planner.reserve((max_batch * hb_dim * 4) as u64)?;
+        let s_hb2 = planner.reserve((max_batch * hb_dim * 4) as u64)?;
+        struct MoeScratchSlices {
+            logits: VkSlice,
+            probs: VkSlice,
+            sel: VkSlice,
+            top_ids: VkSlice,
+            top_w: VkSlice,
+            gate: VkSlice,
+            up: VkSlice,
+            down: VkSlice,
+            shexp_out: Option<VkSlice>,
+            shexp_gate: Option<VkSlice>,
+        }
+        let moe_scratch = if let Some(ref mp) = moe_params {
+            let n_exp = mp.n_expert;
+            let k_used = mp.n_expert_used;
+            let ff_exp = max_n_ff_exp_seen.max(1);
+            Some(MoeScratchSlices {
+                logits: planner.reserve((max_batch * n_exp * 4) as u64)?,
+                probs: planner.reserve((max_batch * n_exp * 4) as u64)?,
+                sel: planner.reserve((max_batch * n_exp * 4) as u64)?,
+                top_ids: planner.reserve((max_batch * k_used * 4) as u64)?,
+                top_w: planner.reserve((max_batch * k_used * 4) as u64)?,
+                gate: planner.reserve((max_batch * k_used * ff_exp * 4) as u64)?,
+                up: planner.reserve((max_batch * k_used * ff_exp * 4) as u64)?,
+                down: planner.reserve((max_batch * k_used * n_embd * 4) as u64)?,
+                shexp_out: if any_moe_shexp_1d_gate {
+                    Some(planner.reserve((max_batch * n_embd * 4) as u64)?)
+                } else {
+                    None
+                },
+                shexp_gate: if any_moe_shexp_1d_gate {
+                    Some(planner.reserve((max_batch * 4) as u64)?)
+                } else {
+                    None
+                },
+            })
+        } else {
+            None
+        };
         let gqa_group = n_head / n_head_kv;
         let attn_splits: u32 = if (1..=8).contains(&gqa_group)
             && head_dim <= 256
@@ -1266,6 +1802,13 @@ impl LlamaVkRunner {
             }
         };
 
+        let write_mat_3d = |pm: &PendingMat3D<'_>| -> Result<(), VulkanError> {
+            if pm.imported {
+                return Ok(());
+            }
+            ctx.write_bytes(&slabs[pm.slice.slab], pm.slice.offset, &pm.bytes)
+        };
+
         write_mat(&p_token_embd)?;
         if let Some(ref po) = p_output {
             write_mat(po)?;
@@ -1280,10 +1823,14 @@ impl LlamaVkRunner {
             write_f32(&pl.attn_norm)?;
             write_f32(&pl.ffn_norm)?;
             if let Some(ref qn) = pl.q_norm {
-                write_f32(qn)?;
+                match qn {
+                    PendingQkNorm::PerHead(pf) | PendingQkNorm::FullVec(pf) => write_f32(pf)?,
+                }
             }
             if let Some(ref kn) = pl.k_norm {
-                write_f32(kn)?;
+                match kn {
+                    PendingQkNorm::PerHead(pf) | PendingQkNorm::FullVec(pf) => write_f32(pf)?,
+                }
             }
             if let Some(ref bq) = pl.bq {
                 write_f32(bq)?;
@@ -1301,9 +1848,45 @@ impl LlamaVkRunner {
             write_mat(&pl.wk)?;
             write_mat(&pl.wv)?;
             write_mat(&pl.wo)?;
-            write_mat(&pl.w_gate)?;
-            write_mat(&pl.w_up)?;
-            write_mat(&pl.w_down)?;
+            match &pl.ffn {
+                PendingLayerFfn::Dense {
+                    w_gate,
+                    w_up,
+                    w_down,
+                } => {
+                    write_mat(w_gate)?;
+                    write_mat(w_up)?;
+                    write_mat(w_down)?;
+                }
+                PendingLayerFfn::Moe(m) => {
+                    write_mat(&m.gate_inp)?;
+                    if let Some(ref b) = m.gate_inp_bias {
+                        write_f32(b)?;
+                    }
+                    if let Some(ref epb) = m.exp_probs_b {
+                        write_f32(epb)?;
+                    }
+                    match &m.experts {
+                        PendingMoeExperts::Separate { gate, up, down } => {
+                            write_mat_3d(gate)?;
+                            write_mat_3d(up)?;
+                            write_mat_3d(down)?;
+                        }
+                        PendingMoeExperts::FusedGateUp { gate_up, down } => {
+                            write_mat_3d(gate_up)?;
+                            write_mat_3d(down)?;
+                        }
+                    }
+                    if let Some(ref sh) = m.shared_expert {
+                        write_mat(&sh.w_gate)?;
+                        write_mat(&sh.w_up)?;
+                        write_mat(&sh.w_down)?;
+                        if let Some(ref gi) = sh.w_gate_inp_1d {
+                            write_mat(gi)?;
+                        }
+                    }
+                }
+            }
         }
 
         let step_buf = ctx.create_host_buffer(32)?;
@@ -1406,6 +1989,8 @@ impl LlamaVkRunner {
             silu_mul: ctx.pipeline("silu_mul", 0, SPV_SILU_MUL, 2, 4, &[256])?,
             quant_q8_1,
             argmax: ctx.pipeline("argmax", 0, SPV_ARGMAX, 2, 4, &[256])?,
+            moe_router: ctx.pipeline("moe_router_topk", 64, SPV_MOE_ROUTER_TOPK, 6, 32, &[64])?,
+            moe_reduce: ctx.pipeline("moe_reduce", 256, SPV_MOE_REDUCE, 3, 16, &[256])?,
         };
 
         let gemv_pipe_for = |mat: &VkMat| -> Result<(Arc<Pipeline>, u32, [u32; 4]), VulkanError> {
@@ -1426,7 +2011,7 @@ impl LlamaVkRunner {
         };
 
         // 4. Allocate static descriptor pool, command pool, pre-bound descriptor sets.
-        let max_sets = (n_layers as u32) * 40 + 40;
+        let max_sets = (n_layers as u32) * 56 + 60;
         let max_desc = max_sets * 10;
         let d = &ctx.inner.device;
         // SAFETY: `d` is a valid logical device and `ctx.inner.queue_family` is its compute queue family.
@@ -1967,17 +2552,33 @@ impl LlamaVkRunner {
             let bo_set = mk_bias_set(&pl.bo, s_x)?;
 
             let q_norm_set = match pl.q_norm {
-                Some(ref qn) => Some(alloc_set(
+                Some(PendingQkNorm::PerHead(ref qn)) => Some(QkNormPlan::PerHead(alloc_set(
                     &pipes.qk_norm,
                     &[Binding::Arena(s_q), Binding::Arena(qn.slice)],
-                )?),
+                )?)),
+                Some(PendingQkNorm::FullVec(ref qn)) => Some(QkNormPlan::FullVec(alloc_set(
+                    &pipes.rms_norm,
+                    &[
+                        Binding::Arena(s_q),
+                        Binding::Arena(qn.slice),
+                        Binding::Arena(s_q),
+                    ],
+                )?)),
                 None => None,
             };
             let k_norm_set = match pl.k_norm {
-                Some(ref kn) => Some(alloc_set(
+                Some(PendingQkNorm::PerHead(ref kn)) => Some(QkNormPlan::PerHead(alloc_set(
                     &pipes.qk_norm,
                     &[Binding::Arena(s_k), Binding::Arena(kn.slice)],
-                )?),
+                )?)),
+                Some(PendingQkNorm::FullVec(ref kn)) => Some(QkNormPlan::FullVec(alloc_set(
+                    &pipes.rms_norm,
+                    &[
+                        Binding::Arena(s_k),
+                        Binding::Arena(kn.slice),
+                        Binding::Arena(s_k),
+                    ],
+                )?)),
                 None => None,
             };
 
@@ -2053,133 +2654,366 @@ impl LlamaVkRunner {
                 ],
             )?;
 
-            let ffn_dec_sep = {
-                let g_call = alloc_gemv_call(&pl.w_gate.mat, s_xb, s_hb, false)?;
-                let u_call = alloc_gemv_call(&pl.w_up.mat, s_xb, s_hb2, false)?;
-                let silu_set = alloc_set(
-                    &pipes.silu_mul,
-                    &[Binding::Arena(s_hb), Binding::Arena(s_hb2)],
-                )?;
-                (g_call, u_call, silu_set)
-            };
+            let (ffn_plan, gate_up_weight_bytes, down_weight_bytes) = match &pl.ffn {
+                PendingLayerFfn::Dense {
+                    w_gate,
+                    w_up,
+                    w_down,
+                } => {
+                    let ffn_dec_sep = {
+                        let g_call = alloc_gemv_call(&w_gate.mat, s_xb, s_hb, false)?;
+                        let u_call = alloc_gemv_call(&w_up.mat, s_xb, s_hb2, false)?;
+                        let silu_set = alloc_set(
+                            &pipes.silu_mul,
+                            &[Binding::Arena(s_hb), Binding::Arena(s_hb2)],
+                        )?;
+                        (g_call, u_call, silu_set)
+                    };
 
-            let ffn_dec = if let (Some(gd), Some(ud)) = (pl.w_gate.mat.soa_d, pl.w_up.mat.soa_d) {
-                let wg = 128u32;
-                let nr = 2u32;
-                let pipe = ctx.pipeline(
-                    "gemv_pair_silu_q4_0_soa",
-                    wg | (nr << 16),
-                    SPV_GEMV_PAIR_SILU_Q4_0_SOA,
-                    6,
-                    8,
-                    &[wg, nr],
-                )?;
-                let set = alloc_set(
-                    &pipe,
-                    &[
-                        Binding::Arena(pl.w_gate.slice),
-                        Binding::Arena(gd),
-                        Binding::Arena(pl.w_up.slice),
-                        Binding::Arena(ud),
-                        Binding::Arena(s_xb),
-                        Binding::Arena(s_hb),
-                    ],
-                )?;
-                let rows_per_wg = (wg / sg).max(1) * nr;
-                DecodeFfnSets::FusedPairSilu {
-                    pipe,
-                    set,
-                    groups_x: (pl.w_gate.mat.rows as u32).div_ceil(rows_per_wg),
-                    push: [pl.w_gate.mat.cols as u32, pl.w_gate.mat.rows as u32],
+                    let ffn_dec = if let (Some(gd), Some(ud)) = (w_gate.mat.soa_d, w_up.mat.soa_d) {
+                        let wg = 128u32;
+                        let nr = 2u32;
+                        let pipe = ctx.pipeline(
+                            "gemv_pair_silu_q4_0_soa",
+                            wg | (nr << 16),
+                            SPV_GEMV_PAIR_SILU_Q4_0_SOA,
+                            6,
+                            8,
+                            &[wg, nr],
+                        )?;
+                        let set = alloc_set(
+                            &pipe,
+                            &[
+                                Binding::Arena(w_gate.slice),
+                                Binding::Arena(gd),
+                                Binding::Arena(w_up.slice),
+                                Binding::Arena(ud),
+                                Binding::Arena(s_xb),
+                                Binding::Arena(s_hb),
+                            ],
+                        )?;
+                        let rows_per_wg = (wg / sg).max(1) * nr;
+                        DecodeFfnSets::FusedPairSilu {
+                            pipe,
+                            set,
+                            groups_x: (w_gate.mat.rows as u32).div_ceil(rows_per_wg),
+                            push: [w_gate.mat.cols as u32, w_gate.mat.rows as u32],
+                        }
+                    } else if w_gate.mat.dtype == DType::Q4_0 && w_up.mat.dtype == DType::Q4_0 {
+                        let wg = 128u32;
+                        let nr = 2u32;
+                        let pipe = ctx.pipeline(
+                            "gemv_pair_silu_q4_0",
+                            wg | (nr << 16),
+                            SPV_GEMV_PAIR_SILU_Q4_0,
+                            4,
+                            8,
+                            &[wg, nr],
+                        )?;
+                        let set = alloc_set(
+                            &pipe,
+                            &[
+                                Binding::Arena(w_gate.slice),
+                                Binding::Arena(w_up.slice),
+                                Binding::Arena(s_xb),
+                                Binding::Arena(s_hb),
+                            ],
+                        )?;
+                        let rows_per_wg = (wg / sg).max(1) * nr;
+                        DecodeFfnSets::FusedPairSilu {
+                            pipe,
+                            set,
+                            groups_x: (w_gate.mat.rows as u32).div_ceil(rows_per_wg),
+                            push: [w_gate.mat.cols as u32, w_gate.mat.rows as u32],
+                        }
+                    } else {
+                        DecodeFfnSets::Separate {
+                            gate: ffn_dec_sep.0.clone(),
+                            up: ffn_dec_sep.1.clone(),
+                            silu_set: ffn_dec_sep.2,
+                        }
+                    };
+
+                    let ffn_batch_sep = {
+                        let gate = make_batch_gemm(w_gate.mat, s_xb, s_hb)?;
+                        let up = make_batch_gemm(w_up.mat, s_xb, s_hb2)?;
+                        let silu_set = alloc_set(
+                            &pipes.silu_mul,
+                            &[Binding::Arena(s_hb), Binding::Arena(s_hb2)],
+                        )?;
+                        (gate, up, silu_set)
+                    };
+
+                    let ffn_batch = if prefill_kind == ResolvedPrefill::CoopMatF16
+                        && w_gate.mat.dtype == w_up.mat.dtype
+                        && matches!(w_gate.mat.dtype, DType::Q4_0 | DType::Q4_1 | DType::Q8_0)
+                        && (8 * sg) <= info.max_workgroup_invocations
+                    {
+                        let dt = dtype_code(w_gate.mat.dtype)?;
+                        let cm_wg = 8 * sg;
+                        let pipe = ctx.pipeline(
+                            "gemm_pair_silu_coopmat_f16",
+                            dt | (cm_wg << 8),
+                            SPV_GEMM_PAIR_SILU_COOPMAT_F16,
+                            4,
+                            16,
+                            &[cm_wg, dt],
+                        )?;
+                        let set = alloc_set(
+                            &pipe,
+                            &[
+                                Binding::Arena(w_gate.slice),
+                                Binding::Arena(w_up.slice),
+                                Binding::Arena(s_xb),
+                                Binding::Arena(s_hb),
+                            ],
+                        )?;
+                        BatchFfnPlan::FusedPairSiluCoopMat {
+                            pipe,
+                            set,
+                            cols: w_gate.mat.cols,
+                            rows: w_gate.mat.rows,
+                            row_bytes: w_gate.mat.row_bytes,
+                        }
+                    } else {
+                        let gate = make_batch_gemm(w_gate.mat, s_xb, s_hb)?;
+                        let up = make_batch_gemm(w_up.mat, s_xb, s_hb2)?;
+                        BatchFfnPlan::Separate {
+                            gate,
+                            up,
+                            silu_set: ffn_batch_sep.2,
+                        }
+                    };
+
+                    let down_dec = alloc_gemv_call(&w_down.mat, s_hb, s_x, true)?;
+                    let down_batch = make_batch_gemm(w_down.mat, s_hb, s_x)?;
+                    let gu_bytes = w_gate.mat.byte_len() + w_up.mat.byte_len();
+                    let dn_bytes = w_down.mat.byte_len();
+                    (
+                        LayerFfnPlan::Dense {
+                            ffn_dec,
+                            ffn_dec_sep,
+                            ffn_batch,
+                            ffn_batch_sep,
+                            down_dec,
+                            down_batch,
+                        },
+                        gu_bytes,
+                        dn_bytes,
+                    )
                 }
-            } else if pl.w_gate.mat.dtype == DType::Q4_0 && pl.w_up.mat.dtype == DType::Q4_0 {
-                let wg = 128u32;
-                let nr = 2u32;
-                let pipe = ctx.pipeline(
-                    "gemv_pair_silu_q4_0",
-                    wg | (nr << 16),
-                    SPV_GEMV_PAIR_SILU_Q4_0,
-                    4,
-                    8,
-                    &[wg, nr],
-                )?;
-                let set = alloc_set(
-                    &pipe,
-                    &[
-                        Binding::Arena(pl.w_gate.slice),
-                        Binding::Arena(pl.w_up.slice),
-                        Binding::Arena(s_xb),
-                        Binding::Arena(s_hb),
-                    ],
-                )?;
-                let rows_per_wg = (wg / sg).max(1) * nr;
-                DecodeFfnSets::FusedPairSilu {
-                    pipe,
-                    set,
-                    groups_x: (pl.w_gate.mat.rows as u32).div_ceil(rows_per_wg),
-                    push: [pl.w_gate.mat.cols as u32, pl.w_gate.mat.rows as u32],
-                }
-            } else {
-                DecodeFfnSets::Separate {
-                    gate: ffn_dec_sep.0.clone(),
-                    up: ffn_dec_sep.1.clone(),
-                    silu_set: ffn_dec_sep.2,
+                PendingLayerFfn::Moe(m) => {
+                    let ms = moe_scratch
+                        .as_ref()
+                        .expect("moe_scratch allocated when MoE layers present");
+                    let router_dec = alloc_gemv_call(&m.gate_inp.mat, s_xb, ms.logits, false)?;
+                    let router_batch = make_batch_gemm(m.gate_inp.mat, s_xb, ms.logits)?;
+                    let router_bias_set = mk_bias_set(&m.gate_inp_bias, ms.logits)?;
+                    let epb_slice = m.exp_probs_b.as_ref().map_or(ms.logits, |b| b.slice);
+                    let router_topk_set = alloc_set(
+                        &pipes.moe_router,
+                        &[
+                            Binding::Arena(ms.logits),
+                            Binding::Arena(epb_slice),
+                            Binding::Arena(ms.probs),
+                            Binding::Arena(ms.sel),
+                            Binding::Arena(ms.top_ids),
+                            Binding::Arena(ms.top_w),
+                        ],
+                    )?;
+
+                    let mk_indexed = |pm3: &PendingMat3D<'_>,
+                                      n_out: usize,
+                                      intra_off_bytes: usize,
+                                      x_slice: VkSlice,
+                                      y_slice: VkSlice,
+                                      x_tok_stride: usize,
+                                      x_slot_stride: usize,
+                                      scale_by_router: u32|
+                     -> Result<
+                        (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 9]),
+                        VulkanError,
+                    > {
+                        let dt = dtype_code(pm3.dtype)?;
+                        let wg = 128u32;
+                        let nr = 2u32;
+                        let key = dt | (nr << 8) | (wg << 16);
+                        let pipe = ctx.pipeline(
+                            "moe_indexed_gemv",
+                            key,
+                            SPV_MOE_INDEXED_GEMV,
+                            5,
+                            36,
+                            &[wg, dt, nr],
+                        )?;
+                        let set = alloc_set(
+                            &pipe,
+                            &[
+                                Binding::Arena(pm3.slice),
+                                Binding::Arena(x_slice),
+                                Binding::Arena(ms.top_ids),
+                                Binding::Arena(ms.top_w),
+                                Binding::Arena(y_slice),
+                            ],
+                        )?;
+                        let rows_per_wg = (wg / sg).max(1) * nr;
+                        let gx = (n_out as u32).div_ceil(rows_per_wg);
+                        let push = [
+                            pm3.cols as u32,
+                            n_out as u32,
+                            (pm3.row_bytes / 2) as u32,
+                            (pm3.exp_stride_bytes / 2) as u32,
+                            (intra_off_bytes / 2) as u32,
+                            m.n_expert_used as u32,
+                            x_tok_stride as u32,
+                            x_slot_stride as u32,
+                            scale_by_router,
+                        ];
+                        Ok((pipe, set, gx, push))
+                    };
+
+                    let (
+                        (gate_pipe, gate_set, gate_gx, gate_push),
+                        (up_pipe, up_set, up_gx, up_push),
+                        (down_pipe, down_set, down_gx, down_push),
+                        gu_bytes,
+                        dn_bytes,
+                    ) = match &m.experts {
+                        PendingMoeExperts::Separate { gate, up, down } => {
+                            let g = mk_indexed(gate, m.n_ff_exp, 0, s_xb, ms.gate, n_embd, 0, 0)?;
+                            let u = mk_indexed(up, m.n_ff_exp, 0, s_xb, ms.up, n_embd, 0, 0)?;
+                            let dn = mk_indexed(
+                                down,
+                                n_embd,
+                                0,
+                                ms.gate,
+                                ms.down,
+                                m.n_expert_used * m.n_ff_exp,
+                                m.n_ff_exp,
+                                1,
+                            )?;
+                            let gub = ((gate.exp_stride_bytes + up.exp_stride_bytes)
+                                * m.n_expert_used) as u64;
+                            let dnb = (down.exp_stride_bytes * m.n_expert_used) as u64;
+                            (g, u, dn, gub, dnb)
+                        }
+                        PendingMoeExperts::FusedGateUp { gate_up, down } => {
+                            let half_off = m.n_ff_exp * gate_up.row_bytes;
+                            let g =
+                                mk_indexed(gate_up, m.n_ff_exp, 0, s_xb, ms.gate, n_embd, 0, 0)?;
+                            let u = mk_indexed(
+                                gate_up, m.n_ff_exp, half_off, s_xb, ms.up, n_embd, 0, 0,
+                            )?;
+                            let dn = mk_indexed(
+                                down,
+                                n_embd,
+                                0,
+                                ms.gate,
+                                ms.down,
+                                m.n_expert_used * m.n_ff_exp,
+                                m.n_ff_exp,
+                                1,
+                            )?;
+                            let gub = (gate_up.exp_stride_bytes * m.n_expert_used) as u64;
+                            let dnb = (down.exp_stride_bytes * m.n_expert_used) as u64;
+                            (g, u, dn, gub, dnb)
+                        }
+                    };
+
+                    let silu_set = alloc_set(
+                        &pipes.silu_mul,
+                        &[Binding::Arena(ms.gate), Binding::Arena(ms.up)],
+                    )?;
+                    let reduce_set = alloc_set(
+                        &pipes.moe_reduce,
+                        &[
+                            Binding::Arena(ms.down),
+                            Binding::Arena(ms.top_w),
+                            Binding::Arena(s_x),
+                        ],
+                    )?;
+
+                    let shared_expert = if let Some(ref sh) = m.shared_expert {
+                        let gate_dec = alloc_gemv_call(&sh.w_gate.mat, s_xb, s_hb, false)?;
+                        let up_dec = alloc_gemv_call(&sh.w_up.mat, s_xb, s_hb2, false)?;
+                        let gate_batch = make_batch_gemm(sh.w_gate.mat, s_xb, s_hb)?;
+                        let up_batch = make_batch_gemm(sh.w_up.mat, s_xb, s_hb2)?;
+                        let sh_silu_set = alloc_set(
+                            &pipes.silu_mul,
+                            &[Binding::Arena(s_hb), Binding::Arena(s_hb2)],
+                        )?;
+                        let (down_dec, down_batch, gate_inp_1d) =
+                            if let Some(ref gi) = sh.w_gate_inp_1d {
+                                let sh_out = ms.shexp_out.expect("shexp_out allocated");
+                                let sh_gate = ms.shexp_gate.expect("shexp_gate allocated");
+                                let dd = alloc_gemv_call(&sh.w_down.mat, s_hb, sh_out, false)?;
+                                let db = make_batch_gemm(sh.w_down.mat, s_hb, sh_out)?;
+                                let gi_dec = alloc_gemv_call(&gi.mat, s_xb, sh_gate, false)?;
+                                let gi_batch = make_batch_gemm(gi.mat, s_xb, sh_gate)?;
+                                let gi_red = alloc_set(
+                                    &pipes.moe_reduce,
+                                    &[
+                                        Binding::Arena(sh_out),
+                                        Binding::Arena(sh_gate),
+                                        Binding::Arena(s_x),
+                                    ],
+                                )?;
+                                (dd, db, Some((gi_dec, gi_batch, gi_red)))
+                            } else {
+                                let dd = alloc_gemv_call(&sh.w_down.mat, s_hb, s_x, true)?;
+                                let db = make_batch_gemm(sh.w_down.mat, s_hb, s_x)?;
+                                (dd, db, None)
+                            };
+                        Some(Box::new(MoeSharedExpertPlan {
+                            n_ff_shexp: sh.n_ff_shexp,
+                            gate_dec,
+                            up_dec,
+                            down_dec,
+                            gate_batch,
+                            up_batch,
+                            down_batch,
+                            silu_set: sh_silu_set,
+                            gate_inp_1d,
+                        }))
+                    } else {
+                        None
+                    };
+
+                    (
+                        LayerFfnPlan::Moe(Box::new(MoeLayerPlan {
+                            n_expert: m.n_expert as u32,
+                            n_expert_used: m.n_expert_used as u32,
+                            n_ff_exp: m.n_ff_exp as u32,
+                            gating_func: m.gating_func,
+                            norm_weights: u32::from(m.norm_weights),
+                            has_exp_probs_b: u32::from(m.exp_probs_b.is_some()),
+                            norm_eps_bits: m.norm_weights_eps.to_bits(),
+                            weights_scale_bits: m.weights_scale.to_bits(),
+                            router_dec,
+                            router_batch,
+                            router_bias_set,
+                            router_topk_set,
+                            gate_pipe,
+                            gate_set,
+                            gate_gx,
+                            gate_push,
+                            up_pipe,
+                            up_set,
+                            up_gx,
+                            up_push,
+                            silu_set,
+                            down_pipe,
+                            down_set,
+                            down_gx,
+                            down_push,
+                            reduce_set,
+                            shared_expert,
+                        })),
+                        gu_bytes,
+                        dn_bytes,
+                    )
                 }
             };
-
-            let ffn_batch_sep = {
-                let gate = make_batch_gemm(pl.w_gate.mat, s_xb, s_hb)?;
-                let up = make_batch_gemm(pl.w_up.mat, s_xb, s_hb2)?;
-                let silu_set = alloc_set(
-                    &pipes.silu_mul,
-                    &[Binding::Arena(s_hb), Binding::Arena(s_hb2)],
-                )?;
-                (gate, up, silu_set)
-            };
-
-            let ffn_batch = if prefill_kind == ResolvedPrefill::CoopMatF16
-                && pl.w_gate.mat.dtype == pl.w_up.mat.dtype
-                && matches!(pl.w_gate.mat.dtype, DType::Q4_0 | DType::Q4_1 | DType::Q8_0)
-                && (8 * sg) <= info.max_workgroup_invocations
-            {
-                let dt = dtype_code(pl.w_gate.mat.dtype)?;
-                let cm_wg = 8 * sg;
-                let pipe = ctx.pipeline(
-                    "gemm_pair_silu_coopmat_f16",
-                    dt | (cm_wg << 8),
-                    SPV_GEMM_PAIR_SILU_COOPMAT_F16,
-                    4,
-                    16,
-                    &[cm_wg, dt],
-                )?;
-                let set = alloc_set(
-                    &pipe,
-                    &[
-                        Binding::Arena(pl.w_gate.slice),
-                        Binding::Arena(pl.w_up.slice),
-                        Binding::Arena(s_xb),
-                        Binding::Arena(s_hb),
-                    ],
-                )?;
-                BatchFfnPlan::FusedPairSiluCoopMat {
-                    pipe,
-                    set,
-                    cols: pl.w_gate.mat.cols,
-                    rows: pl.w_gate.mat.rows,
-                    row_bytes: pl.w_gate.mat.row_bytes,
-                }
-            } else {
-                let gate = make_batch_gemm(pl.w_gate.mat, s_xb, s_hb)?;
-                let up = make_batch_gemm(pl.w_up.mat, s_xb, s_hb2)?;
-                BatchFfnPlan::Separate {
-                    gate,
-                    up,
-                    silu_set: ffn_batch_sep.2,
-                }
-            };
-
-            let (p_dn, s_dn, g_dn, push_dn) = alloc_gemv_call(&pl.w_down.mat, s_hb, s_x, true)?;
-            let down_batch = make_batch_gemm(pl.w_down.mat, s_hb, s_x)?;
 
             layers.push(LayerPlan {
                 idx: il,
@@ -2201,18 +3035,13 @@ impl LlamaVkRunner {
                 wo_dec: (p_wo, s_wo, g_wo, push_wo),
                 wo_batch,
                 ffn_norm_set,
-                ffn_dec,
-                ffn_dec_sep,
-                ffn_batch,
-                ffn_batch_sep,
-                down_dec: (p_dn, s_dn, g_dn, push_dn),
-                down_batch,
+                ffn: ffn_plan,
                 qkv_weight_bytes: pl.wq.mat.byte_len()
                     + pl.wk.mat.byte_len()
                     + pl.wv.mat.byte_len(),
                 wo_weight_bytes: pl.wo.mat.byte_len(),
-                gate_up_weight_bytes: pl.w_gate.mat.byte_len() + pl.w_up.mat.byte_len(),
-                down_weight_bytes: pl.w_down.mat.byte_len(),
+                gate_up_weight_bytes,
+                down_weight_bytes,
             });
         }
 
@@ -2349,7 +3178,7 @@ impl LlamaVkRunner {
     ) -> Result<(), VulkanError> {
         self.check_groups(pipe.name, gx, gy)?;
         let d = &self.ctx.inner.device;
-        let mut push_bytes = [0u8; 32];
+        let mut push_bytes = [0u8; 40];
         let byte_len = push_u32.len() * 4;
         for (i, &w) in push_u32.iter().enumerate() {
             push_bytes[i * 4..(i + 1) * 4].copy_from_slice(&w.to_ne_bytes());
@@ -2399,6 +3228,271 @@ impl LlamaVkRunner {
             n_tok,
             barrier_after,
         )
+    }
+
+    fn cmd_record_qk_norm(
+        &self,
+        cb: vk::CommandBuffer,
+        layer: &LayerPlan,
+        n_tok: u32,
+    ) -> Result<(), VulkanError> {
+        if layer.q_norm_set.is_none() && layer.k_norm_set.is_none() {
+            return Ok(());
+        }
+        let eps_bits = self.cfg.rms_eps.to_bits();
+        let qk_push = [self.cfg.head_dim as u32, eps_bits];
+        let q_dim = (self.cfg.n_head * self.cfg.head_dim) as u32;
+        let kv_dim = (self.cfg.n_head_kv * self.cfg.head_dim) as u32;
+        if let Some(ref qn) = layer.q_norm_set {
+            match qn {
+                QkNormPlan::PerHead(set) => {
+                    self.cmd_dispatch_set(
+                        cb,
+                        &self.pipes.qk_norm,
+                        *set,
+                        &qk_push,
+                        self.cfg.n_head as u32,
+                        n_tok,
+                        false,
+                    )?;
+                }
+                QkNormPlan::FullVec(set) => {
+                    self.cmd_dispatch_set(
+                        cb,
+                        &self.pipes.rms_norm,
+                        *set,
+                        &[q_dim, 0, eps_bits],
+                        n_tok,
+                        1,
+                        false,
+                    )?;
+                }
+            }
+        }
+        if let Some(ref kn) = layer.k_norm_set {
+            match kn {
+                QkNormPlan::PerHead(set) => {
+                    self.cmd_dispatch_set(
+                        cb,
+                        &self.pipes.qk_norm,
+                        *set,
+                        &qk_push,
+                        self.cfg.n_head_kv as u32,
+                        n_tok,
+                        false,
+                    )?;
+                }
+                QkNormPlan::FullVec(set) => {
+                    self.cmd_dispatch_set(
+                        cb,
+                        &self.pipes.rms_norm,
+                        *set,
+                        &[kv_dim, 0, eps_bits],
+                        n_tok,
+                        1,
+                        false,
+                    )?;
+                }
+            }
+        }
+        Self::cmd_compute_barrier(&self.ctx.inner.device, cb);
+        Ok(())
+    }
+
+    fn cmd_record_moe_ffn(
+        &self,
+        cb: vk::CommandBuffer,
+        moe: &MoeLayerPlan,
+        n_tok: u32,
+    ) -> Result<(), VulkanError> {
+        let n_embd = self.cfg.n_embd;
+        // 1. Router logits
+        if n_tok == 1 {
+            self.cmd_dispatch_set(
+                cb,
+                &moe.router_dec.0,
+                moe.router_dec.1,
+                &moe.router_dec.3,
+                moe.router_dec.2,
+                1,
+                true,
+            )?;
+        } else {
+            self.cmd_quant_if_needed(
+                cb,
+                self.quant_xb_set,
+                n_tok,
+                n_embd,
+                moe.router_batch.flavor.uses_i8(),
+            )?;
+            self.cmd_gemm(cb, &moe.router_batch, n_tok, false, true)?;
+        }
+        if let Some(bset) = moe.router_bias_set {
+            self.cmd_add_bias(cb, bset, moe.n_expert as usize, n_tok, true)?;
+        }
+
+        // 2. Top-K routing
+        let r_push = [
+            moe.n_expert,
+            moe.n_expert_used,
+            n_tok,
+            moe.gating_func,
+            moe.norm_weights,
+            moe.has_exp_probs_b,
+            moe.norm_eps_bits,
+            moe.weights_scale_bits,
+        ];
+        self.cmd_dispatch_set(
+            cb,
+            &self.pipes.moe_router,
+            moe.router_topk_set,
+            &r_push,
+            n_tok.div_ceil(64),
+            1,
+            true,
+        )?;
+
+        // 3. Indexed expert gate & up + SwiGLU
+        let gy = n_tok * moe.n_expert_used;
+        self.cmd_dispatch_set(
+            cb,
+            &moe.gate_pipe,
+            moe.gate_set,
+            &moe.gate_push,
+            moe.gate_gx,
+            gy,
+            false,
+        )?;
+        self.cmd_dispatch_set(
+            cb,
+            &moe.up_pipe,
+            moe.up_set,
+            &moe.up_push,
+            moe.up_gx,
+            gy,
+            true,
+        )?;
+        let total_ff = gy * moe.n_ff_exp;
+        self.cmd_dispatch_set(
+            cb,
+            &self.pipes.silu_mul,
+            moe.silu_set,
+            &[total_ff],
+            total_ff.div_ceil(256).min(65535),
+            1,
+            true,
+        )?;
+
+        // 4. Indexed expert down (scaled by router weight) + deterministic 0..k reduction
+        self.cmd_dispatch_set(
+            cb,
+            &moe.down_pipe,
+            moe.down_set,
+            &moe.down_push,
+            moe.down_gx,
+            gy,
+            true,
+        )?;
+        self.cmd_dispatch_set(
+            cb,
+            &self.pipes.moe_reduce,
+            moe.reduce_set,
+            &[n_embd as u32, moe.n_expert_used, n_tok, 0],
+            (n_embd as u32).div_ceil(256),
+            n_tok,
+            true,
+        )?;
+
+        // 5. Optional shared expert (+ optional 1D sigmoid gate for qwen2moe)
+        if let Some(ref sh) = moe.shared_expert {
+            let has_1d_gate = sh.gate_inp_1d.is_some();
+            if n_tok == 1 {
+                self.cmd_dispatch_set(
+                    cb,
+                    &sh.gate_dec.0,
+                    sh.gate_dec.1,
+                    &sh.gate_dec.3,
+                    sh.gate_dec.2,
+                    1,
+                    false,
+                )?;
+                self.cmd_dispatch_set(
+                    cb,
+                    &sh.up_dec.0,
+                    sh.up_dec.1,
+                    &sh.up_dec.3,
+                    sh.up_dec.2,
+                    1,
+                    true,
+                )?;
+                let n_sh = sh.n_ff_shexp as u32;
+                self.cmd_dispatch_set(
+                    cb,
+                    &self.pipes.silu_mul,
+                    sh.silu_set,
+                    &[n_sh],
+                    n_sh.div_ceil(256).min(65535),
+                    1,
+                    true,
+                )?;
+                self.cmd_dispatch_set(
+                    cb,
+                    &sh.down_dec.0,
+                    sh.down_dec.1,
+                    &sh.down_dec.3,
+                    sh.down_dec.2,
+                    1,
+                    true,
+                )?;
+            } else {
+                let gu_i8 = sh.gate_batch.flavor.uses_i8() || sh.up_batch.flavor.uses_i8();
+                self.cmd_quant_if_needed(cb, self.quant_xb_set, n_tok, n_embd, gu_i8)?;
+                self.cmd_gemm(cb, &sh.gate_batch, n_tok, false, false)?;
+                self.cmd_gemm(cb, &sh.up_batch, n_tok, false, true)?;
+                let total_sh = n_tok * sh.n_ff_shexp as u32;
+                self.cmd_dispatch_set(
+                    cb,
+                    &self.pipes.silu_mul,
+                    sh.silu_set,
+                    &[total_sh],
+                    total_sh.div_ceil(256).min(65535),
+                    1,
+                    true,
+                )?;
+                self.cmd_quant_if_needed(
+                    cb,
+                    self.quant_hb_set,
+                    n_tok,
+                    sh.n_ff_shexp,
+                    sh.down_batch.flavor.uses_i8(),
+                )?;
+                self.cmd_gemm(cb, &sh.down_batch, n_tok, !has_1d_gate, true)?;
+            }
+            if let Some((ref gi_dec, ref gi_batch, gi_red_set)) = sh.gate_inp_1d {
+                if n_tok == 1 {
+                    self.cmd_dispatch_set(cb, &gi_dec.0, gi_dec.1, &gi_dec.3, gi_dec.2, 1, true)?;
+                } else {
+                    self.cmd_quant_if_needed(
+                        cb,
+                        self.quant_xb_set,
+                        n_tok,
+                        n_embd,
+                        gi_batch.flavor.uses_i8(),
+                    )?;
+                    self.cmd_gemm(cb, gi_batch, n_tok, false, true)?;
+                }
+                self.cmd_dispatch_set(
+                    cb,
+                    &self.pipes.moe_reduce,
+                    gi_red_set,
+                    &[n_embd as u32, 1, n_tok, 1],
+                    (n_embd as u32).div_ceil(256),
+                    n_tok,
+                    true,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn cmd_compute_barrier(d: &ash::Device, cb: vk::CommandBuffer) {
@@ -2492,7 +3586,6 @@ impl LlamaVkRunner {
 
         let eps_bits = self.cfg.rms_eps.to_bits();
         let norm_push = [self.cfg.n_embd as u32, 0, eps_bits];
-        let qk_push = [self.cfg.head_dim as u32, eps_bits];
         let half_rope = self.cfg.rope_dim / 2;
         let q_dim = self.cfg.n_head * self.cfg.head_dim;
         let kv_dim = self.cfg.n_head_kv * self.cfg.head_dim;
@@ -2567,31 +3660,7 @@ impl LlamaVkRunner {
                 Self::cmd_compute_barrier(d, cb);
             }
 
-            if layer.q_norm_set.is_some() || layer.k_norm_set.is_some() {
-                if let Some(qns) = layer.q_norm_set {
-                    self.cmd_dispatch_set(
-                        cb,
-                        &self.pipes.qk_norm,
-                        qns,
-                        &qk_push,
-                        self.cfg.n_head as u32,
-                        1,
-                        false,
-                    )?;
-                }
-                if let Some(kns) = layer.k_norm_set {
-                    self.cmd_dispatch_set(
-                        cb,
-                        &self.pipes.qk_norm,
-                        kns,
-                        &qk_push,
-                        self.cfg.n_head_kv as u32,
-                        1,
-                        false,
-                    )?;
-                }
-                Self::cmd_compute_barrier(d, cb);
-            }
+            self.cmd_record_qk_norm(cb, layer, 1)?;
 
             let mut l_rope_push = rope_push;
             if !self.cfg.layer_uses_rope(layer.idx) {
@@ -2678,60 +3747,74 @@ impl LlamaVkRunner {
                 true,
             )?;
 
-            let force_sep = self.lora.has_linear(&wg_n) || self.lora.has_linear(&wu_n);
-            if force_sep {
-                let (ref gate, ref up, silu_set) = layer.ffn_dec_sep;
-                self.cmd_dispatch_set(cb, &gate.0, gate.1, &gate.3, gate.2, 1, false)?;
-                self.cmd_dispatch_set(cb, &up.0, up.1, &up.3, up.2, 1, true)?;
-                self.lora.cmd_record_linear(&self.ctx, cb, &wg_n, 1)?;
-                self.lora.cmd_record_linear(&self.ctx, cb, &wu_n, 1)?;
-                let gx = (self.cfg.n_ff as u32).div_ceil(256).min(65535);
-                self.cmd_dispatch_set(
-                    cb,
-                    &self.pipes.silu_mul,
-                    silu_set,
-                    &[self.cfg.n_ff as u32],
-                    gx,
-                    1,
-                    true,
-                )?;
-            } else {
-                match &layer.ffn_dec {
-                    DecodeFfnSets::FusedPairSilu {
-                        pipe,
-                        set,
-                        groups_x,
-                        push,
-                    } => {
-                        self.cmd_dispatch_set(cb, pipe, *set, push, *groups_x, 1, true)?;
-                    }
-                    DecodeFfnSets::Separate { gate, up, silu_set } => {
+            match &layer.ffn {
+                LayerFfnPlan::Dense {
+                    ffn_dec,
+                    ffn_dec_sep,
+                    down_dec,
+                    ..
+                } => {
+                    let force_sep = self.lora.has_linear(&wg_n) || self.lora.has_linear(&wu_n);
+                    if force_sep {
+                        let (ref gate, ref up, silu_set) = *ffn_dec_sep;
                         self.cmd_dispatch_set(cb, &gate.0, gate.1, &gate.3, gate.2, 1, false)?;
                         self.cmd_dispatch_set(cb, &up.0, up.1, &up.3, up.2, 1, true)?;
+                        self.lora.cmd_record_linear(&self.ctx, cb, &wg_n, 1)?;
+                        self.lora.cmd_record_linear(&self.ctx, cb, &wu_n, 1)?;
                         let gx = (self.cfg.n_ff as u32).div_ceil(256).min(65535);
                         self.cmd_dispatch_set(
                             cb,
                             &self.pipes.silu_mul,
-                            *silu_set,
+                            silu_set,
                             &[self.cfg.n_ff as u32],
                             gx,
                             1,
                             true,
                         )?;
+                    } else {
+                        match ffn_dec {
+                            DecodeFfnSets::FusedPairSilu {
+                                pipe,
+                                set,
+                                groups_x,
+                                push,
+                            } => {
+                                self.cmd_dispatch_set(cb, pipe, *set, push, *groups_x, 1, true)?;
+                            }
+                            DecodeFfnSets::Separate { gate, up, silu_set } => {
+                                self.cmd_dispatch_set(
+                                    cb, &gate.0, gate.1, &gate.3, gate.2, 1, false,
+                                )?;
+                                self.cmd_dispatch_set(cb, &up.0, up.1, &up.3, up.2, 1, true)?;
+                                let gx = (self.cfg.n_ff as u32).div_ceil(256).min(65535);
+                                self.cmd_dispatch_set(
+                                    cb,
+                                    &self.pipes.silu_mul,
+                                    *silu_set,
+                                    &[self.cfg.n_ff as u32],
+                                    gx,
+                                    1,
+                                    true,
+                                )?;
+                            }
+                        }
                     }
+
+                    self.cmd_dispatch_set(
+                        cb,
+                        &down_dec.0,
+                        down_dec.1,
+                        &down_dec.3,
+                        down_dec.2,
+                        1,
+                        true,
+                    )?;
+                    self.lora.cmd_record_linear(&self.ctx, cb, &wd_n, 1)?;
+                }
+                LayerFfnPlan::Moe(moe) => {
+                    self.cmd_record_moe_ffn(cb, moe, 1)?;
                 }
             }
-
-            self.cmd_dispatch_set(
-                cb,
-                &layer.down_dec.0,
-                layer.down_dec.1,
-                &layer.down_dec.3,
-                layer.down_dec.2,
-                1,
-                true,
-            )?;
-            self.lora.cmd_record_linear(&self.ctx, cb, &wd_n, 1)?;
         }
 
         if compute_logits {
@@ -3098,7 +4181,6 @@ impl LlamaVkRunner {
         let emb_items = embed_items(self.token_embd.dtype, self.cfg.n_embd)?;
         let eps_bits = self.cfg.rms_eps.to_bits();
         let norm_push = [self.cfg.n_embd as u32, 0, eps_bits];
-        let qk_push = [self.cfg.head_dim as u32, eps_bits];
         let half_rope = self.cfg.rope_dim / 2;
         let rope_total = ((self.cfg.n_head + self.cfg.n_head_kv) * half_rope)
             .max(self.cfg.n_head_kv * self.cfg.head_dim);
@@ -3217,31 +4299,7 @@ impl LlamaVkRunner {
                     Self::cmd_compute_barrier(d, cb);
                 }
 
-                if layer.q_norm_set.is_some() || layer.k_norm_set.is_some() {
-                    if let Some(qns) = layer.q_norm_set {
-                        self.cmd_dispatch_set(
-                            cb,
-                            &self.pipes.qk_norm,
-                            qns,
-                            &qk_push,
-                            self.cfg.n_head as u32,
-                            b_u32,
-                            false,
-                        )?;
-                    }
-                    if let Some(kns) = layer.k_norm_set {
-                        self.cmd_dispatch_set(
-                            cb,
-                            &self.pipes.qk_norm,
-                            kns,
-                            &qk_push,
-                            self.cfg.n_head_kv as u32,
-                            b_u32,
-                            false,
-                        )?;
-                    }
-                    Self::cmd_compute_barrier(d, cb);
-                }
+                self.cmd_record_qk_norm(cb, layer, b_u32)?;
 
                 let mut l_rope_push = rope_push;
                 if !self.cfg.layer_uses_rope(layer.idx) {
@@ -3282,47 +4340,16 @@ impl LlamaVkRunner {
                     true,
                 )?;
 
-                let force_sep = self.lora.has_linear(&wg_n) || self.lora.has_linear(&wu_n);
-                if force_sep {
-                    let (ref gate, ref up, silu_set) = layer.ffn_batch_sep;
-                    let gu_i8 = gate.flavor.uses_i8() || up.flavor.uses_i8();
-                    self.cmd_quant_if_needed(cb, self.quant_xb_set, b_u32, self.cfg.n_embd, gu_i8)?;
-                    self.cmd_gemm(cb, gate, b_u32, false, false)?;
-                    self.cmd_gemm(cb, up, b_u32, false, true)?;
-                    self.lora.cmd_record_linear(&self.ctx, cb, &wg_n, b_u32)?;
-                    self.lora.cmd_record_linear(&self.ctx, cb, &wu_n, b_u32)?;
-                    let total_ff = (b * self.cfg.n_ff) as u32;
-                    let gx = total_ff.div_ceil(256).min(65535);
-                    self.cmd_dispatch_set(
-                        cb,
-                        &self.pipes.silu_mul,
-                        silu_set,
-                        &[total_ff],
-                        gx,
-                        1,
-                        true,
-                    )?;
-                } else {
-                    match &layer.ffn_batch {
-                        BatchFfnPlan::FusedPairSiluCoopMat {
-                            pipe,
-                            set,
-                            cols,
-                            rows,
-                            row_bytes,
-                        } => {
-                            let push = [*cols as u32, *rows as u32, b_u32, (*row_bytes / 2) as u32];
-                            self.cmd_dispatch_set(
-                                cb,
-                                pipe,
-                                *set,
-                                &push,
-                                (*rows as u32).div_ceil(64),
-                                b_u32.div_ceil(128),
-                                true,
-                            )?;
-                        }
-                        BatchFfnPlan::Separate { gate, up, silu_set } => {
+                match &layer.ffn {
+                    LayerFfnPlan::Dense {
+                        ffn_batch,
+                        ffn_batch_sep,
+                        down_batch,
+                        ..
+                    } => {
+                        let force_sep = self.lora.has_linear(&wg_n) || self.lora.has_linear(&wu_n);
+                        if force_sep {
+                            let (ref gate, ref up, silu_set) = *ffn_batch_sep;
                             let gu_i8 = gate.flavor.uses_i8() || up.flavor.uses_i8();
                             self.cmd_quant_if_needed(
                                 cb,
@@ -3333,30 +4360,84 @@ impl LlamaVkRunner {
                             )?;
                             self.cmd_gemm(cb, gate, b_u32, false, false)?;
                             self.cmd_gemm(cb, up, b_u32, false, true)?;
+                            self.lora.cmd_record_linear(&self.ctx, cb, &wg_n, b_u32)?;
+                            self.lora.cmd_record_linear(&self.ctx, cb, &wu_n, b_u32)?;
                             let total_ff = (b * self.cfg.n_ff) as u32;
                             let gx = total_ff.div_ceil(256).min(65535);
                             self.cmd_dispatch_set(
                                 cb,
                                 &self.pipes.silu_mul,
-                                *silu_set,
+                                silu_set,
                                 &[total_ff],
                                 gx,
                                 1,
                                 true,
                             )?;
+                        } else {
+                            match ffn_batch {
+                                BatchFfnPlan::FusedPairSiluCoopMat {
+                                    pipe,
+                                    set,
+                                    cols,
+                                    rows,
+                                    row_bytes,
+                                } => {
+                                    let push = [
+                                        *cols as u32,
+                                        *rows as u32,
+                                        b_u32,
+                                        (*row_bytes / 2) as u32,
+                                    ];
+                                    self.cmd_dispatch_set(
+                                        cb,
+                                        pipe,
+                                        *set,
+                                        &push,
+                                        (*rows as u32).div_ceil(64),
+                                        b_u32.div_ceil(128),
+                                        true,
+                                    )?;
+                                }
+                                BatchFfnPlan::Separate { gate, up, silu_set } => {
+                                    let gu_i8 = gate.flavor.uses_i8() || up.flavor.uses_i8();
+                                    self.cmd_quant_if_needed(
+                                        cb,
+                                        self.quant_xb_set,
+                                        b_u32,
+                                        self.cfg.n_embd,
+                                        gu_i8,
+                                    )?;
+                                    self.cmd_gemm(cb, gate, b_u32, false, false)?;
+                                    self.cmd_gemm(cb, up, b_u32, false, true)?;
+                                    let total_ff = (b * self.cfg.n_ff) as u32;
+                                    let gx = total_ff.div_ceil(256).min(65535);
+                                    self.cmd_dispatch_set(
+                                        cb,
+                                        &self.pipes.silu_mul,
+                                        *silu_set,
+                                        &[total_ff],
+                                        gx,
+                                        1,
+                                        true,
+                                    )?;
+                                }
+                            }
                         }
+
+                        self.cmd_quant_if_needed(
+                            cb,
+                            self.quant_hb_set,
+                            b_u32,
+                            self.cfg.n_ff,
+                            down_batch.flavor.uses_i8(),
+                        )?;
+                        self.cmd_gemm(cb, down_batch, b_u32, true, true)?;
+                        self.lora.cmd_record_linear(&self.ctx, cb, &wd_n, b_u32)?;
+                    }
+                    LayerFfnPlan::Moe(moe) => {
+                        self.cmd_record_moe_ffn(cb, moe, b_u32)?;
                     }
                 }
-
-                self.cmd_quant_if_needed(
-                    cb,
-                    self.quant_hb_set,
-                    b_u32,
-                    self.cfg.n_ff,
-                    layer.down_batch.flavor.uses_i8(),
-                )?;
-                self.cmd_gemm(cb, &layer.down_batch, b_u32, true, true)?;
-                self.lora.cmd_record_linear(&self.ctx, cb, &wd_n, b_u32)?;
             }
 
             if is_last_chunk && compute_last_logits {
@@ -3541,7 +4622,6 @@ impl LlamaVkRunner {
             let emb_items = embed_items(self.token_embd.dtype, self.cfg.n_embd)?;
             let eps_bits = self.cfg.rms_eps.to_bits();
             let norm_push = [self.cfg.n_embd as u32, 0, eps_bits];
-            let qk_push = [self.cfg.head_dim as u32, eps_bits];
             let half_rope = self.cfg.rope_dim / 2;
             let rope_total = ((self.cfg.n_head + self.cfg.n_head_kv) * half_rope)
                 .max(self.cfg.n_head_kv * self.cfg.head_dim);
@@ -3658,29 +4738,7 @@ impl LlamaVkRunner {
                     prev = cur;
 
                     if layer.q_norm_set.is_some() || layer.k_norm_set.is_some() {
-                        if let Some(qns) = layer.q_norm_set {
-                            self.cmd_dispatch_set(
-                                cb,
-                                &self.pipes.qk_norm,
-                                qns,
-                                &qk_push,
-                                self.cfg.n_head as u32,
-                                1,
-                                false,
-                            )?;
-                        }
-                        if let Some(kns) = layer.k_norm_set {
-                            self.cmd_dispatch_set(
-                                cb,
-                                &self.pipes.qk_norm,
-                                kns,
-                                &qk_push,
-                                self.cfg.n_head_kv as u32,
-                                1,
-                                false,
-                            )?;
-                        }
-                        Self::cmd_compute_barrier(d, cb);
+                        self.cmd_record_qk_norm(cb, layer, 1)?;
                         let cur = mark(cb);
                         spans.push((3, prev, cur));
                         prev = cur;
@@ -3779,46 +4837,62 @@ impl LlamaVkRunner {
                     spans.push((7, prev, cur));
                     prev = cur;
 
-                    match &layer.ffn_dec {
-                        DecodeFfnSets::FusedPairSilu {
-                            pipe,
-                            set,
-                            groups_x,
-                            push,
+                    match &layer.ffn {
+                        LayerFfnPlan::Dense {
+                            ffn_dec, down_dec, ..
                         } => {
-                            self.cmd_dispatch_set(cb, pipe, *set, push, *groups_x, 1, true)?;
-                        }
-                        DecodeFfnSets::Separate { gate, up, silu_set } => {
-                            self.cmd_dispatch_set(cb, &gate.0, gate.1, &gate.3, gate.2, 1, false)?;
-                            self.cmd_dispatch_set(cb, &up.0, up.1, &up.3, up.2, 1, true)?;
-                            let gx = (self.cfg.n_ff as u32).div_ceil(256).min(65535);
+                            match ffn_dec {
+                                DecodeFfnSets::FusedPairSilu {
+                                    pipe,
+                                    set,
+                                    groups_x,
+                                    push,
+                                } => {
+                                    self.cmd_dispatch_set(
+                                        cb, pipe, *set, push, *groups_x, 1, true,
+                                    )?;
+                                }
+                                DecodeFfnSets::Separate { gate, up, silu_set } => {
+                                    self.cmd_dispatch_set(
+                                        cb, &gate.0, gate.1, &gate.3, gate.2, 1, false,
+                                    )?;
+                                    self.cmd_dispatch_set(cb, &up.0, up.1, &up.3, up.2, 1, true)?;
+                                    let gx = (self.cfg.n_ff as u32).div_ceil(256).min(65535);
+                                    self.cmd_dispatch_set(
+                                        cb,
+                                        &self.pipes.silu_mul,
+                                        *silu_set,
+                                        &[self.cfg.n_ff as u32],
+                                        gx,
+                                        1,
+                                        true,
+                                    )?;
+                                }
+                            }
+                            let cur = mark(cb);
+                            spans.push((8, prev, cur));
+                            prev = cur;
+
                             self.cmd_dispatch_set(
                                 cb,
-                                &self.pipes.silu_mul,
-                                *silu_set,
-                                &[self.cfg.n_ff as u32],
-                                gx,
+                                &down_dec.0,
+                                down_dec.1,
+                                &down_dec.3,
+                                down_dec.2,
                                 1,
                                 true,
                             )?;
+                            let cur = mark(cb);
+                            spans.push((9, prev, cur));
+                            prev = cur;
+                        }
+                        LayerFfnPlan::Moe(moe) => {
+                            self.cmd_record_moe_ffn(cb, moe, 1)?;
+                            let cur = mark(cb);
+                            spans.push((8, prev, cur));
+                            prev = cur;
                         }
                     }
-                    let cur = mark(cb);
-                    spans.push((8, prev, cur));
-                    prev = cur;
-
-                    self.cmd_dispatch_set(
-                        cb,
-                        &layer.down_dec.0,
-                        layer.down_dec.1,
-                        &layer.down_dec.3,
-                        layer.down_dec.2,
-                        1,
-                        true,
-                    )?;
-                    let cur = mark(cb);
-                    spans.push((9, prev, cur));
-                    prev = cur;
                 }
 
                 self.cmd_dispatch_set(
@@ -3973,29 +5047,7 @@ impl LlamaVkRunner {
                     prev = cur;
 
                     if layer.q_norm_set.is_some() || layer.k_norm_set.is_some() {
-                        if let Some(qns) = layer.q_norm_set {
-                            self.cmd_dispatch_set(
-                                cb,
-                                &self.pipes.qk_norm,
-                                qns,
-                                &qk_push,
-                                self.cfg.n_head as u32,
-                                b_u32,
-                                false,
-                            )?;
-                        }
-                        if let Some(kns) = layer.k_norm_set {
-                            self.cmd_dispatch_set(
-                                cb,
-                                &self.pipes.qk_norm,
-                                kns,
-                                &qk_push,
-                                self.cfg.n_head_kv as u32,
-                                b_u32,
-                                false,
-                            )?;
-                        }
-                        Self::cmd_compute_barrier(d, cb);
+                        self.cmd_record_qk_norm(cb, layer, b_u32)?;
                         let cur = mark_pp(cb);
                         pp_spans.push((3, prev, cur));
                         prev = cur;
@@ -4048,64 +5100,83 @@ impl LlamaVkRunner {
                     pp_spans.push((7, prev, cur));
                     prev = cur;
 
-                    match &layer.ffn_batch {
-                        BatchFfnPlan::FusedPairSiluCoopMat {
-                            pipe,
-                            set,
-                            cols,
-                            rows,
-                            row_bytes,
+                    match &layer.ffn {
+                        LayerFfnPlan::Dense {
+                            ffn_batch,
+                            down_batch,
+                            ..
                         } => {
-                            let push = [*cols as u32, *rows as u32, b_u32, (*row_bytes / 2) as u32];
-                            self.cmd_dispatch_set(
-                                cb,
-                                pipe,
-                                *set,
-                                &push,
-                                (*rows as u32).div_ceil(64),
-                                b_u32.div_ceil(64),
-                                true,
-                            )?;
-                        }
-                        BatchFfnPlan::Separate { gate, up, silu_set } => {
-                            let gu_i8 = gate.flavor.uses_i8() || up.flavor.uses_i8();
+                            match ffn_batch {
+                                BatchFfnPlan::FusedPairSiluCoopMat {
+                                    pipe,
+                                    set,
+                                    cols,
+                                    rows,
+                                    row_bytes,
+                                } => {
+                                    let push = [
+                                        *cols as u32,
+                                        *rows as u32,
+                                        b_u32,
+                                        (*row_bytes / 2) as u32,
+                                    ];
+                                    self.cmd_dispatch_set(
+                                        cb,
+                                        pipe,
+                                        *set,
+                                        &push,
+                                        (*rows as u32).div_ceil(64),
+                                        b_u32.div_ceil(64),
+                                        true,
+                                    )?;
+                                }
+                                BatchFfnPlan::Separate { gate, up, silu_set } => {
+                                    let gu_i8 = gate.flavor.uses_i8() || up.flavor.uses_i8();
+                                    self.cmd_quant_if_needed(
+                                        cb,
+                                        self.quant_xb_set,
+                                        b_u32,
+                                        self.cfg.n_embd,
+                                        gu_i8,
+                                    )?;
+                                    self.cmd_gemm(cb, gate, b_u32, false, false)?;
+                                    self.cmd_gemm(cb, up, b_u32, false, true)?;
+                                    let total_ff = (b_pp * self.cfg.n_ff) as u32;
+                                    let gx = total_ff.div_ceil(256).min(65535);
+                                    self.cmd_dispatch_set(
+                                        cb,
+                                        &self.pipes.silu_mul,
+                                        *silu_set,
+                                        &[total_ff],
+                                        gx,
+                                        1,
+                                        true,
+                                    )?;
+                                }
+                            }
+                            let cur = mark_pp(cb);
+                            pp_spans.push((8, prev, cur));
+                            prev = cur;
+
                             self.cmd_quant_if_needed(
                                 cb,
-                                self.quant_xb_set,
+                                self.quant_hb_set,
                                 b_u32,
-                                self.cfg.n_embd,
-                                gu_i8,
+                                self.cfg.n_ff,
+                                down_batch.flavor.uses_i8(),
                             )?;
-                            self.cmd_gemm(cb, gate, b_u32, false, false)?;
-                            self.cmd_gemm(cb, up, b_u32, false, true)?;
-                            let total_ff = (b_pp * self.cfg.n_ff) as u32;
-                            let gx = total_ff.div_ceil(256).min(65535);
-                            self.cmd_dispatch_set(
-                                cb,
-                                &self.pipes.silu_mul,
-                                *silu_set,
-                                &[total_ff],
-                                gx,
-                                1,
-                                true,
-                            )?;
+                            self.cmd_gemm(cb, down_batch, b_u32, true, true)?;
+                            let cur = mark_pp(cb);
+                            pp_spans.push((9, prev, cur));
+                            prev = cur;
+                        }
+                        LayerFfnPlan::Moe(moe) => {
+                            self.cmd_record_moe_ffn(cb, moe, b_u32)?;
+                            let cur = mark_pp(cb);
+                            pp_spans.push((8, prev, cur));
+                            prev = cur;
                         }
                     }
-                    let cur = mark_pp(cb);
-                    pp_spans.push((8, prev, cur));
-                    prev = cur;
-
-                    self.cmd_quant_if_needed(
-                        cb,
-                        self.quant_hb_set,
-                        b_u32,
-                        self.cfg.n_ff,
-                        layer.down_batch.flavor.uses_i8(),
-                    )?;
-                    self.cmd_gemm(cb, &layer.down_batch, b_u32, true, true)?;
-                    let cur = mark_pp(cb);
-                    pp_spans.push((9, prev, cur));
-                    prev = cur;
                 }
 
                 let last_x_off = ((b_pp - 1) * self.cfg.n_embd) as u32;
