@@ -41,6 +41,7 @@ const SPV_GEMV_PAIR_SILU_Q4_0: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemv_pair_silu_q4_0.spv"));
 const SPV_SILU_MUL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silu_mul.spv"));
 const SPV_GEMM_TILED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_tiled.spv"));
+const SPV_GEMM_TILED_DP4A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_tiled_dp4a.spv"));
 const SPV_GEMM_KQUANT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_kquant.spv"));
 const SPV_GEMM_COOPMAT_F16: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_f16.spv"));
@@ -59,6 +60,7 @@ const TARGET_SLAB_BYTES: u64 = 512 << 20;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResolvedPrefill {
     Fallback,
+    TiledDp4a,
     CoopMatF16,
     CoopMatI8,
 }
@@ -67,9 +69,14 @@ impl ResolvedPrefill {
     fn label(self) -> &'static str {
         match self {
             Self::Fallback => "tiled-fallback",
+            Self::TiledDp4a => "tiled-dp4a",
             Self::CoopMatF16 => "coopmat-f16",
             Self::CoopMatI8 => "coopmat-i8",
         }
+    }
+
+    fn uses_q8_1(self) -> bool {
+        matches!(self, Self::CoopMatI8 | Self::TiledDp4a)
     }
 }
 
@@ -140,9 +147,17 @@ struct VkMat {
 #[derive(Clone, Copy)]
 enum GemmFlavor {
     Tiled32,
+    TiledDp4a,
     KQuantSubgroup,
     CoopMatF16 { bm: u32, bn: u32 },
     CoopMatI8,
+}
+
+impl GemmFlavor {
+    #[inline]
+    fn uses_i8(self) -> bool {
+        matches!(self, Self::CoopMatI8 | Self::TiledDp4a)
+    }
 }
 
 struct BatchGemmEntry {
@@ -252,7 +267,7 @@ impl ArenaPlanner {
 
 fn gemv_nr(dt: DType) -> u32 {
     match dt {
-        DType::Q8_0 | DType::Q6K => 4,
+        DType::Q4_0 | DType::Q8_0 | DType::Q6K => 4,
         _ => 2,
     }
 }
@@ -725,6 +740,8 @@ impl LlamaVkRunner {
             VkPrefillMode::Auto => {
                 if can_cm_f16 {
                     ResolvedPrefill::CoopMatF16
+                } else if info.int8_dot_accelerated {
+                    ResolvedPrefill::TiledDp4a
                 } else {
                     ResolvedPrefill::Fallback
                 }
@@ -1075,7 +1092,7 @@ impl LlamaVkRunner {
         let s_v = planner.reserve((max_batch * kv_dim * 4) as u64)?;
         let s_hb = planner.reserve((max_batch * n_ff * 4) as u64)?;
         let s_hb2 = planner.reserve((max_batch * n_ff * 4) as u64)?;
-        let (s_xq, s_xd) = if prefill_kind == ResolvedPrefill::CoopMatI8 {
+        let (s_xq, s_xd) = if prefill_kind.uses_q8_1() {
             let max_blocks = (max_batch * max_dim) / 32;
             (
                 Some(planner.reserve((max_blocks * 32) as u64)?),
@@ -1225,7 +1242,7 @@ impl LlamaVkRunner {
             )
         };
 
-        let quant_q8_1 = if prefill_kind == ResolvedPrefill::CoopMatI8 {
+        let quant_q8_1 = if prefill_kind.uses_q8_1() {
             Some(ctx.pipeline("quantize_q8_1", 256, SPV_QUANTIZE_Q8_1, 3, 4, &[256])?)
         } else {
             None
@@ -1398,6 +1415,35 @@ impl LlamaVkRunner {
                     set,
                     mat,
                     flavor: GemmFlavor::CoopMatI8,
+                });
+            }
+
+            if prefill_kind == ResolvedPrefill::TiledDp4a
+                && matches!(mat.dtype, DType::Q4_0 | DType::Q4_1 | DType::Q8_0)
+                && let (Some(xq), Some(xd)) = (s_xq, s_xd)
+            {
+                let pipe = ctx.pipeline(
+                    "gemm_tiled_dp4a",
+                    dt,
+                    SPV_GEMM_TILED_DP4A,
+                    4,
+                    20,
+                    &[128, dt],
+                )?;
+                let set = alloc_set(
+                    &pipe,
+                    &[
+                        Binding::Arena(mat.slice),
+                        Binding::Arena(xq),
+                        Binding::Arena(xd),
+                        Binding::Arena(y_slice),
+                    ],
+                )?;
+                return Ok(BatchGemmEntry {
+                    pipe,
+                    set,
+                    mat,
+                    flavor: GemmFlavor::TiledDp4a,
                 });
             }
 
@@ -1590,9 +1636,19 @@ impl LlamaVkRunner {
                 && pl.wk.mat.rows.is_multiple_of(2)
             {
                 let wg = 128u32;
-                let nr = 2u32;
-                let pipe =
-                    ctx.pipeline("gemv_qkv_q4_0", wg, SPV_GEMV_QKV_Q4_0, 7, 16, &[wg, nr])?;
+                let nr = if pl.wq.mat.rows.is_multiple_of(4) && pl.wk.mat.rows.is_multiple_of(4) {
+                    4u32
+                } else {
+                    2u32
+                };
+                let pipe = ctx.pipeline(
+                    "gemv_qkv_q4_0",
+                    wg | (nr << 16),
+                    SPV_GEMV_QKV_Q4_0,
+                    7,
+                    16,
+                    &[wg, nr],
+                )?;
                 let set = alloc_set(
                     &pipe,
                     &[
@@ -1786,13 +1842,14 @@ impl LlamaVkRunner {
             let ffn_dec = if pl.w_gate.mat.dtype == DType::Q4_0 && pl.w_up.mat.dtype == DType::Q4_0
             {
                 let wg = 128u32;
+                let nr = 2u32;
                 let pipe = ctx.pipeline(
                     "gemv_pair_silu_q4_0",
-                    wg,
+                    wg | (nr << 16),
                     SPV_GEMV_PAIR_SILU_Q4_0,
                     4,
                     8,
-                    &[wg],
+                    &[wg, nr],
                 )?;
                 let set = alloc_set(
                     &pipe,
@@ -1803,7 +1860,7 @@ impl LlamaVkRunner {
                         Binding::Arena(s_hb),
                     ],
                 )?;
-                let rows_per_wg = (wg / sg).max(1);
+                let rows_per_wg = (wg / sg).max(1) * nr;
                 DecodeFfnSets::FusedPairSilu {
                     pipe,
                     set,
@@ -2559,7 +2616,9 @@ impl LlamaVkRunner {
         let sg = self.ctx.info().subgroup_size;
         let mat = entry.mat;
         let (gx, gy) = match entry.flavor {
-            GemmFlavor::Tiled32 => ((mat.rows as u32).div_ceil(64), n_tok.div_ceil(32)),
+            GemmFlavor::Tiled32 | GemmFlavor::TiledDp4a => {
+                ((mat.rows as u32).div_ceil(64), n_tok.div_ceil(32))
+            }
             GemmFlavor::KQuantSubgroup => {
                 let rows_per_wg = (128 / sg).max(1);
                 ((mat.rows as u32).div_ceil(rows_per_wg), n_tok.div_ceil(8))
@@ -2768,9 +2827,9 @@ impl LlamaVkRunner {
                     true,
                 )?;
 
-                let qkv_needs_i8 = matches!(layer.wq_batch.flavor, GemmFlavor::CoopMatI8)
-                    || matches!(layer.wk_batch.flavor, GemmFlavor::CoopMatI8)
-                    || matches!(layer.wv_batch.flavor, GemmFlavor::CoopMatI8);
+                let qkv_needs_i8 = layer.wq_batch.flavor.uses_i8()
+                    || layer.wk_batch.flavor.uses_i8()
+                    || layer.wv_batch.flavor.uses_i8();
                 self.cmd_quant_if_needed(
                     cb,
                     self.quant_xb_set,
@@ -2845,7 +2904,7 @@ impl LlamaVkRunner {
                     self.quant_xb_set,
                     b_u32,
                     q_dim,
-                    matches!(layer.wo_batch.flavor, GemmFlavor::CoopMatI8),
+                    layer.wo_batch.flavor.uses_i8(),
                 )?;
                 self.cmd_gemm(cb, &layer.wo_batch, b_u32, true, true)?;
                 self.lora.cmd_record_linear(&self.ctx, cb, &wo_n, b_u32)?;
@@ -2866,8 +2925,7 @@ impl LlamaVkRunner {
                 let force_sep = self.lora.has_linear(&wg_n) || self.lora.has_linear(&wu_n);
                 if force_sep {
                     let (ref gate, ref up, silu_set) = layer.ffn_batch_sep;
-                    let gu_i8 = matches!(gate.flavor, GemmFlavor::CoopMatI8)
-                        || matches!(up.flavor, GemmFlavor::CoopMatI8);
+                    let gu_i8 = gate.flavor.uses_i8() || up.flavor.uses_i8();
                     self.cmd_quant_if_needed(cb, self.quant_xb_set, b_u32, self.cfg.n_embd, gu_i8)?;
                     self.cmd_gemm(cb, gate, b_u32, false, false)?;
                     self.cmd_gemm(cb, up, b_u32, false, true)?;
@@ -2905,8 +2963,7 @@ impl LlamaVkRunner {
                             )?;
                         }
                         BatchFfnPlan::Separate { gate, up, silu_set } => {
-                            let gu_i8 = matches!(gate.flavor, GemmFlavor::CoopMatI8)
-                                || matches!(up.flavor, GemmFlavor::CoopMatI8);
+                            let gu_i8 = gate.flavor.uses_i8() || up.flavor.uses_i8();
                             self.cmd_quant_if_needed(
                                 cb,
                                 self.quant_xb_set,
@@ -2936,7 +2993,7 @@ impl LlamaVkRunner {
                     self.quant_hb_set,
                     b_u32,
                     self.cfg.n_ff,
-                    matches!(layer.down_batch.flavor, GemmFlavor::CoopMatI8),
+                    layer.down_batch.flavor.uses_i8(),
                 )?;
                 self.cmd_gemm(cb, &layer.down_batch, b_u32, true, true)?;
                 self.lora.cmd_record_linear(&self.ctx, cb, &wd_n, b_u32)?;
@@ -3489,9 +3546,9 @@ impl LlamaVkRunner {
                     pp_spans.push((1, prev, cur));
                     prev = cur;
 
-                    let qkv_i8 = matches!(layer.wq_batch.flavor, GemmFlavor::CoopMatI8)
-                        || matches!(layer.wk_batch.flavor, GemmFlavor::CoopMatI8)
-                        || matches!(layer.wv_batch.flavor, GemmFlavor::CoopMatI8);
+                    let qkv_i8 = layer.wq_batch.flavor.uses_i8()
+                        || layer.wk_batch.flavor.uses_i8()
+                        || layer.wv_batch.flavor.uses_i8();
                     self.cmd_quant_if_needed(
                         cb,
                         self.quant_xb_set,
@@ -3574,7 +3631,7 @@ impl LlamaVkRunner {
                         self.quant_xb_set,
                         b_u32,
                         q_dim,
-                        matches!(layer.wo_batch.flavor, GemmFlavor::CoopMatI8),
+                        layer.wo_batch.flavor.uses_i8(),
                     )?;
                     self.cmd_gemm(cb, &layer.wo_batch, b_u32, true, true)?;
                     let cur = mark_pp(cb);
@@ -3614,8 +3671,7 @@ impl LlamaVkRunner {
                             )?;
                         }
                         BatchFfnPlan::Separate { gate, up, silu_set } => {
-                            let gu_i8 = matches!(gate.flavor, GemmFlavor::CoopMatI8)
-                                || matches!(up.flavor, GemmFlavor::CoopMatI8);
+                            let gu_i8 = gate.flavor.uses_i8() || up.flavor.uses_i8();
                             self.cmd_quant_if_needed(
                                 cb,
                                 self.quant_xb_set,
@@ -3647,7 +3703,7 @@ impl LlamaVkRunner {
                         self.quant_hb_set,
                         b_u32,
                         self.cfg.n_ff,
-                        matches!(layer.down_batch.flavor, GemmFlavor::CoopMatI8),
+                        layer.down_batch.flavor.uses_i8(),
                     )?;
                     self.cmd_gemm(cb, &layer.down_batch, b_u32, true, true)?;
                     let cur = mark_pp(cb);

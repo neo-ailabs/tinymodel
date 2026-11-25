@@ -719,7 +719,8 @@ impl VulkanContext {
             .vulkan_memory_model_device_scope(probe.f12_vmm_dev_scope && probe.enable_coopmat);
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
             .subgroup_size_control(probe.f13_size_control)
-            .compute_full_subgroups(probe.f13_full_subgroups && probe.f13_size_control);
+            .compute_full_subgroups(probe.f13_full_subgroups && probe.f13_size_control)
+            .shader_integer_dot_product(probe.info.int8_dot_accelerated);
         let mut f_cm =
             vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
         let mut ext_names: Vec<*const core::ffi::c_char> = Vec::new();

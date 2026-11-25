@@ -1,12 +1,15 @@
 #version 450
 // Fused FFN Gate + Up + SwiGLU for Q4_0 weights:
 // y[row] = silu(dot(W_gate[row], x)) * dot(W_up[row], x) in a SINGLE dispatch.
+// NR (constant_id = 1): output rows per subgroup (1..2; NR=2 keeps 4 weight rows in flight).
 
+#extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
 layout(constant_id = 0) const uint WG = 128;
+layout(constant_id = 1) const uint NR = 1;
 layout(local_size_x_id = 0) in;
 
 layout(std430, binding = 0) readonly buffer WGate { uint16_t wg[]; };
@@ -20,37 +23,49 @@ layout(push_constant) uniform PC {
 } pc;
 
 void main() {
-    const uint row = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
-    if (row >= pc.n_out) return;
+    const uint row0 = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * NR;
+    if (row0 >= pc.n_out) return;
 
     const uint nb = pc.n_in / 32u;
     const uint lane = gl_SubgroupInvocationID;
     const uint sub = lane & 3u;
     const uint blk_step = gl_SubgroupSize >> 2u;
-    float acc_g = 0.0;
-    float acc_u = 0.0;
+
+    float acc_g[NR];
+    float acc_u[NR];
+    uint row_b[NR];
+    [[unroll]] for (uint r = 0u; r < NR; ++r) {
+        acc_g[r] = 0.0;
+        acc_u[r] = 0.0;
+        row_b[r] = min(row0 + r, pc.n_out - 1u) * nb * 9u;
+    }
 
     for (uint ib = (lane >> 2u); ib < nb; ib += blk_step) {
         const vec4 xlo = x4[ib * 8u + sub];
         const vec4 xhi = x4[ib * 8u + 4u + sub];
+        const uint ib9 = ib * 9u;
 
-        const uint base = (row * nb + ib) * 9u;
-        const float dg = unpackHalf2x16(uint(wg[base])).x;
-        const float du = unpackHalf2x16(uint(wu[base])).x;
-        const uint ug = uint(wg[base + 1u + 2u * sub]) | (uint(wg[base + 2u + 2u * sub]) << 16u);
-        const uint uu = uint(wu[base + 1u + 2u * sub]) | (uint(wu[base + 2u + 2u * sub]) << 16u);
+        [[unroll]] for (uint r = 0u; r < NR; ++r) {
+            const uint base = row_b[r] + ib9;
+            const float dg = unpackHalf2x16(uint(wg[base])).x;
+            const float du = unpackHalf2x16(uint(wu[base])).x;
+            const uint ug = uint(wg[base + 1u + 2u * sub]) | (uint(wg[base + 2u + 2u * sub]) << 16u);
+            const uint uu = uint(wu[base + 1u + 2u * sub]) | (uint(wu[base + 2u + 2u * sub]) << 16u);
 
-        const float sg_dot = dot(vec4(ug & 15u, (ug >> 8u) & 15u, (ug >> 16u) & 15u, (ug >> 24u) & 15u) - 8.0, xlo)
-                           + dot(vec4((ug >> 4u) & 15u, (ug >> 12u) & 15u, (ug >> 20u) & 15u, ug >> 28u) - 8.0, xhi);
-        const float su_dot = dot(vec4(uu & 15u, (uu >> 8u) & 15u, (uu >> 16u) & 15u, (uu >> 24u) & 15u) - 8.0, xlo)
-                           + dot(vec4((uu >> 4u) & 15u, (uu >> 12u) & 15u, (uu >> 20u) & 15u, uu >> 28u) - 8.0, xhi);
-        acc_g = fma(dg, sg_dot, acc_g);
-        acc_u = fma(du, su_dot, acc_u);
+            const float sg_dot = dot(vec4(ug & 15u, (ug >> 8u) & 15u, (ug >> 16u) & 15u, (ug >> 24u) & 15u) - 8.0, xlo)
+                               + dot(vec4((ug >> 4u) & 15u, (ug >> 12u) & 15u, (ug >> 20u) & 15u, ug >> 28u) - 8.0, xhi);
+            const float su_dot = dot(vec4(uu & 15u, (uu >> 8u) & 15u, (uu >> 16u) & 15u, (uu >> 24u) & 15u) - 8.0, xlo)
+                               + dot(vec4((uu >> 4u) & 15u, (uu >> 12u) & 15u, (uu >> 20u) & 15u, uu >> 28u) - 8.0, xhi);
+            acc_g[r] = fma(dg, sg_dot, acc_g[r]);
+            acc_u[r] = fma(du, su_dot, acc_u[r]);
+        }
     }
 
-    const float g = subgroupAdd(acc_g);
-    const float u = subgroupAdd(acc_u);
-    if (subgroupElect()) {
-        y[row] = (g / (1.0 + exp(-g))) * u;
+    [[unroll]] for (uint r = 0u; r < NR; ++r) {
+        const float g = subgroupAdd(acc_g[r]);
+        const float u = subgroupAdd(acc_u[r]);
+        if (subgroupElect() && row0 + r < pc.n_out) {
+            y[row0 + r] = (g / (1.0 + exp(-g))) * u;
+        }
     }
 }
