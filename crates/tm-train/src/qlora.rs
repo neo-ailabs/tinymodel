@@ -30,6 +30,7 @@ use tm_models::{LlamaModel, decode_embedding_row};
 use crate::TrainError;
 use crate::accel::{LinearAccel, linear_bwd_with_accel, linear_fwd_with_accel};
 use crate::dataset::TrainDataset;
+use crate::moe_qlora::{MoeTrainScratch, backward_moe_ffn, forward_moe_chunk};
 use crate::optim::{
     AdamW, AdamWConfig, LoraGradStore, LoraTargets, init_lora_adapter, load_train_checkpoint,
     lr_at_step, save_train_checkpoint,
@@ -174,6 +175,7 @@ struct TrainArena {
     lora_h: Vec<f32>,
     lora_dh: Vec<f32>,
     lora_bt: Vec<f32>,
+    moe_scratch: MoeTrainScratch,
 }
 
 impl TrainArena {
@@ -187,14 +189,39 @@ impl TrainArena {
         let d = c.n_embd;
         let q_dim = c.n_head * c.head_dim;
         let kv_dim = c.n_head_kv * c.head_dim;
-        let ff = c.n_ff;
+        let has_dense_ffn = model.layers.iter().any(|l| l.moe.is_none());
+        let ff = if has_dense_ffn { c.n_ff } else { 0 };
+        let mut max_n_exp = 0usize;
+        let mut max_k_exp = 0usize;
+        let mut max_ff_exp = 0usize;
+        let mut max_ff_shexp = 0usize;
+        for lw in &model.layers {
+            if let Some(ref moe) = lw.moe {
+                max_n_exp = max_n_exp.max(moe.cfg.n_expert);
+                max_k_exp = max_k_exp.max(moe.cfg.n_expert_used);
+                max_ff_exp = max_ff_exp.max(moe.cfg.n_ff_exp);
+                max_ff_shexp = max_ff_shexp.max(moe.cfg.n_ff_shexp);
+            }
+        }
+        let moe_scratch =
+            MoeTrainScratch::new(max_seq, d, max_n_exp, max_k_exp, max_ff_exp, max_ff_shexp);
         let has_q_norm = model.layers.iter().any(|l| l.q_norm.is_some());
         let has_k_norm = model.layers.iter().any(|l| l.k_norm.is_some());
         let has_post_attn_norm = model.layers.iter().any(|l| l.post_attn_norm.is_some());
         let has_post_ffn_norm = model.layers.iter().any(|l| l.post_ffn_norm.is_some());
-        let max_cols = d.max(ff).max(q_dim).max(c.vocab_size);
+        let max_cols = d
+            .max(ff)
+            .max(max_ff_exp)
+            .max(max_ff_shexp)
+            .max(q_dim)
+            .max(c.vocab_size);
         let r_cap = max_rank.max(1);
-        let max_d_out = d.max(2 * ff).max(q_dim + 2 * kv_dim).max(c.vocab_size);
+        let max_d_out = d
+            .max(2 * ff)
+            .max(max_n_exp)
+            .max(max_ff_shexp)
+            .max(q_dim + 2 * kv_dim)
+            .max(c.vocab_size);
 
         let (ckpt_f16, ckpt_f32) = match ckpt_mode {
             CheckpointMode::Fp16 => (vec![0u16; c.n_layers * max_seq * d], Vec::new()),
@@ -268,6 +295,7 @@ impl TrainArena {
             lora_h: vec![0.0; max_seq * r_cap],
             lora_dh: vec![0.0; max_seq * r_cap],
             lora_bt: vec![0.0; r_cap * max_d_out],
+            moe_scratch,
         }
     }
 
@@ -324,9 +352,28 @@ pub fn estimate_qlora_dirty_bytes(
     };
     let ckpt_bytes = c.n_layers * max_seq * d * ckpt_elem_bytes;
 
+    let mut max_n_exp = 0usize;
+    let mut max_k_exp = 0usize;
+    let mut max_ff_exp = 0usize;
+    let mut max_ff_shexp = 0usize;
+    for lw in &model.layers {
+        if let Some(ref moe) = lw.moe {
+            max_n_exp = max_n_exp.max(moe.cfg.n_expert);
+            max_k_exp = max_k_exp.max(moe.cfg.n_expert_used);
+            max_ff_exp = max_ff_exp.max(moe.cfg.n_ff_exp);
+            max_ff_shexp = max_ff_shexp.max(moe.cfg.n_ff_shexp);
+        }
+    }
+    let moe_arena_bytes = if max_n_exp > 0 {
+        max_seq * (2 * max_n_exp + max_k_exp * (3 * max_ff_exp + d) + 7 * max_ff_shexp + 2 * d) * 4
+    } else {
+        0
+    };
+
     // Single-layer activations + grad buffers + chunked CE (`16 * vocab * 4`)
     let per_tok_floats = 6 * d + 4 * q_dim + 4 * kv_dim + 6 * ff;
     let arena_bytes = max_seq * per_tok_floats * 4
+        + moe_arena_bytes
         + 2 * max_seq * kv_dim * 2
         + CE_CHUNK_TOKENS * (c.vocab_size + 3 * d) * 4;
 
@@ -910,140 +957,159 @@ impl<'a> LlamaTrainer<'a> {
             }
 
             let xfn_chunk = &arena.x_ffn_norm[offset * d..(offset + b) * d];
-            if accel.is_some() {
-                linear_fwd_with_accel(
+            if let Some(ref moe) = lw.moe {
+                forward_moe_chunk(
+                    moe,
+                    bound,
                     accel.as_deref_mut(),
                     pool,
                     kt,
-                    &lw.w_gate,
-                    bound,
-                    slot_wg,
                     xfn_chunk,
-                    &mut arena.gate_pre[offset * ff..(offset + b) * ff],
+                    &mut arena.xb2_chunk[..b * d],
+                    d,
+                    offset,
                     b,
-                    single_tok_mode,
+                    save_recompute,
                     &mut arena.mv_scratch,
                     &mut arena.lora_scratch,
-                );
-                linear_fwd_with_accel(
-                    accel.as_deref_mut(),
-                    pool,
-                    kt,
-                    &lw.w_up,
-                    bound,
-                    slot_wu,
-                    xfn_chunk,
-                    &mut arena.up_pre[offset * ff..(offset + b) * ff],
-                    b,
-                    single_tok_mode,
-                    &mut arena.mv_scratch,
-                    &mut arena.lora_scratch,
+                    &mut arena.moe_scratch,
                 );
             } else {
-                if single_tok_mode {
-                    matvec_pair_f32(
+                if accel.is_some() {
+                    linear_fwd_with_accel(
+                        accel.as_deref_mut(),
                         pool,
                         kt,
-                        lw.w_gate.dtype,
-                        lw.w_gate.bytes,
-                        ff,
-                        &mut arena.gate_pre[..ff],
-                        lw.w_up.dtype,
-                        lw.w_up.bytes,
-                        ff,
-                        &mut arena.up_pre[..ff],
+                        &lw.w_gate,
+                        bound,
+                        slot_wg,
                         xfn_chunk,
+                        &mut arena.gate_pre[offset * ff..(offset + b) * ff],
+                        b,
+                        single_tok_mode,
                         &mut arena.mv_scratch,
-                        d,
+                        &mut arena.lora_scratch,
+                    );
+                    linear_fwd_with_accel(
+                        accel.as_deref_mut(),
+                        pool,
+                        kt,
+                        &lw.w_up,
+                        bound,
+                        slot_wu,
+                        xfn_chunk,
+                        &mut arena.up_pre[offset * ff..(offset + b) * ff],
+                        b,
+                        single_tok_mode,
+                        &mut arena.mv_scratch,
+                        &mut arena.lora_scratch,
                     );
                 } else {
-                    matmul_pair_f32(
-                        pool,
-                        kt,
-                        lw.w_gate.dtype,
-                        lw.w_gate.bytes,
-                        ff,
-                        &mut arena.gate_pre[offset * ff..(offset + b) * ff],
-                        lw.w_up.dtype,
-                        lw.w_up.bytes,
-                        ff,
-                        &mut arena.up_pre[offset * ff..(offset + b) * ff],
-                        xfn_chunk,
-                        &mut arena.mv_scratch,
-                        d,
-                        b,
-                    );
-                }
-                if !bound.is_empty() {
-                    bound.apply_linear_slice(
-                        slot_wg,
-                        pool,
-                        kt,
-                        xfn_chunk,
-                        &mut arena.gate_pre[offset * ff..(offset + b) * ff],
-                        b,
-                        lw.w_gate.row_offset,
-                        ff,
-                        &mut arena.lora_scratch,
-                    );
-                    bound.apply_linear_slice(
-                        slot_wu,
-                        pool,
-                        kt,
-                        xfn_chunk,
-                        &mut arena.up_pre[offset * ff..(offset + b) * ff],
-                        b,
-                        lw.w_up.row_offset,
-                        ff,
-                        &mut arena.lora_scratch,
-                    );
-                }
-            }
-            if let Some(ref bg) = lw.b_gate {
-                for t in 0..b {
-                    let dst = &mut arena.gate_pre[(offset + t) * ff..(offset + t + 1) * ff];
-                    for (y, &bi) in dst.iter_mut().zip(bg.iter()) {
-                        *y += bi;
+                    if single_tok_mode {
+                        matvec_pair_f32(
+                            pool,
+                            kt,
+                            lw.w_gate.dtype,
+                            lw.w_gate.bytes,
+                            ff,
+                            &mut arena.gate_pre[..ff],
+                            lw.w_up.dtype,
+                            lw.w_up.bytes,
+                            ff,
+                            &mut arena.up_pre[..ff],
+                            xfn_chunk,
+                            &mut arena.mv_scratch,
+                            d,
+                        );
+                    } else {
+                        matmul_pair_f32(
+                            pool,
+                            kt,
+                            lw.w_gate.dtype,
+                            lw.w_gate.bytes,
+                            ff,
+                            &mut arena.gate_pre[offset * ff..(offset + b) * ff],
+                            lw.w_up.dtype,
+                            lw.w_up.bytes,
+                            ff,
+                            &mut arena.up_pre[offset * ff..(offset + b) * ff],
+                            xfn_chunk,
+                            &mut arena.mv_scratch,
+                            d,
+                            b,
+                        );
+                    }
+                    if !bound.is_empty() {
+                        bound.apply_linear_slice(
+                            slot_wg,
+                            pool,
+                            kt,
+                            xfn_chunk,
+                            &mut arena.gate_pre[offset * ff..(offset + b) * ff],
+                            b,
+                            lw.w_gate.row_offset,
+                            ff,
+                            &mut arena.lora_scratch,
+                        );
+                        bound.apply_linear_slice(
+                            slot_wu,
+                            pool,
+                            kt,
+                            xfn_chunk,
+                            &mut arena.up_pre[offset * ff..(offset + b) * ff],
+                            b,
+                            lw.w_up.row_offset,
+                            ff,
+                            &mut arena.lora_scratch,
+                        );
                     }
                 }
-            }
-            if let Some(ref bu) = lw.b_up {
-                for t in 0..b {
-                    let dst = &mut arena.up_pre[(offset + t) * ff..(offset + t + 1) * ff];
-                    for (y, &bi) in dst.iter_mut().zip(bu.iter()) {
-                        *y += bi;
+                if let Some(ref bg) = lw.b_gate {
+                    for t in 0..b {
+                        let dst = &mut arena.gate_pre[(offset + t) * ff..(offset + t + 1) * ff];
+                        for (y, &bi) in dst.iter_mut().zip(bg.iter()) {
+                            *y += bi;
+                        }
                     }
                 }
-            }
+                if let Some(ref bu) = lw.b_up {
+                    for t in 0..b {
+                        let dst = &mut arena.up_pre[(offset + t) * ff..(offset + t + 1) * ff];
+                        for (y, &bi) in dst.iter_mut().zip(bu.iter()) {
+                            *y += bi;
+                        }
+                    }
+                }
 
-            arena.swiglu_out[offset * ff..(offset + b) * ff]
-                .copy_from_slice(&arena.gate_pre[offset * ff..(offset + b) * ff]);
-            swiglu_inplace_parallel(
-                pool,
-                &mut arena.swiglu_out[offset * ff..(offset + b) * ff],
-                &arena.up_pre[offset * ff..(offset + b) * ff],
-            );
+                arena.swiglu_out[offset * ff..(offset + b) * ff]
+                    .copy_from_slice(&arena.gate_pre[offset * ff..(offset + b) * ff]);
+                swiglu_inplace_parallel(
+                    pool,
+                    &mut arena.swiglu_out[offset * ff..(offset + b) * ff],
+                    &arena.up_pre[offset * ff..(offset + b) * ff],
+                );
 
-            let sw_chunk = &arena.swiglu_out[offset * ff..(offset + b) * ff];
-            linear_fwd_with_accel(
-                accel.as_deref_mut(),
-                pool,
-                kt,
-                &lw.w_down,
-                bound,
-                slot_wd,
-                sw_chunk,
-                &mut arena.xb2_chunk[..b * d],
-                b,
-                single_tok_mode,
-                &mut arena.mv_scratch,
-                &mut arena.lora_scratch,
-            );
-            if let Some(ref bd) = lw.b_down {
-                for t in 0..b {
-                    let dst = &mut arena.xb2_chunk[t * d..(t + 1) * d];
-                    for (y, &bi) in dst.iter_mut().zip(bd.iter()) {
-                        *y += bi;
+                let sw_chunk = &arena.swiglu_out[offset * ff..(offset + b) * ff];
+                linear_fwd_with_accel(
+                    accel.as_deref_mut(),
+                    pool,
+                    kt,
+                    &lw.w_down,
+                    bound,
+                    slot_wd,
+                    sw_chunk,
+                    &mut arena.xb2_chunk[..b * d],
+                    b,
+                    single_tok_mode,
+                    &mut arena.mv_scratch,
+                    &mut arena.lora_scratch,
+                );
+                if let Some(ref bd) = lw.b_down {
+                    for t in 0..b {
+                        let dst = &mut arena.xb2_chunk[t * d..(t + 1) * d];
+                        for (y, &bi) in dst.iter_mut().zip(bd.iter()) {
+                            *y += bi;
+                        }
                     }
                 }
             }
@@ -1424,61 +1490,81 @@ impl<'a> LlamaTrainer<'a> {
                 }
             }
 
-            linear_bwd_with_accel(
-                accel.as_deref_mut(),
-                pool,
-                kt,
-                &lw.w_down,
-                adapter,
-                grads,
-                &self.arena.swiglu_out[..seq_len * ff],
-                &self.arena.d_branch[..seq_len * d],
-                &mut self.arena.d_swiglu[..seq_len * ff],
-                seq_len,
-                false,
-                &mut self.arena.lora_h,
-                &mut self.arena.lora_dh,
-                &mut self.arena.lora_bt,
-            );
-            swiglu_bwd_f32(
-                &mut self.arena.d_gate[..seq_len * ff],
-                &mut self.arena.d_up[..seq_len * ff],
-                &self.arena.gate_pre[..seq_len * ff],
-                &self.arena.up_pre[..seq_len * ff],
-                &self.arena.d_swiglu[..seq_len * ff],
-            );
-            linear_bwd_with_accel(
-                accel.as_deref_mut(),
-                pool,
-                kt,
-                &lw.w_gate,
-                adapter,
-                grads,
-                &self.arena.x_ffn_norm[..seq_len * d],
-                &self.arena.d_gate[..seq_len * ff],
-                &mut self.arena.d_x_norm[..seq_len * d],
-                seq_len,
-                false,
-                &mut self.arena.lora_h,
-                &mut self.arena.lora_dh,
-                &mut self.arena.lora_bt,
-            );
-            linear_bwd_with_accel(
-                accel.as_deref_mut(),
-                pool,
-                kt,
-                &lw.w_up,
-                adapter,
-                grads,
-                &self.arena.x_ffn_norm[..seq_len * d],
-                &self.arena.d_up[..seq_len * ff],
-                &mut self.arena.d_x_norm[..seq_len * d],
-                seq_len,
-                true,
-                &mut self.arena.lora_h,
-                &mut self.arena.lora_dh,
-                &mut self.arena.lora_bt,
-            );
+            if let Some(ref moe) = lw.moe {
+                backward_moe_ffn(
+                    moe,
+                    adapter,
+                    grads,
+                    accel.as_deref_mut(),
+                    pool,
+                    kt,
+                    &self.arena.x_ffn_norm[..seq_len * d],
+                    &self.arena.d_branch[..seq_len * d],
+                    &mut self.arena.d_x_norm[..seq_len * d],
+                    d,
+                    seq_len,
+                    &mut self.arena.moe_scratch,
+                    &mut self.arena.lora_h,
+                    &mut self.arena.lora_dh,
+                    &mut self.arena.lora_bt,
+                );
+            } else {
+                linear_bwd_with_accel(
+                    accel.as_deref_mut(),
+                    pool,
+                    kt,
+                    &lw.w_down,
+                    adapter,
+                    grads,
+                    &self.arena.swiglu_out[..seq_len * ff],
+                    &self.arena.d_branch[..seq_len * d],
+                    &mut self.arena.d_swiglu[..seq_len * ff],
+                    seq_len,
+                    false,
+                    &mut self.arena.lora_h,
+                    &mut self.arena.lora_dh,
+                    &mut self.arena.lora_bt,
+                );
+                swiglu_bwd_f32(
+                    &mut self.arena.d_gate[..seq_len * ff],
+                    &mut self.arena.d_up[..seq_len * ff],
+                    &self.arena.gate_pre[..seq_len * ff],
+                    &self.arena.up_pre[..seq_len * ff],
+                    &self.arena.d_swiglu[..seq_len * ff],
+                );
+                linear_bwd_with_accel(
+                    accel.as_deref_mut(),
+                    pool,
+                    kt,
+                    &lw.w_gate,
+                    adapter,
+                    grads,
+                    &self.arena.x_ffn_norm[..seq_len * d],
+                    &self.arena.d_gate[..seq_len * ff],
+                    &mut self.arena.d_x_norm[..seq_len * d],
+                    seq_len,
+                    false,
+                    &mut self.arena.lora_h,
+                    &mut self.arena.lora_dh,
+                    &mut self.arena.lora_bt,
+                );
+                linear_bwd_with_accel(
+                    accel.as_deref_mut(),
+                    pool,
+                    kt,
+                    &lw.w_up,
+                    adapter,
+                    grads,
+                    &self.arena.x_ffn_norm[..seq_len * d],
+                    &self.arena.d_up[..seq_len * ff],
+                    &mut self.arena.d_x_norm[..seq_len * d],
+                    seq_len,
+                    true,
+                    &mut self.arena.lora_h,
+                    &mut self.arena.lora_dh,
+                    &mut self.arena.lora_bt,
+                );
+            }
             if let Some(ref fn_w) = lw.ffn_norm {
                 for t in 0..seq_len {
                     rms_norm_bwd_f32(

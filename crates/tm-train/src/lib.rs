@@ -14,6 +14,7 @@ pub mod dataset;
 pub mod gemma4_qlora;
 pub mod lfm2_qlora;
 pub mod mamba2_qlora;
+pub mod moe_qlora;
 pub mod mtp_trainer;
 pub mod optim;
 pub mod qlora;

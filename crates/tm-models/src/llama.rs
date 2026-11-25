@@ -17,6 +17,9 @@ use tm_cpu::{
 use tm_gguf::{GgufError, GgufFile};
 use tm_lora::{BoundLora, LoraScratch, LoraSet};
 
+use crate::moe::{
+    MoeScratch, SparseMoeFfn, eval_sparse_moe_ffn, load_layer_moe_ffn, parse_moe_arch_params,
+};
 use crate::state::{MAX_SPEC_WINDOW, SpecVerifyBuf, decode_embedding_row};
 
 #[derive(Debug, Error)]
@@ -24,7 +27,7 @@ pub enum ModelError {
     #[error(transparent)]
     Gguf(#[from] GgufError),
     #[error(
-        "unsupported model architecture '{0}' (supports 'llama', 'qwen2', 'qwen3', 'smollm3', 'phi3', 'mistral', 'mistral3', 'olmo2', 'olmo3', 'granite', 'qwen35', 'gemma2', 'gemma3', 'gemma4', 'lfm2', 'lfm3', 'mamba2', 'nemotron_h', 'falcon-h1', 'granitehybrid', 'inkling2', and 'inkling2_loop')"
+        "unsupported model architecture '{0}' (supports 'llama', 'qwen2', 'qwen3', 'smollm3', 'phi3', 'mistral', 'mistral3', 'olmo2', 'olmo3', 'granite', 'exaone', 'olmoe', 'granitemoe', 'qwen2moe', 'qwen3moe', 'bailingmoe2', 'qwen35', 'gemma2', 'gemma3', 'gemma4', 'lfm2', 'lfm3', 'mamba2', 'nemotron_h', 'falcon-h1', 'granitehybrid', 'granitemoehybrid', 'inkling2', and 'inkling2_loop')"
     )]
     UnsupportedArch(String),
     #[error("invalid model configuration: {0}")]
@@ -70,6 +73,14 @@ pub struct LlamaConfig {
     pub residual_scale: f32,
     /// Inverse logit scale (`1.0 / granite.logit_scale`, default `1.0`).
     pub inv_logit_scale: f32,
+    /// Sparse MoE total experts (`0` for dense models).
+    pub n_expert: usize,
+    /// Sparse MoE active top-k experts per token (`0` for dense models).
+    pub n_expert_used: usize,
+    /// Maximum per-expert intermediate FFN width across MoE layers.
+    pub max_n_ff_exp: usize,
+    /// Maximum shared-expert intermediate FFN width across MoE layers.
+    pub max_n_ff_shexp: usize,
 }
 
 impl LlamaConfig {
@@ -112,9 +123,24 @@ pub struct RawMatView<'a> {
     pub lora_slot: Option<usize>,
 }
 
+impl<'a> RawMatView<'a> {
+    pub const fn empty() -> Self {
+        Self {
+            name: "",
+            bytes: &[],
+            dtype: DType::F32,
+            rows: 0,
+            cols: 0,
+            row_offset: 0,
+            is_sliced: false,
+            lora_slot: None,
+        }
+    }
+}
+
 type MatView<'a> = RawMatView<'a>;
 
-/// Per-layer weights for `LlamaModel` (`llama` / `qwen2` / `qwen3` / `smollm3` / `phi3` / `mistral` / `olmo2` / `granite`).
+/// Per-layer weights for `LlamaModel` (dense SwiGLU or fine-grained `SparseMoeFfn`).
 pub struct LlamaLayerWeights<'a> {
     pub attn_norm: Option<Vec<f32>>,
     pub ffn_norm: Option<Vec<f32>>,
@@ -136,6 +162,7 @@ pub struct LlamaLayerWeights<'a> {
     pub w_gate: RawMatView<'a>,
     pub w_up: RawMatView<'a>,
     pub w_down: RawMatView<'a>,
+    pub moe: Option<SparseMoeFfn<'a>>,
 }
 
 type LayerWeights<'a> = LlamaLayerWeights<'a>;
@@ -189,6 +216,7 @@ pub struct LlamaState {
     last_hidden: Vec<f32>,
     mv_scratch: MatvecScratch,
     pub lora_scratch: LoraScratch,
+    pub moe_scratch: MoeScratch,
 }
 
 impl LlamaState {
@@ -227,7 +255,12 @@ impl LlamaState {
                 )
             }
         };
-        let max_cols = cfg.n_embd.max(cfg.n_ff).max(q_dim);
+        let max_cols = cfg
+            .n_embd
+            .max(cfg.n_ff)
+            .max(q_dim)
+            .max(cfg.max_n_ff_exp)
+            .max(cfg.max_n_ff_shexp);
 
         Self {
             max_ctx,
@@ -254,6 +287,13 @@ impl LlamaState {
             last_hidden: vec![0.0; cfg.n_embd],
             mv_scratch: MatvecScratch::new(max_cols),
             lora_scratch: LoraScratch::new(64),
+            moe_scratch: MoeScratch::new(
+                cfg.n_embd,
+                cfg.n_expert,
+                cfg.n_expert_used,
+                cfg.max_n_ff_exp,
+                cfg.max_n_ff_shexp,
+            ),
         }
     }
 
@@ -454,17 +494,46 @@ impl<'a> LlamaModel<'a> {
                 | "olmo2"
                 | "olmo3"
                 | "granite"
+                | "exaone"
+                | "olmoe"
+                | "granitemoe"
+                | "qwen2moe"
+                | "qwen3moe"
+                | "bailingmoe2"
         ) {
             return Err(ModelError::UnsupportedArch(arch));
         }
 
         let pfx = arch.as_str();
-        let is_qwen = matches!(pfx, "qwen2" | "qwen3");
+        let is_qwen = matches!(pfx, "qwen2" | "qwen3" | "qwen2moe" | "qwen3moe");
         let is_olmo = matches!(pfx, "olmo2" | "olmo3");
-        let is_neox = matches!(pfx, "qwen2" | "qwen3" | "phi3" | "olmo2" | "olmo3");
+        let is_neox = matches!(
+            pfx,
+            "qwen2"
+                | "qwen3"
+                | "phi3"
+                | "olmo2"
+                | "olmo3"
+                | "exaone"
+                | "olmoe"
+                | "qwen2moe"
+                | "qwen3moe"
+                | "bailingmoe2"
+        );
         let n_layers = gguf.req_usize(&format!("{pfx}.block_count"))?;
         let n_embd = gguf.req_usize(&format!("{pfx}.embedding_length"))?;
-        let n_ff = gguf.req_usize(&format!("{pfx}.feed_forward_length"))?;
+        let has_experts = gguf
+            .get_meta(&format!("{pfx}.expert_count"))
+            .and_then(|v| v.as_usize())
+            .unwrap_or(0)
+            > 0;
+        let n_ff = if has_experts {
+            gguf.get_meta(&format!("{pfx}.feed_forward_length"))
+                .and_then(|v| v.as_usize())
+                .unwrap_or(0)
+        } else {
+            gguf.req_usize(&format!("{pfx}.feed_forward_length"))?
+        };
         let n_head = gguf.req_usize(&format!("{pfx}.attention.head_count"))?;
         let n_head_kv = gguf
             .get_meta(&format!("{pfx}.attention.head_count_kv"))
@@ -604,7 +673,9 @@ impl<'a> LlamaModel<'a> {
             .and_then(|v| v.as_usize())
             .unwrap_or_else(|| embd_info.dims.get(1).copied().unwrap_or(0));
 
-        let cfg = LlamaConfig {
+        let moe_params = parse_moe_arch_params(gguf, pfx, &arch, n_layers, n_ff)?;
+
+        let mut cfg = LlamaConfig {
             arch,
             n_layers,
             n_embd,
@@ -628,6 +699,10 @@ impl<'a> LlamaModel<'a> {
             custom_attn_scale,
             residual_scale,
             inv_logit_scale,
+            n_expert: moe_params.as_ref().map_or(0, |m| m.n_expert),
+            n_expert_used: moe_params.as_ref().map_or(0, |m| m.n_expert_used),
+            max_n_ff_exp: 0,
+            max_n_ff_shexp: 0,
         };
 
         let token_embd = load_mat(gguf, "token_embd.weight", "global", n_embd, vocab_size)?;
@@ -754,31 +829,65 @@ impl<'a> LlamaModel<'a> {
                 )
             };
 
-            // Support both separate `ffn_gate.weight` + `ffn_up.weight` and fused `ffn_up.weight` (`[n_embd, 2*n_ff]`, gate then up).
-            let gate_name = format!("{ltag}.ffn_gate.weight");
-            let up_name = format!("{ltag}.ffn_up.weight");
-            let (w_gate, w_up, b_gate, b_up) = if gguf.tensor_info(&gate_name).is_some() {
+            let moe = if let Some(ref mp) = moe_params {
+                load_layer_moe_ffn(gguf, l, &ltag, n_embd, mp)?
+            } else {
+                None
+            };
+            if let Some(ref m) = moe {
+                cfg.max_n_ff_exp = cfg.max_n_ff_exp.max(m.cfg.n_ff_exp);
+                cfg.max_n_ff_shexp = cfg.max_n_ff_shexp.max(m.cfg.n_ff_shexp);
+            }
+
+            let (w_gate, w_up, w_down, b_gate, b_up, b_down) = if moe.is_some() {
                 (
-                    load_mat(gguf, &gate_name, &ltag, n_embd, n_ff)?,
-                    load_mat(gguf, &up_name, &ltag, n_embd, n_ff)?,
-                    load_opt_f32_vec(gguf, &format!("{ltag}.ffn_gate.bias"), &ltag, n_ff)?,
-                    load_opt_f32_vec(gguf, &format!("{ltag}.ffn_up.bias"), &ltag, n_ff)?,
+                    RawMatView::empty(),
+                    RawMatView::empty(),
+                    RawMatView::empty(),
+                    None,
+                    None,
+                    None,
                 )
             } else {
-                let fused_b_up =
-                    load_opt_f32_vec(gguf, &format!("{ltag}.ffn_up.bias"), &ltag, 2 * n_ff)?;
-                let (bg, bu) = match fused_b_up {
-                    Some(full) => (Some(full[..n_ff].to_vec()), Some(full[n_ff..].to_vec())),
-                    None => (None, None),
+                if n_ff == 0 {
+                    return Err(ModelError::InvalidConfig(format!(
+                        "{ltag}: dense FFN layer requires feed_forward_length > 0"
+                    )));
+                }
+                // Support both separate `ffn_gate.weight` + `ffn_up.weight` and fused `ffn_up.weight` (`[n_embd, 2*n_ff]`, gate then up).
+                let gate_name = format!("{ltag}.ffn_gate.weight");
+                let up_name = format!("{ltag}.ffn_up.weight");
+                let (wg, wu, bg, bu) = if gguf.tensor_info(&gate_name).is_some() {
+                    (
+                        load_mat(gguf, &gate_name, &ltag, n_embd, n_ff)?,
+                        load_mat(gguf, &up_name, &ltag, n_embd, n_ff)?,
+                        load_opt_f32_vec(gguf, &format!("{ltag}.ffn_gate.bias"), &ltag, n_ff)?,
+                        load_opt_f32_vec(gguf, &format!("{ltag}.ffn_up.bias"), &ltag, n_ff)?,
+                    )
+                } else {
+                    let fused_b_up =
+                        load_opt_f32_vec(gguf, &format!("{ltag}.ffn_up.bias"), &ltag, 2 * n_ff)?;
+                    let (bg, bu) = match fused_b_up {
+                        Some(full) => (Some(full[..n_ff].to_vec()), Some(full[n_ff..].to_vec())),
+                        None => (None, None),
+                    };
+                    (
+                        load_mat_slice(gguf, &up_name, &ltag, n_embd, 2 * n_ff, 0, n_ff)?,
+                        load_mat_slice(gguf, &up_name, &ltag, n_embd, 2 * n_ff, n_ff, n_ff)?,
+                        bg,
+                        bu,
+                    )
                 };
-                (
-                    load_mat_slice(gguf, &up_name, &ltag, n_embd, 2 * n_ff, 0, n_ff)?,
-                    load_mat_slice(gguf, &up_name, &ltag, n_embd, 2 * n_ff, n_ff, n_ff)?,
-                    bg,
-                    bu,
-                )
+                let bd = load_opt_f32_vec(gguf, &format!("{ltag}.ffn_down.bias"), &ltag, n_embd)?;
+                let wd = load_mat(
+                    gguf,
+                    &format!("{ltag}.ffn_down.weight"),
+                    &ltag,
+                    n_ff,
+                    n_embd,
+                )?;
+                (wg, wu, wd, bg, bu, bd)
             };
-            let b_down = load_opt_f32_vec(gguf, &format!("{ltag}.ffn_down.bias"), &ltag, n_embd)?;
 
             let attn_norm_name = format!("{ltag}.attn_norm.weight");
             let ffn_norm_name = format!("{ltag}.ffn_norm.weight");
@@ -843,13 +952,8 @@ impl<'a> LlamaModel<'a> {
                 )?,
                 w_gate,
                 w_up,
-                w_down: load_mat(
-                    gguf,
-                    &format!("{ltag}.ffn_down.weight"),
-                    &ltag,
-                    n_ff,
-                    n_embd,
-                )?,
+                w_down,
+                moe,
             });
         }
 
@@ -898,9 +1002,13 @@ impl<'a> LlamaModel<'a> {
             l.wk.lora_slot = bound.slot_for(l.wk.name);
             l.wv.lora_slot = bound.slot_for(l.wv.name);
             l.wo.lora_slot = bound.slot_for(l.wo.name);
-            l.w_gate.lora_slot = bound.slot_for(l.w_gate.name);
-            l.w_up.lora_slot = bound.slot_for(l.w_up.name);
-            l.w_down.lora_slot = bound.slot_for(l.w_down.name);
+            if let Some(ref mut moe) = l.moe {
+                moe.bind_lora(&bound);
+            } else {
+                l.w_gate.lora_slot = bound.slot_for(l.w_gate.name);
+                l.w_up.lora_slot = bound.slot_for(l.w_up.name);
+                l.w_down.lora_slot = bound.slot_for(l.w_down.name);
+            }
         }
         self.lora = bound;
     }
@@ -1206,7 +1314,7 @@ impl<'a> LlamaModel<'a> {
                 state.x[i] += res_scale * state.xb2[i];
             }
 
-            // FFN (SwiGLU)
+            // FFN (Sparse MoE or Dense SwiGLU)
             if let Some(ref fn_w) = layer.ffn_norm {
                 rms_norm(
                     &mut state.xb[..n_embd],
@@ -1217,74 +1325,90 @@ impl<'a> LlamaModel<'a> {
             } else {
                 state.xb[..n_embd].copy_from_slice(&state.x[..n_embd]);
             }
-            matvec_pair_f32(
-                pool,
-                kt,
-                layer.w_gate.dtype,
-                layer.w_gate.bytes,
-                layer.w_gate.rows,
-                &mut state.hb[..n_ff],
-                layer.w_up.dtype,
-                layer.w_up.bytes,
-                layer.w_up.rows,
-                &mut state.hb2[..n_ff],
-                &state.xb[..n_embd],
-                &mut state.mv_scratch,
-                n_embd,
-            );
-            if !self.lora.is_empty() {
-                self.lora.apply_linear_slice(
-                    layer.w_gate.lora_slot,
+            if let Some(ref moe) = layer.moe {
+                eval_sparse_moe_ffn(
+                    moe,
+                    &self.lora,
                     pool,
                     kt,
                     &state.xb[..n_embd],
+                    &mut state.xb2[..n_embd],
+                    n_embd,
+                    1,
+                    &mut state.mv_scratch,
+                    &mut state.lora_scratch,
+                    &mut state.moe_scratch,
+                );
+            } else {
+                matvec_pair_f32(
+                    pool,
+                    kt,
+                    layer.w_gate.dtype,
+                    layer.w_gate.bytes,
+                    layer.w_gate.rows,
                     &mut state.hb[..n_ff],
-                    1,
-                    layer.w_gate.row_offset,
-                    n_ff,
-                    &mut state.lora_scratch,
+                    layer.w_up.dtype,
+                    layer.w_up.bytes,
+                    layer.w_up.rows,
+                    &mut state.hb2[..n_ff],
+                    &state.xb[..n_embd],
+                    &mut state.mv_scratch,
+                    n_embd,
                 );
-                self.lora.apply_linear_slice(
-                    layer.w_up.lora_slot,
+                if !self.lora.is_empty() {
+                    self.lora.apply_linear_slice(
+                        layer.w_gate.lora_slot,
+                        pool,
+                        kt,
+                        &state.xb[..n_embd],
+                        &mut state.hb[..n_ff],
+                        1,
+                        layer.w_gate.row_offset,
+                        n_ff,
+                        &mut state.lora_scratch,
+                    );
+                    self.lora.apply_linear_slice(
+                        layer.w_up.lora_slot,
+                        pool,
+                        kt,
+                        &state.xb[..n_embd],
+                        &mut state.hb2[..n_ff],
+                        1,
+                        layer.w_up.row_offset,
+                        n_ff,
+                        &mut state.lora_scratch,
+                    );
+                }
+                if let Some(ref bg) = layer.b_gate {
+                    add_bias_slice(&mut state.hb[..n_ff], bg);
+                }
+                if let Some(ref bu) = layer.b_up {
+                    add_bias_slice(&mut state.hb2[..n_ff], bu);
+                }
+                swiglu_inplace_parallel(pool, &mut state.hb[..n_ff], &state.hb2[..n_ff]);
+                matvec_f32(
                     pool,
                     kt,
-                    &state.xb[..n_embd],
-                    &mut state.hb2[..n_ff],
+                    layer.w_down.dtype,
+                    layer.w_down.bytes,
+                    &state.hb[..n_ff],
+                    &mut state.mv_scratch,
+                    &mut state.xb2[..n_embd],
+                    layer.w_down.rows,
+                    layer.w_down.cols,
+                );
+                self.lora.apply_linear(
+                    layer.w_down.lora_slot,
+                    pool,
+                    kt,
+                    &state.hb[..n_ff],
+                    &mut state.xb2[..n_embd],
                     1,
-                    layer.w_up.row_offset,
-                    n_ff,
                     &mut state.lora_scratch,
                 );
-            }
-            if let Some(ref bg) = layer.b_gate {
-                add_bias_slice(&mut state.hb[..n_ff], bg);
-            }
-            if let Some(ref bu) = layer.b_up {
-                add_bias_slice(&mut state.hb2[..n_ff], bu);
-            }
-            swiglu_inplace_parallel(pool, &mut state.hb[..n_ff], &state.hb2[..n_ff]);
-            matvec_f32(
-                pool,
-                kt,
-                layer.w_down.dtype,
-                layer.w_down.bytes,
-                &state.hb[..n_ff],
-                &mut state.mv_scratch,
-                &mut state.xb2[..n_embd],
-                layer.w_down.rows,
-                layer.w_down.cols,
-            );
-            self.lora.apply_linear(
-                layer.w_down.lora_slot,
-                pool,
-                kt,
-                &state.hb[..n_ff],
-                &mut state.xb2[..n_embd],
-                1,
-                &mut state.lora_scratch,
-            );
-            if let Some(ref bd) = layer.b_down {
-                add_bias_slice(&mut state.xb2[..n_embd], bd);
+                if let Some(ref bd) = layer.b_down {
+                    add_bias_slice(&mut state.xb2[..n_embd], bd);
+                }
             }
             if let Some(ref pfn) = layer.post_ffn_norm {
                 rms_norm(
@@ -1779,87 +1903,114 @@ impl<'a> LlamaModel<'a> {
                     p.ffn_norm_ns += ts.elapsed().as_nanos() as u64;
                 }
 
-                let t0 = prof.as_ref().map(|_| Instant::now());
-                matmul_pair_f32(
-                    pool,
-                    kt,
-                    layer.w_gate.dtype,
-                    layer.w_gate.bytes,
-                    n_ff,
-                    &mut state.hb[..b * n_ff],
-                    layer.w_up.dtype,
-                    layer.w_up.bytes,
-                    n_ff,
-                    &mut state.hb2[..b * n_ff],
-                    &state.xb[..b * n_embd],
-                    &mut state.mv_scratch,
-                    n_embd,
-                    b,
-                );
-                if !self.lora.is_empty() {
-                    self.lora.apply_linear_slice(
-                        layer.w_gate.lora_slot,
+                if let Some(ref moe) = layer.moe {
+                    let t0 = prof.as_ref().map(|_| Instant::now());
+                    eval_sparse_moe_ffn(
+                        moe,
+                        &self.lora,
                         pool,
                         kt,
                         &state.xb[..b * n_embd],
+                        &mut state.xb2[..b * n_embd],
+                        n_embd,
+                        b,
+                        &mut state.mv_scratch,
+                        &mut state.lora_scratch,
+                        &mut state.moe_scratch,
+                    );
+                    if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
+                        p.ffn_down_ns += ts.elapsed().as_nanos() as u64;
+                    }
+                } else {
+                    let t0 = prof.as_ref().map(|_| Instant::now());
+                    matmul_pair_f32(
+                        pool,
+                        kt,
+                        layer.w_gate.dtype,
+                        layer.w_gate.bytes,
+                        n_ff,
                         &mut state.hb[..b * n_ff],
-                        b,
-                        layer.w_gate.row_offset,
+                        layer.w_up.dtype,
+                        layer.w_up.bytes,
                         n_ff,
-                        &mut state.lora_scratch,
+                        &mut state.hb2[..b * n_ff],
+                        &state.xb[..b * n_embd],
+                        &mut state.mv_scratch,
+                        n_embd,
+                        b,
                     );
-                    self.lora.apply_linear_slice(
-                        layer.w_up.lora_slot,
+                    if !self.lora.is_empty() {
+                        self.lora.apply_linear_slice(
+                            layer.w_gate.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..b * n_embd],
+                            &mut state.hb[..b * n_ff],
+                            b,
+                            layer.w_gate.row_offset,
+                            n_ff,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear_slice(
+                            layer.w_up.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..b * n_embd],
+                            &mut state.hb2[..b * n_ff],
+                            b,
+                            layer.w_up.row_offset,
+                            n_ff,
+                            &mut state.lora_scratch,
+                        );
+                    }
+                    if let Some(ref bg) = layer.b_gate {
+                        add_bias_rows(&mut state.hb[..b * n_ff], bg, b);
+                    }
+                    if let Some(ref bu) = layer.b_up {
+                        add_bias_rows(&mut state.hb2[..b * n_ff], bu, b);
+                    }
+                    if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
+                        p.ffn_gate_up_ns += ts.elapsed().as_nanos() as u64;
+                    }
+
+                    let t0 = prof.as_ref().map(|_| Instant::now());
+                    swiglu_inplace_parallel(
+                        pool,
+                        &mut state.hb[..b * n_ff],
+                        &state.hb2[..b * n_ff],
+                    );
+                    if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
+                        p.swiglu_ns += ts.elapsed().as_nanos() as u64;
+                    }
+
+                    let t0 = prof.as_ref().map(|_| Instant::now());
+                    matmul_f32(
                         pool,
                         kt,
-                        &state.xb[..b * n_embd],
-                        &mut state.hb2[..b * n_ff],
-                        b,
-                        layer.w_up.row_offset,
+                        layer.w_down.dtype,
+                        layer.w_down.bytes,
+                        &state.hb[..b * n_ff],
+                        &mut state.mv_scratch,
+                        &mut state.xb2[..b * n_embd],
+                        n_embd,
                         n_ff,
+                        b,
+                    );
+                    self.lora.apply_linear(
+                        layer.w_down.lora_slot,
+                        pool,
+                        kt,
+                        &state.hb[..b * n_ff],
+                        &mut state.xb2[..b * n_embd],
+                        b,
                         &mut state.lora_scratch,
                     );
-                }
-                if let Some(ref bg) = layer.b_gate {
-                    add_bias_rows(&mut state.hb[..b * n_ff], bg, b);
-                }
-                if let Some(ref bu) = layer.b_up {
-                    add_bias_rows(&mut state.hb2[..b * n_ff], bu, b);
-                }
-                if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
-                    p.ffn_gate_up_ns += ts.elapsed().as_nanos() as u64;
-                }
-
-                let t0 = prof.as_ref().map(|_| Instant::now());
-                swiglu_inplace_parallel(pool, &mut state.hb[..b * n_ff], &state.hb2[..b * n_ff]);
-                if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
-                    p.swiglu_ns += ts.elapsed().as_nanos() as u64;
-                }
-
-                let t0 = prof.as_ref().map(|_| Instant::now());
-                matmul_f32(
-                    pool,
-                    kt,
-                    layer.w_down.dtype,
-                    layer.w_down.bytes,
-                    &state.hb[..b * n_ff],
-                    &mut state.mv_scratch,
-                    &mut state.xb2[..b * n_embd],
-                    n_embd,
-                    n_ff,
-                    b,
-                );
-                self.lora.apply_linear(
-                    layer.w_down.lora_slot,
-                    pool,
-                    kt,
-                    &state.hb[..b * n_ff],
-                    &mut state.xb2[..b * n_embd],
-                    b,
-                    &mut state.lora_scratch,
-                );
-                if let Some(ref bd) = layer.b_down {
-                    add_bias_rows(&mut state.xb2[..b * n_embd], bd, b);
+                    if let Some(ref bd) = layer.b_down {
+                        add_bias_rows(&mut state.xb2[..b * n_embd], bd, b);
+                    }
+                    if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t0) {
+                        p.ffn_down_ns += ts.elapsed().as_nanos() as u64;
+                    }
                 }
                 if let Some(ref pfn) = layer.post_ffn_norm {
                     rms_norm_batch_parallel(
@@ -2277,82 +2428,105 @@ impl<'a> LlamaModel<'a> {
             }
             prof.ffn_norm_ns += t0.elapsed().as_nanos() as u64;
 
-            let t0 = Instant::now();
-            matvec_pair_f32(
-                pool,
-                kt,
-                layer.w_gate.dtype,
-                layer.w_gate.bytes,
-                layer.w_gate.rows,
-                &mut state.hb[..n_ff],
-                layer.w_up.dtype,
-                layer.w_up.bytes,
-                layer.w_up.rows,
-                &mut state.hb2[..n_ff],
-                &state.xb[..n_embd],
-                &mut state.mv_scratch,
-                n_embd,
-            );
-            if !self.lora.is_empty() {
-                self.lora.apply_linear_slice(
-                    layer.w_gate.lora_slot,
+            if let Some(ref moe) = layer.moe {
+                let t0 = Instant::now();
+                eval_sparse_moe_ffn(
+                    moe,
+                    &self.lora,
                     pool,
                     kt,
                     &state.xb[..n_embd],
+                    &mut state.xb2[..n_embd],
+                    n_embd,
+                    1,
+                    &mut state.mv_scratch,
+                    &mut state.lora_scratch,
+                    &mut state.moe_scratch,
+                );
+                prof.ffn_down_ns += t0.elapsed().as_nanos() as u64;
+                prof.ffn_down_bytes += moe.gate_inp.bytes.len() as u64
+                    + moe.experts.active_bytes_per_token(moe.cfg.n_expert_used);
+            } else {
+                let t0 = Instant::now();
+                matvec_pair_f32(
+                    pool,
+                    kt,
+                    layer.w_gate.dtype,
+                    layer.w_gate.bytes,
+                    layer.w_gate.rows,
                     &mut state.hb[..n_ff],
-                    1,
-                    layer.w_gate.row_offset,
-                    n_ff,
-                    &mut state.lora_scratch,
+                    layer.w_up.dtype,
+                    layer.w_up.bytes,
+                    layer.w_up.rows,
+                    &mut state.hb2[..n_ff],
+                    &state.xb[..n_embd],
+                    &mut state.mv_scratch,
+                    n_embd,
                 );
-                self.lora.apply_linear_slice(
-                    layer.w_up.lora_slot,
+                if !self.lora.is_empty() {
+                    self.lora.apply_linear_slice(
+                        layer.w_gate.lora_slot,
+                        pool,
+                        kt,
+                        &state.xb[..n_embd],
+                        &mut state.hb[..n_ff],
+                        1,
+                        layer.w_gate.row_offset,
+                        n_ff,
+                        &mut state.lora_scratch,
+                    );
+                    self.lora.apply_linear_slice(
+                        layer.w_up.lora_slot,
+                        pool,
+                        kt,
+                        &state.xb[..n_embd],
+                        &mut state.hb2[..n_ff],
+                        1,
+                        layer.w_up.row_offset,
+                        n_ff,
+                        &mut state.lora_scratch,
+                    );
+                }
+                if let Some(ref bg) = layer.b_gate {
+                    add_bias_slice(&mut state.hb[..n_ff], bg);
+                }
+                if let Some(ref bu) = layer.b_up {
+                    add_bias_slice(&mut state.hb2[..n_ff], bu);
+                }
+                prof.ffn_gate_up_ns += t0.elapsed().as_nanos() as u64;
+                prof.ffn_gate_up_bytes +=
+                    (layer.w_gate.bytes.len() + layer.w_up.bytes.len()) as u64;
+
+                let t0 = Instant::now();
+                swiglu_inplace_parallel(pool, &mut state.hb[..n_ff], &state.hb2[..n_ff]);
+                prof.swiglu_ns += t0.elapsed().as_nanos() as u64;
+
+                let t0 = Instant::now();
+                matvec_f32(
                     pool,
                     kt,
-                    &state.xb[..n_embd],
-                    &mut state.hb2[..n_ff],
+                    layer.w_down.dtype,
+                    layer.w_down.bytes,
+                    &state.hb[..n_ff],
+                    &mut state.mv_scratch,
+                    &mut state.xb2[..n_embd],
+                    layer.w_down.rows,
+                    layer.w_down.cols,
+                );
+                self.lora.apply_linear(
+                    layer.w_down.lora_slot,
+                    pool,
+                    kt,
+                    &state.hb[..n_ff],
+                    &mut state.xb2[..n_embd],
                     1,
-                    layer.w_up.row_offset,
-                    n_ff,
                     &mut state.lora_scratch,
                 );
-            }
-            if let Some(ref bg) = layer.b_gate {
-                add_bias_slice(&mut state.hb[..n_ff], bg);
-            }
-            if let Some(ref bu) = layer.b_up {
-                add_bias_slice(&mut state.hb2[..n_ff], bu);
-            }
-            prof.ffn_gate_up_ns += t0.elapsed().as_nanos() as u64;
-            prof.ffn_gate_up_bytes += (layer.w_gate.bytes.len() + layer.w_up.bytes.len()) as u64;
-
-            let t0 = Instant::now();
-            swiglu_inplace_parallel(pool, &mut state.hb[..n_ff], &state.hb2[..n_ff]);
-            prof.swiglu_ns += t0.elapsed().as_nanos() as u64;
-
-            let t0 = Instant::now();
-            matvec_f32(
-                pool,
-                kt,
-                layer.w_down.dtype,
-                layer.w_down.bytes,
-                &state.hb[..n_ff],
-                &mut state.mv_scratch,
-                &mut state.xb2[..n_embd],
-                layer.w_down.rows,
-                layer.w_down.cols,
-            );
-            self.lora.apply_linear(
-                layer.w_down.lora_slot,
-                pool,
-                kt,
-                &state.hb[..n_ff],
-                &mut state.xb2[..n_embd],
-                1,
-                &mut state.lora_scratch,
-            );
-            if let Some(ref bd) = layer.b_down {
-                add_bias_slice(&mut state.xb2[..n_embd], bd);
+                if let Some(ref bd) = layer.b_down {
+                    add_bias_slice(&mut state.xb2[..n_embd], bd);
+                }
+                prof.ffn_down_ns += t0.elapsed().as_nanos() as u64;
+                prof.ffn_down_bytes += layer.w_down.bytes.len() as u64;
             }
             if let Some(ref pfn) = layer.post_ffn_norm {
                 rms_norm(
@@ -2366,8 +2540,6 @@ impl<'a> LlamaModel<'a> {
             for i in 0..n_embd {
                 state.x[i] += res_scale * state.xb2[i];
             }
-            prof.ffn_down_ns += t0.elapsed().as_nanos() as u64;
-            prof.ffn_down_bytes += layer.w_down.bytes.len() as u64;
         }
 
         state.last_hidden.copy_from_slice(&state.x[..n_embd]);

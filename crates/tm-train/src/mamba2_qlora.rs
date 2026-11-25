@@ -27,6 +27,7 @@ use tm_models::{
 };
 
 use crate::accel::{LinearAccel, linear_bwd_with_accel, linear_fwd_with_accel};
+use crate::moe_qlora::{MoeTrainScratch, backward_moe_ffn, forward_moe_chunk};
 use crate::optim::{LoraGradStore, LoraTargets};
 use crate::qlora::{CE_CHUNK_TOKENS, CheckpointMode};
 
@@ -120,6 +121,7 @@ struct Mamba2TrainArena {
     lora_h: Vec<f32>,
     lora_dh: Vec<f32>,
     lora_bt: Vec<f32>,
+    moe_scratch: MoeTrainScratch,
 }
 
 impl Mamba2TrainArena {
@@ -144,17 +146,42 @@ impl Mamba2TrainArena {
         let max_kv = c.max_kv_dim();
         let max_ff = c.max_n_ff();
         let max_n_head = c.n_head_per_layer.iter().copied().max().unwrap_or(0);
+        let mut max_n_exp = 0usize;
+        let mut max_k_exp = 0usize;
+        let mut max_ff_exp = 0usize;
+        let mut max_ff_shexp = 0usize;
+        for lw in &model.layers {
+            let ffn_opt = match &lw.block {
+                Mamba2Block::FfnOnly { ffn }
+                | Mamba2Block::SsmAndFfn { ffn, .. }
+                | Mamba2Block::AttnAndFfn { ffn, .. }
+                | Mamba2Block::ParallelAttnSsmAndFfn { ffn, .. } => Some(ffn),
+                _ => None,
+            };
+            if let Some(Mamba2FfnWeights::SparseMoe(moe)) = ffn_opt {
+                max_n_exp = max_n_exp.max(moe.cfg.n_expert);
+                max_k_exp = max_k_exp.max(moe.cfg.n_expert_used);
+                max_ff_exp = max_ff_exp.max(moe.cfg.n_ff_exp);
+                max_ff_shexp = max_ff_shexp.max(moe.cfg.n_ff_shexp);
+            }
+        }
+        let moe_scratch =
+            MoeTrainScratch::new(max_seq, d, max_n_exp, max_k_exp, max_ff_exp, max_ff_shexp);
         let max_cols = d
             .max(d_inner)
             .max(d_in_proj)
             .max(max_q)
             .max(max_ff)
+            .max(max_ff_exp)
+            .max(max_ff_shexp)
             .max(c.vocab_size);
         let r_cap = max_rank.max(1);
         let max_d_out = d
             .max(d_in_proj)
             .max(max_q + 2 * max_kv)
             .max(2 * max_ff)
+            .max(max_n_exp)
+            .max(max_ff_shexp)
             .max(c.vocab_size);
 
         let (ckpt_f16, ckpt_f32) = match ckpt_mode {
@@ -240,6 +267,7 @@ impl Mamba2TrainArena {
             lora_h: vec![0.0; max_seq * r_cap],
             lora_dh: vec![0.0; max_seq * r_cap],
             lora_bt: vec![0.0; r_cap * max_d_out],
+            moe_scratch,
         }
     }
 
@@ -1259,6 +1287,7 @@ impl<'a> Mamba2Trainer<'a> {
         kt: &KernelTable,
         use_ffn_norm_input: bool,
         seq_len: usize,
+        save_recompute: bool,
     ) {
         let d = model.cfg.n_embd;
         match ffn {
@@ -1489,6 +1518,34 @@ impl<'a> Mamba2Trainer<'a> {
                     offset += b;
                 }
             }
+            Mamba2FfnWeights::SparseMoe(moe) => {
+                let mut offset = 0usize;
+                while offset < seq_len {
+                    let b = (seq_len - offset).min(MAX_CPU_BATCH);
+                    let xin = if use_ffn_norm_input {
+                        &arena.x_ffn_norm[offset * d..(offset + b) * d]
+                    } else {
+                        &arena.x_attn_norm[offset * d..(offset + b) * d]
+                    };
+                    forward_moe_chunk(
+                        moe,
+                        bound,
+                        accel.as_deref_mut(),
+                        pool,
+                        kt,
+                        xin,
+                        &mut arena.xb2_chunk[offset * d..(offset + b) * d],
+                        d,
+                        offset,
+                        b,
+                        save_recompute,
+                        &mut arena.mv_scratch,
+                        &mut arena.lora_scratch,
+                        &mut arena.moe_scratch,
+                    );
+                    offset += b;
+                }
+            }
         }
     }
 
@@ -1619,6 +1676,25 @@ impl<'a> Mamba2Trainer<'a> {
                     &mut arena.lora_bt,
                 );
             }
+            Mamba2FfnWeights::SparseMoe(moe) => {
+                backward_moe_ffn(
+                    moe,
+                    adapter,
+                    grads,
+                    accel,
+                    pool,
+                    kt,
+                    xin,
+                    d_branch_in,
+                    &mut arena.d_x_norm[..seq_len * d],
+                    d,
+                    seq_len,
+                    &mut arena.moe_scratch,
+                    &mut arena.lora_h,
+                    &mut arena.lora_dh,
+                    &mut arena.lora_bt,
+                );
+            }
         }
     }
 
@@ -1697,7 +1773,18 @@ impl<'a> Mamba2Trainer<'a> {
                 }
             }
             Mamba2Block::FfnOnly { ffn } => {
-                Self::run_ffn_forward(model, ffn, bound, arena, accel, pool, kt, false, seq_len);
+                Self::run_ffn_forward(
+                    model,
+                    ffn,
+                    bound,
+                    arena,
+                    accel,
+                    pool,
+                    kt,
+                    false,
+                    seq_len,
+                    save_recompute,
+                );
                 if !save_recompute {
                     for i in 0..(seq_len * d) {
                         arena.x_cur[i] += res_scale * arena.xb2_chunk[i];
@@ -1736,7 +1823,18 @@ impl<'a> Mamba2Trainer<'a> {
                     d,
                     seq_len,
                 );
-                Self::run_ffn_forward(model, ffn, bound, arena, accel, pool, kt, true, seq_len);
+                Self::run_ffn_forward(
+                    model,
+                    ffn,
+                    bound,
+                    arena,
+                    accel,
+                    pool,
+                    kt,
+                    true,
+                    seq_len,
+                    save_recompute,
+                );
                 if !save_recompute {
                     for i in 0..(seq_len * d) {
                         arena.x_cur[i] = arena.x_mid[i] + res_scale * arena.xb2_chunk[i];
@@ -1777,7 +1875,18 @@ impl<'a> Mamba2Trainer<'a> {
                     d,
                     seq_len,
                 );
-                Self::run_ffn_forward(model, ffn, bound, arena, accel, pool, kt, true, seq_len);
+                Self::run_ffn_forward(
+                    model,
+                    ffn,
+                    bound,
+                    arena,
+                    accel,
+                    pool,
+                    kt,
+                    true,
+                    seq_len,
+                    save_recompute,
+                );
                 if !save_recompute {
                     for i in 0..(seq_len * d) {
                         arena.x_cur[i] = arena.x_mid[i] + res_scale * arena.xb2_chunk[i];
@@ -1833,7 +1942,18 @@ impl<'a> Mamba2Trainer<'a> {
                     d,
                     seq_len,
                 );
-                Self::run_ffn_forward(model, ffn, bound, arena, accel, pool, kt, true, seq_len);
+                Self::run_ffn_forward(
+                    model,
+                    ffn,
+                    bound,
+                    arena,
+                    accel,
+                    pool,
+                    kt,
+                    true,
+                    seq_len,
+                    save_recompute,
+                );
                 if !save_recompute {
                     for i in 0..(seq_len * d) {
                         arena.x_cur[i] = arena.x_mid[i] + res_scale * arena.xb2_chunk[i];

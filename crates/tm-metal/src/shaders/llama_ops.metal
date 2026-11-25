@@ -4265,3 +4265,693 @@ kernel void mamba2_gate_grouped_norm_f32(
         yg[i] = yg[i] * scale * wg[i];
     }
 }
+
+// ============================================================================
+// 14. P2a Sparse MoE Kernels (`ADR-018`): Single-CB Router + Indexed Expert GEMV
+// ============================================================================
+
+struct MoeRouterArgs {
+    uint n_expert;
+    uint n_expert_used;
+    uint n_tok;
+    uint gating_func;     // 0=Softmax, 1=Sigmoid, 2=SoftmaxWeight, 3=SqrtSoftplus
+    uint norm_weights;    // 0 or 1
+    uint has_exp_probs_b; // 0 or 1
+    float norm_eps;
+    float weights_scale;
+};
+
+// 1 thread per token `t in 0..n_tok` (`TG = 64`).
+kernel void moe_router_topk_f32(
+    device const float* logits      [[buffer(0)]],
+    device const float* exp_probs_b [[buffer(1)]],
+    device float* probs_scratch     [[buffer(2)]],
+    device float* sel_scratch       [[buffer(3)]],
+    device uint* top_ids            [[buffer(4)]],
+    device float* top_weights       [[buffer(5)]],
+    constant MoeRouterArgs& a       [[buffer(6)]],
+    uint t [[thread_position_in_grid]]
+) {
+    if (t >= a.n_tok) return;
+    const uint n_exp = a.n_expert;
+    const uint k = a.n_expert_used;
+    device const float* l_row = logits + ulong(t) * ulong(n_exp);
+    device float* probs = probs_scratch + ulong(t) * ulong(n_exp);
+    device float* sel = sel_scratch + ulong(t) * ulong(n_exp);
+    device uint* ids_t = top_ids + ulong(t) * ulong(k);
+    device float* w_t = top_weights + ulong(t) * ulong(k);
+
+    if (a.gating_func == 0) {
+        float max_l = -INFINITY;
+        for (uint e = 0; e < n_exp; ++e) {
+            max_l = max(max_l, l_row[e]);
+        }
+        float sum = 0.0f;
+        for (uint e = 0; e < n_exp; ++e) {
+            const float ev = exp(l_row[e] - max_l);
+            probs[e] = ev;
+            sum += ev;
+        }
+        const float inv = 1.0f / sum;
+        for (uint e = 0; e < n_exp; ++e) {
+            probs[e] *= inv;
+        }
+    } else if (a.gating_func == 1) {
+        for (uint e = 0; e < n_exp; ++e) {
+            probs[e] = 1.0f / (1.0f + exp(-l_row[e]));
+        }
+    } else if (a.gating_func == 2) {
+        for (uint e = 0; e < n_exp; ++e) {
+            probs[e] = l_row[e];
+        }
+    } else {
+        for (uint e = 0; e < n_exp; ++e) {
+            const float lv = l_row[e];
+            const float sp = (lv > 20.0f) ? lv : ((lv < -20.0f) ? exp(lv) : log(1.0f + exp(lv)));
+            probs[e] = sqrt(sp);
+        }
+    }
+
+    if (a.has_exp_probs_b != 0) {
+        for (uint e = 0; e < n_exp; ++e) {
+            sel[e] = probs[e] + exp_probs_b[e];
+        }
+    } else {
+        for (uint e = 0; e < n_exp; ++e) {
+            sel[e] = probs[e];
+        }
+    }
+
+    for (uint slot = 0; slot < k; ++slot) {
+        uint best_idx = 0;
+        float best_val = -INFINITY;
+        for (uint e = 0; e < n_exp; ++e) {
+            bool already = false;
+            for (uint prev = 0; prev < slot; ++prev) {
+                if (ids_t[prev] == e) {
+                    already = true;
+                    break;
+                }
+            }
+            if (!already && sel[e] > best_val) {
+                best_val = sel[e];
+                best_idx = e;
+            }
+        }
+        ids_t[slot] = best_idx;
+        w_t[slot] = probs[best_idx];
+    }
+
+    if (a.gating_func == 2) {
+        float max_w = -INFINITY;
+        for (uint slot = 0; slot < k; ++slot) {
+            max_w = max(max_w, w_t[slot]);
+        }
+        float sum = 0.0f;
+        for (uint slot = 0; slot < k; ++slot) {
+            w_t[slot] = exp(w_t[slot] - max_w);
+            sum += w_t[slot];
+        }
+        const float inv = 1.0f / sum;
+        for (uint slot = 0; slot < k; ++slot) {
+            w_t[slot] *= inv;
+        }
+    }
+
+    if (a.norm_weights != 0) {
+        float sum_w = 0.0f;
+        for (uint slot = 0; slot < k; ++slot) {
+            sum_w += w_t[slot];
+        }
+        const float denom = (a.norm_eps > 0.0f) ? (sum_w + a.norm_eps) : max(sum_w, 6.103515625e-5f);
+        const float inv = 1.0f / denom;
+        for (uint slot = 0; slot < k; ++slot) {
+            w_t[slot] *= inv;
+        }
+    }
+
+    if (a.weights_scale != 0.0f && fabs(a.weights_scale - 1.0f) > 1e-12f) {
+        for (uint slot = 0; slot < k; ++slot) {
+            w_t[slot] *= a.weights_scale;
+        }
+    }
+}
+
+kernel void silu_inplace_f32(
+    device float* x [[buffer(0)]],
+    constant uint& n [[buffer(1)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= n) return;
+    const float v = x[tid];
+    x[tid] = v / (1.0f + exp(-v));
+}
+
+struct MoeIndexedGemvArgs {
+    uint n_in;
+    uint n_out;
+    uint row_bytes;
+    uint exp_stride_bytes;
+    uint intra_exp_offset_bytes;
+    uint k;
+    uint x_tok_stride;
+    uint x_slot_stride;
+    uint scale_by_router; // 0 = 1.0f, 1 = top_weights[tk]
+};
+
+// Grid: `(ceil(n_out / 32), n_tok * k, 1)`, TG = 128.
+kernel void moe_indexed_gemv_q4_0(
+    device const uchar* exps_base   [[buffer(0)]],
+    device const float* x_base      [[buffer(1)]],
+    device const uint* top_ids      [[buffer(2)]],
+    device const float* top_weights [[buffer(3)]],
+    device float* y_base            [[buffer(4)]],
+    constant MoeIndexedGemvArgs& a  [[buffer(5)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint LPR = 8;
+    constexpr uint NR = 2;
+    constexpr uint RG = 4;
+    constexpr uint SG = 4;
+
+    const uint li = lane % LPR;
+    const uint row0 = tg.x * (SG * RG * NR) + (sg * RG + lane / LPR) * NR;
+    if (row0 >= a.n_out) return;
+
+    const uint tk = tg.y;
+    const uint t = tk / a.k;
+    const uint slot = tk % a.k;
+    const uint exp_id = top_ids[tk];
+    const float w_scale = (a.scale_by_router != 0) ? top_weights[tk] : 1.0f;
+
+    device const uchar* W = exps_base + ulong(exp_id) * ulong(a.exp_stride_bytes) + ulong(a.intra_exp_offset_bytes);
+    device const float* x = x_base + ulong(t) * ulong(a.x_tok_stride) + ulong(slot) * ulong(a.x_slot_stride);
+    device float* y = y_base + ulong(tk) * ulong(a.n_out);
+
+    const uint nb = a.n_in / 32;
+    const uint r0 = row0;
+    const uint r1 = min(row0 + 1, a.n_out - 1);
+    device const uchar* wp0 = W + ulong(r0) * ulong(a.row_bytes);
+    device const uchar* wp1 = W + ulong(r1) * ulong(a.row_bytes);
+
+    float acc0 = 0.0f, acc1 = 0.0f;
+    for (uint ib = li; ib < nb; ib += LPR) {
+        device const float* xp = x + ib * 32;
+        device const uchar* b0 = wp0 + ib * 18;
+        device const uchar* b1 = wp1 + ib * 18;
+        const float d0 = read_f16_u(b0);
+        const float d1 = read_f16_u(b1);
+        device const ushort* p0 = (device const ushort*)(b0 + 2);
+        device const ushort* p1 = (device const ushort*)(b1 + 2);
+
+        float dot0 = 0.0f, dot1 = 0.0f, sumx = 0.0f;
+        #pragma unroll
+        for (uint j = 0; j < 8; ++j) {
+            const float x0 = xp[2 * j];
+            const float x1 = xp[2 * j + 1];
+            const float x2 = xp[2 * j + 16];
+            const float x3 = xp[2 * j + 17];
+            sumx += (x0 + x1) + (x2 + x3);
+
+            const ushort v0 = p0[j];
+            dot0 = fma(float(v0 & 15), x0, dot0);
+            dot0 = fma(float((v0 >> 4) & 15), x2, dot0);
+            dot0 = fma(float((v0 >> 8) & 15), x1, dot0);
+            dot0 = fma(float(v0 >> 12), x3, dot0);
+
+            const ushort v1 = p1[j];
+            dot1 = fma(float(v1 & 15), x0, dot1);
+            dot1 = fma(float((v1 >> 4) & 15), x2, dot1);
+            dot1 = fma(float((v1 >> 8) & 15), x1, dot1);
+            dot1 = fma(float(v1 >> 12), x3, dot1);
+        }
+        const float corr = -8.0f * sumx;
+        acc0 = fma(d0, dot0 + corr, acc0);
+        acc1 = fma(d1, dot1 + corr, acc1);
+    }
+
+    const float out0 = reduce_lpr8(acc0) * w_scale;
+    const float out1 = reduce_lpr8(acc1) * w_scale;
+    if (li == 0) {
+        y[r0] = out0;
+        if (row0 + 1 < a.n_out) y[row0 + 1] = out1;
+    }
+}
+
+kernel void moe_indexed_gemv_q4_1(
+    device const uchar* exps_base   [[buffer(0)]],
+    device const float* x_base      [[buffer(1)]],
+    device const uint* top_ids      [[buffer(2)]],
+    device const float* top_weights [[buffer(3)]],
+    device float* y_base            [[buffer(4)]],
+    constant MoeIndexedGemvArgs& a  [[buffer(5)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint LPR = 8;
+    constexpr uint NR = 2;
+    constexpr uint RG = 4;
+    constexpr uint SG = 4;
+
+    const uint li = lane % LPR;
+    const uint row0 = tg.x * (SG * RG * NR) + (sg * RG + lane / LPR) * NR;
+    if (row0 >= a.n_out) return;
+
+    const uint tk = tg.y;
+    const uint t = tk / a.k;
+    const uint slot = tk % a.k;
+    const uint exp_id = top_ids[tk];
+    const float w_scale = (a.scale_by_router != 0) ? top_weights[tk] : 1.0f;
+
+    device const uchar* W = exps_base + ulong(exp_id) * ulong(a.exp_stride_bytes) + ulong(a.intra_exp_offset_bytes);
+    device const float* x = x_base + ulong(t) * ulong(a.x_tok_stride) + ulong(slot) * ulong(a.x_slot_stride);
+    device float* y = y_base + ulong(tk) * ulong(a.n_out);
+
+    const uint nb = a.n_in / 32;
+    const uint r0 = row0;
+    const uint r1 = min(row0 + 1, a.n_out - 1);
+    device const uchar* wp0 = W + ulong(r0) * ulong(a.row_bytes);
+    device const uchar* wp1 = W + ulong(r1) * ulong(a.row_bytes);
+
+    float acc0 = 0.0f, acc1 = 0.0f;
+    for (uint ib = li; ib < nb; ib += LPR) {
+        device const float* xp = x + ib * 32;
+        device const uchar* b0 = wp0 + ib * 20;
+        device const uchar* b1 = wp1 + ib * 20;
+        const float d0 = read_f16_u(b0);
+        const float m0 = read_f16_u(b0 + 2);
+        const float d1 = read_f16_u(b1);
+        const float m1 = read_f16_u(b1 + 2);
+        device const ushort* p0 = (device const ushort*)(b0 + 4);
+        device const ushort* p1 = (device const ushort*)(b1 + 4);
+
+        float dot0 = 0.0f, dot1 = 0.0f, sumx = 0.0f;
+        #pragma unroll
+        for (uint j = 0; j < 8; ++j) {
+            const float x0 = xp[2 * j];
+            const float x1 = xp[2 * j + 1];
+            const float x2 = xp[2 * j + 16];
+            const float x3 = xp[2 * j + 17];
+            sumx += (x0 + x1) + (x2 + x3);
+
+            const ushort v0 = p0[j];
+            dot0 = fma(float(v0 & 15), x0, dot0);
+            dot0 = fma(float((v0 >> 4) & 15), x2, dot0);
+            dot0 = fma(float((v0 >> 8) & 15), x1, dot0);
+            dot0 = fma(float(v0 >> 12), x3, dot0);
+
+            const ushort v1 = p1[j];
+            dot1 = fma(float(v1 & 15), x0, dot1);
+            dot1 = fma(float((v1 >> 4) & 15), x2, dot1);
+            dot1 = fma(float((v1 >> 8) & 15), x1, dot1);
+            dot1 = fma(float(v1 >> 12), x3, dot1);
+        }
+        acc0 = fma(d0, dot0, fma(m0, sumx, acc0));
+        acc1 = fma(d1, dot1, fma(m1, sumx, acc1));
+    }
+
+    const float out0 = reduce_lpr8(acc0) * w_scale;
+    const float out1 = reduce_lpr8(acc1) * w_scale;
+    if (li == 0) {
+        y[r0] = out0;
+        if (row0 + 1 < a.n_out) y[row0 + 1] = out1;
+    }
+}
+
+// Grid: `(ceil(n_out / 16), n_tok * k, 1)`, TG = 128 (`SG = 4`, `NR = 4`).
+kernel void moe_indexed_gemv_q8_0(
+    device const uchar* exps_base   [[buffer(0)]],
+    device const float* x_base      [[buffer(1)]],
+    device const uint* top_ids      [[buffer(2)]],
+    device const float* top_weights [[buffer(3)]],
+    device float* y_base            [[buffer(4)]],
+    constant MoeIndexedGemvArgs& a  [[buffer(5)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NR = 4;
+    constexpr uint SG = 4;
+    const uint row0 = (tg.x * SG + sg) * NR;
+    if (row0 >= a.n_out) return;
+
+    const uint tk = tg.y;
+    const uint t = tk / a.k;
+    const uint slot = tk % a.k;
+    const uint exp_id = top_ids[tk];
+    const float w_scale = (a.scale_by_router != 0) ? top_weights[tk] : 1.0f;
+
+    device const uchar* W = exps_base + ulong(exp_id) * ulong(a.exp_stride_bytes) + ulong(a.intra_exp_offset_bytes);
+    device const float* x = x_base + ulong(t) * ulong(a.x_tok_stride) + ulong(slot) * ulong(a.x_slot_stride);
+    device float* y = y_base + ulong(tk) * ulong(a.n_out);
+
+    const uint nb = a.n_in / 32;
+    const uint r0 = row0;
+    const uint r1 = min(row0 + 1, a.n_out - 1);
+    const uint r2 = min(row0 + 2, a.n_out - 1);
+    const uint r3 = min(row0 + 3, a.n_out - 1);
+    device const uchar* wp0 = W + ulong(r0) * ulong(a.row_bytes);
+    device const uchar* wp1 = W + ulong(r1) * ulong(a.row_bytes);
+    device const uchar* wp2 = W + ulong(r2) * ulong(a.row_bytes);
+    device const uchar* wp3 = W + ulong(r3) * ulong(a.row_bytes);
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint ib = 0; ib < nb; ++ib) {
+        const float xv = x[ib * 32 + lane];
+        device const uchar* b0 = wp0 + ib * 34;
+        device const uchar* b1 = wp1 + ib * 34;
+        device const uchar* b2 = wp2 + ib * 34;
+        device const uchar* b3 = wp3 + ib * 34;
+        acc0 = fma(read_f16_u(b0) * float(((device const char*)(b0 + 2))[lane]), xv, acc0);
+        acc1 = fma(read_f16_u(b1) * float(((device const char*)(b1 + 2))[lane]), xv, acc1);
+        acc2 = fma(read_f16_u(b2) * float(((device const char*)(b2 + 2))[lane]), xv, acc2);
+        acc3 = fma(read_f16_u(b3) * float(((device const char*)(b3 + 2))[lane]), xv, acc3);
+    }
+    const float out0 = simd_sum(acc0) * w_scale;
+    const float out1 = simd_sum(acc1) * w_scale;
+    const float out2 = simd_sum(acc2) * w_scale;
+    const float out3 = simd_sum(acc3) * w_scale;
+    if (lane == 0) {
+        y[r0] = out0;
+        if (row0 + 1 < a.n_out) y[r1] = out1;
+        if (row0 + 2 < a.n_out) y[r2] = out2;
+        if (row0 + 3 < a.n_out) y[r3] = out3;
+    }
+}
+
+// Grid: `(ceil(n_out / 8), n_tok * k, 1)`, TG = 128 (`SG = 4`, `NR = 2`).
+kernel void moe_indexed_gemv_q5_k(
+    device const uchar* exps_base   [[buffer(0)]],
+    device const float* x_base      [[buffer(1)]],
+    device const uint* top_ids      [[buffer(2)]],
+    device const float* top_weights [[buffer(3)]],
+    device float* y_base            [[buffer(4)]],
+    constant MoeIndexedGemvArgs& a  [[buffer(5)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NR = 2;
+    constexpr uint SG = 4;
+    const uint row0 = (tg.x * SG + sg) * NR;
+    if (row0 >= a.n_out) return;
+
+    const uint tk = tg.y;
+    const uint t = tk / a.k;
+    const uint slot = tk % a.k;
+    const uint exp_id = top_ids[tk];
+    const float w_scale = (a.scale_by_router != 0) ? top_weights[tk] : 1.0f;
+
+    device const uchar* W = exps_base + ulong(exp_id) * ulong(a.exp_stride_bytes) + ulong(a.intra_exp_offset_bytes);
+    device const float* x = x_base + ulong(t) * ulong(a.x_tok_stride) + ulong(slot) * ulong(a.x_slot_stride);
+    device float* y = y_base + ulong(tk) * ulong(a.n_out);
+
+    const uint nb = a.n_in / 256;
+    const uint r0 = row0;
+    const uint r1 = min(row0 + 1, a.n_out - 1);
+    device const uchar* wp[2] = {
+        W + ulong(r0) * ulong(a.row_bytes),
+        W + ulong(r1) * ulong(a.row_bytes)
+    };
+    float acc[2] = {0.0f, 0.0f};
+
+    for (uint ib = 0; ib < nb; ++ib) {
+        device const float* xp = x + ib * 256;
+        const ulong blk_off = ulong(ib) * 176;
+        #pragma unroll
+        for (uint k = 0; k < 2; ++k) {
+            device const uchar* b = wp[k] + blk_off;
+            const float d = read_f16_u(b);
+            const float dmin = read_f16_u(b + 2);
+            device const uchar* sc = b + 4;
+            device const uchar* qh = b + 16;
+            device const uchar* qs = b + 48;
+
+            for (uint j = 0; j < 4; ++j) {
+                const uint is0 = 2 * j;
+                const uint is1 = 2 * j + 1;
+                const uchar sc0 = (is0 < 4) ? (sc[is0] & 63) : ((sc[is0 + 4] & 0x0F) | ((sc[is0 - 4] >> 6) << 4));
+                const uchar m0  = (is0 < 4) ? (sc[is0 + 4] & 63) : ((sc[is0 + 4] >> 4) | ((sc[is0] >> 6) << 4));
+                const uchar sc1 = (is1 < 4) ? (sc[is1] & 63) : ((sc[is1 + 4] & 0x0F) | ((sc[is1 - 4] >> 6) << 4));
+                const uchar m1  = (is1 < 4) ? (sc[is1 + 4] & 63) : ((sc[is1 + 4] >> 4) | ((sc[is1] >> 6) << 4));
+
+                const uchar qv = qs[j * 32 + lane];
+                const uchar hv = qh[lane];
+                const uint q0 = uint(qv & 0x0F) | (((hv >> (2 * j)) & 1) << 4);
+                const uint q1 = uint(qv >> 4)   | (((hv >> (2 * j + 1)) & 1) << 4);
+
+                const float x0 = xp[j * 64 + lane];
+                const float x1 = xp[j * 64 + 32 + lane];
+                acc[k] = fma(d * float(sc0) * float(q0) - dmin * float(m0), x0, acc[k]);
+                acc[k] = fma(d * float(sc1) * float(q1) - dmin * float(m1), x1, acc[k]);
+            }
+        }
+    }
+    const float out0 = simd_sum(acc[0]) * w_scale;
+    const float out1 = simd_sum(acc[1]) * w_scale;
+    if (lane == 0) {
+        y[r0] = out0;
+        if (row0 + 1 < a.n_out) y[r1] = out1;
+    }
+}
+
+// Grid: `(ceil(n_out / 16), n_tok * k, 1)`, TG = 128 (`SG = 4`, `NR = 4`).
+kernel void moe_indexed_gemv_q6_k(
+    device const uchar* exps_base   [[buffer(0)]],
+    device const float* x_base      [[buffer(1)]],
+    device const uint* top_ids      [[buffer(2)]],
+    device const float* top_weights [[buffer(3)]],
+    device float* y_base            [[buffer(4)]],
+    constant MoeIndexedGemvArgs& a  [[buffer(5)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NR = 4;
+    constexpr uint SG = 4;
+    const uint row0 = (tg.x * SG + sg) * NR;
+    if (row0 >= a.n_out) return;
+
+    const uint tk = tg.y;
+    const uint t = tk / a.k;
+    const uint slot = tk % a.k;
+    const uint exp_id = top_ids[tk];
+    const float w_scale = (a.scale_by_router != 0) ? top_weights[tk] : 1.0f;
+
+    device const uchar* W = exps_base + ulong(exp_id) * ulong(a.exp_stride_bytes) + ulong(a.intra_exp_offset_bytes);
+    device const float* x = x_base + ulong(t) * ulong(a.x_tok_stride) + ulong(slot) * ulong(a.x_slot_stride);
+    device float* y = y_base + ulong(tk) * ulong(a.n_out);
+
+    const uint nb = a.n_in / 256;
+    const uint r0 = row0;
+    const uint r1 = min(row0 + 1, a.n_out - 1);
+    const uint r2 = min(row0 + 2, a.n_out - 1);
+    const uint r3 = min(row0 + 3, a.n_out - 1);
+    device const uchar* wp[NR] = {
+        W + ulong(r0) * ulong(a.row_bytes),
+        W + ulong(r1) * ulong(a.row_bytes),
+        W + ulong(r2) * ulong(a.row_bytes),
+        W + ulong(r3) * ulong(a.row_bytes)
+    };
+    float acc[NR] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint is = lane >> 4;
+
+    for (uint ib = 0; ib < nb; ++ib) {
+        device const float* xp = x + ib * 256;
+        const ulong blk_off = ulong(ib) * 210;
+        float d[NR];
+        float sum[NR] = {0.0f, 0.0f, 0.0f, 0.0f};
+        #pragma unroll
+        for (uint k = 0; k < NR; ++k) {
+            d[k] = read_f16_u(wp[k] + blk_off + 208);
+        }
+        #pragma unroll
+        for (uint half_idx = 0; half_idx < 2; ++half_idx) {
+            device const float* xh = xp + half_idx * 128;
+            const float x_a = xh[lane];
+            const float x_b = xh[lane + 32];
+            const float x_c = xh[lane + 64];
+            const float x_d = xh[lane + 96];
+            #pragma unroll
+            for (uint k = 0; k < NR; ++k) {
+                device const uchar* b = wp[k] + blk_off;
+                device const uchar* ql = b + half_idx * 64;
+                device const uchar* qh = b + 128 + half_idx * 32;
+                device const char*  sc = (device const char*)(b + 192 + half_idx * 8);
+                const uchar ql_lo = ql[lane];
+                const uchar ql_hi = ql[lane + 32];
+                const uchar qh_v  = qh[lane];
+                const int qa = int((ql_lo & 0x0F) | ((qh_v & 3) << 4)) - 32;
+                const int qb = int((ql_hi & 0x0F) | (((qh_v >> 2) & 3) << 4)) - 32;
+                const int qc = int((ql_lo >> 4)   | (((qh_v >> 4) & 3) << 4)) - 32;
+                const int qd = int((ql_hi >> 4)   | (((qh_v >> 6) & 3) << 4)) - 32;
+                sum[k] = fma(float(sc[is])     * float(qa), x_a, sum[k]);
+                sum[k] = fma(float(sc[is + 2]) * float(qb), x_b, sum[k]);
+                sum[k] = fma(float(sc[is + 4]) * float(qc), x_c, sum[k]);
+                sum[k] = fma(float(sc[is + 6]) * float(qd), x_d, sum[k]);
+            }
+        }
+        #pragma unroll
+        for (uint k = 0; k < NR; ++k) {
+            acc[k] = fma(d[k], sum[k], acc[k]);
+        }
+    }
+    const float out0 = simd_sum(acc[0]) * w_scale;
+    const float out1 = simd_sum(acc[1]) * w_scale;
+    const float out2 = simd_sum(acc[2]) * w_scale;
+    const float out3 = simd_sum(acc[3]) * w_scale;
+    if (lane == 0) {
+        y[r0] = out0;
+        if (row0 + 1 < a.n_out) y[r1] = out1;
+        if (row0 + 2 < a.n_out) y[r2] = out2;
+        if (row0 + 3 < a.n_out) y[r3] = out3;
+    }
+}
+
+// Grid: `(ceil(n_out / 16), n_tok * k, 1)`, TG = 128 (`SG = 4`, `NR = 4`).
+kernel void moe_indexed_gemv_bf16(
+    device const uchar* exps_base   [[buffer(0)]],
+    device const float* x_base      [[buffer(1)]],
+    device const uint* top_ids      [[buffer(2)]],
+    device const float* top_weights [[buffer(3)]],
+    device float* y_base            [[buffer(4)]],
+    constant MoeIndexedGemvArgs& a  [[buffer(5)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NR = 4;
+    constexpr uint SG = 4;
+    const uint row0 = (tg.x * SG + sg) * NR;
+    if (row0 >= a.n_out) return;
+
+    const uint tk = tg.y;
+    const uint t = tk / a.k;
+    const uint slot = tk % a.k;
+    const uint exp_id = top_ids[tk];
+    const float w_scale = (a.scale_by_router != 0) ? top_weights[tk] : 1.0f;
+
+    device const uchar* W = exps_base + ulong(exp_id) * ulong(a.exp_stride_bytes) + ulong(a.intra_exp_offset_bytes);
+    device const float* x = x_base + ulong(t) * ulong(a.x_tok_stride) + ulong(slot) * ulong(a.x_slot_stride);
+    device float* y = y_base + ulong(tk) * ulong(a.n_out);
+
+    const uint r0 = row0;
+    const uint r1 = min(row0 + 1, a.n_out - 1);
+    const uint r2 = min(row0 + 2, a.n_out - 1);
+    const uint r3 = min(row0 + 3, a.n_out - 1);
+    device const ushort* wp0 = (device const ushort*)(W + ulong(r0) * ulong(a.row_bytes));
+    device const ushort* wp1 = (device const ushort*)(W + ulong(r1) * ulong(a.row_bytes));
+    device const ushort* wp2 = (device const ushort*)(W + ulong(r2) * ulong(a.row_bytes));
+    device const ushort* wp3 = (device const ushort*)(W + ulong(r3) * ulong(a.row_bytes));
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint col = lane; col < a.n_in; col += 32) {
+        const float xv = x[col];
+        acc0 = fma(bf16_to_f32_msl(wp0[col]), xv, acc0);
+        acc1 = fma(bf16_to_f32_msl(wp1[col]), xv, acc1);
+        acc2 = fma(bf16_to_f32_msl(wp2[col]), xv, acc2);
+        acc3 = fma(bf16_to_f32_msl(wp3[col]), xv, acc3);
+    }
+    const float out0 = simd_sum(acc0) * w_scale;
+    const float out1 = simd_sum(acc1) * w_scale;
+    const float out2 = simd_sum(acc2) * w_scale;
+    const float out3 = simd_sum(acc3) * w_scale;
+    if (lane == 0) {
+        y[r0] = out0;
+        if (row0 + 1 < a.n_out) y[r1] = out1;
+        if (row0 + 2 < a.n_out) y[r2] = out2;
+        if (row0 + 3 < a.n_out) y[r3] = out3;
+    }
+}
+
+// Grid: `(ceil(n_out / 8), n_tok * k, 1)`, TG = 128 (`SG = 4`, `NR = 2`).
+kernel void moe_indexed_gemv_f32(
+    device const uchar* exps_base   [[buffer(0)]],
+    device const float* x_base      [[buffer(1)]],
+    device const uint* top_ids      [[buffer(2)]],
+    device const float* top_weights [[buffer(3)]],
+    device float* y_base            [[buffer(4)]],
+    constant MoeIndexedGemvArgs& a  [[buffer(5)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NR = 2;
+    constexpr uint SG = 4;
+    const uint row0 = (tg.x * SG + sg) * NR;
+    if (row0 >= a.n_out) return;
+
+    const uint tk = tg.y;
+    const uint t = tk / a.k;
+    const uint slot = tk % a.k;
+    const uint exp_id = top_ids[tk];
+    const float w_scale = (a.scale_by_router != 0) ? top_weights[tk] : 1.0f;
+
+    device const uchar* W = exps_base + ulong(exp_id) * ulong(a.exp_stride_bytes) + ulong(a.intra_exp_offset_bytes);
+    device const float* x = x_base + ulong(t) * ulong(a.x_tok_stride) + ulong(slot) * ulong(a.x_slot_stride);
+    device float* y = y_base + ulong(tk) * ulong(a.n_out);
+
+    const uint r0 = row0;
+    const uint r1 = min(row0 + 1, a.n_out - 1);
+    device const float* wp0 = (device const float*)(W + ulong(r0) * ulong(a.row_bytes));
+    device const float* wp1 = (device const float*)(W + ulong(r1) * ulong(a.row_bytes));
+
+    float acc0 = 0.0f, acc1 = 0.0f;
+    for (uint col = lane; col < a.n_in; col += 32) {
+        const float xv = x[col];
+        acc0 = fma(wp0[col], xv, acc0);
+        acc1 = fma(wp1[col], xv, acc1);
+    }
+    const float out0 = simd_sum(acc0) * w_scale;
+    const float out1 = simd_sum(acc1) * w_scale;
+    if (lane == 0) {
+        y[r0] = out0;
+        if (row0 + 1 < a.n_out) y[r1] = out1;
+    }
+}
+
+struct MoeReduceArgs {
+    uint n_embd;
+    uint k;
+    uint n_tok;
+};
+
+// Deterministic `0..k` reduction of `slot_out [n_tok * k, n_embd]` -> `out [n_tok, n_embd]`.
+kernel void moe_reduce_slots_f32(
+    device const float* slot_out [[buffer(0)]],
+    device float* out            [[buffer(1)]],
+    constant MoeReduceArgs& a    [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    const uint total = a.n_tok * a.n_embd;
+    if (tid >= total) return;
+    const uint t = tid / a.n_embd;
+    const uint d = tid % a.n_embd;
+    float sum = 0.0f;
+    for (uint slot = 0; slot < a.k; ++slot) {
+        sum += slot_out[(ulong(t) * ulong(a.k) + ulong(slot)) * ulong(a.n_embd) + d];
+    }
+    out[tid] = sum;
+}
+
+struct MoeShexpGateArgs {
+    uint n_embd;
+    uint n_tok;
+};
+
+kernel void moe_shexp_gated_add_f32(
+    device const float* shexp_out [[buffer(0)]],
+    device const float* gate_raw  [[buffer(1)]],
+    device float* out             [[buffer(2)]],
+    constant MoeShexpGateArgs& a  [[buffer(3)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    const uint total = a.n_tok * a.n_embd;
+    if (tid >= total) return;
+    const uint t = tid / a.n_embd;
+    const float g = 1.0f / (1.0f + exp(-gate_raw[t]));
+    out[tid] = fma(g, shexp_out[tid], out[tid]);
+}

@@ -542,6 +542,57 @@ pub fn init_lora_adapter_mamba2(
                 );
             }
         }
+        Mamba2FfnWeights::SparseMoe(moe) => {
+            if targets.gate {
+                push_linear_pair(
+                    rng,
+                    pairs,
+                    order,
+                    moe.gate_inp.name,
+                    moe.gate_inp.cols,
+                    moe.gate_inp.rows,
+                    rank,
+                );
+            }
+            if let Some(ref sh) = moe.shared_expert {
+                if targets.gate {
+                    push_linear_pair(
+                        rng,
+                        pairs,
+                        order,
+                        sh.w_gate.name,
+                        sh.w_gate.cols,
+                        sh.w_gate.rows,
+                        rank,
+                    );
+                    if let Some(ref gi) = sh.w_gate_inp_shexp {
+                        push_linear_pair(rng, pairs, order, gi.name, gi.cols, gi.rows, rank);
+                    }
+                }
+                if targets.up {
+                    push_linear_pair(
+                        rng,
+                        pairs,
+                        order,
+                        sh.w_up.name,
+                        sh.w_up.cols,
+                        sh.w_up.rows,
+                        rank,
+                    );
+                }
+                if targets.down {
+                    push_linear_pair(
+                        rng,
+                        pairs,
+                        order,
+                        sh.w_down.name,
+                        sh.w_down.cols,
+                        sh.w_down.rows,
+                        rank,
+                    );
+                }
+            }
+        }
     };
 
     for lw in &model.layers {
@@ -960,24 +1011,44 @@ pub fn init_lora_adapter(
         if targets.o {
             add_linear(lw.wo.name, lw.wo.cols, lw.wo.rows);
         }
-        if lw.w_gate.is_sliced {
-            if targets.gate || targets.up {
-                add_linear(
-                    lw.w_gate.name,
-                    lw.w_gate.cols,
-                    lw.w_gate.rows + lw.w_up.rows,
-                );
+        if let Some(ref moe) = lw.moe {
+            if targets.gate {
+                add_linear(moe.gate_inp.name, moe.gate_inp.cols, moe.gate_inp.rows);
+            }
+            if let Some(ref sh) = moe.shared_expert {
+                if targets.gate {
+                    add_linear(sh.w_gate.name, sh.w_gate.cols, sh.w_gate.rows);
+                    if let Some(ref gi) = sh.w_gate_inp_shexp {
+                        add_linear(gi.name, gi.cols, gi.rows);
+                    }
+                }
+                if targets.up {
+                    add_linear(sh.w_up.name, sh.w_up.cols, sh.w_up.rows);
+                }
+                if targets.down {
+                    add_linear(sh.w_down.name, sh.w_down.cols, sh.w_down.rows);
+                }
             }
         } else {
-            if targets.gate {
-                add_linear(lw.w_gate.name, lw.w_gate.cols, lw.w_gate.rows);
+            if lw.w_gate.is_sliced {
+                if targets.gate || targets.up {
+                    add_linear(
+                        lw.w_gate.name,
+                        lw.w_gate.cols,
+                        lw.w_gate.rows + lw.w_up.rows,
+                    );
+                }
+            } else {
+                if targets.gate {
+                    add_linear(lw.w_gate.name, lw.w_gate.cols, lw.w_gate.rows);
+                }
+                if targets.up {
+                    add_linear(lw.w_up.name, lw.w_up.cols, lw.w_up.rows);
+                }
             }
-            if targets.up {
-                add_linear(lw.w_up.name, lw.w_up.cols, lw.w_up.rows);
+            if targets.down {
+                add_linear(lw.w_down.name, lw.w_down.cols, lw.w_down.rows);
             }
-        }
-        if targets.down {
-            add_linear(lw.w_down.name, lw.w_down.cols, lw.w_down.rows);
         }
     }
 

@@ -125,3 +125,13 @@
   2. **落地 `LayerState::Ssm { state, conv_hist }` 与 0-ULP `mamba2_scan_head` 内核三件套**：按 `ARCHITECTURE.md` §5.2 补齐 `LayerState::Ssm`（支持 `PrefixCache` 检查点恢复与 `ADR-005` 投机验证只读扫描 + 重放提交）；在 `tm-cpu` 实现 `generic`、`aarch64::neon_v80` 与 `x86_64::avx2` 三档 `mamba2_scan_head`（统一 8 路成对树形 FMA 归约，达成全 CPU ISA **0-ULP** 逐位一致），并在 `tm-metal` 实现 `mamba2_conv_scan_f32` GPU 内核。
   3. **单一 `Mamba2Model` 统一驱动四类 SSM/混合架构（`mamba2`、`nemotron_h`、`falcon-h1`、`granitehybrid`）**：将每层建模为可组合的算子序列（纯 `Mamba2Mixer`、按层异构 `Ssm | Attn | Relu2Ffn`、或同层并行 `Attn + Ssm -> SwiGLU`），严格遵守分组 RMSNorm（`n_group` 组独立归一化）与 `ssm_d` 按头广播契约，并配套 `Mamba2Trainer` 支持 `O(1)` 块边界状态检查点的精确 QLoRA 反向传播。
 - **后果**：新增一套 Mamba-2 核心算子即可一举打通 `mamba2`、`nemotron_h`、`falcon-h1`、`granitehybrid` 四大架构（连同 `olmo2`/`granite` 共 6 类架构标识），使 `tinymodel` 对 Hugging Face 现代 ≤8B 文本与混合架构实现近乎全量覆盖，且保持推理热路径零堆分配与 `micro` 档静态体积预算。
+
+## ADR-018：通用细粒度稀疏 MoE 子模块（`SparseMoeFfn`）与 P2a 架构群支持（2026-11-24）
+
+- **状态**：已接受
+- **背景**：按 `docs/research/15-hf-sub8b-architectures.md` P2a 路线，端侧 ≤8B 稀疏混合专家模型（`olmoe`、`granitemoe`、`granitehybrid`/`granitemoehybrid`、`qwen2moe`、`qwen3moe`、`bailingmoe2`）可将每 token 访存压至 0.2B–1.0B，显著缓解 Pixel 8、RK3588 与 Pi 5 的内存带宽瓶颈；此前 MoE 路由与专家求值仅内嵌在 `inkling2.rs` 中，尚未复用于标准 Attention 与 Mamba-2 混合主干。
+- **决策**：
+  1. 在 `crates/tm-models/src/moe.rs`（`#![forbid(unsafe_code)]`）新增可复用的 `SparseMoeFfn` 与预分配 `MoeScratch`，支持三维打包专家张量（分离 `ffn_{gate,up,down}_exps.weight` 与融合 `ffn_gate_up_exps.weight` 零拷贝切片，各带自身 `DType`）、`Softmax` / `Sigmoid` / `SoftmaxWeight` / `SqrtSoftplus` 门控、可选 `exp_probs_b.bias` 路由偏置、`expert_weights_norm`（`6.103515625e-5` F16 下限保护）与 `expert_weights_scale`，以及可选共享专家（`ffn_{gate,up,down}_shexp.weight` 及 `qwen2moe` 的 `sigmoid(ffn_gate_inp_shexp)` 门控）；单步与批处理严格按确定性 `0..n_expert_used` 顺序归约以保持 `0-ULP` 批不变性。
+  2. 将 `SparseMoeFfn` 同时挂载到 `LlamaModel`（解锁 `olmoe`、`granitemoe`、`qwen2moe`、`qwen3moe`、`bailingmoe2`，并顺带接入同构稠密架构 `exaone`）与 `Mamba2Model`（解锁 `expert_count > 0` 的 `granitehybrid` / `granitemoehybrid`）。
+  3. 在 `tm-metal` 新增单 `MTLCommandBuffer` 零 CPU 往返的 GPU 路由与间接专家偏移内核（`moe_router_topk_f32` + 索引化专家投影），并在 `tm-train`（`LlamaTrainer`、`Mamba2Trainer`）补齐通过激活专家、共享专家与门控路由器的 **0-ULP** 前向门禁及精确解析反向传播。
+- **后果**：无需新增底层 CPU SIMD 指令即可在稠密 Attention 与 Mamba-2 混合两条主干上同时解锁全部主流端侧细粒度 MoE 架构，保持 token 生成零堆分配与全栈 `CPU + Metal + QLoRA` 一致性。

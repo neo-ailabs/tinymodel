@@ -58,6 +58,8 @@ pub mod lora_gpu;
 #[cfg(target_vendor = "apple")]
 pub mod mamba2_runner;
 #[cfg(target_vendor = "apple")]
+pub mod moe_gpu;
+#[cfg(target_vendor = "apple")]
 pub mod qwen35_runner;
 #[cfg(target_vendor = "apple")]
 pub mod train_accel;
@@ -97,7 +99,8 @@ impl MetalRunner {
         let arch = gguf.req_str("general.architecture")?.to_string();
         match arch.as_str() {
             "llama" | "qwen2" | "qwen3" | "smollm3" | "phi3" | "mistral" | "mistral3" | "olmo2"
-            | "olmo3" | "granite" => Ok(MetalRunner::Llama(LlamaMetalRunner::from_gguf(
+            | "olmo3" | "granite" | "exaone" | "olmoe" | "granitemoe" | "qwen2moe" | "qwen3moe"
+            | "bailingmoe2" => Ok(MetalRunner::Llama(LlamaMetalRunner::from_gguf(
                 gguf, max_ctx,
             )?)),
             "qwen35" => Ok(MetalRunner::Qwen35(Qwen35MetalRunner::from_gguf(
@@ -109,9 +112,9 @@ impl MetalRunner {
             "lfm2" | "lfm3" => Ok(MetalRunner::Lfm2(Lfm2MetalRunner::from_gguf(
                 gguf, max_ctx,
             )?)),
-            "mamba2" | "nemotron_h" | "falcon-h1" | "granitehybrid" => Ok(MetalRunner::Mamba2(
-                Mamba2MetalRunner::from_gguf(gguf, max_ctx)?,
-            )),
+            "mamba2" | "nemotron_h" | "falcon-h1" | "granitehybrid" | "granitemoehybrid" => Ok(
+                MetalRunner::Mamba2(Mamba2MetalRunner::from_gguf(gguf, max_ctx)?),
+            ),
             _ => Err(MetalError::UnsupportedArch(arch)),
         }
     }

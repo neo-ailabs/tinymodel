@@ -31,16 +31,16 @@
 | 10 | **`phi3`** | 5 (1.7%) | 1,168,582 (0.8%) | `microsoft/Phi-3-mini` / `Phi-4-mini` (3.82B) | ✅ 已支持（P0） |
 | 11 | **`qwen3_5`** | 4 (1.4%) | 2,267,361 (1.5%) | `Qwen3.5-0.8B/2B/4B/9B`（主力在 VLM 类目） | ✅ 已支持 |
 | 12 | **`olmo3`** | 4 (1.4%) | 359,402 (0.2%) | `allenai/Olmo-3-7B-Instruct` (7.30B) | ✅ 已支持（P1） |
-| 13 | `exaone` | 3 (1.0%) | 421,979 (0.3%) | `LGAI-EXAONE/EXAONE-3.5-7.8B-Instruct` (7.82B) | ⬜ 易扩展 |
+| 13 | **`exaone`** | 3 (1.0%) | 421,979 (0.3%) | `LGAI-EXAONE/EXAONE-3.5-7.8B-Instruct` (7.82B) | ✅ 已支持（P2a） |
 | 14 | **`smollm3`** | 3 (1.0%) | 483,866 (0.3%) | `HuggingFaceTB/SmolLM3-3B` (3.08B) | ✅ 已支持（P0） |
 | 15 | **`nemotron_h`** | 3 (1.0%) | 327,774 (0.2%) | `nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16` (3.97B) | ✅ 已支持（P1） |
 | 16 | **`gemma2`** | 3 (1.0%) | 384,068 (0.3%) | `google/gemma-2-2b-it` (2.61B) | ✅ 已支持（P0） |
 | 17 | **`olmo2`** | 3 (1.0%) | 281,785 (0.2%) | `allenai/OLMo-2-0425-1B` (1.48B) | ✅ 已支持（P1） |
 | 18 | **`gemma4`** | 3 (1.0%) | 258,626 (0.2%) | `Gemma-4-E2B` / `E4B`（主力在 VLM 类目） | ✅ 已支持 |
 | 19 | `nemotron_labs_diffusion` | 2 (0.7%) | 300,104 (0.2%) | `nvidia/Nemotron-Labs-Diffusion-3B` (3.83B) | ⬜ 扩散范式 |
-| 20 | `olmoe` / `granitemoe` | 4 (1.4%) | 317,391 (0.2%) | `OLMoE-1B-7B` (6.92B) / `granite-3.1-3b-a800m` | ⬜ 需通用 MoE |
+| 20 | **`olmoe` / `granitemoe`** | 4 (1.4%) | 317,391 (0.2%) | `OLMoE-1B-7B` (6.92B) / `granite-3.1-3b-a800m` | ✅ 已支持（P2a） |
 | 21 | `minicpm_sala` | 1 (0.3%) | 631,783 (0.4%) | `openbmb/MiniCPM-SALA` | ⬜ 需稀疏/线性混合 |
-| 22 | `bailing_hybrid` | 1 (0.3%) | 447,716 (0.3%) | `inclusionAI/Ling-3.0-tiny` (7.89B) | ⬜ 需通用 MoE + 混合 |
+| 22 | **`bailing_hybrid` (`bailingmoe2`)** | 1 (0.3%) | 447,716 (0.3%) | `inclusionAI/Ling-3.0-tiny` (7.89B) | ✅ 已支持（P2a） |
 | 23 | **`lfm3`** | 1 (0.3%) | 146,872 (0.1%) | `LiquidAI/LFM3-1.7B` (1.73B) | ✅ 已支持（P0） |
 
 **核心统计结论**：
@@ -125,9 +125,9 @@
 ## 4. `tinymodel` 覆盖度评估与后续扩展路线
 
 ### 4.1 当前覆盖度
-`crates/tm-models/src/` 已实现 `llama`、`qwen2`、`qwen3`、`smollm3`、`phi3`（含 Phi-3.5 / Phi-4-mini）、`mistral` / `mistral3`、`olmo2` / `olmo3`、`granite`、`qwen35`、`gemma2`、`gemma3`、`gemma4`、`lfm2`、`lfm3`、`mamba2`、`nemotron_h`、`falcon-h1`、`granitehybrid`、`inkling2`。按 Hugging Face Top-1,000 实测数据：
-- **存量纯文本覆盖率**：在完成 P0 + P1 扩展后，已覆盖现代 ≤8B 文本模型下载量的 **~98%+**（剔除 `gpt2`/`gpt_neox` 历史教学模型）。
-- **新一代混合范式全覆盖**：已完整覆盖 **GDN 线性注意力（Qwen3.5）**、**Mamba-2 SSM 及三大混合拓扑（`mamba2` 纯 SSM / `nemotron_h` 异构顺序混合 + ReLU² / `falcon-h1` 并行 Attention+SSM / `granitehybrid` 交错混合 + muP）**、**PLE + 共享 KV + SWA + 注意力软上限（Gemma 2 / 3 / 4）**、**门控 ShortConv + SWA/Full 混合注意力 + 逐头门控（LFM2 / LFM3）** 及 **大型循环稀疏 MoE（Inkling-2）**。
+`crates/tm-models/src/` 已实现 `llama`、`qwen2`、`qwen3`、`smollm3`、`phi3`（含 Phi-3.5 / Phi-4-mini）、`mistral` / `mistral3`、`olmo2` / `olmo3`、`granite`、`exaone`、`olmoe`、`granitemoe`、`qwen2moe`、`qwen3moe`、`bailingmoe2`、`qwen35`、`gemma2`、`gemma3`、`gemma4`、`lfm2`、`lfm3`、`mamba2`、`nemotron_h`、`falcon-h1`、`granitehybrid` / `granitemoehybrid`、`inkling2`。按 Hugging Face Top-1,000 实测数据：
+- **存量纯文本覆盖率**：在完成 P0 + P1 + P2a 扩展后，已覆盖现代 ≤8B 文本与稀疏 MoE 模型下载量的 **~99%+**（剔除 `gpt2`/`gpt_neox` 历史教学模型）。
+- **新一代混合与稀疏范式全覆盖**：已完整覆盖 **通用细粒度稀疏 MoE（`SparseMoeFfn`：`olmoe`、`granitemoe`、`granitemoehybrid`、`qwen2moe`、`qwen3moe`、`bailingmoe2`）**、**GDN 线性注意力（Qwen3.5）**、**Mamba-2 SSM 及三大混合拓扑（`mamba2` 纯 SSM / `nemotron_h` 异构顺序混合 + ReLU² / `falcon-h1` 并行 Attention+SSM / `granitehybrid` & `granitemoehybrid` 交错混合 + MoE + muP）**、**PLE + 共享 KV + SWA + 注意力软上限（Gemma 2 / 3 / 4）**、**门控 ShortConv + SWA/Full 混合注意力 + 逐头门控（LFM2 / LFM3）** 及 **大型循环稀疏 MoE（Inkling-2）**。
 
 ### 4.2 算子复用与扩展优先级建议
 
@@ -138,5 +138,5 @@
 | **P0（零新算子）** | `lfm3` | 在 `lfm2.rs` 补齐三路 `ShortConv` + SWA + Full 分发、双频/+inf 部分 RoPE、逐头 `attn_gate` 与三明治归一化 | 低 | ✅ **已完成（2026-11-24）**：支持 Liquid AI 最新 `LFM3-1.7B`（CPU + Metal + QLoRA 全栈） |
 | **P1（小改动）** | `olmo2` / `olmo3`、`granite` | 纯 Post-Norm + 全向量 `[q_dim]`/`[kv_dim]` QK-Norm + 3:1 双频 SWA（OLMo 2/3）；4 项 muP 缩放系数 + MLP bias + LongRoPE（Granite） | 低 | ✅ **已完成（2026-11-24）**：覆盖 AI2 OLMo 2/3 与 IBM Granite 3.x/4.0 稠密全栈（CPU + Metal + QLoRA） |
 | **P1（战略新算子）** | **Mamba-2 SSM**（`mamba2`、`nemotron_h`、`falcon-h1`、`granitehybrid`） | 新增 `tm-cpu` Mamba-2 离散状态扫描三件套 + 因果 Conv1d + 分组 `ssm_norm` + `LayerState::Ssm` 前缀缓存/投机回滚 + Metal `Mamba2MetalRunner` + `Mamba2Trainer` 8 步边界重算 BPTT | 中（对应 `ROADMAP.md` M6） | ✅ **已完成（2026-11-24）**：**一箭四雕**全栈解锁 `mamba2`、`nemotron_h`、`falcon-h1`、`granitehybrid`（见 `ADR-017`） |
-| **P2（通用化）** | 通用细粒度 MoE | 将 `inkling2.rs` 的 Top-K MoE 路由抽离为公共组件 | 中 | 覆盖 `olmoe`、`granitemoe`、`bailing_hybrid` |
+| **P2a（通用化）** | **通用细粒度稀疏 MoE + `exaone`**（`olmoe`、`granitemoe`、`granitemoehybrid`、`qwen2moe`、`qwen3moe`、`bailingmoe2`、`exaone`） | 公共 `SparseMoeFfn`（零拷贝 3D 分离/融合专家、Softmax/Sigmoid/`exp_probs_b`/`norm_weights`/共享专家/1D `ffn_gate_inp_shexp`）+ Apple Metal 单 CB `GpuMoeEngine` + `moe_qlora` 解析反向 | 中（对应 `ROADMAP.md` M6） | ✅ **已完成（2026-11-24）**：一次贯通 Attention 与 Mamba-2 双骨干 6 种稀疏 MoE 架构及 `exaone`（见 `ADR-018`） |
 | **P2（多模态，M6）** | 视觉编码器（SigLIP / Qwen-VL ViT） | 图像预处理 + ViT 编码器 + Projector | 中高 | 释放 `Qwen3.5`、`Gemma 4`、`Qwen3-VL`、`Ministral 3` 的原生多模态能力 |

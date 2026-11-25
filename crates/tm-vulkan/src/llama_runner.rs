@@ -560,11 +560,22 @@ impl LlamaVkRunner {
                 | "olmo2"
                 | "olmo3"
                 | "granite"
+                | "exaone"
         ) {
             return Err(VulkanError::UnsupportedArch(arch));
         }
 
         let pfx = arch.as_str();
+        if gguf_ref
+            .get_meta(&format!("{pfx}.expert_count"))
+            .and_then(|v| v.as_usize())
+            .unwrap_or(0)
+            > 0
+        {
+            return Err(VulkanError::InvalidDimensions(format!(
+                "sparse MoE variant of '{arch}' requires MoE shader path on Vulkan LlamaVkRunner"
+            )));
+        }
         if matches!(pfx, "olmo2" | "olmo3") {
             return Err(VulkanError::InvalidDimensions(
                 "olmo2/olmo3 pure Post-Norm + full-vector QK-Norm requires dedicated shaders on Vulkan LlamaVkRunner"
@@ -587,7 +598,10 @@ impl LlamaVkRunner {
             }
         }
         let is_qwen = matches!(pfx, "qwen2" | "qwen3");
-        let is_neox = matches!(pfx, "qwen2" | "qwen3" | "phi3" | "olmo2" | "olmo3");
+        let is_neox = matches!(
+            pfx,
+            "qwen2" | "qwen3" | "phi3" | "olmo2" | "olmo3" | "exaone"
+        );
         let n_layers = gguf_ref.req_usize(&format!("{pfx}.block_count"))?;
         let n_embd = gguf_ref.req_usize(&format!("{pfx}.embedding_length"))?;
         let n_ff = gguf_ref.req_usize(&format!("{pfx}.feed_forward_length"))?;

@@ -205,6 +205,7 @@ struct GpuAttn {
     v_cache: MtlBuf,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum GpuFfn {
     SwiGlu {
         n_ff: usize,
@@ -222,6 +223,7 @@ enum GpuFfn {
         b_up: Option<MtlBuf>,
         b_down: Option<MtlBuf>,
     },
+    SparseMoe(crate::moe_gpu::GpuSparseMoe),
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -333,6 +335,7 @@ pub struct Mamba2MetalRunner {
     hb: MtlBuf,
     hb2: MtlBuf,
     logits: MtlBuf,
+    moe_engine: Option<crate::moe_gpu::GpuMoeEngine>,
     lora: MetalLoraEngine,
     zero_copy_weights: bool,
     _gguf: Arc<GgufFile>,
@@ -901,7 +904,7 @@ impl Mamba2MetalRunner {
         let arch = gguf_ref.req_str("general.architecture")?.to_string();
         if !matches!(
             arch.as_str(),
-            "mamba2" | "nemotron_h" | "falcon-h1" | "granitehybrid"
+            "mamba2" | "nemotron_h" | "falcon-h1" | "granitehybrid" | "granitemoehybrid"
         ) {
             return Err(MetalError::UnsupportedArch(arch));
         }
@@ -1163,6 +1166,13 @@ impl Mamba2MetalRunner {
             None => (false, dummy_f32.clone()),
         };
 
+        let moe_params =
+            crate::moe_gpu::parse_moe_arch_params(gguf_ref, pfx, &arch, n_layers, max_n_ff)?;
+        let mut max_n_exp = 0usize;
+        let mut max_k_exp = 0usize;
+        let mut max_ff_exp = 0usize;
+        let mut max_ff_shexp = 0usize;
+
         let mut layers = Vec::with_capacity(n_layers);
         for l in 0..n_layers {
             let ltag = format!("blk.{l}");
@@ -1241,7 +1251,7 @@ impl Mamba2MetalRunner {
                         }
                     }
                 }
-                "granitehybrid" => {
+                "granitehybrid" | "granitemoehybrid" => {
                     let nh_kv = n_head_kv_per_layer[l];
                     let n_ff = n_ff_per_layer[l];
                     let ffn_norm = load_gpu_f32_vec(
@@ -1251,7 +1261,18 @@ impl Mamba2MetalRunner {
                         &ltag,
                         n_embd,
                     )?;
-                    let ffn = load_gpu_swiglu(&device, gguf_ref, sw, &ltag, n_embd, n_ff)?;
+                    let ffn = if let Some(ref mp) = moe_params
+                        && let Some(moe) = crate::moe_gpu::load_gpu_layer_moe(
+                            &device, gguf_ref, sw, l, &ltag, n_embd, mp,
+                        )? {
+                        max_n_exp = max_n_exp.max(moe.cfg.n_expert);
+                        max_k_exp = max_k_exp.max(moe.cfg.n_expert_used);
+                        max_ff_exp = max_ff_exp.max(moe.cfg.n_ff_exp);
+                        max_ff_shexp = max_ff_shexp.max(moe.cfg.n_ff_shexp);
+                        GpuFfn::SparseMoe(moe)
+                    } else {
+                        load_gpu_swiglu(&device, gguf_ref, sw, &ltag, n_embd, n_ff)?
+                    };
                     if nh_kv == 0 {
                         let ssm = load_gpu_ssm(&device, gguf_ref, sw, &ltag, n_embd, &cfg, true)?;
                         GpuMamba2Block::SsmAndFfn { ssm, ffn_norm, ffn }
@@ -1339,6 +1360,16 @@ impl Mamba2MetalRunner {
         let hb = alloc_buf(&device, MAX_BATCH * max_n_ff * f32_sz)?;
         let hb2 = alloc_buf(&device, MAX_BATCH * max_n_ff * f32_sz)?;
         let logits = alloc_buf(&device, vocab_size * f32_sz)?;
+        let moe_engine = crate::moe_gpu::GpuMoeEngine::new(
+            &device,
+            &lib,
+            MAX_BATCH,
+            n_embd,
+            max_n_exp,
+            max_k_exp,
+            max_ff_exp,
+            max_ff_shexp,
+        )?;
 
         Ok(Self {
             cfg,
@@ -1374,6 +1405,7 @@ impl Mamba2MetalRunner {
             hb,
             hb2,
             logits,
+            moe_engine,
             lora,
             zero_copy_weights,
             _gguf: gguf,
@@ -2175,6 +2207,19 @@ impl Mamba2MetalRunner {
                 self.encode_linear(enc, w_down, &w_down.name, &self.hb, &self.xb2, b, false)?;
                 if let Some(bd) = b_down {
                     self.encode_add_bias(enc, bd, &self.xb2, self.cfg.n_embd, b)?;
+                }
+            }
+            GpuFfn::SparseMoe(moe) => {
+                if let Some(ref eng) = self.moe_engine {
+                    eng.encode_moe_ffn(
+                        enc,
+                        &self.lora,
+                        moe,
+                        &self.xb,
+                        &self.xb2,
+                        self.cfg.n_embd,
+                        b,
+                    )?;
                 }
             }
         }

@@ -53,11 +53,12 @@ impl<'a> CpuModel<'a> {
         let arch = gguf.req_str("general.architecture")?;
         match arch {
             "llama" | "qwen2" | "qwen3" | "smollm3" | "phi3" | "mistral" | "mistral3" | "olmo2"
-            | "olmo3" | "granite" => Ok(CpuModel::Llama(LlamaModel::from_gguf(gguf)?)),
+            | "olmo3" | "granite" | "exaone" | "olmoe" | "granitemoe" | "qwen2moe" | "qwen3moe"
+            | "bailingmoe2" => Ok(CpuModel::Llama(LlamaModel::from_gguf(gguf)?)),
             "qwen35" => Ok(CpuModel::Qwen35(Qwen35Model::from_gguf(gguf)?)),
             "gemma2" | "gemma3" | "gemma4" => Ok(CpuModel::Gemma4(Gemma4Model::from_gguf(gguf)?)),
             "lfm2" | "lfm3" => Ok(CpuModel::Lfm2(Lfm2Model::from_gguf(gguf)?)),
-            "mamba2" | "nemotron_h" | "falcon-h1" | "granitehybrid" => {
+            "mamba2" | "nemotron_h" | "falcon-h1" | "granitehybrid" | "granitemoehybrid" => {
                 Ok(CpuModel::Mamba2(Mamba2Model::from_gguf(gguf)?))
             }
             "inkling2" | "inkling2_loop" => Ok(CpuModel::Inkling2(Box::new(
@@ -128,7 +129,8 @@ impl<'a> CpuModel<'a> {
             CpuModel::Llama(m) => {
                 let c = &m.cfg;
                 let kv = kv_bytes_for(c.n_layers, c.n_head_kv * c.head_dim);
-                let sc = ((c.vocab_size + 36 * (c.n_embd + c.n_ff)) * 4) as u64;
+                let ff_max = c.n_ff.max(c.max_n_ff_exp).max(c.max_n_ff_shexp);
+                let sc = ((c.vocab_size + 36 * (c.n_embd + ff_max + c.n_expert)) * 4) as u64;
                 kv + sc
             }
             CpuModel::Qwen35(m) => {

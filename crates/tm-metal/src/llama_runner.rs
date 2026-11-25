@@ -223,6 +223,7 @@ struct GpuLayer {
     w_gate: GpuMat,
     w_up: GpuMat,
     w_down: GpuMat,
+    moe: Option<crate::moe_gpu::GpuSparseMoe>,
     k_cache: MtlBuf,
     v_cache: MtlBuf,
 }
@@ -299,6 +300,7 @@ pub struct LlamaMetalRunner {
     hb: MtlBuf,
     hb2: MtlBuf,
     logits: MtlBuf,
+    moe_engine: Option<crate::moe_gpu::GpuMoeEngine>,
     lora: MetalLoraEngine,
     zero_copy_weights: bool,
     // IMPORTANT: Must remain LAST so all `MTLBuffer` fields (including zero-copy views
@@ -572,17 +574,49 @@ impl LlamaMetalRunner {
                 | "olmo2"
                 | "olmo3"
                 | "granite"
+                | "exaone"
+                | "olmoe"
+                | "granitemoe"
+                | "qwen2moe"
+                | "qwen3moe"
+                | "bailingmoe2"
         ) {
             return Err(MetalError::UnsupportedArch(arch));
         }
 
         let pfx = arch.as_str();
-        let is_qwen = matches!(pfx, "qwen2" | "qwen3");
+        let is_qwen = matches!(pfx, "qwen2" | "qwen3" | "qwen2moe" | "qwen3moe");
         let is_olmo = matches!(pfx, "olmo2" | "olmo3");
-        let is_neox = matches!(pfx, "qwen2" | "qwen3" | "phi3" | "olmo2" | "olmo3");
+        let is_neox = matches!(
+            pfx,
+            "qwen2"
+                | "qwen3"
+                | "phi3"
+                | "olmo2"
+                | "olmo3"
+                | "exaone"
+                | "olmoe"
+                | "qwen2moe"
+                | "qwen3moe"
+                | "bailingmoe2"
+        );
         let n_layers = gguf_ref.req_usize(&format!("{pfx}.block_count"))?;
         let n_embd = gguf_ref.req_usize(&format!("{pfx}.embedding_length"))?;
-        let n_ff = gguf_ref.req_usize(&format!("{pfx}.feed_forward_length"))?;
+        let has_experts = gguf_ref
+            .get_meta(&format!("{pfx}.expert_count"))
+            .and_then(|v| v.as_usize())
+            .unwrap_or(0)
+            > 0;
+        let n_ff = if has_experts {
+            gguf_ref
+                .get_meta(&format!("{pfx}.feed_forward_length"))
+                .and_then(|v| v.as_usize())
+                .unwrap_or(0)
+        } else {
+            gguf_ref.req_usize(&format!("{pfx}.feed_forward_length"))?
+        };
+        let moe_params =
+            crate::moe_gpu::parse_moe_arch_params(gguf_ref, pfx, &arch, n_layers, n_ff)?;
         let n_head = gguf_ref.req_usize(&format!("{pfx}.attention.head_count"))?;
         let n_head_kv = gguf_ref
             .get_meta(&format!("{pfx}.attention.head_count_kv"))
@@ -961,76 +995,107 @@ impl LlamaMetalRunner {
                 )
             };
 
-            let gate_name = format!("{ltag}.ffn_gate.weight");
-            let up_name = format!("{ltag}.ffn_up.weight");
-            let (w_gate, w_up, b_gate, b_up) = if gguf_ref.tensor_info(&gate_name).is_some() {
-                (
-                    load_gpu_mat(&device, gguf_ref, sw, &gate_name, &ltag, n_embd, n_ff)?,
-                    load_gpu_mat(&device, gguf_ref, sw, &up_name, &ltag, n_embd, n_ff)?,
-                    load_opt_gpu_f32_vec(
-                        &device,
-                        gguf_ref,
-                        &format!("{ltag}.ffn_gate.bias"),
-                        &ltag,
-                        n_ff,
-                    )?,
-                    load_opt_gpu_f32_vec(
-                        &device,
-                        gguf_ref,
-                        &format!("{ltag}.ffn_up.bias"),
-                        &ltag,
-                        n_ff,
-                    )?,
-                )
+            let moe = if let Some(ref mp) = moe_params {
+                crate::moe_gpu::load_gpu_layer_moe(&device, gguf_ref, sw, l, &ltag, n_embd, mp)?
             } else {
-                let up_bias_name = format!("{ltag}.ffn_up.bias");
-                let (bg, bu) = if gguf_ref.tensor_info(&up_bias_name).is_some() {
-                    let (info, bytes) = gguf_ref.req_tensor(&up_bias_name, &ltag, &[2 * n_ff])?;
-                    let mut full = vec![0.0f32; 2 * n_ff];
-                    dequantize_row_bytes(info.dtype, bytes, &mut full);
+                None
+            };
+
+            let (w_gate, w_up, w_down, b_gate, b_up, b_down) = if moe.is_some() {
+                let dummy_buf = alloc_buf(&device, 16)?;
+                let empty_mat = || GpuMat {
+                    name: String::new(),
+                    buf: dummy_buf.clone(),
+                    offset: 0,
+                    dtype: DType::F32,
+                    rows: 0,
+                    cols: 0,
+                    row_bytes: 0,
+                };
+                (empty_mat(), empty_mat(), empty_mat(), None, None, None)
+            } else {
+                let gate_name = format!("{ltag}.ffn_gate.weight");
+                let up_name = format!("{ltag}.ffn_up.weight");
+                let (wg, wu, bg, bu) = if gguf_ref.tensor_info(&gate_name).is_some() {
                     (
-                        Some(upload_f32(&device, &full[..n_ff])?),
-                        Some(upload_f32(&device, &full[n_ff..])?),
+                        load_gpu_mat(&device, gguf_ref, sw, &gate_name, &ltag, n_embd, n_ff)?,
+                        load_gpu_mat(&device, gguf_ref, sw, &up_name, &ltag, n_embd, n_ff)?,
+                        load_opt_gpu_f32_vec(
+                            &device,
+                            gguf_ref,
+                            &format!("{ltag}.ffn_gate.bias"),
+                            &ltag,
+                            n_ff,
+                        )?,
+                        load_opt_gpu_f32_vec(
+                            &device,
+                            gguf_ref,
+                            &format!("{ltag}.ffn_up.bias"),
+                            &ltag,
+                            n_ff,
+                        )?,
                     )
                 } else {
-                    (None, None)
+                    let up_bias_name = format!("{ltag}.ffn_up.bias");
+                    let (bg, bu) = if gguf_ref.tensor_info(&up_bias_name).is_some() {
+                        let (info, bytes) =
+                            gguf_ref.req_tensor(&up_bias_name, &ltag, &[2 * n_ff])?;
+                        let mut full = vec![0.0f32; 2 * n_ff];
+                        dequantize_row_bytes(info.dtype, bytes, &mut full);
+                        (
+                            Some(upload_f32(&device, &full[..n_ff])?),
+                            Some(upload_f32(&device, &full[n_ff..])?),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    (
+                        load_gpu_mat_slice(
+                            &device,
+                            gguf_ref,
+                            sw,
+                            &up_name,
+                            gate_name,
+                            &ltag,
+                            n_embd,
+                            2 * n_ff,
+                            0,
+                            n_ff,
+                        )?,
+                        load_gpu_mat_slice(
+                            &device,
+                            gguf_ref,
+                            sw,
+                            &up_name,
+                            up_name.clone(),
+                            &ltag,
+                            n_embd,
+                            2 * n_ff,
+                            n_ff,
+                            n_ff,
+                        )?,
+                        bg,
+                        bu,
+                    )
                 };
-                (
-                    load_gpu_mat_slice(
-                        &device,
-                        gguf_ref,
-                        sw,
-                        &up_name,
-                        gate_name,
-                        &ltag,
-                        n_embd,
-                        2 * n_ff,
-                        0,
-                        n_ff,
-                    )?,
-                    load_gpu_mat_slice(
-                        &device,
-                        gguf_ref,
-                        sw,
-                        &up_name,
-                        up_name.clone(),
-                        &ltag,
-                        n_embd,
-                        2 * n_ff,
-                        n_ff,
-                        n_ff,
-                    )?,
-                    bg,
-                    bu,
-                )
+                let bd = load_opt_gpu_f32_vec(
+                    &device,
+                    gguf_ref,
+                    &format!("{ltag}.ffn_down.bias"),
+                    &ltag,
+                    n_embd,
+                )?;
+                let wd = load_gpu_mat(
+                    &device,
+                    gguf_ref,
+                    sw,
+                    &format!("{ltag}.ffn_down.weight"),
+                    &ltag,
+                    n_ff,
+                    n_embd,
+                )?;
+                (wg, wu, wd, bg, bu, bd)
             };
-            let b_down = load_opt_gpu_f32_vec(
-                &device,
-                gguf_ref,
-                &format!("{ltag}.ffn_down.bias"),
-                &ltag,
-                n_embd,
-            )?;
 
             let attn_norm = if is_olmo {
                 load_opt_gpu_f32_vec(
@@ -1109,19 +1174,35 @@ impl LlamaMetalRunner {
                 )?,
                 w_gate,
                 w_up,
-                w_down: load_gpu_mat(
-                    &device,
-                    gguf_ref,
-                    sw,
-                    &format!("{ltag}.ffn_down.weight"),
-                    &ltag,
-                    n_ff,
-                    n_embd,
-                )?,
+                w_down,
+                moe,
                 k_cache: alloc_buf(&device, kv_bytes)?,
                 v_cache: alloc_buf(&device, kv_bytes)?,
             });
         }
+
+        let mut max_n_ff_exp = 0usize;
+        let mut max_n_ff_shexp = 0usize;
+        for ly in &layers {
+            if let Some(ref m) = ly.moe {
+                max_n_ff_exp = max_n_ff_exp.max(m.cfg.n_ff_exp);
+                max_n_ff_shexp = max_n_ff_shexp.max(m.cfg.n_ff_shexp);
+            }
+        }
+        let moe_engine = if let Some(ref mp) = moe_params {
+            crate::moe_gpu::GpuMoeEngine::new(
+                &device,
+                &lib,
+                MAX_BATCH,
+                n_embd,
+                mp.n_expert,
+                mp.n_expert_used,
+                max_n_ff_exp,
+                max_n_ff_shexp,
+            )?
+        } else {
+            None
+        };
 
         let f32_sz = core::mem::size_of::<f32>();
         let token_ids_buf = alloc_buf(&device, MAX_BATCH * core::mem::size_of::<u32>())?;
@@ -1183,6 +1264,7 @@ impl LlamaMetalRunner {
             hb,
             hb2,
             logits,
+            moe_engine,
             lora,
             zero_copy_weights,
             _gguf: gguf,
@@ -2275,49 +2357,17 @@ impl LlamaMetalRunner {
                     self.encode_copy_f32(&enc, &self.x, &self.xb, b * self.cfg.n_embd)?;
                 }
 
-                // Batched Gate + Up via hardware simdgroup_float8x8 GEMM + SwiGLU
-                self.encode_gemm(&enc, &layer.w_gate, &self.xb, &self.hb, b, false)?;
-                self.encode_gemm(&enc, &layer.w_up, &self.xb, &self.hb2, b, false)?;
-                if let Some(ref bg) = layer.b_gate {
-                    self.encode_add_bias(&enc, bg, &self.hb, self.cfg.n_ff, b)?;
-                }
-                if let Some(ref bu) = layer.b_up {
-                    self.encode_add_bias(&enc, bu, &self.hb2, self.cfg.n_ff, b)?;
-                }
-                {
-                    const TG: usize = 256;
-                    let total_ff = (b * self.cfg.n_ff) as u32;
-                    enc.setComputePipelineState(&self.pipes.silu_mul);
-                    // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
-                    unsafe {
-                        enc.setBuffer_offset_atIndex(Some(&self.hb), 0, 0);
-                        enc.setBuffer_offset_atIndex(Some(&self.hb2), 0, 1);
-                        enc.setBytes_length_atIndex(
-                            NonNull::from(&total_ff).cast::<c_void>(),
-                            core::mem::size_of::<u32>(),
-                            2,
-                        );
-                    }
-                    enc.dispatchThreadgroups_threadsPerThreadgroup(
-                        MTLSize {
-                            width: (total_ff as usize).div_ceil(TG),
-                            height: 1,
-                            depth: 1,
-                        },
-                        MTLSize {
-                            width: TG,
-                            height: 1,
-                            depth: 1,
-                        },
-                    );
-                }
-
-                // W_down + optional bias + optional post-ffn norm + residual add
-                if need_separate_res || layer.post_ffn_norm.is_some() || layer.b_down.is_some() {
-                    self.encode_gemm(&enc, &layer.w_down, &self.hb, &self.xb2, b, false)?;
-                    if let Some(ref bd) = layer.b_down {
-                        self.encode_add_bias(&enc, bd, &self.xb2, self.cfg.n_embd, b)?;
-                    }
+                if let Some(ref moe) = layer.moe {
+                    let eng = self.moe_engine.as_ref().expect("moe_engine");
+                    eng.encode_moe_ffn(
+                        &enc,
+                        &self.lora,
+                        moe,
+                        &self.xb,
+                        &self.xb2,
+                        self.cfg.n_embd,
+                        b,
+                    )?;
                     if let Some(ref pfn) = layer.post_ffn_norm {
                         self.encode_rms_norm_batch(
                             &enc,
@@ -2344,7 +2394,78 @@ impl LlamaMetalRunner {
                         )?;
                     }
                 } else {
-                    self.encode_gemm(&enc, &layer.w_down, &self.hb, &self.x, b, true)?;
+                    // Batched Gate + Up via hardware simdgroup_float8x8 GEMM + SwiGLU
+                    self.encode_gemm(&enc, &layer.w_gate, &self.xb, &self.hb, b, false)?;
+                    self.encode_gemm(&enc, &layer.w_up, &self.xb, &self.hb2, b, false)?;
+                    if let Some(ref bg) = layer.b_gate {
+                        self.encode_add_bias(&enc, bg, &self.hb, self.cfg.n_ff, b)?;
+                    }
+                    if let Some(ref bu) = layer.b_up {
+                        self.encode_add_bias(&enc, bu, &self.hb2, self.cfg.n_ff, b)?;
+                    }
+                    {
+                        const TG: usize = 256;
+                        let total_ff = (b * self.cfg.n_ff) as u32;
+                        enc.setComputePipelineState(&self.pipes.silu_mul);
+                        // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
+                        unsafe {
+                            enc.setBuffer_offset_atIndex(Some(&self.hb), 0, 0);
+                            enc.setBuffer_offset_atIndex(Some(&self.hb2), 0, 1);
+                            enc.setBytes_length_atIndex(
+                                NonNull::from(&total_ff).cast::<c_void>(),
+                                core::mem::size_of::<u32>(),
+                                2,
+                            );
+                        }
+                        enc.dispatchThreadgroups_threadsPerThreadgroup(
+                            MTLSize {
+                                width: (total_ff as usize).div_ceil(TG),
+                                height: 1,
+                                depth: 1,
+                            },
+                            MTLSize {
+                                width: TG,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                    }
+
+                    // W_down + optional bias + optional post-ffn norm + residual add
+                    if need_separate_res || layer.post_ffn_norm.is_some() || layer.b_down.is_some()
+                    {
+                        self.encode_gemm(&enc, &layer.w_down, &self.hb, &self.xb2, b, false)?;
+                        if let Some(ref bd) = layer.b_down {
+                            self.encode_add_bias(&enc, bd, &self.xb2, self.cfg.n_embd, b)?;
+                        }
+                        if let Some(ref pfn) = layer.post_ffn_norm {
+                            self.encode_rms_norm_batch(
+                                &enc,
+                                &self.xb2,
+                                pfn,
+                                &self.xb,
+                                self.cfg.n_embd,
+                                b,
+                            )?;
+                            self.encode_scale_axpy(
+                                &enc,
+                                &self.xb,
+                                &self.x,
+                                b * self.cfg.n_embd,
+                                self.cfg.residual_scale,
+                            )?;
+                        } else {
+                            self.encode_scale_axpy(
+                                &enc,
+                                &self.xb2,
+                                &self.x,
+                                b * self.cfg.n_embd,
+                                self.cfg.residual_scale,
+                            )?;
+                        }
+                    } else {
+                        self.encode_gemm(&enc, &layer.w_down, &self.hb, &self.x, b, true)?;
+                    }
                 }
             }
 
@@ -2631,88 +2752,17 @@ impl LlamaMetalRunner {
                 self.encode_copy_f32(enc, &self.x, &self.xb, self.cfg.n_embd)?;
             }
 
-            if layer.w_gate.dtype == DType::Q4_0
-                && layer.w_up.dtype == DType::Q4_0
-                && layer.b_gate.is_none()
-                && layer.b_up.is_none()
-                && !self.lora.has(&layer.w_gate.name)
-                && !self.lora.has(&layer.w_up.name)
-            {
-                const THREADS: usize = 128;
-                const ROWS_PER_TG: usize = 16;
-                let gargs = GemvArgs {
-                    n_in: layer.w_gate.cols as u32,
-                    n_out: layer.w_gate.rows as u32,
-                    add_residual: 0,
-                    row_bytes: layer.w_gate.row_bytes as u32,
-                };
-                enc.setComputePipelineState(&self.pipes.gemv_pair_silu_q4_0);
-                // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
-                unsafe {
-                    enc.setBuffer_offset_atIndex(Some(&layer.w_gate.buf), layer.w_gate.offset, 0);
-                    enc.setBuffer_offset_atIndex(Some(&layer.w_up.buf), layer.w_up.offset, 1);
-                    enc.setBuffer_offset_atIndex(Some(&self.xb), 0, 2);
-                    enc.setBuffer_offset_atIndex(Some(&self.hb), 0, 3);
-                    enc.setBytes_length_atIndex(
-                        NonNull::from(&gargs).cast::<c_void>(),
-                        core::mem::size_of::<GemvArgs>(),
-                        4,
-                    );
-                }
-                enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize {
-                        width: layer.w_gate.rows.div_ceil(ROWS_PER_TG),
-                        height: 1,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: THREADS,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-            } else {
-                self.encode_gemv(enc, &layer.w_gate, &self.xb, &self.hb, false)?;
-                self.encode_gemv(enc, &layer.w_up, &self.xb, &self.hb2, false)?;
-                if let Some(ref bg) = layer.b_gate {
-                    self.encode_add_bias(enc, bg, &self.hb, self.cfg.n_ff, 1)?;
-                }
-                if let Some(ref bu) = layer.b_up {
-                    self.encode_add_bias(enc, bu, &self.hb2, self.cfg.n_ff, 1)?;
-                }
-                const TG: usize = 256;
-                let total_ff = self.cfg.n_ff as u32;
-                require_fit(&self.pipes.silu_mul, "silu_mul", TG)?;
-                enc.setComputePipelineState(&self.pipes.silu_mul);
-                // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
-                unsafe {
-                    enc.setBuffer_offset_atIndex(Some(&self.hb), 0, 0);
-                    enc.setBuffer_offset_atIndex(Some(&self.hb2), 0, 1);
-                    enc.setBytes_length_atIndex(
-                        NonNull::from(&total_ff).cast::<c_void>(),
-                        core::mem::size_of::<u32>(),
-                        2,
-                    );
-                }
-                enc.dispatchThreadgroups_threadsPerThreadgroup(
-                    MTLSize {
-                        width: (total_ff as usize).div_ceil(TG),
-                        height: 1,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: TG,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-            }
-
-            if need_separate_res || layer.post_ffn_norm.is_some() || layer.b_down.is_some() {
-                self.encode_gemv(enc, &layer.w_down, &self.hb, &self.xb2, false)?;
-                if let Some(ref bd) = layer.b_down {
-                    self.encode_add_bias(enc, bd, &self.xb2, self.cfg.n_embd, 1)?;
-                }
+            if let Some(ref moe) = layer.moe {
+                let eng = self.moe_engine.as_ref().expect("moe_engine");
+                eng.encode_moe_ffn(
+                    enc,
+                    &self.lora,
+                    moe,
+                    &self.xb,
+                    &self.xb2,
+                    self.cfg.n_embd,
+                    1,
+                )?;
                 if let Some(ref pfn) = layer.post_ffn_norm {
                     self.encode_rms_norm(enc, &self.xb2, pfn, &self.xb, self.cfg.n_embd)?;
                     self.encode_scale_axpy(
@@ -2732,7 +2782,113 @@ impl LlamaMetalRunner {
                     )?;
                 }
             } else {
-                self.encode_gemv(enc, &layer.w_down, &self.hb, &self.x, true)?;
+                if layer.w_gate.dtype == DType::Q4_0
+                    && layer.w_up.dtype == DType::Q4_0
+                    && layer.b_gate.is_none()
+                    && layer.b_up.is_none()
+                    && !self.lora.has(&layer.w_gate.name)
+                    && !self.lora.has(&layer.w_up.name)
+                {
+                    const THREADS: usize = 128;
+                    const ROWS_PER_TG: usize = 16;
+                    let gargs = GemvArgs {
+                        n_in: layer.w_gate.cols as u32,
+                        n_out: layer.w_gate.rows as u32,
+                        add_residual: 0,
+                        row_bytes: layer.w_gate.row_bytes as u32,
+                    };
+                    enc.setComputePipelineState(&self.pipes.gemv_pair_silu_q4_0);
+                    // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
+                    unsafe {
+                        enc.setBuffer_offset_atIndex(
+                            Some(&layer.w_gate.buf),
+                            layer.w_gate.offset,
+                            0,
+                        );
+                        enc.setBuffer_offset_atIndex(Some(&layer.w_up.buf), layer.w_up.offset, 1);
+                        enc.setBuffer_offset_atIndex(Some(&self.xb), 0, 2);
+                        enc.setBuffer_offset_atIndex(Some(&self.hb), 0, 3);
+                        enc.setBytes_length_atIndex(
+                            NonNull::from(&gargs).cast::<c_void>(),
+                            core::mem::size_of::<GemvArgs>(),
+                            4,
+                        );
+                    }
+                    enc.dispatchThreadgroups_threadsPerThreadgroup(
+                        MTLSize {
+                            width: layer.w_gate.rows.div_ceil(ROWS_PER_TG),
+                            height: 1,
+                            depth: 1,
+                        },
+                        MTLSize {
+                            width: THREADS,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                } else {
+                    self.encode_gemv(enc, &layer.w_gate, &self.xb, &self.hb, false)?;
+                    self.encode_gemv(enc, &layer.w_up, &self.xb, &self.hb2, false)?;
+                    if let Some(ref bg) = layer.b_gate {
+                        self.encode_add_bias(enc, bg, &self.hb, self.cfg.n_ff, 1)?;
+                    }
+                    if let Some(ref bu) = layer.b_up {
+                        self.encode_add_bias(enc, bu, &self.hb2, self.cfg.n_ff, 1)?;
+                    }
+                    const TG: usize = 256;
+                    let total_ff = self.cfg.n_ff as u32;
+                    require_fit(&self.pipes.silu_mul, "silu_mul", TG)?;
+                    enc.setComputePipelineState(&self.pipes.silu_mul);
+                    // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
+                    unsafe {
+                        enc.setBuffer_offset_atIndex(Some(&self.hb), 0, 0);
+                        enc.setBuffer_offset_atIndex(Some(&self.hb2), 0, 1);
+                        enc.setBytes_length_atIndex(
+                            NonNull::from(&total_ff).cast::<c_void>(),
+                            core::mem::size_of::<u32>(),
+                            2,
+                        );
+                    }
+                    enc.dispatchThreadgroups_threadsPerThreadgroup(
+                        MTLSize {
+                            width: (total_ff as usize).div_ceil(TG),
+                            height: 1,
+                            depth: 1,
+                        },
+                        MTLSize {
+                            width: TG,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                }
+
+                if need_separate_res || layer.post_ffn_norm.is_some() || layer.b_down.is_some() {
+                    self.encode_gemv(enc, &layer.w_down, &self.hb, &self.xb2, false)?;
+                    if let Some(ref bd) = layer.b_down {
+                        self.encode_add_bias(enc, bd, &self.xb2, self.cfg.n_embd, 1)?;
+                    }
+                    if let Some(ref pfn) = layer.post_ffn_norm {
+                        self.encode_rms_norm(enc, &self.xb2, pfn, &self.xb, self.cfg.n_embd)?;
+                        self.encode_scale_axpy(
+                            enc,
+                            &self.xb,
+                            &self.x,
+                            self.cfg.n_embd,
+                            self.cfg.residual_scale,
+                        )?;
+                    } else {
+                        self.encode_scale_axpy(
+                            enc,
+                            &self.xb2,
+                            &self.x,
+                            self.cfg.n_embd,
+                            self.cfg.residual_scale,
+                        )?;
+                    }
+                } else {
+                    self.encode_gemv(enc, &layer.w_down, &self.hb, &self.x, true)?;
+                }
             }
         }
 
@@ -3114,67 +3270,92 @@ impl LlamaMetalRunner {
                     cb.commit();
                     pending.push((9, cb));
                 }
-                // 10: ffn_gate_up_silu
-                {
+                if let Some(ref moe) = layer.moe {
                     let cb = pqueue
                         .commandBuffer()
                         .ok_or(MetalError::CommandEncodeFailed)?;
                     let enc = cb
                         .computeCommandEncoder()
                         .ok_or(MetalError::CommandEncodeFailed)?;
-                    const THREADS: usize = 128;
-                    const ROWS_PER_TG: usize = 16;
-                    let gargs = GemvArgs {
-                        n_in: layer.w_gate.cols as u32,
-                        n_out: layer.w_gate.rows as u32,
-                        add_residual: 0,
-                        row_bytes: layer.w_gate.row_bytes as u32,
-                    };
-                    enc.setComputePipelineState(&self.pipes.gemv_pair_silu_q4_0);
-                    // SAFETY: Buffers live until `drain`.
-                    unsafe {
-                        enc.setBuffer_offset_atIndex(
-                            Some(&layer.w_gate.buf),
-                            layer.w_gate.offset,
-                            0,
-                        );
-                        enc.setBuffer_offset_atIndex(Some(&layer.w_up.buf), layer.w_up.offset, 1);
-                        enc.setBuffer_offset_atIndex(Some(&self.xb), 0, 2);
-                        enc.setBuffer_offset_atIndex(Some(&self.hb), 0, 3);
-                        enc.setBytes_length_atIndex(
-                            NonNull::from(&gargs).cast::<c_void>(),
-                            core::mem::size_of::<GemvArgs>(),
-                            4,
-                        );
-                    }
-                    enc.dispatchThreadgroups_threadsPerThreadgroup(
-                        MTLSize {
-                            width: layer.w_gate.rows.div_ceil(ROWS_PER_TG),
-                            height: 1,
-                            depth: 1,
-                        },
-                        MTLSize {
-                            width: THREADS,
-                            height: 1,
-                            depth: 1,
-                        },
-                    );
-                    enc.endEncoding();
-                    cb.commit();
-                    pending.push((10, cb));
-                }
-                // 11: ffn_down + res
-                {
-                    let cb = pqueue
-                        .commandBuffer()
-                        .ok_or(MetalError::CommandEncodeFailed)?;
-                    let enc = cb
-                        .computeCommandEncoder()
-                        .ok_or(MetalError::CommandEncodeFailed)?;
-                    self.encode_gemv(&enc, &layer.w_down, &self.hb, &self.x, true)?;
+                    let eng = self.moe_engine.as_ref().expect("moe_engine");
+                    eng.encode_moe_ffn(&enc, &self.lora, moe, &self.xb, &self.xb2, n_embd, 1)?;
+                    self.encode_scale_axpy(
+                        &enc,
+                        &self.xb2,
+                        &self.x,
+                        n_embd,
+                        self.cfg.residual_scale,
+                    )?;
                     enc.endEncoding();
                     cb.commit();
                     pending.push((11, cb));
+                } else {
+                    // 10: ffn_gate_up_silu
+                    {
+                        let cb = pqueue
+                            .commandBuffer()
+                            .ok_or(MetalError::CommandEncodeFailed)?;
+                        let enc = cb
+                            .computeCommandEncoder()
+                            .ok_or(MetalError::CommandEncodeFailed)?;
+                        const THREADS: usize = 128;
+                        const ROWS_PER_TG: usize = 16;
+                        let gargs = GemvArgs {
+                            n_in: layer.w_gate.cols as u32,
+                            n_out: layer.w_gate.rows as u32,
+                            add_residual: 0,
+                            row_bytes: layer.w_gate.row_bytes as u32,
+                        };
+                        enc.setComputePipelineState(&self.pipes.gemv_pair_silu_q4_0);
+                        // SAFETY: Buffers live until `drain`.
+                        unsafe {
+                            enc.setBuffer_offset_atIndex(
+                                Some(&layer.w_gate.buf),
+                                layer.w_gate.offset,
+                                0,
+                            );
+                            enc.setBuffer_offset_atIndex(
+                                Some(&layer.w_up.buf),
+                                layer.w_up.offset,
+                                1,
+                            );
+                            enc.setBuffer_offset_atIndex(Some(&self.xb), 0, 2);
+                            enc.setBuffer_offset_atIndex(Some(&self.hb), 0, 3);
+                            enc.setBytes_length_atIndex(
+                                NonNull::from(&gargs).cast::<c_void>(),
+                                core::mem::size_of::<GemvArgs>(),
+                                4,
+                            );
+                        }
+                        enc.dispatchThreadgroups_threadsPerThreadgroup(
+                            MTLSize {
+                                width: layer.w_gate.rows.div_ceil(ROWS_PER_TG),
+                                height: 1,
+                                depth: 1,
+                            },
+                            MTLSize {
+                                width: THREADS,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                        enc.endEncoding();
+                        cb.commit();
+                        pending.push((10, cb));
+                    }
+                    // 11: ffn_down + res
+                    {
+                        let cb = pqueue
+                            .commandBuffer()
+                            .ok_or(MetalError::CommandEncodeFailed)?;
+                        let enc = cb
+                            .computeCommandEncoder()
+                            .ok_or(MetalError::CommandEncodeFailed)?;
+                        self.encode_gemv(&enc, &layer.w_down, &self.hb, &self.x, true)?;
+                        enc.endEncoding();
+                        cb.commit();
+                        pending.push((11, cb));
+                    }
                 }
 
                 if (li + 1) % 4 == 0 {
@@ -3491,69 +3672,90 @@ impl LlamaMetalRunner {
                     cb.commit();
                     pp_pending.push((8, cb));
                 }
-                // 9: w_gate_gemm
-                {
+                if let Some(ref moe) = layer.moe {
                     let cb = pqueue
                         .commandBuffer()
                         .ok_or(MetalError::CommandEncodeFailed)?;
                     let enc = cb
                         .computeCommandEncoder()
                         .ok_or(MetalError::CommandEncodeFailed)?;
-                    self.encode_gemm(&enc, &layer.w_gate, &self.xb, &self.hb, b, false)?;
-                    enc.endEncoding();
-                    cb.commit();
-                    pp_pending.push((9, cb));
-                }
-                // 10: w_up_gemm + silu_mul
-                {
-                    let cb = pqueue
-                        .commandBuffer()
-                        .ok_or(MetalError::CommandEncodeFailed)?;
-                    let enc = cb
-                        .computeCommandEncoder()
-                        .ok_or(MetalError::CommandEncodeFailed)?;
-                    self.encode_gemm(&enc, &layer.w_up, &self.xb, &self.hb2, b, false)?;
-                    const TG: usize = 256;
-                    let total_ff = (b * self.cfg.n_ff) as u32;
-                    enc.setComputePipelineState(&self.pipes.silu_mul);
-                    // SAFETY: Buffers live until `drain_pp`.
-                    unsafe {
-                        enc.setBuffer_offset_atIndex(Some(&self.hb), 0, 0);
-                        enc.setBuffer_offset_atIndex(Some(&self.hb2), 0, 1);
-                        enc.setBytes_length_atIndex(
-                            NonNull::from(&total_ff).cast::<c_void>(),
-                            core::mem::size_of::<u32>(),
-                            2,
-                        );
-                    }
-                    enc.dispatchThreadgroups_threadsPerThreadgroup(
-                        MTLSize {
-                            width: (total_ff as usize).div_ceil(TG),
-                            height: 1,
-                            depth: 1,
-                        },
-                        MTLSize {
-                            width: TG,
-                            height: 1,
-                            depth: 1,
-                        },
-                    );
-                    enc.endEncoding();
-                    cb.commit();
-                    pp_pending.push((10, cb));
-                }
-                // 11: w_down_gemm + res
-                {
-                    let cb = pqueue
-                        .commandBuffer()
-                        .ok_or(MetalError::CommandEncodeFailed)?;
-                    let enc = cb
-                        .computeCommandEncoder()
-                        .ok_or(MetalError::CommandEncodeFailed)?;
-                    self.encode_gemm(&enc, &layer.w_down, &self.hb, &self.x, b, true)?;
+                    let eng = self.moe_engine.as_ref().expect("moe_engine");
+                    eng.encode_moe_ffn(&enc, &self.lora, moe, &self.xb, &self.xb2, n_embd, b)?;
+                    self.encode_scale_axpy(
+                        &enc,
+                        &self.xb2,
+                        &self.x,
+                        b * n_embd,
+                        self.cfg.residual_scale,
+                    )?;
                     enc.endEncoding();
                     cb.commit();
                     pp_pending.push((11, cb));
+                } else {
+                    // 9: w_gate_gemm
+                    {
+                        let cb = pqueue
+                            .commandBuffer()
+                            .ok_or(MetalError::CommandEncodeFailed)?;
+                        let enc = cb
+                            .computeCommandEncoder()
+                            .ok_or(MetalError::CommandEncodeFailed)?;
+                        self.encode_gemm(&enc, &layer.w_gate, &self.xb, &self.hb, b, false)?;
+                        enc.endEncoding();
+                        cb.commit();
+                        pp_pending.push((9, cb));
+                    }
+                    // 10: w_up_gemm + silu_mul
+                    {
+                        let cb = pqueue
+                            .commandBuffer()
+                            .ok_or(MetalError::CommandEncodeFailed)?;
+                        let enc = cb
+                            .computeCommandEncoder()
+                            .ok_or(MetalError::CommandEncodeFailed)?;
+                        self.encode_gemm(&enc, &layer.w_up, &self.xb, &self.hb2, b, false)?;
+                        const TG: usize = 256;
+                        let total_ff = (b * self.cfg.n_ff) as u32;
+                        enc.setComputePipelineState(&self.pipes.silu_mul);
+                        // SAFETY: Buffers live until `drain_pp`.
+                        unsafe {
+                            enc.setBuffer_offset_atIndex(Some(&self.hb), 0, 0);
+                            enc.setBuffer_offset_atIndex(Some(&self.hb2), 0, 1);
+                            enc.setBytes_length_atIndex(
+                                NonNull::from(&total_ff).cast::<c_void>(),
+                                core::mem::size_of::<u32>(),
+                                2,
+                            );
+                        }
+                        enc.dispatchThreadgroups_threadsPerThreadgroup(
+                            MTLSize {
+                                width: (total_ff as usize).div_ceil(TG),
+                                height: 1,
+                                depth: 1,
+                            },
+                            MTLSize {
+                                width: TG,
+                                height: 1,
+                                depth: 1,
+                            },
+                        );
+                        enc.endEncoding();
+                        cb.commit();
+                        pp_pending.push((10, cb));
+                    }
+                    // 11: w_down_gemm + res
+                    {
+                        let cb = pqueue
+                            .commandBuffer()
+                            .ok_or(MetalError::CommandEncodeFailed)?;
+                        let enc = cb
+                            .computeCommandEncoder()
+                            .ok_or(MetalError::CommandEncodeFailed)?;
+                        self.encode_gemm(&enc, &layer.w_down, &self.hb, &self.x, b, true)?;
+                        enc.endEncoding();
+                        cb.commit();
+                        pp_pending.push((11, cb));
+                    }
                 }
 
                 if (li + 1) % 4 == 0 {

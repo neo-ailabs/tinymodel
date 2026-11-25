@@ -240,7 +240,10 @@ impl LoraAdapter {
                 })?;
             let a_info = gguf.tensor_info(a_name).expect("a_name from tensor_names");
             let b_info = gguf.tensor_info(b_name).expect("b_name from tensor_names");
-            if a_info.dims.len() != 2 || b_info.dims.len() != 2 {
+            let is_token_embd = base.ends_with("token_embd.weight");
+            if a_info.dims.len() != 2
+                || !(b_info.dims.len() == 2 || (!is_token_embd && b_info.dims.len() == 1))
+            {
                 return Err(LoraError::InvalidPairShape {
                     path: path_str,
                     base_tensor: base.clone(),
@@ -249,7 +252,6 @@ impl LoraAdapter {
                 });
             }
 
-            let is_token_embd = base.ends_with("token_embd.weight");
             if is_token_embd {
                 // `llama-adapter.cpp:365`: `a` is `[r, vocab]`, `b` is `[r, d_in]`.
                 let rank = a_info.dims[0];
@@ -278,11 +280,11 @@ impl LoraAdapter {
                     },
                 );
             } else {
-                // `llama-adapter.cpp:370`: `a` is `[d_in, r]`, `b` is `[r, d_out]`.
+                // `llama-adapter.cpp:370`: `a` is `[d_in, r]`, `b` is `[r, d_out]` (or 1D `[r]` when `d_out == 1`).
                 let d_in = a_info.dims[0];
                 let rank = a_info.dims[1];
                 let b_r = b_info.dims[0];
-                let d_out = b_info.dims[1];
+                let d_out = b_info.dims.get(1).copied().unwrap_or(1);
                 if rank == 0 || rank != b_r || d_in == 0 || d_out == 0 {
                     return Err(LoraError::InvalidPairShape {
                         path: path_str,
@@ -462,7 +464,8 @@ impl LoraSet {
                         base_tensor: base_name.clone(),
                     });
                 };
-                if info.dims.len() != 2 {
+                let valid_1d = !p.is_token_embd && p.d_out == 1 && info.dims.len() == 1;
+                if info.dims.len() != 2 && !valid_1d {
                     return Err(LoraError::BaseShapeMismatch {
                         path: base_gguf.path().display().to_string(),
                         base_tensor: base_name.clone(),
@@ -474,7 +477,7 @@ impl LoraSet {
                 let (exp_in, exp_out) = if p.is_token_embd {
                     (info.dims[1], info.dims[0])
                 } else {
-                    (info.dims[0], info.dims[1])
+                    (info.dims[0], info.dims.get(1).copied().unwrap_or(1))
                 };
                 if p.d_in != exp_in || p.d_out != exp_out {
                     return Err(LoraError::BaseShapeMismatch {
@@ -873,7 +876,7 @@ pub fn merge_lora_gguf<P: AsRef<Path>>(
             merged_tensors += 1;
         }
         let cols = info.dims[0];
-        let rows = info.dims[1];
+        let rows = info.dims.get(1).copied().unwrap_or(1);
         f32_row.resize(cols, 0.0);
 
         let decode_row = |r: usize, dst: &mut [f32]| {

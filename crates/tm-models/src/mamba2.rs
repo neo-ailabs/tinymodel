@@ -20,6 +20,9 @@ use tm_gguf::{GgufError, GgufFile};
 use tm_lora::{BoundLora, LoraScratch, LoraSet};
 
 use crate::llama::{ModelError, RawMatView};
+use crate::moe::{
+    MoeScratch, SparseMoeFfn, eval_sparse_moe_ffn, load_layer_moe_ffn, parse_moe_arch_params,
+};
 use crate::state::{LayerState, MAX_SPEC_WINDOW, SpecVerifyBuf, decode_embedding_row};
 
 /// Model hyperparameters for `mamba2`, `nemotron_h`, `falcon-h1`, and `granitehybrid`.
@@ -55,6 +58,11 @@ pub struct Mamba2Config {
     pub custom_attn_scale: bool,
     pub residual_scale: f32,
     pub inv_logit_scale: f32,
+    // Optional Sparse MoE parameters (`granitehybrid` / `granitemoehybrid` with `expert_count > 0`)
+    pub n_expert: usize,
+    pub n_expert_used: usize,
+    pub max_n_ff_exp: usize,
+    pub max_n_ff_shexp: usize,
 }
 
 impl Mamba2Config {
@@ -128,7 +136,8 @@ pub struct Mamba2AttnWeights<'a> {
     pub bo: Option<Vec<f32>>,
 }
 
-/// FFN sub-block weights (`SwiGLU` for `falcon-h1`/`granitehybrid`, `Relu2` for `nemotron_h`).
+/// FFN sub-block weights (`SwiGLU`, `Relu2`, or fine-grained `SparseMoe`).
+#[allow(clippy::large_enum_variant)]
 pub enum Mamba2FfnWeights<'a> {
     SwiGlu {
         n_ff: usize,
@@ -146,6 +155,7 @@ pub enum Mamba2FfnWeights<'a> {
         b_up: Option<Vec<f32>>,
         b_down: Option<Vec<f32>>,
     },
+    SparseMoe(SparseMoeFfn<'a>),
 }
 
 /// Heterogeneous block topology across `mamba2`, `nemotron_h`, `falcon-h1`, and `granitehybrid`.
@@ -230,6 +240,7 @@ pub struct Mamba2State {
     pub last_hidden: Vec<f32>,
     mv_scratch: MatvecScratch,
     pub lora_scratch: LoraScratch,
+    pub moe_scratch: MoeScratch,
 }
 
 impl Mamba2State {
@@ -281,6 +292,8 @@ impl Mamba2State {
             .max(d_in_proj)
             .max(max_q)
             .max(max_ff)
+            .max(c.max_n_ff_exp)
+            .max(c.max_n_ff_shexp)
             .max(c.vocab_size);
 
         Self {
@@ -315,6 +328,13 @@ impl Mamba2State {
             last_hidden: vec![0.0; c.n_embd],
             mv_scratch: MatvecScratch::new(max_cols),
             lora_scratch: LoraScratch::new(64),
+            moe_scratch: MoeScratch::new(
+                c.n_embd,
+                c.n_expert,
+                c.n_expert_used,
+                c.max_n_ff_exp,
+                c.max_n_ff_shexp,
+            ),
         }
     }
 
@@ -732,12 +752,12 @@ pub fn mamba2_gate_and_grouped_norm(
 }
 
 impl<'a> Mamba2Model<'a> {
-    /// Loads and validates a `mamba2`, `nemotron_h`, `falcon-h1`, or `granitehybrid` GGUF model.
+    /// Loads and validates a `mamba2`, `nemotron_h`, `falcon-h1`, `granitehybrid`, or `granitemoehybrid` GGUF model.
     pub fn from_gguf(gguf: &'a GgufFile) -> Result<Self, ModelError> {
         let arch = gguf.req_str("general.architecture")?.to_string();
         if !matches!(
             arch.as_str(),
-            "mamba2" | "nemotron_h" | "falcon-h1" | "granitehybrid"
+            "mamba2" | "nemotron_h" | "falcon-h1" | "granitehybrid" | "granitemoehybrid"
         ) {
             return Err(ModelError::UnsupportedArch(arch));
         }
@@ -778,16 +798,6 @@ impl<'a> Mamba2Model<'a> {
         {
             return Err(ModelError::InvalidConfig(format!(
                 "invalid Mamba-2 dimensions: inner={ssm_inner_size}, heads={ssm_n_head}, groups={ssm_n_group}, state={ssm_state_size}"
-            )));
-        }
-
-        if let Some(n_exp) = gguf
-            .get_meta(&format!("{pfx}.expert_count"))
-            .and_then(|v| v.as_usize())
-            && n_exp > 0
-        {
-            return Err(ModelError::InvalidConfig(format!(
-                "MoE variant of '{arch}' (expert_count={n_exp}) is outside sub-8B dense/hybrid Mamba-2 scope"
             )));
         }
 
@@ -873,7 +883,10 @@ impl<'a> Mamba2Model<'a> {
             .and_then(|v| v.as_usize())
             .unwrap_or_else(|| embd_info.dims.get(1).copied().unwrap_or(0));
 
-        let cfg = Mamba2Config {
+        let max_n_ff_meta = n_ff_per_layer.iter().copied().max().unwrap_or(0);
+        let moe_params = parse_moe_arch_params(gguf, pfx, &arch, n_layers, max_n_ff_meta)?;
+
+        let mut cfg = Mamba2Config {
             arch: arch.clone(),
             n_layers,
             n_embd,
@@ -900,6 +913,10 @@ impl<'a> Mamba2Model<'a> {
             custom_attn_scale,
             residual_scale,
             inv_logit_scale,
+            n_expert: moe_params.as_ref().map_or(0, |m| m.n_expert),
+            n_expert_used: moe_params.as_ref().map_or(0, |m| m.n_expert_used),
+            max_n_ff_exp: 0,
+            max_n_ff_shexp: 0,
         };
 
         let token_embd = load_mat(gguf, "token_embd.weight", "global", n_embd, vocab_size)?;
@@ -1040,12 +1057,20 @@ impl<'a> Mamba2Model<'a> {
                         });
                     }
                 }
-                "granitehybrid" => {
+                "granitehybrid" | "granitemoehybrid" => {
                     let nh_kv = cfg.n_head_kv_per_layer[l];
                     let n_ff = cfg.n_ff_per_layer[l];
                     let ffn_norm =
                         load_f32_vec(gguf, &format!("{ltag}.ffn_norm.weight"), &ltag, n_embd)?;
-                    let ffn = load_swiglu_ffn(gguf, &ltag, n_embd, n_ff)?;
+                    let ffn = if let Some(ref mp) = moe_params
+                        && let Some(moe) = load_layer_moe_ffn(gguf, l, &ltag, n_embd, mp)?
+                    {
+                        cfg.max_n_ff_exp = cfg.max_n_ff_exp.max(moe.cfg.n_ff_exp);
+                        cfg.max_n_ff_shexp = cfg.max_n_ff_shexp.max(moe.cfg.n_ff_shexp);
+                        Mamba2FfnWeights::SparseMoe(moe)
+                    } else {
+                        load_swiglu_ffn(gguf, &ltag, n_embd, n_ff)?
+                    };
                     let slot = n_state_slots;
                     n_state_slots += 1;
                     if nh_kv == 0 {
@@ -1165,6 +1190,7 @@ impl<'a> Mamba2Model<'a> {
                 w_up.lora_slot = bound.slot_for(w_up.name);
                 w_down.lora_slot = bound.slot_for(w_down.name);
             }
+            Mamba2FfnWeights::SparseMoe(moe) => moe.bind_lora(&bound),
         };
         for lw in &mut self.layers {
             match &mut lw.block {
@@ -2201,6 +2227,21 @@ impl<'a> Mamba2Model<'a> {
                 if let Some(bd) = b_down {
                     add_bias_rows(&mut state.xb2[..b * d], bd, b);
                 }
+            }
+            Mamba2FfnWeights::SparseMoe(moe) => {
+                eval_sparse_moe_ffn(
+                    moe,
+                    &self.lora,
+                    pool,
+                    kt,
+                    &state.xb[..b * d],
+                    &mut state.xb2[..b * d],
+                    d,
+                    b,
+                    &mut state.mv_scratch,
+                    &mut state.lora_scratch,
+                    &mut state.moe_scratch,
+                );
             }
         }
     }
