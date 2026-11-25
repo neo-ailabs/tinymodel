@@ -19,10 +19,11 @@ layout(constant_id = 1) const uint NR = 2;
 layout(constant_id = 2) const uint NTOK = 1;
 layout(local_size_x_id = 0) in;
 
-layout(std430, binding = 0) readonly buffer WQ { uvec4 wq[]; };
-layout(std430, binding = 1) readonly buffer WD { uint16_t wd[]; };
-layout(std430, binding = 2) readonly buffer X { vec4 x4[]; };
-layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+layout(std430, binding = 0) readonly buffer WQ   { uvec4 wq[]; };
+layout(std430, binding = 0) readonly buffer WQ64 { uvec2 wq64[]; };
+layout(std430, binding = 1) readonly buffer WD   { uint16_t wd[]; };
+layout(std430, binding = 2) readonly buffer X    { vec4 x4[]; };
+layout(std430, binding = 3) writeonly buffer Y   { float y[]; };
 
 layout(push_constant) uniform PC {
     uint n_in;
@@ -42,26 +43,55 @@ void main() {
         acc[i] = 0.0;
     }
 
-    for (uint ib = gl_SubgroupInvocationID; ib < nb; ib += gl_SubgroupSize) {
+    if (NTOK == 1u) {
+        const uint lane = gl_SubgroupInvocationID;
+        const uint sub = lane & 1u;
+        const uint blk_step = gl_SubgroupSize >> 1u;
+        uint row_b[NR];
         for (uint r = 0u; r < NR; ++r) {
-            const uint row = min(row0 + r, pc.n_out - 1u);
-            const uint bi = row * nb + ib;
-            const uvec4 q = wq[bi];
-            const float d = unpackHalf2x16(uint(wd[bi])).x;
-            vec4 lo[4];
-            vec4 hi[4];
-            for (uint c = 0u; c < 4u; ++c) {
-                const uint u = q[c];
-                lo[c] = vec4(u & 15u, (u >> 8) & 15u, (u >> 16) & 15u, (u >> 24) & 15u) - 8.0;
-                hi[c] = vec4((u >> 4) & 15u, (u >> 12) & 15u, (u >> 20) & 15u, u >> 28) - 8.0;
+            row_b[r] = min(row0 + r, pc.n_out - 1u) * nb;
+        }
+        for (uint ib = (lane >> 1u); ib < nb; ib += blk_step) {
+            const uint xb = ib * 8u + sub * 2u;
+            const vec4 xlo0 = x4[xb];
+            const vec4 xlo1 = x4[xb + 1u];
+            const vec4 xhi0 = x4[xb + 4u];
+            const vec4 xhi1 = x4[xb + 5u];
+            for (uint r = 0u; r < NR; ++r) {
+                const uint bi = row_b[r] + ib;
+                const float d = unpackHalf2x16(uint(wd[bi])).x;
+                const uvec2 q2 = wq64[bi * 2u + sub];
+                const uint u0 = q2.x;
+                const uint u1 = q2.y;
+                const float s = dot(vec4(u0 & 15u, (u0 >> 8u) & 15u, (u0 >> 16u) & 15u, (u0 >> 24u) & 15u) - 8.0, xlo0)
+                              + dot(vec4((u0 >> 4u) & 15u, (u0 >> 12u) & 15u, (u0 >> 20u) & 15u, u0 >> 28u) - 8.0, xhi0)
+                              + dot(vec4(u1 & 15u, (u1 >> 8u) & 15u, (u1 >> 16u) & 15u, (u1 >> 24u) & 15u) - 8.0, xlo1)
+                              + dot(vec4((u1 >> 4u) & 15u, (u1 >> 12u) & 15u, (u1 >> 20u) & 15u, u1 >> 28u) - 8.0, xhi1);
+                acc[r] = fma(d, s, acc[r]);
             }
-            for (uint t = 0u; t < NTOK; ++t) {
-                const uint xb = t * xs + ib * 8u;
-                float s = 0.0;
+        }
+    } else {
+        for (uint ib = gl_SubgroupInvocationID; ib < nb; ib += gl_SubgroupSize) {
+            for (uint r = 0u; r < NR; ++r) {
+                const uint row = min(row0 + r, pc.n_out - 1u);
+                const uint bi = row * nb + ib;
+                const uvec4 q = wq[bi];
+                const float d = unpackHalf2x16(uint(wd[bi])).x;
+                vec4 lo[4];
+                vec4 hi[4];
                 for (uint c = 0u; c < 4u; ++c) {
-                    s += dot(lo[c], x4[xb + c]) + dot(hi[c], x4[xb + 4u + c]);
+                    const uint u = q[c];
+                    lo[c] = vec4(u & 15u, (u >> 8) & 15u, (u >> 16) & 15u, (u >> 24) & 15u) - 8.0;
+                    hi[c] = vec4((u >> 4) & 15u, (u >> 12) & 15u, (u >> 20) & 15u, u >> 28) - 8.0;
                 }
-                acc[r * NTOK + t] = fma(d, s, acc[r * NTOK + t]);
+                for (uint t = 0u; t < NTOK; ++t) {
+                    const uint xb = t * xs + ib * 8u;
+                    float s = 0.0;
+                    for (uint c = 0u; c < 4u; ++c) {
+                        s += dot(lo[c], x4[xb + c]) + dot(hi[c], x4[xb + 4u + c]);
+                    }
+                    acc[r * NTOK + t] = fma(d, s, acc[r * NTOK + t]);
+                }
             }
         }
     }

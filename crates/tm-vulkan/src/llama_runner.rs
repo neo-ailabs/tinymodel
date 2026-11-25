@@ -36,12 +36,20 @@ const SPV_GQA_ATTN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gqa_attn.s
 const SPV_FA_COOPMAT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_coopmat.spv"));
 const SPV_FA_GQA_TILED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_gqa_tiled.spv"));
 const SPV_GEMV_RES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_res.spv"));
+const SPV_GEMV_RES_Q4_0_SOA: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemv_res_q4_0_soa.spv"));
 const SPV_GEMV_QKV_Q4_0: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_qkv_q4_0.spv"));
+const SPV_GEMV_QKV_Q4_0_SOA: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemv_qkv_q4_0_soa.spv"));
 const SPV_GEMV_PAIR_SILU_Q4_0: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemv_pair_silu_q4_0.spv"));
+const SPV_GEMV_PAIR_SILU_Q4_0_SOA: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemv_pair_silu_q4_0_soa.spv"));
 const SPV_SILU_MUL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silu_mul.spv"));
 const SPV_GEMM_TILED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_tiled.spv"));
 const SPV_GEMM_TILED_DP4A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_tiled_dp4a.spv"));
+const SPV_GEMM_TILED_DP4A_Q4_SOA: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_tiled_dp4a_q4_soa.spv"));
 const SPV_GEMM_KQUANT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_kquant.spv"));
 const SPV_GEMM_COOPMAT_F16: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_f16.spv"));
@@ -138,10 +146,20 @@ struct VkSlice {
 #[derive(Clone, Copy)]
 struct VkMat {
     slice: VkSlice,
+    /// When `Some`, this Q4_0 matrix is stored in 16B-aligned SoA layout:
+    /// `slice` holds packed nibbles (`16B/block`) and `soa_d` holds fp16 scales (`2B/block`).
+    soa_d: Option<VkSlice>,
     dtype: DType,
     rows: usize,
     cols: usize,
     row_bytes: usize,
+}
+
+impl VkMat {
+    #[inline]
+    fn byte_len(&self) -> u64 {
+        self.slice.len + self.soa_d.map_or(0, |d| d.len)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -167,6 +185,7 @@ struct BatchGemmEntry {
     flavor: GemmFlavor,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum BatchFfnPlan {
     FusedPairSiluCoopMat {
         pipe: Arc<Pipeline>,
@@ -432,6 +451,18 @@ fn plan_f32_vec(
     Ok(PendingF32 { slice, vals })
 }
 
+fn repack_q4_0_to_soa(raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let n_blocks = raw.len() / 18;
+    let mut wq = Vec::with_capacity(n_blocks * 16);
+    let mut wd = Vec::with_capacity(n_blocks * 2);
+    for blk in raw.as_chunks::<18>().0 {
+        wd.extend_from_slice(&blk[0..2]);
+        wq.extend_from_slice(&blk[2..18]);
+    }
+    (wq, wd)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn plan_mat<'a>(
     planner: &mut ArenaPlanner,
     gguf: &'a GgufFile,
@@ -439,6 +470,7 @@ fn plan_mat<'a>(
     layer: &str,
     cols: usize,
     rows: usize,
+    repack_q4_soa: bool,
 ) -> Result<PendingMat<'a>, VulkanError> {
     let (info, raw_bytes) = gguf.req_tensor(name, layer, &[cols, rows])?;
     let (eff_dtype, bytes) = normalize_vk_mat_bytes(info.dtype, raw_bytes, rows, cols)?;
@@ -446,20 +478,24 @@ fn plan_mat<'a>(
     let row_bytes = eff_dtype.row_bytes(cols);
     let file_off = gguf.tensor_file_offset(info) as u64;
     let can_import = matches!(&bytes, std::borrow::Cow::Borrowed(_));
-    let (slice, imported) = if can_import {
-        match planner.try_import_slice(file_off, bytes.len() as u64) {
-            Some(s) => (s, true),
-            None => (planner.reserve(bytes.len() as u64)?, false),
-        }
-    } else {
-        (planner.reserve(bytes.len() as u64)?, false)
-    };
+    let (slice, soa_d, imported) =
+        if can_import && let Some(s) = planner.try_import_slice(file_off, bytes.len() as u64) {
+            (s, None, true)
+        } else if repack_q4_soa && eff_dtype == DType::Q4_0 {
+            let n_blocks = bytes.len() / 18;
+            let sq = planner.reserve((n_blocks * 16) as u64)?;
+            let sd = planner.reserve((n_blocks * 2) as u64)?;
+            (sq, Some(sd), false)
+        } else {
+            (planner.reserve(bytes.len() as u64)?, None, false)
+        };
     Ok(PendingMat {
         slice,
         bytes,
         imported,
         mat: VkMat {
             slice,
+            soa_d,
             dtype: eff_dtype,
             rows,
             cols,
@@ -478,6 +514,7 @@ fn plan_mat_slice<'a>(
     total_rows: usize,
     row_start: usize,
     rows: usize,
+    repack_q4_soa: bool,
 ) -> Result<PendingMat<'a>, VulkanError> {
     let (info, raw_bytes) = gguf.req_tensor(fused_name, layer, &[cols, total_rows])?;
     if info.dtype == DType::Q4_0x4 && (!row_start.is_multiple_of(4) || !rows.is_multiple_of(4)) {
@@ -495,20 +532,24 @@ fn plan_mat_slice<'a>(
     let row_bytes = eff_dtype.row_bytes(cols);
     let file_off = gguf.tensor_file_offset(info) as u64 + byte_off as u64;
     let can_import = matches!(&bytes, std::borrow::Cow::Borrowed(_));
-    let (slice, imported) = if can_import {
-        match planner.try_import_slice(file_off, bytes.len() as u64) {
-            Some(s) => (s, true),
-            None => (planner.reserve(bytes.len() as u64)?, false),
-        }
-    } else {
-        (planner.reserve(bytes.len() as u64)?, false)
-    };
+    let (slice, soa_d, imported) =
+        if can_import && let Some(s) = planner.try_import_slice(file_off, bytes.len() as u64) {
+            (s, None, true)
+        } else if repack_q4_soa && eff_dtype == DType::Q4_0 {
+            let n_blocks = bytes.len() / 18;
+            let sq = planner.reserve((n_blocks * 16) as u64)?;
+            let sd = planner.reserve((n_blocks * 2) as u64)?;
+            (sq, Some(sd), false)
+        } else {
+            (planner.reserve(bytes.len() as u64)?, None, false)
+        };
     Ok(PendingMat {
         slice,
         bytes,
         imported,
         mat: VkMat {
             slice,
+            soa_d,
             dtype: eff_dtype,
             rows,
             cols,
@@ -762,6 +803,7 @@ impl LlamaVkRunner {
         );
 
         // 1. Plan every device allocation up front BEFORE touching GPU memory (`MUST #4 & #6`).
+        let use_q4_soa = prefill_kind == ResolvedPrefill::TiledDp4a;
         let p_token_embd = plan_mat(
             &mut planner,
             gguf_ref,
@@ -769,6 +811,7 @@ impl LlamaVkRunner {
             "global",
             n_embd,
             vocab_size,
+            false,
         )?;
         let p_output = if gguf_ref.tensor_info("output.weight").is_some() {
             Some(plan_mat(
@@ -778,6 +821,7 @@ impl LlamaVkRunner {
                 "global",
                 n_embd,
                 vocab_size,
+                use_q4_soa,
             )?)
         } else {
             None
@@ -932,7 +976,15 @@ impl LlamaVkRunner {
             let qkv_name = format!("{ltag}.attn_qkv.weight");
             let (wq, wk, wv) = if gguf_ref.tensor_info(&q_name).is_some() {
                 (
-                    plan_mat(&mut planner, gguf_ref, &q_name, &ltag, n_embd, q_dim)?,
+                    plan_mat(
+                        &mut planner,
+                        gguf_ref,
+                        &q_name,
+                        &ltag,
+                        n_embd,
+                        q_dim,
+                        use_q4_soa,
+                    )?,
                     plan_mat(
                         &mut planner,
                         gguf_ref,
@@ -940,6 +992,7 @@ impl LlamaVkRunner {
                         &ltag,
                         n_embd,
                         kv_dim,
+                        use_q4_soa,
                     )?,
                     plan_mat(
                         &mut planner,
@@ -948,6 +1001,7 @@ impl LlamaVkRunner {
                         &ltag,
                         n_embd,
                         kv_dim,
+                        use_q4_soa,
                     )?,
                 )
             } else {
@@ -962,6 +1016,7 @@ impl LlamaVkRunner {
                         total_qkv,
                         0,
                         q_dim,
+                        use_q4_soa,
                     )?,
                     plan_mat_slice(
                         &mut planner,
@@ -972,6 +1027,7 @@ impl LlamaVkRunner {
                         total_qkv,
                         q_dim,
                         kv_dim,
+                        use_q4_soa,
                     )?,
                     plan_mat_slice(
                         &mut planner,
@@ -982,6 +1038,7 @@ impl LlamaVkRunner {
                         total_qkv,
                         q_dim + kv_dim,
                         kv_dim,
+                        use_q4_soa,
                     )?,
                 )
             };
@@ -989,8 +1046,24 @@ impl LlamaVkRunner {
             let up_name = format!("{ltag}.ffn_up.weight");
             let (w_gate, w_up) = if gguf_ref.tensor_info(&gate_name).is_some() {
                 (
-                    plan_mat(&mut planner, gguf_ref, &gate_name, &ltag, n_embd, n_ff)?,
-                    plan_mat(&mut planner, gguf_ref, &up_name, &ltag, n_embd, n_ff)?,
+                    plan_mat(
+                        &mut planner,
+                        gguf_ref,
+                        &gate_name,
+                        &ltag,
+                        n_embd,
+                        n_ff,
+                        use_q4_soa,
+                    )?,
+                    plan_mat(
+                        &mut planner,
+                        gguf_ref,
+                        &up_name,
+                        &ltag,
+                        n_embd,
+                        n_ff,
+                        use_q4_soa,
+                    )?,
                 )
             } else {
                 (
@@ -1003,6 +1076,7 @@ impl LlamaVkRunner {
                         2 * n_ff,
                         0,
                         n_ff,
+                        use_q4_soa,
                     )?,
                     plan_mat_slice(
                         &mut planner,
@@ -1013,6 +1087,7 @@ impl LlamaVkRunner {
                         2 * n_ff,
                         n_ff,
                         n_ff,
+                        use_q4_soa,
                     )?,
                 )
             };
@@ -1047,6 +1122,7 @@ impl LlamaVkRunner {
                     &ltag,
                     q_dim,
                     n_embd,
+                    use_q4_soa,
                 )?,
                 w_gate,
                 w_up,
@@ -1057,6 +1133,7 @@ impl LlamaVkRunner {
                     &ltag,
                     n_ff,
                     n_embd,
+                    use_q4_soa,
                 )?,
                 k_cache: planner.reserve(kv_bytes)?,
                 v_cache: planner.reserve(kv_bytes)?,
@@ -1156,7 +1233,13 @@ impl LlamaVkRunner {
             if pm.imported {
                 return Ok(());
             }
-            ctx.write_bytes(&slabs[pm.slice.slab], pm.slice.offset, &pm.bytes)
+            if let Some(d_slice) = pm.mat.soa_d {
+                let (wq, wd) = repack_q4_0_to_soa(&pm.bytes);
+                ctx.write_bytes(&slabs[pm.slice.slab], pm.slice.offset, &wq)?;
+                ctx.write_bytes(&slabs[d_slice.slab], d_slice.offset, &wd)
+            } else {
+                ctx.write_bytes(&slabs[pm.slice.slab], pm.slice.offset, &pm.bytes)
+            }
         };
 
         write_mat(&p_token_embd)?;
@@ -1300,7 +1383,7 @@ impl LlamaVkRunner {
 
         // 4. Allocate static descriptor pool, command pool, pre-bound descriptor sets.
         let max_sets = (n_layers as u32) * 40 + 40;
-        let max_desc = max_sets * 8;
+        let max_desc = max_sets * 10;
         let d = &ctx.inner.device;
         // SAFETY: `d` is a valid logical device and `ctx.inner.queue_family` is its compute queue family.
         let (desc_pool, cmd_pool, cbs, fence) = unsafe {
@@ -1418,6 +1501,36 @@ impl LlamaVkRunner {
                     set,
                     mat,
                     flavor: GemmFlavor::CoopMatI8,
+                });
+            }
+
+            if prefill_kind == ResolvedPrefill::TiledDp4a
+                && let Some(d_slice) = mat.soa_d
+                && let (Some(xq), Some(xd)) = (s_xq, s_xd)
+            {
+                let pipe = ctx.pipeline(
+                    "gemm_tiled_dp4a_q4_soa",
+                    0,
+                    SPV_GEMM_TILED_DP4A_Q4_SOA,
+                    5,
+                    20,
+                    &[128],
+                )?;
+                let set = alloc_set(
+                    &pipe,
+                    &[
+                        Binding::Arena(mat.slice),
+                        Binding::Arena(d_slice),
+                        Binding::Arena(xq),
+                        Binding::Arena(xd),
+                        Binding::Arena(y_slice),
+                    ],
+                )?;
+                return Ok(BatchGemmEntry {
+                    pipe,
+                    set,
+                    mat,
+                    flavor: GemmFlavor::TiledDp4a,
                 });
             }
 
@@ -1568,16 +1681,52 @@ impl LlamaVkRunner {
                 Binding::Arena(s_xb),
             ],
         )?;
-        let (lm_pipe, lm_groups, lm_push) = gemv_pipe_for(&out_mat)?;
-        let lm_set = alloc_set(
-            &lm_pipe,
-            &[
-                Binding::Arena(out_mat.slice),
-                Binding::Arena(s_xb),
-                Binding::Arena(logits_dev),
-            ],
-        )?;
-        let lm_head_dec = (lm_pipe, lm_set, lm_groups, lm_push);
+        let alloc_gemv_call =
+            |mat: &VkMat,
+             x_slice: VkSlice,
+             y_slice: VkSlice,
+             add_residual: bool|
+             -> Result<(Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]), VulkanError> {
+                if let Some(d_slice) = mat.soa_d {
+                    let wg = 128u32;
+                    let nr = 4u32;
+                    let p = ctx.pipeline(
+                        "gemv_res_q4_0_soa",
+                        wg | (nr << 16),
+                        SPV_GEMV_RES_Q4_0_SOA,
+                        4,
+                        16,
+                        &[wg, nr],
+                    )?;
+                    let set = alloc_set(
+                        &p,
+                        &[
+                            Binding::Arena(mat.slice),
+                            Binding::Arena(d_slice),
+                            Binding::Arena(x_slice),
+                            Binding::Arena(y_slice),
+                        ],
+                    )?;
+                    let rows_per_wg = (wg / sg).max(1) * nr;
+                    let groups = (mat.rows as u32).div_ceil(rows_per_wg);
+                    let push = [mat.cols as u32, mat.rows as u32, u32::from(add_residual), 0];
+                    Ok((p, set, groups, push))
+                } else {
+                    let (p, g, mut push) = gemv_pipe_for(mat)?;
+                    push[2] = u32::from(add_residual);
+                    let set = alloc_set(
+                        &p,
+                        &[
+                            Binding::Arena(mat.slice),
+                            Binding::Arena(x_slice),
+                            Binding::Arena(y_slice),
+                        ],
+                    )?;
+                    Ok((p, set, g, push))
+                }
+            };
+
+        let lm_head_dec = alloc_gemv_call(&out_mat, s_xb, logits_dev, false)?;
         let output_bias_set = match p_output_bias {
             Some(ref pob) => Some(alloc_set(
                 &pipes.add_bias,
@@ -1635,7 +1784,54 @@ impl LlamaVkRunner {
                 ],
             )?;
 
-            let qkv_dec = if pl.wq.mat.dtype == DType::Q4_0
+            let qkv_dec = if let (Some(qd), Some(kd), Some(vd)) =
+                (pl.wq.mat.soa_d, pl.wk.mat.soa_d, pl.wv.mat.soa_d)
+                && pl.wq.mat.rows.is_multiple_of(2)
+                && pl.wk.mat.rows.is_multiple_of(2)
+            {
+                let wg = 128u32;
+                let nr = if pl.wq.mat.rows.is_multiple_of(4) && pl.wk.mat.rows.is_multiple_of(4) {
+                    4u32
+                } else {
+                    2u32
+                };
+                let pipe = ctx.pipeline(
+                    "gemv_qkv_q4_0_soa",
+                    wg | (nr << 16),
+                    SPV_GEMV_QKV_Q4_0_SOA,
+                    10,
+                    16,
+                    &[wg, nr],
+                )?;
+                let set = alloc_set(
+                    &pipe,
+                    &[
+                        Binding::Arena(pl.wq.slice),
+                        Binding::Arena(qd),
+                        Binding::Arena(pl.wk.slice),
+                        Binding::Arena(kd),
+                        Binding::Arena(pl.wv.slice),
+                        Binding::Arena(vd),
+                        Binding::Arena(s_xb),
+                        Binding::Arena(s_q),
+                        Binding::Arena(s_k),
+                        Binding::Arena(s_v),
+                    ],
+                )?;
+                let total_rows = (pl.wq.mat.rows + pl.wk.mat.rows + pl.wv.mat.rows) as u32;
+                let rows_per_wg = (wg / sg).max(1) * nr;
+                DecodeQkvSets::Fused {
+                    pipe,
+                    set,
+                    groups_x: total_rows.div_ceil(rows_per_wg),
+                    push: [
+                        pl.wq.mat.cols as u32,
+                        pl.wq.mat.rows as u32,
+                        pl.wk.mat.rows as u32,
+                        pl.wv.mat.rows as u32,
+                    ],
+                }
+            } else if pl.wq.mat.dtype == DType::Q4_0
                 && pl.wk.mat.dtype == DType::Q4_0
                 && pl.wv.mat.dtype == DType::Q4_0
                 && pl.wq.mat.rows.is_multiple_of(2)
@@ -1681,37 +1877,10 @@ impl LlamaVkRunner {
                     ],
                 }
             } else {
-                let (pq, gq, push_q) = gemv_pipe_for(&pl.wq.mat)?;
-                let sq = alloc_set(
-                    &pq,
-                    &[
-                        Binding::Arena(pl.wq.slice),
-                        Binding::Arena(s_xb),
-                        Binding::Arena(s_q),
-                    ],
-                )?;
-                let (pk, gk, push_k) = gemv_pipe_for(&pl.wk.mat)?;
-                let sk = alloc_set(
-                    &pk,
-                    &[
-                        Binding::Arena(pl.wk.slice),
-                        Binding::Arena(s_xb),
-                        Binding::Arena(s_k),
-                    ],
-                )?;
-                let (pv, gv, push_v) = gemv_pipe_for(&pl.wv.mat)?;
-                let sv = alloc_set(
-                    &pv,
-                    &[
-                        Binding::Arena(pl.wv.slice),
-                        Binding::Arena(s_xb),
-                        Binding::Arena(s_v),
-                    ],
-                )?;
                 DecodeQkvSets::Separate {
-                    wq: (pq, sq, gq, push_q),
-                    wk: (pk, sk, gk, push_k),
-                    wv: (pv, sv, gv, push_v),
+                    wq: alloc_gemv_call(&pl.wq.mat, s_xb, s_q, false)?,
+                    wk: alloc_gemv_call(&pl.wk.mat, s_xb, s_k, false)?,
+                    wv: alloc_gemv_call(&pl.wv.mat, s_xb, s_v, false)?,
                 }
             };
 
@@ -1798,16 +1967,7 @@ impl LlamaVkRunner {
                 )?,
             };
 
-            let (p_wo, g_wo, mut push_wo) = gemv_pipe_for(&pl.wo.mat)?;
-            push_wo[2] = 1;
-            let s_wo = alloc_set(
-                &p_wo,
-                &[
-                    Binding::Arena(pl.wo.slice),
-                    Binding::Arena(s_xb),
-                    Binding::Arena(s_x),
-                ],
-            )?;
+            let (p_wo, s_wo, g_wo, push_wo) = alloc_gemv_call(&pl.wo.mat, s_xb, s_x, true)?;
             let wo_batch = make_batch_gemm(pl.wo.mat, s_xb, s_x)?;
 
             let ffn_norm_set = alloc_set(
@@ -1820,33 +1980,45 @@ impl LlamaVkRunner {
             )?;
 
             let ffn_dec_sep = {
-                let (pg, gg, push_g) = gemv_pipe_for(&pl.w_gate.mat)?;
-                let sg_set = alloc_set(
-                    &pg,
-                    &[
-                        Binding::Arena(pl.w_gate.slice),
-                        Binding::Arena(s_xb),
-                        Binding::Arena(s_hb),
-                    ],
-                )?;
-                let (pu, gu, push_u) = gemv_pipe_for(&pl.w_up.mat)?;
-                let su_set = alloc_set(
-                    &pu,
-                    &[
-                        Binding::Arena(pl.w_up.slice),
-                        Binding::Arena(s_xb),
-                        Binding::Arena(s_hb2),
-                    ],
-                )?;
+                let g_call = alloc_gemv_call(&pl.w_gate.mat, s_xb, s_hb, false)?;
+                let u_call = alloc_gemv_call(&pl.w_up.mat, s_xb, s_hb2, false)?;
                 let silu_set = alloc_set(
                     &pipes.silu_mul,
                     &[Binding::Arena(s_hb), Binding::Arena(s_hb2)],
                 )?;
-                ((pg, sg_set, gg, push_g), (pu, su_set, gu, push_u), silu_set)
+                (g_call, u_call, silu_set)
             };
 
-            let ffn_dec = if pl.w_gate.mat.dtype == DType::Q4_0 && pl.w_up.mat.dtype == DType::Q4_0
-            {
+            let ffn_dec = if let (Some(gd), Some(ud)) = (pl.w_gate.mat.soa_d, pl.w_up.mat.soa_d) {
+                let wg = 128u32;
+                let nr = 2u32;
+                let pipe = ctx.pipeline(
+                    "gemv_pair_silu_q4_0_soa",
+                    wg | (nr << 16),
+                    SPV_GEMV_PAIR_SILU_Q4_0_SOA,
+                    6,
+                    8,
+                    &[wg, nr],
+                )?;
+                let set = alloc_set(
+                    &pipe,
+                    &[
+                        Binding::Arena(pl.w_gate.slice),
+                        Binding::Arena(gd),
+                        Binding::Arena(pl.w_up.slice),
+                        Binding::Arena(ud),
+                        Binding::Arena(s_xb),
+                        Binding::Arena(s_hb),
+                    ],
+                )?;
+                let rows_per_wg = (wg / sg).max(1) * nr;
+                DecodeFfnSets::FusedPairSilu {
+                    pipe,
+                    set,
+                    groups_x: (pl.w_gate.mat.rows as u32).div_ceil(rows_per_wg),
+                    push: [pl.w_gate.mat.cols as u32, pl.w_gate.mat.rows as u32],
+                }
+            } else if pl.w_gate.mat.dtype == DType::Q4_0 && pl.w_up.mat.dtype == DType::Q4_0 {
                 let wg = 128u32;
                 let nr = 2u32;
                 let pipe = ctx.pipeline(
@@ -1932,16 +2104,7 @@ impl LlamaVkRunner {
                 }
             };
 
-            let (p_dn, g_dn, mut push_dn) = gemv_pipe_for(&pl.w_down.mat)?;
-            push_dn[2] = 1;
-            let s_dn = alloc_set(
-                &p_dn,
-                &[
-                    Binding::Arena(pl.w_down.slice),
-                    Binding::Arena(s_hb),
-                    Binding::Arena(s_x),
-                ],
-            )?;
+            let (p_dn, s_dn, g_dn, push_dn) = alloc_gemv_call(&pl.w_down.mat, s_hb, s_x, true)?;
             let down_batch = make_batch_gemm(pl.w_down.mat, s_hb, s_x)?;
 
             layers.push(LayerPlan {
@@ -1970,10 +2133,12 @@ impl LlamaVkRunner {
                 ffn_batch_sep,
                 down_dec: (p_dn, s_dn, g_dn, push_dn),
                 down_batch,
-                qkv_weight_bytes: pl.wq.slice.len + pl.wk.slice.len + pl.wv.slice.len,
-                wo_weight_bytes: pl.wo.slice.len,
-                gate_up_weight_bytes: pl.w_gate.slice.len + pl.w_up.slice.len,
-                down_weight_bytes: pl.w_down.slice.len,
+                qkv_weight_bytes: pl.wq.mat.byte_len()
+                    + pl.wk.mat.byte_len()
+                    + pl.wv.mat.byte_len(),
+                wo_weight_bytes: pl.wo.mat.byte_len(),
+                gate_up_weight_bytes: pl.w_gate.mat.byte_len() + pl.w_up.mat.byte_len(),
+                down_weight_bytes: pl.w_down.mat.byte_len(),
             });
         }
 
@@ -3237,7 +3402,7 @@ impl LlamaVkRunner {
             stage_bytes[9] += l.down_weight_bytes;
             stage_flops[9] += (2 * self.cfg.n_ff * self.cfg.n_embd) as u64;
         }
-        stage_bytes[10] = self.out_mat.slice.len;
+        stage_bytes[10] = self.out_mat.byte_len();
         stage_flops[10] = (2 * self.cfg.n_embd * self.cfg.vocab_size) as u64;
 
         let mut stage_gpu_us = [0.0f64; N_STAGES];
@@ -3869,7 +4034,7 @@ impl LlamaVkRunner {
                         + b_u64 * ((self.cfg.n_ff + 2 * self.cfg.n_embd) * 4) as u64;
                     pp_flops[9] += b_u64 * (2 * self.cfg.n_ff * self.cfg.n_embd) as u64;
                 }
-                pp_bytes[10] = self.out_mat.slice.len;
+                pp_bytes[10] = self.out_mat.byte_len();
                 pp_flops[10] = (2 * self.cfg.n_embd * self.cfg.vocab_size) as u64;
 
                 for i in 0..N_STAGES {

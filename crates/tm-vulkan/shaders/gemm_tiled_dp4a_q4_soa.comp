@@ -1,0 +1,188 @@
+#version 450
+// LDS-tiled 32x64x32 INT8 DP4A (`OpSDotKHR`) batched GEMM for 16B-aligned Q4_0 SoA weights.
+// Identical math & tile geometry to `gemm_tiled_dp4a.comp`, with coalesced 32-bit `wq32` loads.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_spirv_intrinsics : require
+
+spirv_instruction(extensions = ["SPV_KHR_integer_dot_product"], capabilities = [6018, 6019], id = 4450)
+int sdot4x8(int a, int b, spirv_literal int packed_fmt);
+
+layout(constant_id = 0) const uint WG = 128;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer WQ32 { uint wq32[]; };
+layout(std430, binding = 1) readonly buffer WD   { uint16_t wd[]; };
+layout(std430, binding = 2) readonly buffer XQ   { int xq[]; };
+layout(std430, binding = 3) readonly buffer XD   { vec2 xd[]; };
+layout(std430, binding = 4) buffer Y             { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint n_in;
+    uint n_out;
+    uint n_tok;
+    uint add_residual;
+    uint _pad;
+} pc;
+
+shared int  X_sh[32][9];
+shared vec2 XD_sh[32];
+shared int  W_sh[64][9];
+shared vec2 WDM_sh[4][64];
+
+void store_row4(uint gm, uint gn0, vec4 c) {
+    if (gm >= pc.n_tok) return;
+    const uint yb = gm * pc.n_out + gn0;
+    if (pc.add_residual != 0u) {
+        if (gn0 + 0u < pc.n_out) y[yb + 0u] += c.x;
+        if (gn0 + 1u < pc.n_out) y[yb + 1u] += c.y;
+        if (gn0 + 2u < pc.n_out) y[yb + 2u] += c.z;
+        if (gn0 + 3u < pc.n_out) y[yb + 3u] += c.w;
+    } else {
+        if (gn0 + 0u < pc.n_out) y[yb + 0u] = c.x;
+        if (gn0 + 1u < pc.n_out) y[yb + 1u] = c.y;
+        if (gn0 + 2u < pc.n_out) y[yb + 2u] = c.z;
+        if (gn0 + 3u < pc.n_out) y[yb + 3u] = c.w;
+    }
+}
+
+void main() {
+    const uint num_n = gl_NumWorkGroups.x;
+    const uint num_m = gl_NumWorkGroups.y;
+    const uint wg_linear = gl_WorkGroupID.y * num_n + gl_WorkGroupID.x;
+    const uint group_sz = num_m * 8u;
+    const uint group_id = wg_linear / group_sz;
+    const uint first_n = group_id * 8u;
+    const uint group_n = min(num_n - first_n, 8u);
+    const uint in_group = wg_linear % group_sz;
+    const uint pid_n = first_n + (in_group % group_n);
+    const uint pid_m = in_group / group_n;
+
+    const uint r0 = pid_n * 64u;
+    const uint t0 = pid_m * 32u;
+    if (r0 >= pc.n_out || t0 >= pc.n_tok) return;
+
+    const uint tid = gl_LocalInvocationID.x;
+    const uint x_row = tid >> 2u;
+    const uint sub = tid & 3u;
+    const bool valid_x = (t0 + x_row) < pc.n_tok;
+
+    const uint tm = (tid >> 4u) * 4u;
+    const uint rn = (tid & 15u) * 4u;
+
+    vec4 c0 = vec4(0.0);
+    vec4 c1 = vec4(0.0);
+    vec4 c2 = vec4(0.0);
+    vec4 c3 = vec4(0.0);
+
+    const uint nb = pc.n_in >> 5u;
+
+    for (uint ib = 0u; ib < nb; ++ib) {
+        if (valid_x) {
+            const uint blk_idx = (t0 + x_row) * nb + ib;
+            const uint q_base = blk_idx * 8u + sub * 2u;
+            X_sh[x_row][sub * 2u + 0u] = xq[q_base + 0u];
+            X_sh[x_row][sub * 2u + 1u] = xq[q_base + 1u];
+            if (sub == 0u) {
+                XD_sh[x_row] = xd[blk_idx];
+            }
+        } else {
+            X_sh[x_row][sub * 2u + 0u] = 0;
+            X_sh[x_row][sub * 2u + 1u] = 0;
+            if (sub == 0u) {
+                XD_sh[x_row] = vec2(0.0);
+            }
+        }
+
+        const uint ib_phase = ib & 3u;
+        [[unroll]] for (uint rp = 0u; rp < 2u; ++rp) {
+            const uint lr = rp * 32u + x_row;
+            if (r0 + lr < pc.n_out) {
+                const uint bi = (r0 + lr) * nb + ib;
+                if (ib_phase == 0u) {
+                    const uint ib_s = ib + sub;
+                    if (ib_s < nb) {
+                        const float dw = unpackHalf2x16(uint(wd[(r0 + lr) * nb + ib_s])).x;
+                        WDM_sh[sub][lr] = vec2(dw, -8.0 * dw);
+                    } else {
+                        WDM_sh[sub][lr] = vec2(0.0);
+                    }
+                }
+                const uint u = wq32[bi * 4u + sub];
+                W_sh[lr][sub]      = int(u & 0x0F0F0F0Fu);
+                W_sh[lr][4u + sub] = int((u >> 4u) & 0x0F0F0F0Fu);
+            } else {
+                W_sh[lr][sub] = 0;
+                W_sh[lr][4u + sub] = 0;
+                if (ib_phase == 0u) {
+                    WDM_sh[sub][lr] = vec2(0.0);
+                }
+            }
+        }
+
+        barrier();
+
+        const vec2 xd0 = XD_sh[tm + 0u];
+        const vec2 xd1 = XD_sh[tm + 1u];
+        const vec2 xd2 = XD_sh[tm + 2u];
+        const vec2 xd3 = XD_sh[tm + 3u];
+
+        const vec2 wd0 = WDM_sh[ib_phase][rn + 0u];
+        const vec2 wd1 = WDM_sh[ib_phase][rn + 1u];
+        const vec2 wd2 = WDM_sh[ib_phase][rn + 2u];
+        const vec2 wd3 = WDM_sh[ib_phase][rn + 3u];
+
+        const vec4 dw_vec = vec4(wd0.x, wd1.x, wd2.x, wd3.x);
+        const vec4 mw_vec = vec4(wd0.y, wd1.y, wd2.y, wd3.y);
+
+        ivec4 i0 = ivec4(0);
+        ivec4 i1 = ivec4(0);
+        ivec4 i2 = ivec4(0);
+        ivec4 i3 = ivec4(0);
+
+        [[unroll]] for (uint k = 0u; k < 8u; ++k) {
+            const int x0 = X_sh[tm + 0u][k];
+            const int x1 = X_sh[tm + 1u][k];
+            const int x2 = X_sh[tm + 2u][k];
+            const int x3 = X_sh[tm + 3u][k];
+
+            const int w0 = W_sh[rn + 0u][k];
+            const int w1 = W_sh[rn + 1u][k];
+            const int w2 = W_sh[rn + 2u][k];
+            const int w3 = W_sh[rn + 3u][k];
+
+            i0.x += sdot4x8(x0, w0, 0);
+            i0.y += sdot4x8(x0, w1, 0);
+            i0.z += sdot4x8(x0, w2, 0);
+            i0.w += sdot4x8(x0, w3, 0);
+
+            i1.x += sdot4x8(x1, w0, 0);
+            i1.y += sdot4x8(x1, w1, 0);
+            i1.z += sdot4x8(x1, w2, 0);
+            i1.w += sdot4x8(x1, w3, 0);
+
+            i2.x += sdot4x8(x2, w0, 0);
+            i2.y += sdot4x8(x2, w1, 0);
+            i2.z += sdot4x8(x2, w2, 0);
+            i2.w += sdot4x8(x2, w3, 0);
+
+            i3.x += sdot4x8(x3, w0, 0);
+            i3.y += sdot4x8(x3, w1, 0);
+            i3.z += sdot4x8(x3, w2, 0);
+            i3.w += sdot4x8(x3, w3, 0);
+        }
+
+        c0 = fma(dw_vec * xd0.x, vec4(i0), fma(mw_vec, vec4(xd0.y), c0));
+        c1 = fma(dw_vec * xd1.x, vec4(i1), fma(mw_vec, vec4(xd1.y), c1));
+        c2 = fma(dw_vec * xd2.x, vec4(i2), fma(mw_vec, vec4(xd2.y), c2));
+        c3 = fma(dw_vec * xd3.x, vec4(i3), fma(mw_vec, vec4(xd3.y), c3));
+
+        barrier();
+    }
+
+    store_row4(t0 + tm + 0u, r0 + rn, c0);
+    store_row4(t0 + tm + 1u, r0 + rn, c1);
+    store_row4(t0 + tm + 2u, r0 + rn, c2);
+    store_row4(t0 + tm + 3u, r0 + rn, c3);
+}
