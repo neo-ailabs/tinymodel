@@ -1718,6 +1718,12 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
     }
 
     if arch == "qwen35" {
+        let vision_embeds = if !opts.image_paths.is_empty() {
+            let pool = ThreadPool::new(opts.threads);
+            encode_cli_images(&opts, &pool)?
+        } else {
+            Vec::new()
+        };
         let mut runner = tm_vulkan::Qwen35VkRunner::from_gguf(gguf, opts.max_ctx)?;
         if let Some(ref ls) = loras {
             runner.bind_lora(ls)?;
@@ -1741,12 +1747,19 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
         let mut history = prompt_ids.clone();
 
         let t_pp = Instant::now();
-        let logits = runner.forward_batch(&prompt_ids, 0, true)?;
+        let mut pos = 0usize;
+        for vis in &vision_embeds {
+            for t in 0..vis.n_tokens {
+                runner.forward_embed(vis.token_embed(t), pos, false)?;
+                pos += 1;
+            }
+        }
+        let logits = runner.forward_batch(&prompt_ids, pos, true)?;
+        pos += prompt_ids.len();
         let mut next_id = sampler.sample(logits, &history);
         let pp_sec = t_pp.elapsed().as_secs_f64();
 
         let mut stdout = io::stdout().lock();
-        let mut pos = prompt_ids.len();
         let mut generated = 0usize;
         let t_gen = Instant::now();
         while generated < opts.n_predict {
@@ -1789,6 +1802,12 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
         return Ok(());
     }
 
+    let vision_embeds = if !opts.image_paths.is_empty() {
+        let pool = ThreadPool::new(opts.threads);
+        encode_cli_images(&opts, &pool)?
+    } else {
+        Vec::new()
+    };
     let mut runner = tm_vulkan::LlamaVkRunner::from_gguf(gguf, opts.max_ctx)?;
     if let Some(ref ls) = loras {
         runner.bind_lora(ls)?;
@@ -1811,12 +1830,19 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
     let mut history = prompt_ids.clone();
 
     let t_pp = Instant::now();
-    let logits = runner.forward_batch(&prompt_ids, 0, true)?;
+    let mut pos = 0usize;
+    for vis in &vision_embeds {
+        for t in 0..vis.n_tokens {
+            runner.forward_embed(vis.token_embed(t), pos, false)?;
+            pos += 1;
+        }
+    }
+    let logits = runner.forward_batch(&prompt_ids, pos, true)?;
+    pos += prompt_ids.len();
     let mut next_id = sampler.sample(logits, &history);
     let pp_sec = t_pp.elapsed().as_secs_f64();
 
     let mut stdout = io::stdout().lock();
-    let mut pos = prompt_ids.len();
     let mut generated = 0usize;
 
     let t_gen = Instant::now();

@@ -25,8 +25,9 @@ layout(constant_id = 0) const uint WG = 128;
 layout(constant_id = 1) const uint DTYPE = 0;
 layout(local_size_x_id = 0) in;
 
-layout(std430, binding = 0) readonly buffer W  { uint16_t w16[]; };
-layout(std430, binding = 1) readonly buffer XQ { int xq[]; };
+layout(std430, binding = 0) readonly buffer W   { uint16_t w16[]; };
+layout(std430, binding = 0) readonly buffer W32 { uint w32[]; };
+layout(std430, binding = 1) readonly buffer XQ  { int xq[]; };
 layout(std430, binding = 2) readonly buffer XD { vec2 xd[]; };
 layout(std430, binding = 3) buffer Y           { float y[]; };
 
@@ -138,7 +139,7 @@ void main() {
                     const uint u = uint(w16[b + 2u + sub * 2u]) | (uint(w16[b + 3u + sub * 2u]) << 16u);
                     W_sh[lr][sub]      = int(u & 0x0F0F0F0Fu);
                     W_sh[lr][4u + sub] = int((u >> 4u) & 0x0F0F0F0Fu);
-                } else {
+                } else if (DTYPE == 2u) {
                     // Q8_0
                     const uint b = w_row_base + ib * 17u;
                     if (sub == 0u) {
@@ -149,6 +150,46 @@ void main() {
                     const uint j1 = j0 + 1u;
                     W_sh[lr][j0] = int(uint(w16[b + 1u + 2u * j0]) | (uint(w16[b + 2u + 2u * j0]) << 16u));
                     W_sh[lr][j1] = int(uint(w16[b + 1u + 2u * j1]) | (uint(w16[b + 2u + 2u * j1]) << 16u));
+                } else {
+                    // DTYPE == 3u: Q5_K (256 elems = 8x32 sub-blocks = 176B = 44 uint32_t)
+                    // 5-bit unsigned quants in [0..31] are valid signed int8 values for OpSDotKHR.
+                    const uint isb = ib >> 3u;
+                    const uint is = ib & 7u;
+                    const uint chunk = is >> 1u;
+                    const uint is_hi = is & 1u;
+                    const uint b32 = (w_row_base >> 1u) + isb * 44u;
+                    if (sub == 0u) {
+                        const vec2 dm = unpackHalf2x16(w32[b32]);
+                        const uint s0 = w32[b32 + 1u];
+                        const uint s1 = w32[b32 + 2u];
+                        const uint s2 = w32[b32 + 3u];
+                        uint sc, m;
+                        if (is < 4u) {
+                            const uint sh = is * 8u;
+                            sc = (s0 >> sh) & 63u;
+                            m  = (s1 >> sh) & 63u;
+                        } else {
+                            const uint k = (is - 4u) * 8u;
+                            const uint b4  = (s2 >> k) & 0xFFu;
+                            const uint bm4 = (s0 >> k) & 0xFFu;
+                            const uint b0  = (s1 >> k) & 0xFFu;
+                            sc = (b4 & 0x0Fu) | ((bm4 >> 6u) << 4u);
+                            m  = (b4 >> 4u)   | ((b0  >> 6u) << 4u);
+                        }
+                        WDM_sh[lr] = vec2(dm.x * float(sc), -dm.y * float(m));
+                    }
+                    const uint j0 = sub * 2u;
+                    const uint j1 = j0 + 1u;
+                    const uint ql0 = w32[b32 + 12u + chunk * 8u + j0];
+                    const uint ql1 = w32[b32 + 12u + chunk * 8u + j1];
+                    const uint qh0 = w32[b32 + 4u + j0];
+                    const uint qh1 = w32[b32 + 4u + j1];
+                    const uint lo0 = (is_hi == 0u) ? (ql0 & 0x0F0F0F0Fu) : ((ql0 >> 4u) & 0x0F0F0F0Fu);
+                    const uint lo1 = (is_hi == 0u) ? (ql1 & 0x0F0F0F0Fu) : ((ql1 >> 4u) & 0x0F0F0F0Fu);
+                    const uint hi0 = ((qh0 >> is) & 0x01010101u) << 4u;
+                    const uint hi1 = ((qh1 >> is) & 0x01010101u) << 4u;
+                    W_sh[lr][j0] = int(lo0 | hi0);
+                    W_sh[lr][j1] = int(lo1 | hi1);
                 }
             } else {
                 W_sh[lr][sub] = 0;

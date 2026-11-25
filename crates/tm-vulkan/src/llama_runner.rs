@@ -373,6 +373,8 @@ pub struct LlamaVkRunner {
     slabs: Vec<VkBuffer>,
     step_buf: VkBuffer,
     token_ids_buf: VkBuffer,
+    embed_staging: VkBuffer,
+    x_dev: VkSlice,
     argmax_buf: VkBuffer,
     logits_host: VkBuffer,
     logits_dev: VkSlice,
@@ -1199,6 +1201,7 @@ impl LlamaVkRunner {
 
         let step_buf = ctx.create_host_buffer(32)?;
         let token_ids_buf = ctx.create_host_buffer((max_batch * 4) as u64)?;
+        let embed_staging = ctx.create_host_buffer((n_embd * 4) as u64)?;
         let argmax_buf = ctx.create_host_buffer(16)?;
         let logits_host = ctx.create_host_buffer((vocab_size * 4) as u64)?;
 
@@ -1419,7 +1422,10 @@ impl LlamaVkRunner {
             }
 
             if prefill_kind == ResolvedPrefill::TiledDp4a
-                && matches!(mat.dtype, DType::Q4_0 | DType::Q4_1 | DType::Q8_0)
+                && matches!(
+                    mat.dtype,
+                    DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q5K
+                )
                 && let (Some(xq), Some(xd)) = (s_xq, s_xd)
             {
                 let pipe = ctx.pipeline(
@@ -1997,6 +2003,8 @@ impl LlamaVkRunner {
             slabs,
             step_buf,
             token_ids_buf,
+            embed_staging,
+            x_dev: s_x,
             argmax_buf,
             logits_host,
             logits_dev,
@@ -2177,6 +2185,16 @@ impl LlamaVkRunner {
         compute_logits: bool,
         greedy_argmax: bool,
     ) -> Result<(), VulkanError> {
+        self.record_decode_into_inner(cb, compute_logits, greedy_argmax, false)
+    }
+
+    fn record_decode_into_inner(
+        &self,
+        cb: vk::CommandBuffer,
+        compute_logits: bool,
+        greedy_argmax: bool,
+        skip_embed: bool,
+    ) -> Result<(), VulkanError> {
         let d = &self.ctx.inner.device;
         // SAFETY: `cb` is idle and owned by `self.cmd_pool`.
         unsafe {
@@ -2186,21 +2204,51 @@ impl LlamaVkRunner {
                 .ctx("vkBeginCommandBuffer")?;
         }
 
-        let emb_items = embed_items(self.token_embd.dtype, self.cfg.n_embd)?;
-        self.cmd_dispatch_set(
-            cb,
-            &self.pipes.embed_dec,
-            self.embed_dec_set,
-            &[
-                self.cfg.n_embd as u32,
-                (self.token_embd.row_bytes / 2) as u32,
-            ],
-            emb_items.div_ceil(64),
-            1,
-            true,
-        )?;
-        self.lora
-            .cmd_record_embed(&self.ctx, cb, "token_embd.weight", 1, false)?;
+        if skip_embed {
+            let bytes = (self.cfg.n_embd * 4) as u64;
+            let region = vk::BufferCopy {
+                src_offset: 0,
+                dst_offset: self.x_dev.offset,
+                size: bytes,
+            };
+            let to_compute = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+            // SAFETY: `embed_staging` holds `n_embd` f32s and `x_dev` is valid in `self.slabs`.
+            unsafe {
+                d.cmd_copy_buffer(
+                    cb,
+                    self.embed_staging.buf,
+                    self.slabs[self.x_dev.slab].buf,
+                    &[region],
+                );
+                d.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[to_compute],
+                    &[],
+                    &[],
+                );
+            }
+        } else {
+            let emb_items = embed_items(self.token_embd.dtype, self.cfg.n_embd)?;
+            self.cmd_dispatch_set(
+                cb,
+                &self.pipes.embed_dec,
+                self.embed_dec_set,
+                &[
+                    self.cfg.n_embd as u32,
+                    (self.token_embd.row_bytes / 2) as u32,
+                ],
+                emb_items.div_ceil(64),
+                1,
+                true,
+            )?;
+            self.lora
+                .cmd_record_embed(&self.ctx, cb, "token_embd.weight", 1, false)?;
+        }
 
         let eps_bits = self.cfg.rms_eps.to_bits();
         let norm_push = [self.cfg.n_embd as u32, 0, eps_bits];
@@ -2564,6 +2612,41 @@ impl LlamaVkRunner {
             self.cb_decode_no_logits
         };
         self.submit_and_wait(cb)?;
+        Ok(self.logits())
+    }
+
+    /// Runs a single-position forward pass from a precomputed input embedding (`embed.len() == n_embd`),
+    /// used for multimodal vision token injection (`ADR-019`).
+    pub fn forward_embed(
+        &mut self,
+        embed: &[f32],
+        pos: usize,
+        compute_logits: bool,
+    ) -> Result<&[f32], VulkanError> {
+        if pos >= self.cfg.max_ctx {
+            return Err(VulkanError::InvalidDimensions(format!(
+                "pos {pos} >= max_ctx {}",
+                self.cfg.max_ctx
+            )));
+        }
+        if embed.len() != self.cfg.n_embd {
+            return Err(VulkanError::InvalidDimensions(format!(
+                "forward_embed length {} != n_embd {}",
+                embed.len(),
+                self.cfg.n_embd
+            )));
+        }
+        let ptr = self
+            .embed_staging
+            .mapped_ptr()
+            .expect("embed_staging mapped") as *mut f32;
+        // SAFETY: `embed_staging` is host-mapped with capacity `n_embd` f32s and no CB is in flight.
+        unsafe {
+            core::ptr::copy_nonoverlapping(embed.as_ptr(), ptr, self.cfg.n_embd);
+        }
+        self.write_step_params(0, pos);
+        self.record_decode_into_inner(self.cb_batch, compute_logits, false, true)?;
+        self.submit_and_wait(self.cb_batch)?;
         Ok(self.logits())
     }
 
