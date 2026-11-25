@@ -7,6 +7,7 @@
 pub mod prefix_cache;
 pub mod spec;
 
+use std::path::Path;
 use std::time::Instant;
 
 pub use tm_core::KvType;
@@ -18,12 +19,37 @@ use tm_models::{
     LlamaModel, LlamaState, MAX_SPEC_WINDOW, Mamba2Model, Mamba2State, ModelError, Qwen35Model,
     Qwen35State, SpecVerifyBuf, argmax,
 };
+pub use tm_models::{
+    PreprocessedImage, RgbImage, VisionConfig, VisionEmbeddings, VisionModel, VisionProjectorType,
+};
 
 pub use prefix_cache::{CachedLayer, PrefixCache};
 pub use spec::{
     DraftChoice, LinearMtpHead, MAX_DRAFT_TOKENS, MIN_NET_GAIN_THRESHOLD, MtpDrafter,
     SpecController, SpecMode, SpecStats, SuffixDrafter,
 };
+
+/// A contiguous text or vision segment in a multimodal prompt (`ADR-019`).
+pub enum MultimodalChunk<'a> {
+    Tokens(&'a [u32]),
+    Image(&'a VisionEmbeddings),
+}
+
+/// Staged multimodal image encoding (`ADR-019`):
+/// memory-maps `mmproj_path`, runs the Vision Encoder + Projector on `image`, and **immediately
+/// drops** the `mmproj` mmap and `VisionModel` before returning so zero vision weights stay
+/// resident during LLM decoding.
+pub fn encode_image_staged(
+    mmproj_path: &Path,
+    image: &RgbImage,
+    pool: &ThreadPool,
+    kt: &KernelTable,
+) -> Result<VisionEmbeddings, ModelError> {
+    let gguf = GgufFile::open(mmproj_path)?;
+    let vision = VisionModel::from_gguf(&gguf)?;
+    let pre = image.preprocess(&vision.cfg);
+    vision.encode(&pre, pool, kt)
+}
 
 /// Unified CPU model wrapper supporting all `tinymodel` architectures.
 #[allow(clippy::large_enum_variant)]
@@ -335,6 +361,40 @@ impl<'a> CpuModel<'a> {
         }
     }
 
+    /// Runs a single-position forward pass from a precomputed embedding (`embed.len() == n_embd`),
+    /// used for multimodal vision token injection (`ADR-019`).
+    pub fn forward_embed(
+        &self,
+        state: &mut CpuState,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        embed: &[f32],
+        pos: usize,
+        compute_logits: bool,
+    ) -> Result<(), ModelError> {
+        match (self, state) {
+            (CpuModel::Llama(m), CpuState::Llama(s)) => {
+                m.forward_embed(s, pool, kt, embed, pos, compute_logits)
+            }
+            (CpuModel::Qwen35(m), CpuState::Qwen35(s)) => {
+                m.forward_embed(s, pool, kt, embed, pos, compute_logits)
+            }
+            (CpuModel::Gemma4(m), CpuState::Gemma4(s)) => {
+                m.forward_embed(s, pool, kt, embed, pos, compute_logits)
+            }
+            (CpuModel::Lfm2(m), CpuState::Lfm2(s)) => {
+                m.forward_embed(s, pool, kt, embed, pos, compute_logits)
+            }
+            (CpuModel::Mamba2(m), CpuState::Mamba2(s)) => {
+                m.forward_embed(s, pool, kt, embed, pos, compute_logits)
+            }
+            (CpuModel::Inkling2(m), CpuState::Inkling2(_)) => Err(ModelError::UnsupportedArch(
+                format!("forward_embed not yet implemented for '{}'", m.cfg.arch),
+            )),
+            _ => unreachable!("CpuModel and CpuState variants always match"),
+        }
+    }
+
     pub fn forward_batch(
         &self,
         state: &mut CpuState,
@@ -627,6 +687,86 @@ impl<'a> Session<'a> {
         if self.spec_buf.is_none() {
             self.spec_buf = Some(self.model.new_spec_buf());
         }
+    }
+
+    /// Evaluates an interleaved sequence of text token chunks and projected visual embeddings
+    /// from position 0, computing final logits on the very last position (`ADR-019`).
+    ///
+    /// Validates total sequence length, token IDs, and embedding dimensions BEFORE mutating
+    /// session state (`AGENTS.md` Rule #6).
+    pub fn prefill_multimodal(
+        &mut self,
+        pool: &ThreadPool,
+        chunks: &[MultimodalChunk<'_>],
+    ) -> Result<usize, ModelError> {
+        let kt = active_kernels();
+        let mut total = 0usize;
+        for chunk in chunks {
+            match chunk {
+                MultimodalChunk::Tokens(toks) => {
+                    for &tid in *toks {
+                        if (tid as usize) >= self.model.vocab_size() {
+                            return Err(ModelError::TokenOutOfRange {
+                                token_id: tid,
+                                vocab_size: self.model.vocab_size(),
+                            });
+                        }
+                    }
+                    total += toks.len();
+                }
+                MultimodalChunk::Image(vis) => {
+                    if vis.d_llm != self.model.n_embd() {
+                        return Err(ModelError::InvalidConfig(format!(
+                            "vision embedding dim {} does not match LLM n_embd {}",
+                            vis.d_llm,
+                            self.model.n_embd()
+                        )));
+                    }
+                    total += vis.n_tokens;
+                }
+            }
+        }
+        if total == 0 {
+            return Ok(0);
+        }
+        if total > self.state.max_ctx() {
+            return Err(ModelError::ContextOverflow {
+                pos: total - 1,
+                max_ctx: self.state.max_ctx(),
+            });
+        }
+
+        self.state.reset();
+        let mut pos = 0usize;
+        for chunk in chunks {
+            match chunk {
+                MultimodalChunk::Tokens(toks) => {
+                    if toks.is_empty() {
+                        continue;
+                    }
+                    let is_last = pos + toks.len() == total;
+                    self.model
+                        .forward_batch(&mut self.state, pool, kt, toks, pos, is_last)?;
+                    pos += toks.len();
+                }
+                MultimodalChunk::Image(vis) => {
+                    for idx in 0..vis.n_tokens {
+                        let is_last = pos + 1 == total;
+                        self.model.forward_embed(
+                            &mut self.state,
+                            pool,
+                            kt,
+                            vis.token_embed(idx),
+                            pos,
+                            is_last,
+                        )?;
+                        pos += 1;
+                    }
+                }
+            }
+        }
+        self.pos = pos;
+        Ok(pos)
     }
 
     /// Saves an explicit checkpoint for `prefix_tokens` (must match current session state at `prefix_tokens.len()`).

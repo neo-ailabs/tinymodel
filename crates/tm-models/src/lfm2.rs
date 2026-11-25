@@ -648,6 +648,57 @@ impl<'a> Lfm2Model<'a> {
         }
 
         let n_embd = self.cfg.n_embd;
+
+        decode_embedding_row(
+            self.token_embd.dtype,
+            self.token_embd.bytes,
+            n_embd,
+            tid,
+            &mut state.x[..n_embd],
+        );
+        self.lora
+            .apply_embed_row(self.token_embd.lora_slot, kt, tid, &mut state.x[..n_embd]);
+
+        self.forward_from_x(state, pool, kt, pos, compute_logits)
+    }
+
+    /// Runs a single-position forward pass from a precomputed input embedding (`embed.len() == n_embd`),
+    /// used for multimodal vision token injection (`ADR-019`).
+    pub fn forward_embed(
+        &self,
+        state: &mut Lfm2State,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        embed: &[f32],
+        pos: usize,
+        compute_logits: bool,
+    ) -> Result<(), ModelError> {
+        if pos >= state.max_ctx {
+            return Err(ModelError::ContextOverflow {
+                pos,
+                max_ctx: state.max_ctx,
+            });
+        }
+        let n_embd = self.cfg.n_embd;
+        if embed.len() != n_embd {
+            return Err(ModelError::InvalidConfig(format!(
+                "forward_embed length mismatch: expected {n_embd}, got {}",
+                embed.len()
+            )));
+        }
+        state.x[..n_embd].copy_from_slice(embed);
+        self.forward_from_x(state, pool, kt, pos, compute_logits)
+    }
+
+    fn forward_from_x(
+        &self,
+        state: &mut Lfm2State,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        pos: usize,
+        compute_logits: bool,
+    ) -> Result<(), ModelError> {
+        let n_embd = self.cfg.n_embd;
         let n_ff = self.cfg.n_ff;
         let hd = self.cfg.head_dim;
         let q_dim = self.cfg.n_head * hd;
@@ -667,16 +718,6 @@ impl<'a> Lfm2Model<'a> {
             &mut state.rope_cos_swa,
             &mut state.rope_sin_swa,
         );
-
-        decode_embedding_row(
-            self.token_embd.dtype,
-            self.token_embd.bytes,
-            n_embd,
-            tid,
-            &mut state.x[..n_embd],
-        );
-        self.lora
-            .apply_embed_row(self.token_embd.lora_slot, kt, tid, &mut state.x[..n_embd]);
 
         for (il, layer) in self.layers.iter().enumerate() {
             rms_norm(

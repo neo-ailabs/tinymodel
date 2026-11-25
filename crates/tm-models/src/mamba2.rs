@@ -1228,6 +1228,34 @@ impl<'a> Mamba2Model<'a> {
         self.forward_chunk_internal(state, None, pool, kt, &toks, pos, compute_logits)
     }
 
+    /// Runs a single-position forward pass from a precomputed input embedding (`embed.len() == n_embd`),
+    /// used for multimodal vision token injection (`ADR-019`).
+    pub fn forward_embed(
+        &self,
+        state: &mut Mamba2State,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        embed: &[f32],
+        pos: usize,
+        compute_logits: bool,
+    ) -> Result<(), ModelError> {
+        if pos >= state.max_ctx {
+            return Err(ModelError::ContextOverflow {
+                pos,
+                max_ctx: state.max_ctx,
+            });
+        }
+        let d = self.cfg.n_embd;
+        if embed.len() != d {
+            return Err(ModelError::InvalidConfig(format!(
+                "forward_embed length mismatch: expected {d}, got {}",
+                embed.len()
+            )));
+        }
+        state.x[..d].copy_from_slice(embed);
+        self.forward_chunk_from_x(state, None, pool, kt, 1, pos, compute_logits)
+    }
+
     pub fn forward_batch(
         &self,
         state: &mut Mamba2State,
@@ -1279,7 +1307,7 @@ impl<'a> Mamba2Model<'a> {
     fn forward_chunk_internal(
         &self,
         state: &mut Mamba2State,
-        mut spec_buf: Option<&mut SpecVerifyBuf>,
+        spec_buf: Option<&mut SpecVerifyBuf>,
         pool: &ThreadPool,
         kt: &KernelTable,
         chunk: &[u32],
@@ -1305,8 +1333,6 @@ impl<'a> Mamba2Model<'a> {
 
         let c = &self.cfg;
         let d = c.n_embd;
-        let single_tok = b == 1;
-        let res_scale = c.residual_scale;
 
         for (t, &tok) in chunk.iter().enumerate() {
             let dst = &mut state.x[t * d..(t + 1) * d];
@@ -1321,6 +1347,25 @@ impl<'a> Mamba2Model<'a> {
                 .apply_embed_row(self.token_embd.lora_slot, kt, tok as usize, dst);
         }
         scale_slice_inplace(&mut state.x[..b * d], c.embedding_scale);
+
+        self.forward_chunk_from_x(state, spec_buf, pool, kt, b, chunk_pos, compute_last_logits)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_chunk_from_x(
+        &self,
+        state: &mut Mamba2State,
+        mut spec_buf: Option<&mut SpecVerifyBuf>,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        b: usize,
+        chunk_pos: usize,
+        compute_last_logits: bool,
+    ) -> Result<(), ModelError> {
+        let c = &self.cfg;
+        let d = c.n_embd;
+        let single_tok = b == 1;
+        let res_scale = c.residual_scale;
 
         for lw in &self.layers {
             if single_tok {

@@ -20,7 +20,8 @@ use tm_models::{
     Sampler, SamplerConfig, argmax,
 };
 use tm_runtime::{
-    CpuModel, LinearMtpHead, MtpDrafter, Session, SpecController, SpecMode, SuffixDrafter,
+    CpuModel, LinearMtpHead, MtpDrafter, MultimodalChunk, RgbImage, Session, SpecController,
+    SpecMode, SuffixDrafter, VisionEmbeddings, encode_image_staged,
 };
 use tm_tokenizer::Tokenizer;
 
@@ -31,7 +32,7 @@ fn print_usage() {
   tinymodel inspect <model.gguf>
   tinymodel convert -i <in.gguf> -o <out.gguf> [--quant q4_0x4|q4_0|q8_0|iq4_nl|iq3_xxs|q2_0|iq2_xxs|tq2_0] [--lm-head-quant <fmt>] [--prune-vocab <N>] [--vocab-corpus <file>]
   tinymodel lora-merge -m <base.gguf> --lora <adapter.gguf>[:scale] -o <out.gguf> [--quant <fmt>] [--lm-head-quant <fmt>]
-  tinymodel run -m <model.gguf> [-md <dspark.gguf>] [--draft-max <k>] [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--spec off|auto|suffix|mtp] [--mtp <mtp.gguf>] [--lora <adapter.gguf>[:scale]] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]
+  tinymodel run -m <model.gguf> [--mmproj <mmproj.gguf> --image <img.ppm|bmp>] [-md <dspark.gguf>] [--draft-max <k>] [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--spec off|auto|suffix|mtp] [--mtp <mtp.gguf>] [--lora <adapter.gguf>[:scale]] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]
   tinymodel bench -m <model.gguf> [-md <dspark.gguf>] [--draft-max <k>] [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--spec off|auto|suffix|mtp] [--mtp <mtp.gguf>] [--lora <adapter.gguf>[:scale]] [--vulkan | --metal | --gpu <vulkan|metal|cpu>] [--json]
   tinymodel profile -m <model.gguf> [-n <tokens>] [-t <threads>] [-c <ctx>] [--lora <adapter.gguf>[:scale]] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]
   tinymodel logits -m <model.gguf> -o <out.bin> [-p <prompt> | --tokens 1,2,3] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--lora <adapter.gguf>[:scale]] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]
@@ -290,6 +291,8 @@ struct RunOpts {
     use_vulkan: bool,
     json: bool,
     sampler: SamplerConfig,
+    mmproj_path: Option<PathBuf>,
+    image_paths: Vec<PathBuf>,
 }
 
 fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
@@ -312,6 +315,8 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
     let mut use_vulkan = false;
     let mut json = false;
     let mut sampler = SamplerConfig::default();
+    let mut mmproj_path: Option<PathBuf> = None;
+    let mut image_paths: Vec<PathBuf> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -494,6 +499,18 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
                     .parse()
                     .context("invalid --prefix-cache-mib")?;
             }
+            "--mmproj" => {
+                i += 1;
+                mmproj_path = Some(PathBuf::from(
+                    args.get(i).context("missing value for --mmproj")?,
+                ));
+            }
+            "--image" => {
+                i += 1;
+                image_paths.push(PathBuf::from(
+                    args.get(i).context("missing value for --image")?,
+                ));
+            }
             "--json" => {
                 json = true;
             }
@@ -504,6 +521,9 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
 
     if use_metal && use_vulkan {
         bail!("cannot specify both --metal and --vulkan");
+    }
+    if !image_paths.is_empty() && mmproj_path.is_none() {
+        bail!("--image requires --mmproj <mmproj.gguf>");
     }
 
     let model = model.context("missing required -m <model.gguf>")?;
@@ -527,7 +547,41 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
         use_vulkan,
         json,
         sampler,
+        mmproj_path,
+        image_paths,
     })
+}
+
+/// Staged multimodal image encoding helper (`ADR-019`): encodes all `--image` files through
+/// `--mmproj` and immediately drops the vision encoder mmap before LLM inference starts.
+fn encode_cli_images(opts: &RunOpts, pool: &ThreadPool) -> Result<Vec<VisionEmbeddings>> {
+    if opts.image_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mmproj = opts
+        .mmproj_path
+        .as_ref()
+        .context("--image requires --mmproj <mmproj.gguf>")?;
+    let kt = active_kernels();
+    let mut out = Vec::with_capacity(opts.image_paths.len());
+    for img_path in &opts.image_paths {
+        let t0 = Instant::now();
+        let img = RgbImage::from_file(img_path)?;
+        let vis = encode_image_staged(mmproj, &img, pool, kt)?;
+        eprintln!(
+            "[tinymodel] vision: encoded '{}' ({}x{}) -> {} tokens ({}x{}, d={}) in {:.1}ms (staged mmap released)",
+            img_path.display(),
+            img.width,
+            img.height,
+            vis.n_tokens,
+            vis.grid_h,
+            vis.grid_w,
+            vis.d_llm,
+            t0.elapsed().as_secs_f64() * 1e3
+        );
+        out.push(vis);
+    }
+    Ok(out)
 }
 
 fn resolve_prompt_ids(opts: &RunOpts, tok: &Tokenizer) -> Result<Vec<u32>> {
@@ -674,16 +728,34 @@ fn cmd_run_metal(opts: RunOpts) -> Result<()> {
         runner.n_layers()
     );
 
+    let pool = ThreadPool::new(opts.threads);
+    let vision_embeds = encode_cli_images(&opts, &pool)?;
+
     let mut sampler = Sampler::new(opts.sampler, runner.vocab_size());
     let mut history = prompt_ids.clone();
 
     let t_pp = Instant::now();
-    let logits = runner.forward_batch(&prompt_ids, 0, true)?;
+    let mut pos = 0usize;
+    let total_vis: usize = vision_embeds.iter().map(|v| v.n_tokens).sum();
+    let total_pp = total_vis + prompt_ids.len();
+    for vis in &vision_embeds {
+        for idx in 0..vis.n_tokens {
+            let is_last = pos + 1 == total_pp;
+            let _ = runner.forward_embed(vis.token_embed(idx), pos, is_last)?;
+            pos += 1;
+        }
+    }
+    let logits = if !prompt_ids.is_empty() {
+        let l = runner.forward_batch(&prompt_ids, pos, true)?;
+        pos += prompt_ids.len();
+        l
+    } else {
+        bail!("prompt must contain at least 1 text token");
+    };
     let mut next_id = sampler.sample(logits, &history);
     let pp_sec = t_pp.elapsed().as_secs_f64();
 
     let mut stdout = io::stdout().lock();
-    let mut pos = prompt_ids.len();
     let mut generated = 0usize;
 
     let t_gen = Instant::now();
@@ -2339,13 +2411,24 @@ fn cmd_run(opts: RunOpts) -> Result<()> {
         opts.prefix_cache_mib
     );
 
+    let vision_embeds = encode_cli_images(&opts, &pool)?;
     let t_pp = Instant::now();
-    let rep = session.prefill_with_cache(&pool, &prompt_ids, (cache_bytes > 0).then_some(64))?;
-    if cache_bytes > 0 && rep.cached_tokens > 0 {
-        eprintln!(
-            "[tinymodel] prefix_cache hit: reused {}/{} tokens",
-            rep.cached_tokens, rep.total_tokens
-        );
+    if !vision_embeds.is_empty() {
+        let mut chunks: Vec<MultimodalChunk<'_>> = Vec::with_capacity(vision_embeds.len() + 1);
+        for vis in &vision_embeds {
+            chunks.push(MultimodalChunk::Image(vis));
+        }
+        chunks.push(MultimodalChunk::Tokens(&prompt_ids));
+        let _ = session.prefill_multimodal(&pool, &chunks)?;
+    } else {
+        let rep =
+            session.prefill_with_cache(&pool, &prompt_ids, (cache_bytes > 0).then_some(64))?;
+        if cache_bytes > 0 && rep.cached_tokens > 0 {
+            eprintln!(
+                "[tinymodel] prefix_cache hit: reused {}/{} tokens",
+                rep.cached_tokens, rep.total_tokens
+            );
+        }
     }
     let pp_sec = t_pp.elapsed().as_secs_f64();
 

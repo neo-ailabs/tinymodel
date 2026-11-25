@@ -1523,52 +1523,65 @@ impl Qwen35MetalRunner {
         compute_logits: bool,
         compute_argmax: bool,
     ) -> Result<(), MetalError> {
+        self.encode_decode_input_pass(enc, Some(token_id), pos, compute_logits, compute_argmax)
+    }
+
+    fn encode_decode_input_pass(
+        &self,
+        enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        opt_token_id: Option<u32>,
+        pos: usize,
+        compute_logits: bool,
+        compute_argmax: bool,
+    ) -> Result<(), MetalError> {
         let n_embd = self.cfg.n_embd;
 
-        // 1. Token embedding
-        let (epipe, n_items): (&MtlPipe, usize) = match self.token_embd.dtype {
-            DType::Q4_0 => (&self.pipes.embed_q4_0, n_embd / 32),
-            DType::Q8_0 => (&self.pipes.embed_q8_0, n_embd / 32),
-            DType::Q6K => (&self.pipes.embed_q6_k, n_embd / 256),
-            DType::F32 => (&self.pipes.embed_f32, n_embd),
-            other => return Err(MetalError::UnsupportedDType(other)),
-        };
-        let eargs = EmbedArgs {
-            token_id,
-            n_embd: n_embd as u32,
-            row_bytes: self.token_embd.row_bytes as u32,
-        };
-        let etg = n_items.clamp(1, 64);
-        enc.setComputePipelineState(epipe);
-        // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(&self.token_embd.buf), self.token_embd.offset, 0);
-            enc.setBuffer_offset_atIndex(Some(&self.x), 0, 1);
-            enc.setBytes_length_atIndex(
-                NonNull::from(&eargs).cast::<c_void>(),
-                core::mem::size_of::<EmbedArgs>(),
-                2,
+        // 1. Token embedding (skipped when `opt_token_id` is `None`, i.e., preloaded by `forward_embed`)
+        if let Some(token_id) = opt_token_id {
+            let (epipe, n_items): (&MtlPipe, usize) = match self.token_embd.dtype {
+                DType::Q4_0 => (&self.pipes.embed_q4_0, n_embd / 32),
+                DType::Q8_0 => (&self.pipes.embed_q8_0, n_embd / 32),
+                DType::Q6K => (&self.pipes.embed_q6_k, n_embd / 256),
+                DType::F32 => (&self.pipes.embed_f32, n_embd),
+                other => return Err(MetalError::UnsupportedDType(other)),
+            };
+            let eargs = EmbedArgs {
+                token_id,
+                n_embd: n_embd as u32,
+                row_bytes: self.token_embd.row_bytes as u32,
+            };
+            let etg = n_items.clamp(1, 64);
+            enc.setComputePipelineState(epipe);
+            // SAFETY: Buffers live on `self` until `waitUntilCompleted`.
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&self.token_embd.buf), self.token_embd.offset, 0);
+                enc.setBuffer_offset_atIndex(Some(&self.x), 0, 1);
+                enc.setBytes_length_atIndex(
+                    NonNull::from(&eargs).cast::<c_void>(),
+                    core::mem::size_of::<EmbedArgs>(),
+                    2,
+                );
+            }
+            enc.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: n_items.div_ceil(etg),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: etg,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            self.lora.encode_embed_single(
+                enc,
+                "token_embd.weight",
+                &self.token_ids_buf,
+                token_id,
+                &self.x,
             );
         }
-        enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize {
-                width: n_items.div_ceil(etg),
-                height: 1,
-                depth: 1,
-            },
-            MTLSize {
-                width: etg,
-                height: 1,
-                depth: 1,
-            },
-        );
-        self.lora.encode_embed_single(
-            enc,
-            "token_embd.weight",
-            &self.token_ids_buf,
-            token_id,
-            &self.x,
-        );
 
         // 2. Hybrid layers
         for layer in &self.layers {
@@ -1911,6 +1924,47 @@ impl Qwen35MetalRunner {
             .computeCommandEncoder()
             .ok_or(MetalError::CommandEncodeFailed)?;
         self.encode_decode_pass(&enc, token_id, pos, compute_logits, false)?;
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        Ok(())
+    }
+
+    /// Runs a single-position forward pass from a precomputed input embedding (`embed.len() == n_embd`),
+    /// used for multimodal vision token injection (`ADR-019`).
+    pub fn forward_embed(
+        &mut self,
+        embed: &[f32],
+        pos: usize,
+        compute_logits: bool,
+    ) -> Result<(), MetalError> {
+        if pos >= self.cfg.max_ctx {
+            return Err(MetalError::InvalidDimensions(format!(
+                "position {pos} exceeds max_ctx {}",
+                self.cfg.max_ctx
+            )));
+        }
+        if embed.len() != self.cfg.n_embd {
+            return Err(MetalError::InvalidDimensions(format!(
+                "forward_embed length {} != n_embd {}",
+                embed.len(),
+                self.cfg.n_embd
+            )));
+        }
+        // SAFETY: `self.x` is a shared-storage MTLBuffer of at least `n_embd` f32s and no GPU
+        // command buffer is in flight (`&mut self` exclusive access).
+        unsafe {
+            let dst = self.x.contents().as_ptr().cast::<f32>();
+            core::ptr::copy_nonoverlapping(embed.as_ptr(), dst, self.cfg.n_embd);
+        }
+        let cmd = self
+            .queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandEncodeFailed)?;
+        let enc = cmd
+            .computeCommandEncoder()
+            .ok_or(MetalError::CommandEncodeFailed)?;
+        self.encode_decode_input_pass(&enc, None, pos, compute_logits, false)?;
         enc.endEncoding();
         cmd.commit();
         cmd.waitUntilCompleted();

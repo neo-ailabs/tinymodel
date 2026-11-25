@@ -135,3 +135,12 @@
   2. 将 `SparseMoeFfn` 同时挂载到 `LlamaModel`（解锁 `olmoe`、`granitemoe`、`qwen2moe`、`qwen3moe`、`bailingmoe2`，并顺带接入同构稠密架构 `exaone`）与 `Mamba2Model`（解锁 `expert_count > 0` 的 `granitehybrid` / `granitemoehybrid`）。
   3. 在 `tm-metal` 新增单 `MTLCommandBuffer` 零 CPU 往返的 GPU 路由与间接专家偏移内核（`moe_router_topk_f32` + 索引化专家投影），并在 `tm-train`（`LlamaTrainer`、`Mamba2Trainer`）补齐通过激活专家、共享专家与门控路由器的 **0-ULP** 前向门禁及精确解析反向传播。
 - **后果**：无需新增底层 CPU SIMD 指令即可在稠密 Attention 与 Mamba-2 混合两条主干上同时解锁全部主流端侧细粒度 MoE 架构，保持 token 生成零堆分配与全栈 `CPU + Metal + QLoRA` 一致性。
+
+## ADR-019：通用多模态视觉编码器（`VisionModel`）与阶段加载 VLM 运行时（2026-11-25）
+
+- **状态**：已接受
+- **背景**：按 `docs/research/15-hf-sub8b-architectures.md` §4.2 P2 与 `ROADMAP.md` M6，2025–2026 年主流端侧 ≤8B 模型（`Qwen3.5`、`Qwen3-VL`、`Qwen2.5-VL`、`Gemma 3/4`、`Ministral 3`、`SmolVLM`、`LFM2-VL`）普遍以原生 VLM 形态发布，在 `llama.cpp` 生态中统一通过独立 `mmproj` GGUF 承载视觉编码器与多模态投影器。端侧设备（Apple M4 / Pixel 8 / RK3588 / Pi 5）内存受限，不能让视觉编码器权重在纯文本解码阶段常驻内存，也不能引入重型第三方图像依赖膨胀 `micro` 档体积。
+- **决策**：
+  1. 在 `crates/tm-models/src/vision.rs`（`#![forbid(unsafe_code)]`，零新增外部 crate）实现兼容 `llama.cpp` / `mtmd` `mmproj` GGUF 规范的零拷贝 `VisionModel`，统一覆盖四大视觉编码器与投影族：**SigLIP / Gemma 3 & 4**（2D Patch Conv + 可学习位置编码 + Pre-LN + 空间平均池化 + `mm.soft_emb_norm` + 线性投影）、**Qwen2-VL / Qwen2.5-VL / Qwen3-VL / Qwen3.5**（3D 时序-2 卷积 `v.patch_embd.weight` + `.weight.1` + 2D Vision RoPE + 融合 QKV + SwiGLU + 2×2 空间合并 MLP + 3D M-RoPE 坐标）、**Pixtral / Mistral-3**（2D Vision RoPE + Pre-RMSNorm + SwiGLU + `mm.patch_merger`）及 **SmolVLM / LFM2-VL**（双线性位置编码插值 + Pixel-Shuffle MLP），并内置纯 Rust PPM/PGM/BMP 解码、Keys 双三次缩放与 Qwen-VL `smart_resize_dims`。
+  2. 在全部五大主干（`LlamaModel`、`Qwen35Model`、`Gemma4Model`、`Lfm2Model`、`Mamba2Model`）及对应的 Apple Metal GPU Runner（`MetalRunner::forward_embed`）补齐零堆分配 `forward_embed` 视觉嵌入注入接口，在 `tm-runtime` 提供 `Session::prefill_multimodal` 与**阶段加载（Staged Load）**`encode_image_staged`（编码完成后立即释放 `mmproj` mmap，稳态解码零额外内存占用），并在 `tm-cli` `run` 接入 `--mmproj <file> --image <file>`。
+- **后果**：零外部依赖一次打通全栈原生多模态推理（CPU + Apple Metal），全部 4 大视觉族通过独立 FP64 Python Oracle（`tools/oracle/p2_vision_oracle.py`）对齐与 CPU/Metal `forward_embed` 0-ULP/精确一致验收，且不影响 `micro` 档纯文本静态二进制体积。

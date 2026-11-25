@@ -13,6 +13,7 @@ pub mod moe;
 pub mod qwen35;
 pub mod sampler;
 pub mod state;
+pub mod vision;
 
 pub use dflash::{DFlashConfig, DFlashModel, DFlashState, MAX_DFLASH_BLOCK_SIZE};
 pub use gemma4::{
@@ -46,3 +47,8 @@ pub use qwen35::{
 };
 pub use sampler::{Sampler, SamplerConfig, argmax};
 pub use state::{LayerState, MAX_SPEC_WINDOW, SpecVerifyBuf, decode_embedding_row};
+pub use vision::{
+    PreprocessedImage, RgbImage, VisionAct, VisionAttnProj, VisionConfig, VisionEmbeddings,
+    VisionFfn, VisionLayerWeights, VisionModel, VisionProjector, VisionProjectorType,
+    smart_resize_dims,
+};

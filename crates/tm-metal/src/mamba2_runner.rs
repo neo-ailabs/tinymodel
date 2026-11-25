@@ -2241,10 +2241,24 @@ impl Mamba2MetalRunner {
         b: usize,
         compute_logits: bool,
     ) -> Result<(), MetalError> {
+        self.encode_chunk_impl(enc, single_token, false, chunk_pos, b, compute_logits)
+    }
+
+    fn encode_chunk_impl(
+        &self,
+        enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        single_token: Option<u32>,
+        preloaded_embed: bool,
+        chunk_pos: usize,
+        b: usize,
+        compute_logits: bool,
+    ) -> Result<(), MetalError> {
         let d = self.cfg.n_embd;
 
-        // 1. Embedding
-        if let Some(tok) = single_token {
+        // 1. Embedding (skipped when `preloaded_embed` is true)
+        if preloaded_embed {
+            // `self.x` already populated by `forward_embed`
+        } else if let Some(tok) = single_token {
             let (pipe, name, n_items): (&MtlPipe, &'static str, usize) = match self.token_embd.dtype
             {
                 DType::Q4_0 => (&self.pipes.embed_q4_0, "embed_q4_0", d / 32),
@@ -2333,7 +2347,9 @@ impl Mamba2MetalRunner {
             self.lora
                 .encode_embed_batch(enc, "token_embd.weight", &self.token_ids_buf, &self.x, b);
         }
-        self.encode_scale_inplace(enc, &self.x, b * d, self.cfg.embedding_scale)?;
+        if !preloaded_embed {
+            self.encode_scale_inplace(enc, &self.x, b * d, self.cfg.embedding_scale)?;
+        }
 
         // 2. Blocks
         for lw in &self.layers {
@@ -2443,6 +2459,50 @@ impl Mamba2MetalRunner {
         cmd.commit();
         cmd.waitUntilCompleted();
 
+        Ok(self.logits())
+    }
+
+    /// Runs a single-position forward pass from a precomputed input embedding (`embed.len() == n_embd`),
+    /// used for multimodal vision token injection (`ADR-019`).
+    pub fn forward_embed(
+        &mut self,
+        embed: &[f32],
+        pos: usize,
+        compute_logits: bool,
+    ) -> Result<&[f32], MetalError> {
+        if pos >= self.cfg.max_ctx {
+            return Err(MetalError::InvalidDimensions(format!(
+                "pos {pos} >= max_ctx {}",
+                self.cfg.max_ctx
+            )));
+        }
+        if embed.len() != self.cfg.n_embd {
+            return Err(MetalError::InvalidDimensions(format!(
+                "forward_embed length {} != n_embd {}",
+                embed.len(),
+                self.cfg.n_embd
+            )));
+        }
+        // SAFETY: `self.x` is a shared-storage MTLBuffer of at least `n_embd` f32s and no GPU
+        // command buffer is in flight (`&mut self` exclusive access).
+        unsafe {
+            let dst = self.x.contents().as_ptr().cast::<f32>();
+            core::ptr::copy_nonoverlapping(embed.as_ptr(), dst, self.cfg.n_embd);
+        }
+        let cmd = self
+            .queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandEncodeFailed)?;
+        let enc = cmd
+            .computeCommandEncoder()
+            .ok_or(MetalError::CommandEncodeFailed)?;
+        if let Err(e) = self.encode_chunk_impl(&enc, None, true, pos, 1, compute_logits) {
+            enc.endEncoding();
+            return Err(e);
+        }
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
         Ok(self.logits())
     }
 

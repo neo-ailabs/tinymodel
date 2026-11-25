@@ -1441,27 +1441,54 @@ impl Gemma4MetalRunner {
         compute_logits: bool,
         greedy_argmax: bool,
     ) {
+        self.encode_chunk_impl(
+            enc,
+            n_tok,
+            start_pos,
+            single_token_id,
+            false,
+            compute_logits,
+            greedy_argmax,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_chunk_impl(
+        &self,
+        enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        n_tok: usize,
+        start_pos: usize,
+        single_token_id: Option<u32>,
+        preloaded_embed: bool,
+        compute_logits: bool,
+        greedy_argmax: bool,
+    ) {
         let n_embd = self.cfg.n_embd;
         let ple_dim = self.cfg.n_embd_per_layer;
         let ple_total = self.cfg.n_layers * ple_dim;
 
-        // 1. Input token embedding + sqrt(n_embd)
-        if let Some(tid) = single_token_id {
-            self.enc_embed_row(enc, &self.token_embd, tid, &self.x);
-        } else {
-            self.enc_embed_batch(enc, &self.token_embd, n_tok, &self.x);
+        // 1. Input token embedding + sqrt(n_embd) (skipped when `preloaded_embed` is true:
+        //    Gemma 3/4 vision projector outputs are already in scaled residual space).
+        if !preloaded_embed {
+            if let Some(tid) = single_token_id {
+                self.enc_embed_row(enc, &self.token_embd, tid, &self.x);
+            } else {
+                self.enc_embed_batch(enc, &self.token_embd, n_tok, &self.x);
+            }
+            self.enc_scale(enc, &self.x, 0, n_tok * n_embd, (n_embd as f32).sqrt());
         }
-        self.enc_scale(enc, &self.x, 0, n_tok * n_embd, (n_embd as f32).sqrt());
 
         // 2. Global Per-Layer Embeddings (`PLE`) lookup + BF16 `per_layer_model_proj`
         if let Some(ref ple_g) = self.ple_global {
-            if let Some(tid) = single_token_id {
-                self.enc_embed_row(enc, &ple_g.tok_embd, tid, &self.ple_inputs);
-            } else {
-                self.enc_embed_batch(enc, &ple_g.tok_embd, n_tok, &self.ple_inputs);
+            if !preloaded_embed {
+                if let Some(tid) = single_token_id {
+                    self.enc_embed_row(enc, &ple_g.tok_embd, tid, &self.ple_inputs);
+                } else {
+                    self.enc_embed_batch(enc, &ple_g.tok_embd, n_tok, &self.ple_inputs);
+                }
+                let tok_ple_scale = (ple_dim as f32).sqrt() / 2.0f32.sqrt();
+                self.enc_scale(enc, &self.ple_inputs, 0, n_tok * ple_total, tok_ple_scale);
             }
-            let tok_ple_scale = (ple_dim as f32).sqrt() / 2.0f32.sqrt();
-            self.enc_scale(enc, &self.ple_inputs, 0, n_tok * ple_total, tok_ple_scale);
 
             self.enc_gemm(
                 enc,
@@ -2281,6 +2308,52 @@ impl Gemma4MetalRunner {
             .computeCommandEncoder()
             .ok_or(MetalError::CommandEncodeFailed)?;
         self.encode_chunk(&enc, 1, pos, Some(token_id), compute_logits, false);
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        Ok(self.logits())
+    }
+
+    /// Runs a single-position forward pass from a precomputed input embedding (`embed.len() == n_embd`),
+    /// used for multimodal vision token injection (`ADR-019`).
+    pub fn forward_embed(
+        &mut self,
+        embed: &[f32],
+        pos: usize,
+        compute_logits: bool,
+    ) -> Result<&[f32], MetalError> {
+        if pos >= self.cfg.max_ctx {
+            return Err(MetalError::InvalidDimensions(format!(
+                "pos {pos} >= max_ctx {}",
+                self.cfg.max_ctx
+            )));
+        }
+        if embed.len() != self.cfg.n_embd {
+            return Err(MetalError::InvalidDimensions(format!(
+                "forward_embed length {} != n_embd {}",
+                embed.len(),
+                self.cfg.n_embd
+            )));
+        }
+        // SAFETY: `self.x` and `self.ple_inputs` are shared-storage MTLBuffers and no GPU
+        // command buffer is in flight (`&mut self` exclusive access).
+        unsafe {
+            let dst = self.x.contents().as_ptr().cast::<f32>();
+            core::ptr::copy_nonoverlapping(embed.as_ptr(), dst, self.cfg.n_embd);
+            if self.ple_global.is_some() {
+                let ple_total = self.cfg.n_layers * self.cfg.n_embd_per_layer;
+                let ple_ptr = self.ple_inputs.contents().as_ptr().cast::<f32>();
+                core::ptr::write_bytes(ple_ptr, 0, ple_total);
+            }
+        }
+        let cmd = self
+            .queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandEncodeFailed)?;
+        let enc = cmd
+            .computeCommandEncoder()
+            .ok_or(MetalError::CommandEncodeFailed)?;
+        self.encode_chunk_impl(&enc, 1, pos, None, true, compute_logits, false);
         enc.endEncoding();
         cmd.commit();
         cmd.waitUntilCompleted();

@@ -1970,6 +1970,52 @@ impl LlamaMetalRunner {
         Ok(unsafe { core::slice::from_raw_parts(ptr, self.cfg.vocab_size) })
     }
 
+    /// Runs a single-position forward pass from a precomputed input embedding (`embed.len() == n_embd`),
+    /// used for multimodal vision token injection (`ADR-019`).
+    pub fn forward_embed(
+        &mut self,
+        embed: &[f32],
+        pos: usize,
+        compute_logits: bool,
+    ) -> Result<&[f32], MetalError> {
+        if pos >= self.cfg.max_ctx {
+            return Err(MetalError::InvalidDimensions(format!(
+                "pos {pos} >= max_ctx {}",
+                self.cfg.max_ctx
+            )));
+        }
+        if embed.len() != self.cfg.n_embd {
+            return Err(MetalError::InvalidDimensions(format!(
+                "forward_embed length {} != n_embd {}",
+                embed.len(),
+                self.cfg.n_embd
+            )));
+        }
+        // SAFETY: `self.x` is a shared-storage MTLBuffer of at least `n_embd` f32s and no GPU
+        // command buffer is in flight (`&mut self` exclusive access).
+        unsafe {
+            let dst = self.x.contents().as_ptr().cast::<f32>();
+            core::ptr::copy_nonoverlapping(embed.as_ptr(), dst, self.cfg.n_embd);
+        }
+        let cmd = self
+            .queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandEncodeFailed)?;
+        let enc = cmd
+            .computeCommandEncoder()
+            .ok_or(MetalError::CommandEncodeFailed)?;
+        if let Err(e) = self.encode_single_input_into(&enc, None, pos, compute_logits) {
+            enc.endEncoding();
+            return Err(e);
+        }
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        let ptr = self.logits.contents().as_ptr() as *const f32;
+        // SAFETY: `waitUntilCompleted` finished; `self.logits` holds `vocab_size` f32s.
+        Ok(unsafe { core::slice::from_raw_parts(ptr, self.cfg.vocab_size) })
+    }
+
     /// Executes a single-token forward pass AND greedy argmax in ONE Metal command buffer,
     /// reading back only the 4-byte winning token ID instead of scanning `vocab_size` floats on CPU.
     pub fn forward_token_greedy(&mut self, token_id: u32, pos: usize) -> Result<u32, MetalError> {
@@ -2547,8 +2593,18 @@ impl LlamaMetalRunner {
         pos: usize,
         compute_logits: bool,
     ) -> Result<(), MetalError> {
-        // 1. Embedding
-        {
+        self.encode_single_input_into(enc, Some(token_id), pos, compute_logits)
+    }
+
+    fn encode_single_input_into(
+        &self,
+        enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        opt_token_id: Option<u32>,
+        pos: usize,
+        compute_logits: bool,
+    ) -> Result<(), MetalError> {
+        // 1. Embedding (skipped when `opt_token_id` is `None`, i.e., `self.x` preloaded by `forward_embed`)
+        if let Some(token_id) = opt_token_id {
             let (pipe, n_items): (&MtlPipe, usize) = match self.token_embd.dtype {
                 DType::Q4_0 => (&self.pipes.embed_q4_0, self.cfg.n_embd / 32),
                 DType::Q8_0 => (&self.pipes.embed_q8_0, self.cfg.n_embd / 32),

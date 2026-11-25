@@ -1180,6 +1180,28 @@ impl Lfm2MetalRunner {
         compute_logits: bool,
         greedy_argmax: bool,
     ) {
+        self.encode_chunk_impl(
+            enc,
+            n_tok,
+            start_pos,
+            single_token_id,
+            false,
+            compute_logits,
+            greedy_argmax,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_chunk_impl(
+        &self,
+        enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        n_tok: usize,
+        start_pos: usize,
+        single_token_id: Option<u32>,
+        preloaded_embed: bool,
+        compute_logits: bool,
+        greedy_argmax: bool,
+    ) {
         let n_embd = self.cfg.n_embd;
         let n_ff = self.cfg.n_ff;
         let hd = self.cfg.head_dim;
@@ -1187,8 +1209,10 @@ impl Lfm2MetalRunner {
         let window = self.cfg.sliding_window.unwrap_or(0) as u32;
         let attn_scale = 1.0f32 / (hd as f32).sqrt();
 
-        // 1. Input embedding
-        if let Some(tid) = single_token_id {
+        // 1. Input embedding (skipped when `preloaded_embed` is true)
+        if preloaded_embed {
+            // `self.x` already populated by `forward_embed`
+        } else if let Some(tid) = single_token_id {
             let args = EmbedArgs {
                 token_id: tid,
                 n_embd: n_embd as u32,
@@ -1769,6 +1793,47 @@ impl Lfm2MetalRunner {
             .computeCommandEncoder()
             .ok_or(MetalError::CommandEncodeFailed)?;
         self.encode_chunk(&enc, 1, pos, Some(token_id), compute_logits, false);
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        Ok(self.logits())
+    }
+
+    /// Runs a single-position forward pass from a precomputed input embedding (`embed.len() == n_embd`),
+    /// used for multimodal vision token injection (`ADR-019`).
+    pub fn forward_embed(
+        &mut self,
+        embed: &[f32],
+        pos: usize,
+        compute_logits: bool,
+    ) -> Result<&[f32], MetalError> {
+        if pos >= self.cfg.max_ctx {
+            return Err(MetalError::InvalidDimensions(format!(
+                "pos {pos} >= max_ctx {}",
+                self.cfg.max_ctx
+            )));
+        }
+        if embed.len() != self.cfg.n_embd {
+            return Err(MetalError::InvalidDimensions(format!(
+                "forward_embed length {} != n_embd {}",
+                embed.len(),
+                self.cfg.n_embd
+            )));
+        }
+        // SAFETY: `self.x` is a shared-storage MTLBuffer of at least `n_embd` f32s and no GPU
+        // command buffer is in flight (`&mut self` exclusive access).
+        unsafe {
+            let dst = self.x.contents().as_ptr().cast::<f32>();
+            core::ptr::copy_nonoverlapping(embed.as_ptr(), dst, self.cfg.n_embd);
+        }
+        let cmd = self
+            .queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandEncodeFailed)?;
+        let enc = cmd
+            .computeCommandEncoder()
+            .ok_or(MetalError::CommandEncodeFailed)?;
+        self.encode_chunk_impl(&enc, 1, pos, None, true, compute_logits, false);
         enc.endEncoding();
         cmd.commit();
         cmd.waitUntilCompleted();

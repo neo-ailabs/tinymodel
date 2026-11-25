@@ -208,6 +208,26 @@ impl MetalRunner {
         }
     }
 
+    /// Runs a single-position forward pass from a precomputed input embedding (`embed.len() == n_embd`),
+    /// used for multimodal vision token injection (`ADR-019`).
+    pub fn forward_embed(
+        &mut self,
+        embed: &[f32],
+        pos: usize,
+        compute_logits: bool,
+    ) -> Result<&[f32], MetalError> {
+        match self {
+            MetalRunner::Llama(r) => r.forward_embed(embed, pos, compute_logits),
+            MetalRunner::Qwen35(r) => {
+                r.forward_embed(embed, pos, compute_logits)?;
+                Ok(r.logits())
+            }
+            MetalRunner::Gemma4(r) => r.forward_embed(embed, pos, compute_logits),
+            MetalRunner::Lfm2(r) => r.forward_embed(embed, pos, compute_logits),
+            MetalRunner::Mamba2(r) => r.forward_embed(embed, pos, compute_logits),
+        }
+    }
+
     pub fn forward_token_greedy(&mut self, token_id: u32, pos: usize) -> Result<u32, MetalError> {
         match self {
             MetalRunner::Llama(r) => r.forward_token_greedy(token_id, pos),

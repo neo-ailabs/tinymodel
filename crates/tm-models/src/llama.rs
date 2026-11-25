@@ -1041,6 +1041,61 @@ impl<'a> LlamaModel<'a> {
         }
 
         let n_embd = self.cfg.n_embd;
+
+        // 1. Token embedding lookup (zero-copy row slice -> f32; supports both standard and Q4_0x4!)
+        decode_embedding_row(
+            self.token_embd.dtype,
+            self.token_embd.bytes,
+            n_embd,
+            tid,
+            &mut state.x[..n_embd],
+        );
+        self.lora
+            .apply_embed_row(self.token_embd.lora_slot, kt, tid, &mut state.x[..n_embd]);
+        scale_slice_inplace(&mut state.x[..n_embd], self.cfg.embedding_scale);
+
+        self.forward_from_x(state, pool, kt, pos, compute_logits)
+    }
+
+    /// Runs a single-position forward pass from a precomputed input embedding (`embed.len() == n_embd`),
+    /// used for multimodal vision token injection (`ADR-019`).
+    ///
+    /// Performs **zero heap allocations** and validates bounds before mutating any state.
+    pub fn forward_embed(
+        &self,
+        state: &mut LlamaState,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        embed: &[f32],
+        pos: usize,
+        compute_logits: bool,
+    ) -> Result<(), ModelError> {
+        if pos >= state.max_ctx {
+            return Err(ModelError::ContextOverflow {
+                pos,
+                max_ctx: state.max_ctx,
+            });
+        }
+        let n_embd = self.cfg.n_embd;
+        if embed.len() != n_embd {
+            return Err(ModelError::InvalidConfig(format!(
+                "forward_embed length mismatch: expected {n_embd}, got {}",
+                embed.len()
+            )));
+        }
+        state.x[..n_embd].copy_from_slice(embed);
+        self.forward_from_x(state, pool, kt, pos, compute_logits)
+    }
+
+    fn forward_from_x(
+        &self,
+        state: &mut LlamaState,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        pos: usize,
+        compute_logits: bool,
+    ) -> Result<(), ModelError> {
+        let n_embd = self.cfg.n_embd;
         let n_ff = self.cfg.n_ff;
         let q_dim = self.cfg.n_head * self.cfg.head_dim;
         let kv_dim = self.cfg.n_head_kv * self.cfg.head_dim;
@@ -1060,18 +1115,6 @@ impl<'a> LlamaModel<'a> {
                 &mut state.rope_sin_swa,
             );
         }
-
-        // 1. Token embedding lookup (zero-copy row slice -> f32; supports both standard and Q4_0x4!)
-        decode_embedding_row(
-            self.token_embd.dtype,
-            self.token_embd.bytes,
-            n_embd,
-            tid,
-            &mut state.x[..n_embd],
-        );
-        self.lora
-            .apply_embed_row(self.token_embd.lora_slot, kt, tid, &mut state.x[..n_embd]);
-        scale_slice_inplace(&mut state.x[..n_embd], self.cfg.embedding_scale);
 
         let res_scale = self.cfg.residual_scale;
 

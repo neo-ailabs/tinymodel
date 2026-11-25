@@ -748,8 +748,6 @@ impl<'a> Gemma4Model<'a> {
         }
 
         let n_embd = self.cfg.n_embd;
-        let ple_dim = self.cfg.n_embd_per_layer;
-        let ple_total = self.cfg.n_layers * ple_dim;
 
         // 1. Scaled input token embedding (`sqrt(n_embd)`)
         decode_embedding_row(
@@ -766,18 +764,69 @@ impl<'a> Gemma4Model<'a> {
             *v *= emb_scale;
         }
 
+        self.forward_from_x(state, pool, kt, Some(tid), pos, compute_logits)
+    }
+
+    /// Runs a single-position forward pass from a precomputed input embedding (`embed.len() == n_embd`),
+    /// used for multimodal vision token injection (`ADR-019`).
+    ///
+    /// Note: Gemma 3 / Gemma 4 `mm.input_projection` outputs are already in scaled residual space,
+    /// so `sqrt(n_embd)` is NOT re-applied.
+    pub fn forward_embed(
+        &self,
+        state: &mut Gemma4State,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        embed: &[f32],
+        pos: usize,
+        compute_logits: bool,
+    ) -> Result<(), ModelError> {
+        if pos >= state.max_ctx {
+            return Err(ModelError::ContextOverflow {
+                pos,
+                max_ctx: state.max_ctx,
+            });
+        }
+        let n_embd = self.cfg.n_embd;
+        if embed.len() != n_embd {
+            return Err(ModelError::InvalidConfig(format!(
+                "forward_embed length mismatch: expected {n_embd}, got {}",
+                embed.len()
+            )));
+        }
+        state.x[..n_embd].copy_from_slice(embed);
+        self.forward_from_x(state, pool, kt, None, pos, compute_logits)
+    }
+
+    fn forward_from_x(
+        &self,
+        state: &mut Gemma4State,
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        ple_tid: Option<usize>,
+        pos: usize,
+        compute_logits: bool,
+    ) -> Result<(), ModelError> {
+        let n_embd = self.cfg.n_embd;
+        let ple_dim = self.cfg.n_embd_per_layer;
+        let ple_total = self.cfg.n_layers * ple_dim;
+
         // 2. Per-Layer Embeddings (PLE) on-demand row read + projection (`gemma4.cpp:189-198 & 537-560`)
         if let Some(ref ple_g) = self.ple_global {
-            decode_embedding_row(
-                ple_g.tok_embd.dtype,
-                ple_g.tok_embd.bytes,
-                ple_total,
-                tid,
-                &mut state.ple_inputs[..ple_total],
-            );
-            let tok_ple_scale = (ple_dim as f32).sqrt() / 2.0f32.sqrt();
-            for v in &mut state.ple_inputs[..ple_total] {
-                *v *= tok_ple_scale;
+            if let Some(tid) = ple_tid {
+                decode_embedding_row(
+                    ple_g.tok_embd.dtype,
+                    ple_g.tok_embd.bytes,
+                    ple_total,
+                    tid,
+                    &mut state.ple_inputs[..ple_total],
+                );
+                let tok_ple_scale = (ple_dim as f32).sqrt() / 2.0f32.sqrt();
+                for v in &mut state.ple_inputs[..ple_total] {
+                    *v *= tok_ple_scale;
+                }
+            } else {
+                state.ple_inputs[..ple_total].fill(0.0);
             }
 
             matvec_f32(
