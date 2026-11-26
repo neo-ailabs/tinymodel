@@ -69,10 +69,11 @@ pub fn detect_caps() -> Caps {
             i8mm: false,
             avx2: std::arch::is_x86_feature_detected!("avx2")
                 && std::arch::is_x86_feature_detected!("fma"),
-            avx512_vnni: std::arch::is_x86_feature_detected!("avx512f")
+            avx512_vnni: std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("fma")
+                && std::arch::is_x86_feature_detected!("avx512f")
                 && std::arch::is_x86_feature_detected!("avx512bw")
-                && std::arch::is_x86_feature_detected!("avx512vl")
-                && std::arch::is_x86_feature_detected!("avx512vnni"),
+                && std::arch::is_x86_feature_detected!("avx512vl"),
         }
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]

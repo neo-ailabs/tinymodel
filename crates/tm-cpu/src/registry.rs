@@ -1062,7 +1062,58 @@ mod aarch64_wrappers {
 #[cfg(target_arch = "x86_64")]
 mod x86_64_wrappers {
     use super::*;
-    use crate::x86_64::avx2;
+    use crate::x86_64::{avx2, avx512};
+
+    fn avx512_vec_dot_q4_0(x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
+        // SAFETY: `AVX512_TABLE` is only selected after runtime `avx512f+bw+vl+fma` detection.
+        unsafe { avx512::vec_dot_q4_0_q8_0(x, y) }
+    }
+    fn avx512_gemv_q4_0(
+        w: &[BlockQ4_0],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: `AVX512_TABLE` is only selected after runtime `avx512f+bw+vl+fma` detection.
+        unsafe { avx512::gemv_q4_0_q8_0(w, x, out, rows, cols_blocks) }
+    }
+    fn avx512_gemm_q4_0(
+        w: &[BlockQ4_0],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: `AVX512_TABLE` is only selected after runtime `avx512f+bw+vl+fma` detection.
+        unsafe { avx512::gemm_q4_0_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+    fn avx512_vec_dot_q8_0(x: &[BlockQ8_0], y: &[BlockQ8_0]) -> f32 {
+        // SAFETY: `AVX512_TABLE` is only selected after runtime `avx512f+bw+vl` detection.
+        unsafe { avx512::vec_dot_q8_0_q8_0(x, y) }
+    }
+    fn avx512_gemv_q8_0(
+        w: &[BlockQ8_0],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: `AVX512_TABLE` is only selected after runtime `avx512f+bw+vl` detection.
+        unsafe { avx512::gemv_q8_0_q8_0(w, x, out, rows, cols_blocks) }
+    }
+    fn avx512_gemm_q8_0(
+        w: &[BlockQ8_0],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: `AVX512_TABLE` is only selected after runtime `avx512f+bw+vl` detection.
+        unsafe { avx512::gemm_q8_0_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
+    }
 
     fn avx2_vec_dot_q4_0(x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
         // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
@@ -1236,6 +1287,17 @@ mod x86_64_wrappers {
         gdn_recurrence_head: avx2_gdn_recurrence_head,
         mamba2_scan_head: avx2_mamba2_scan_head,
     };
+
+    pub const AVX512_TABLE: KernelTable = KernelTable {
+        isa: Isa::Avx512,
+        vec_dot_q4_0_q8_0: avx512_vec_dot_q4_0,
+        gemv_q4_0_q8_0: avx512_gemv_q4_0,
+        gemm_q4_0_q8_0: avx512_gemm_q4_0,
+        vec_dot_q8_0_q8_0: avx512_vec_dot_q8_0,
+        gemv_q8_0_q8_0: avx512_gemv_q8_0,
+        gemm_q8_0_q8_0: avx512_gemm_q8_0,
+        ..AVX2_TABLE
+    };
 }
 
 pub fn select_kernels(isa: Isa) -> &'static KernelTable {
@@ -1263,7 +1325,9 @@ pub fn select_kernels(isa: Isa) -> &'static KernelTable {
         ))]
         Isa::NeonI8mm => &aarch64_wrappers::NEON_V80_TABLE,
         #[cfg(target_arch = "x86_64")]
-        Isa::Avx2 | Isa::Avx512 => &x86_64_wrappers::AVX2_TABLE,
+        Isa::Avx2 => &x86_64_wrappers::AVX2_TABLE,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx512 => &x86_64_wrappers::AVX512_TABLE,
         _ => &GENERIC_TABLE,
     }
 }

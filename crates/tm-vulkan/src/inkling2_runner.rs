@@ -3313,7 +3313,12 @@ impl Inkling2VkRunner {
                     }
                 }
 
+                let max_visits_per_cb = (256 / w.max(1)).clamp(1, 64);
+                let mut visits_in_cb = 0usize;
                 while cursor < schedule.len() {
+                    if visits_in_cb >= max_visits_per_cb {
+                        break;
+                    }
                     let st = schedule[cursor];
                     let in_vram = self.layers[st.ip].vram_experts.is_some();
                     let kv_dim = self.cfg.kv_dim(st.ip);
@@ -3449,6 +3454,7 @@ impl Inkling2VkRunner {
                     prelude_blocks_len = next_pb;
                     bank_len = next_bk;
                     cursor += 1;
+                    visits_in_cb += 1;
 
                     if !in_vram {
                         stop_for_host_ip = Some((st.il, st.ip));
@@ -3456,7 +3462,7 @@ impl Inkling2VkRunner {
                     }
                 }
 
-                if stop_for_host_ip.is_none() {
+                if cursor == schedule.len() && stop_for_host_ip.is_none() {
                     self.record_window_outputs(
                         rec,
                         w,
