@@ -14,6 +14,7 @@ pub mod llama_runner;
 pub mod lora_gpu;
 pub mod qwen35_runner;
 pub mod train_accel;
+pub mod vision_runner;
 
 pub use context::{DeviceInfo, VkBuffer, VkPrefillMode, VulkanContext};
 pub use inkling2_runner::{
@@ -24,6 +25,9 @@ pub use kernels::{Q4Layout, VkMatQ4_0};
 pub use llama_runner::{LlamaVkConfig, LlamaVkRunner, VkProfileReport, VkStageStat};
 pub use qwen35_runner::{Qwen35VkConfig, Qwen35VkRunner};
 pub use train_accel::VulkanGpuAccel;
+pub use vision_runner::{
+    VisionVkConfig, VisionVkEmbeddings, VisionVkProjectorType, VisionVkRunner,
+};
 
 use thiserror::Error;
 

@@ -584,6 +584,58 @@ fn encode_cli_images(opts: &RunOpts, pool: &ThreadPool) -> Result<Vec<VisionEmbe
     Ok(out)
 }
 
+#[cfg(feature = "vulkan")]
+fn encode_cli_images_vulkan(opts: &RunOpts) -> Result<Vec<VisionEmbeddings>> {
+    if opts.image_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mmproj = opts
+        .mmproj_path
+        .as_ref()
+        .context("--image requires --mmproj <mmproj.gguf>")?;
+    let gguf = std::sync::Arc::new(GgufFile::open(mmproj)?);
+    let vis_cfg = tm_models::VisionConfig::from_gguf(&gguf)?;
+    let mut runner = match tm_vulkan::VisionVkRunner::from_gguf(gguf) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[tinymodel] vision: Vulkan init fallback to CPU ({e})");
+            let pool = ThreadPool::new(opts.threads);
+            return encode_cli_images(opts, &pool);
+        }
+    };
+    let dev = runner.device_name().to_string();
+    let mut out = Vec::with_capacity(opts.image_paths.len());
+    for img_path in &opts.image_paths {
+        let t0 = Instant::now();
+        let img = RgbImage::from_file(img_path)?;
+        let pre = img.preprocess(&vis_cfg);
+        let vk_emb = runner.encode_preprocessed(&pre.pixels_chw, pre.width, pre.height)?;
+        eprintln!(
+            "[tinymodel] vision: encoded '{}' ({}x{}) on Vulkan ({}) -> {} tokens ({}x{}, d={}) in {:.1}ms (staged VRAM released)",
+            img_path.display(),
+            img.width,
+            img.height,
+            dev,
+            vk_emb.n_tokens,
+            vk_emb.grid_h,
+            vk_emb.grid_w,
+            vk_emb.d_llm,
+            t0.elapsed().as_secs_f64() * 1e3
+        );
+        out.push(VisionEmbeddings {
+            embeddings: vk_emb.embeddings,
+            n_tokens: vk_emb.n_tokens,
+            d_llm: vk_emb.d_llm,
+            grid_h: vk_emb.grid_h,
+            grid_w: vk_emb.grid_w,
+            mrope_positions: vk_emb.mrope_positions,
+        });
+    }
+    // Drop `runner` here before LLM VRAM allocation (staged VLM lifecycle).
+    drop(runner);
+    Ok(out)
+}
+
 fn resolve_prompt_ids(opts: &RunOpts, tok: &Tokenizer) -> Result<Vec<u32>> {
     if let Some(ref ids) = opts.explicit_tokens {
         if ids.is_empty() {
@@ -1719,8 +1771,7 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
 
     if arch == "qwen35" {
         let vision_embeds = if !opts.image_paths.is_empty() {
-            let pool = ThreadPool::new(opts.threads);
-            encode_cli_images(&opts, &pool)?
+            encode_cli_images_vulkan(&opts)?
         } else {
             Vec::new()
         };
@@ -1804,8 +1855,7 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
     }
 
     let vision_embeds = if !opts.image_paths.is_empty() {
-        let pool = ThreadPool::new(opts.threads);
-        encode_cli_images(&opts, &pool)?
+        encode_cli_images_vulkan(&opts)?
     } else {
         Vec::new()
     };

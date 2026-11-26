@@ -1,0 +1,52 @@
+#version 450
+// General F32 tiled GEMM for arbitrary `n_in` (including non-32-aligned ViT dims like 588 or 4304).
+// Computes Y[t, r] = sum_{k=0..n_in-1} W[r, k] * X[t, k] (+ Y[t, r] if add_residual != 0).
+// 16x16 shared-memory tile, WG = 256 (16x16).
+
+layout(constant_id = 0) const uint WG = 256;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer W { float w[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) buffer Y          { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint n_in;
+    uint n_out;
+    uint n_tok;
+    uint add_residual;
+} pc;
+
+shared float w_sh[16][17];
+shared float x_sh[16][17];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint lx = tid & 15u; // 0..15 -> col within N tile (row of W)
+    const uint ly = tid >> 4u; // 0..15 -> row within M tile (tok)
+    const uint r = gl_WorkGroupID.x * 16u + lx;
+    const uint t = gl_WorkGroupID.y * 16u + ly;
+
+    float acc = 0.0;
+    for (uint k0 = 0u; k0 < pc.n_in; k0 += 16u) {
+        const uint wk = k0 + ly;
+        const uint xk = k0 + lx;
+        w_sh[ly][lx] = (r < pc.n_out && wk < pc.n_in) ? w[r * pc.n_in + wk] : 0.0;
+        x_sh[ly][lx] = (t < pc.n_tok && xk < pc.n_in) ? x[t * pc.n_in + xk] : 0.0;
+        barrier();
+
+        for (uint k = 0u; k < 16u; ++k) {
+            acc = fma(x_sh[ly][k], w_sh[k][lx], acc);
+        }
+        barrier();
+    }
+
+    if (t < pc.n_tok && r < pc.n_out) {
+        const uint idx = t * pc.n_out + r;
+        if (pc.add_residual != 0u) {
+            y[idx] += acc;
+        } else {
+            y[idx] = acc;
+        }
+    }
+}

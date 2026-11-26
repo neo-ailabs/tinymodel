@@ -1,0 +1,156 @@
+#version 450
+// Portable ViT elementwise & row-wise ops for `VisionVkRunner` (zero subgroupShuffle, WG=256).
+// MODE (constant_id = 1):
+//   0 = LayerNorm:       b0=x (ro), b1=w (ro), b2=b (ro), b3=y (wo); pc=(dim, eps_bits, 0, 0); gx=n_tok
+//   1 = AddBias:         b0=y (rw), b1=b (ro);                       pc=(dim, total, 0, 0)
+//   2 = SplitQkv:        b0=qkv (ro), b1=q (wo), b2=k (wo), b3=v (wo); pc=(d_vit, total, 0, 0)
+//   3 = VisionRope2D:    b0=qk (rw), b1=cos (ro), b2=sin (ro);       pc=(n_heads, head_dim, total, 0)
+//   4 = ActInplace:      b0=x (rw);                                  pc=(total, act_kind, 0, 0)
+//   5 = GatedActMul:     b0=gate (rw), b1=up (ro);                   pc=(total, act_kind, 0, 0)
+//   6 = ResidualAdd:     b0=y (rw), b1=x (ro);                       pc=(total, 0, 0, 0)
+//
+// act_kind: 0 = GeluTanh, 1 = GeluQuick, 2 = GeluErf (A&S 7.1.26), 3 = Silu.
+
+layout(constant_id = 0) const uint WG = 256;
+layout(constant_id = 1) const uint MODE = 0;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) buffer B0 { float b0[]; };
+layout(std430, binding = 1) buffer B1 { float b1[]; };
+layout(std430, binding = 2) buffer B2 { float b2[]; };
+layout(std430, binding = 3) buffer B3 { float b3[]; };
+
+layout(push_constant) uniform PC {
+    uint p0;
+    uint p1;
+    uint p2;
+    uint p3;
+} pc;
+
+shared float s_red[256];
+
+float erf_approx(float x) {
+    float s = (x < 0.0) ? -1.0 : 1.0;
+    float ax = abs(x);
+    float t = 1.0 / (1.0 + 0.3275911 * ax);
+    float poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t
+        + 0.254829592) * t;
+    return s * (1.0 - poly * exp(-ax * ax));
+}
+
+float apply_act(float x, uint kind) {
+    if (kind == 0u) {
+        // GeluTanh: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        const float c = 0.7978845608028654 * (x + 0.044715 * x * x * x);
+        return 0.5 * x * (1.0 + tanh(c));
+    } else if (kind == 1u) {
+        // GeluQuick
+        return x / (1.0 + exp(-1.702 * x));
+    } else if (kind == 2u) {
+        // GeluErf
+        return 0.5 * x * (1.0 + erf_approx(x * 0.7071067811865475));
+    } else {
+        // Silu
+        return x / (1.0 + exp(-x));
+    }
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint gid = gl_GlobalInvocationID.x;
+
+    if (MODE == 0u) {
+        // LayerNorm: 1 workgroup per token
+        const uint tok = gl_WorkGroupID.x;
+        const uint dim = pc.p0;
+        const float eps = uintBitsToFloat(pc.p1);
+        const uint base = tok * dim;
+
+        float sum = 0.0;
+        for (uint d = tid; d < dim; d += WG) {
+            sum += b0[base + d];
+        }
+        s_red[tid] = sum;
+        barrier();
+        for (uint stride = WG >> 1u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) s_red[tid] += s_red[tid + stride];
+            barrier();
+        }
+        const float mean = s_red[0] / float(dim);
+
+        float var = 0.0;
+        for (uint d = tid; d < dim; d += WG) {
+            const float diff = b0[base + d] - mean;
+            var += diff * diff;
+        }
+        s_red[tid] = var;
+        barrier();
+        for (uint stride = WG >> 1u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) s_red[tid] += s_red[tid + stride];
+            barrier();
+        }
+        const float inv_std = inversesqrt(s_red[0] / float(dim) + eps);
+
+        for (uint d = tid; d < dim; d += WG) {
+            b3[base + d] = (b0[base + d] - mean) * inv_std * b1[d] + b2[d];
+        }
+    } else if (MODE == 1u) {
+        // AddBias
+        const uint dim = pc.p0;
+        const uint total = pc.p1;
+        if (gid < total) {
+            b0[gid] += b1[gid % dim];
+        }
+    } else if (MODE == 2u) {
+        // SplitQkv
+        const uint d_vit = pc.p0;
+        const uint total = pc.p1;
+        if (gid < total) {
+            const uint t = gid / d_vit;
+            const uint d = gid - t * d_vit;
+            const uint src = t * (3u * d_vit) + d;
+            b1[gid] = b0[src];
+            b2[gid] = b0[src + d_vit];
+            b3[gid] = b0[src + 2u * d_vit];
+        }
+    } else if (MODE == 3u) {
+        // VisionRope2D in-place
+        const uint n_heads = pc.p0;
+        const uint head_dim = pc.p1;
+        const uint total = pc.p2;
+        if (gid < total) {
+            const uint half_d = head_dim >> 1u;
+            const uint i = gid % half_d;
+            const uint th = gid / half_d;
+            const uint h = th % n_heads;
+            const uint t = th / n_heads;
+            const uint off = t * (n_heads * head_dim) + h * head_dim;
+            const float c = b1[t * half_d + i];
+            const float s = b2[t * half_d + i];
+            const float x0 = b0[off + i];
+            const float x1 = b0[off + i + half_d];
+            b0[off + i] = x0 * c - x1 * s;
+            b0[off + i + half_d] = x0 * s + x1 * c;
+        }
+    } else if (MODE == 4u) {
+        // ActInplace
+        const uint total = pc.p0;
+        const uint kind = pc.p1;
+        if (gid < total) {
+            b0[gid] = apply_act(b0[gid], kind);
+        }
+    } else if (MODE == 5u) {
+        // GatedActMul: gate[i] = act(gate[i]) * up[i]
+        const uint total = pc.p0;
+        const uint kind = pc.p1;
+        if (gid < total) {
+            b0[gid] = apply_act(b0[gid], kind) * b1[gid];
+        }
+    } else if (MODE == 6u) {
+        // ResidualAdd: y[i] += x[i]
+        const uint total = pc.p0;
+        if (gid < total) {
+            b0[gid] += b1[gid];
+        }
+    }
+}
