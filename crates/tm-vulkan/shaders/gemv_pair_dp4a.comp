@@ -1,0 +1,160 @@
+#version 450
+// Fused 2-matrix AoS INT8 DP4A (`OpSDotKHR`) GEMV sharing Q8_1 input `(xq, xd)`:
+//   `ya = Wa * x`, `yb = Wb * x` in 1 dispatch.
+// DTYPE: 0 = Q4_0, 2 = Q8_0.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_spirv_intrinsics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+spirv_instruction(extensions = ["SPV_KHR_integer_dot_product"], capabilities = [6018, 6019], id = 4450)
+int sdot4x8(int a, int b, spirv_literal int packed_fmt);
+
+layout(constant_id = 0) const uint WG = 128;
+layout(constant_id = 1) const uint DTYPE = 0; // 0 = Q4_0, 2 = Q8_0
+layout(constant_id = 2) const uint NR = 2;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer WA   { uint16_t wa[]; };
+layout(std430, binding = 0) readonly buffer WA32 { uint wa32[]; };
+layout(std430, binding = 1) readonly buffer WB   { uint16_t wb[]; };
+layout(std430, binding = 1) readonly buffer WB32 { uint wb32[]; };
+layout(std430, binding = 2) readonly buffer XQ   { int xq[]; };
+layout(std430, binding = 3) readonly buffer XD   { vec2 xd[]; };
+layout(std430, binding = 4) writeonly buffer YA  { float ya[]; };
+layout(std430, binding = 5) writeonly buffer YB  { float yb[]; };
+
+layout(push_constant) uniform PC {
+    uint n_in;
+    uint a_rows;
+    uint b_rows;
+    uint row_u16s;
+} pc;
+
+void main() {
+    const uint global_row0 = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * NR;
+    const uint total_rows = pc.a_rows + pc.b_rows;
+    if (global_row0 >= total_rows) return;
+
+    const bool is_b = (global_row0 >= pc.a_rows);
+    const uint local_row0 = is_b ? (global_row0 - pc.a_rows) : global_row0;
+    const uint mat_rows = is_b ? pc.b_rows : pc.a_rows;
+
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg_size = gl_SubgroupSize;
+
+    float acc[NR];
+    uint row_b[NR];
+    [[unroll]] for (uint r = 0u; r < NR; ++r) {
+        acc[r] = 0.0;
+        const uint row = min(local_row0 + r, mat_rows - 1u);
+        row_b[r] = row * pc.row_u16s;
+    }
+
+    const uint nb = pc.n_in >> 5u;
+
+    if (DTYPE == 0u) {
+        const uint sub = lane & 3u;
+        const uint blk_step = sg_size >> 2u;
+        if ((nb & 1u) == 0u && (pc.row_u16s & 1u) == 0u) {
+            const uint np = nb >> 1u;
+            for (uint ip = (lane >> 2u); ip < np; ip += blk_step) {
+                const uint ib0 = ip << 1u;
+                const uint ib1 = ib0 + 1u;
+                const int xlo0 = xq[ib0 * 8u + sub];
+                const int xhi0 = xq[ib0 * 8u + 4u + sub];
+                const int xlo1 = xq[ib1 * 8u + sub];
+                const int xhi1 = xq[ib1 * 8u + 4u + sub];
+                const vec2 dm0 = xd[ib0];
+                const vec2 dm1 = xd[ib1];
+                const float m8_0 = (sub == 0u) ? (-8.0 * dm0.y) : 0.0;
+                const float m8_1 = (sub == 0u) ? (-8.0 * dm1.y) : 0.0;
+                const uint ip9 = ip * 9u;
+
+                [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                    const uint b32 = (row_b[r] >> 1u) + ip9;
+                    float d0, d1;
+                    uint u0, u1;
+                    if (is_b) {
+                        d0 = unpackHalf2x16(wb32[b32]).x;
+                        u0 = (wb32[b32 + sub] >> 16u) | (wb32[b32 + sub + 1u] << 16u);
+                        d1 = unpackHalf2x16(wb32[b32 + 4u]).y;
+                        u1 = wb32[b32 + 5u + sub];
+                    } else {
+                        d0 = unpackHalf2x16(wa32[b32]).x;
+                        u0 = (wa32[b32 + sub] >> 16u) | (wa32[b32 + sub + 1u] << 16u);
+                        d1 = unpackHalf2x16(wa32[b32 + 4u]).y;
+                        u1 = wa32[b32 + 5u + sub];
+                    }
+                    const int s0 = sdot4x8(int(u0 & 0x0F0F0F0Fu), xlo0, 0)
+                                 + sdot4x8(int((u0 >> 4u) & 0x0F0F0F0Fu), xhi0, 0);
+                    const int s1 = sdot4x8(int(u1 & 0x0F0F0F0Fu), xlo1, 0)
+                                 + sdot4x8(int((u1 >> 4u) & 0x0F0F0F0Fu), xhi1, 0);
+                    acc[r] = fma(d1, fma(float(s1), dm1.x, m8_1),
+                             fma(d0, fma(float(s0), dm0.x, m8_0), acc[r]));
+                }
+            }
+        } else {
+            for (uint ib = (lane >> 2u); ib < nb; ib += blk_step) {
+                const int xlo = xq[ib * 8u + sub];
+                const int xhi = xq[ib * 8u + 4u + sub];
+                const vec2 dm = xd[ib];
+                const float m8 = (sub == 0u) ? (-8.0 * dm.y) : 0.0;
+                [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                    const uint b = row_b[r] + ib * 9u;
+                    const float d = unpackHalf2x16(is_b ? uint(wb[b]) : uint(wa[b])).x;
+                    const uint u = is_b
+                        ? (uint(wb[b + 1u + 2u * sub]) | (uint(wb[b + 2u + 2u * sub]) << 16u))
+                        : (uint(wa[b + 1u + 2u * sub]) | (uint(wa[b + 2u + 2u * sub]) << 16u));
+                    const int s = sdot4x8(int(u & 0x0F0F0F0Fu), xlo, 0)
+                                + sdot4x8(int((u >> 4u) & 0x0F0F0F0Fu), xhi, 0);
+                    acc[r] = fma(d, fma(float(s), dm.x, m8), acc[r]);
+                }
+            }
+        }
+    } else {
+        // Coalesced 8-lane-per-block Q8_0 DP4A GEMV!
+        const uint sub_blk = lane >> 3u;
+        const uint sub_lane = lane & 7u;
+        const uint step_blk = sg_size >> 3u;
+        const uint q_u16_off = 1u + (sub_lane << 1u);
+        for (uint ib = sub_blk; ib < nb; ib += step_blk) {
+            const int xqv = xq[ib * 8u + sub_lane];
+            const float dx = xd[ib].x;
+            const uint blk_u16 = ib * 17u;
+            [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                const uint b = row_b[r] + blk_u16;
+                float d;
+                uint q32;
+                const uint q = b + q_u16_off;
+                if (is_b) {
+                    const uint dw = wb32[b >> 1u];
+                    d = ((b & 1u) == 0u) ? unpackHalf2x16(dw).x : unpackHalf2x16(dw).y;
+                    q32 = ((q & 1u) == 0u)
+                        ? wb32[q >> 1u]
+                        : ((wb32[q >> 1u] >> 16u) | (wb32[(q >> 1u) + 1u] << 16u));
+                } else {
+                    const uint dw = wa32[b >> 1u];
+                    d = ((b & 1u) == 0u) ? unpackHalf2x16(dw).x : unpackHalf2x16(dw).y;
+                    q32 = ((q & 1u) == 0u)
+                        ? wa32[q >> 1u]
+                        : ((wa32[q >> 1u] >> 16u) | (wa32[(q >> 1u) + 1u] << 16u));
+                }
+                acc[r] = fma(d * dx, float(sdot4x8(int(q32), xqv, 0)), acc[r]);
+            }
+        }
+    }
+
+    [[unroll]] for (uint r = 0u; r < NR; ++r) {
+        const float out_v = subgroupAdd(acc[r]);
+        if (subgroupElect() && local_row0 + r < mat_rows) {
+            if (is_b) {
+                yb[local_row0 + r] = out_v;
+            } else {
+                ya[local_row0 + r] = out_v;
+            }
+        }
+    }
+}

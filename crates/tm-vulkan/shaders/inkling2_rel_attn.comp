@@ -23,6 +23,7 @@ layout(std430, binding = 3) readonly buffer Sinks   { float sinks[]; };
 layout(std430, binding = 4) readonly buffer KCache  { uvec2 k_cache4[]; };
 layout(std430, binding = 5) readonly buffer VCache  { uvec2 v_cache4[]; };
 layout(std430, binding = 6) writeonly buffer OutBuf { vec4  out4[]; };
+layout(std430, binding = 7) readonly buffer PosBuf  { uint  pos_u32[]; };
 
 layout(push_constant) uniform PC {
     uint nh_packed;       // n_head | (n_head_kv << 16)
@@ -66,8 +67,9 @@ void main() {
     const uint n_head_kv = pc.nh_packed >> 16u;
     const uint head_dim = pc.hd_nrel_packed & 0xFFFFu;
     const uint n_rel = pc.hd_nrel_packed >> 16u;
-    const uint pos = pc.pos + tok;
-    const uint kv_start = (gl_NumWorkGroups.y == 1u)
+    const bool dyn_pos = (pc.pos == 0xFFFFFFFFu);
+    const uint pos = (dyn_pos ? pos_u32[0] : pc.pos) + tok;
+    const uint kv_start = (!dyn_pos && gl_NumWorkGroups.y == 1u)
         ? pc.kv_start
         : ((pc.kv_start == 0u) ? 0u : ((pos + 1u > pc.kv_start) ? (pos + 1u - pc.kv_start) : 0u));
 

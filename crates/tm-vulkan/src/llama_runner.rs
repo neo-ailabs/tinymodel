@@ -30,6 +30,7 @@ use crate::{VkResultExt, VulkanError};
 
 const SPV_EMBED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/embed.spv"));
 const SPV_RMS_NORM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm.spv"));
+const SPV_RMS_NORM_Q8_1: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm_q8_1.spv"));
 const SPV_QK_NORM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qk_norm.spv"));
 const SPV_ROPE_KV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_kv.spv"));
 const SPV_ROPE_KV_Q8: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_kv_q8.spv"));
@@ -43,15 +44,28 @@ const SPV_FA_COOPMAT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_coopm
 const SPV_FA_GQA_TILED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_gqa_tiled.spv"));
 const SPV_FA_GQA_TILED_Q8: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_gqa_tiled_q8.spv"));
 const SPV_GEMV_RES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_res.spv"));
+const SPV_GEMV_DP4A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_dp4a.spv"));
 const SPV_GEMV_RES_Q4_0_SOA: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemv_res_q4_0_soa.spv"));
+const SPV_GEMV_RES_Q4_0_SOA_DP4A: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemv_res_q4_0_soa_dp4a.spv"));
 const SPV_GEMV_QKV_Q4_0: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_qkv_q4_0.spv"));
+const SPV_GEMV_QKV_Q4_0_DP4A: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemv_qkv_q4_0_dp4a.spv"));
 const SPV_GEMV_QKV_Q4_0_SOA: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemv_qkv_q4_0_soa.spv"));
+const SPV_GEMV_QKV_Q4_0_SOA_DP4A: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemv_qkv_q4_0_soa_dp4a.spv"));
 const SPV_GEMV_PAIR_SILU_Q4_0: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemv_pair_silu_q4_0.spv"));
+const SPV_GEMV_PAIR_SILU_Q4_0_DP4A: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemv_pair_silu_q4_0_dp4a.spv"));
 const SPV_GEMV_PAIR_SILU_Q4_0_SOA: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemv_pair_silu_q4_0_soa.spv"));
+const SPV_GEMV_PAIR_SILU_Q4_0_SOA_DP4A: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/gemv_pair_silu_q4_0_soa_dp4a.spv"
+));
 const SPV_SILU_MUL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silu_mul.spv"));
 const SPV_GEMM_TILED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_tiled.spv"));
 const SPV_GEMM_TILED_DP4A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_tiled_dp4a.spv"));
@@ -96,6 +110,27 @@ impl ResolvedPrefill {
 
     fn uses_q8_1(self) -> bool {
         matches!(self, Self::CoopMatI8 | Self::TiledDp4a)
+    }
+}
+
+fn dp4a_decode_enabled(
+    prefill_kind: ResolvedPrefill,
+    int8_accel: bool,
+    n_embd: usize,
+    hb_dim: usize,
+    q_dim: usize,
+) -> bool {
+    if !int8_accel
+        || !n_embd.is_multiple_of(32)
+        || !hb_dim.is_multiple_of(32)
+        || !q_dim.is_multiple_of(32)
+    {
+        return false;
+    }
+    match std::env::var("TM_VK_DP4A").ok().as_deref().map(str::trim) {
+        Some("0" | "false" | "off") => false,
+        Some("force") => true,
+        _ => prefill_kind != ResolvedPrefill::Fallback && n_embd >= 256,
     }
 }
 
@@ -350,6 +385,7 @@ struct MoeSharedExpertPlan {
     gate_dec: (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
     up_dec: (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
     down_dec: (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
+    down_dec_q8: bool,
     gate_batch: BatchGemmEntry,
     up_batch: BatchGemmEntry,
     down_batch: BatchGemmEntry,
@@ -405,6 +441,7 @@ enum LayerFfnPlan {
         ffn_batch: BatchFfnPlan,
         ffn_batch_sep: (BatchGemmEntry, BatchGemmEntry, vk::DescriptorSet),
         down_dec: (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
+        down_dec_q8: bool,
         down_batch: BatchGemmEntry,
     },
     Moe(Box<MoeLayerPlan>),
@@ -413,6 +450,7 @@ enum LayerFfnPlan {
 struct LayerPlan {
     idx: usize,
     attn_norm_set: vk::DescriptorSet,
+    attn_norm_dec_set: vk::DescriptorSet,
     qkv_dec: DecodeQkvSets,
     wq_batch: BatchGemmEntry,
     wk_batch: BatchGemmEntry,
@@ -428,8 +466,10 @@ struct LayerPlan {
     attn_dec_set: vk::DescriptorSet,
     attn_batch_set: vk::DescriptorSet,
     wo_dec: (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
+    wo_dec_q8: bool,
     wo_batch: BatchGemmEntry,
     ffn_norm_set: vk::DescriptorSet,
+    ffn_norm_dec_set: vk::DescriptorSet,
     ffn: LayerFfnPlan,
     // Byte sizes for stage bandwidth accounting in `profile`
     qkv_weight_bytes: u64,
@@ -442,6 +482,7 @@ struct RunnerPipes {
     embed_dec: Arc<Pipeline>,
     embed_batch: Arc<Pipeline>,
     rms_norm: Arc<Pipeline>,
+    rms_norm_q8_1: Option<Arc<Pipeline>>,
     qk_norm: Arc<Pipeline>,
     add_bias: Arc<Pipeline>,
     rope_dec: Arc<Pipeline>,
@@ -482,8 +523,10 @@ pub struct LlamaVkRunner {
     quant_xb_set: Option<vk::DescriptorSet>,
     quant_hb_set: Option<vk::DescriptorSet>,
     output_norm_set: vk::DescriptorSet,
+    output_norm_dec_set: vk::DescriptorSet,
     attn_reduce_set: Option<vk::DescriptorSet>,
     lm_head_dec: (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]),
+    lm_head_dec_q8: bool,
     output_bias_set: Option<vk::DescriptorSet>,
     argmax_set: vk::DescriptorSet,
     layers: Vec<LayerPlan>,
@@ -1783,8 +1826,15 @@ impl LlamaVkRunner {
         } else {
             (None, None)
         };
-        let (s_xq, s_xd) = if prefill_kind.uses_q8_1() {
-            let max_blocks = (max_batch * max_dim) / 32;
+        let use_dp4a_dec = dp4a_decode_enabled(
+            prefill_kind,
+            info.int8_dot_accelerated,
+            n_embd,
+            hb_dim,
+            q_dim,
+        );
+        let (s_xq, s_xd) = if prefill_kind.uses_q8_1() || use_dp4a_dec {
+            let max_blocks = (max_batch * max_dim.max(hb_dim)) / 32;
             (
                 Some(planner.reserve((max_blocks * 32) as u64)?),
                 Some(planner.reserve((max_blocks * 8) as u64)?),
@@ -1999,8 +2049,13 @@ impl LlamaVkRunner {
             )
         };
 
-        let quant_q8_1 = if prefill_kind.uses_q8_1() {
+        let quant_q8_1 = if prefill_kind.uses_q8_1() || use_dp4a_dec {
             Some(ctx.pipeline("quantize_q8_1", 256, SPV_QUANTIZE_Q8_1, 3, 4, &[256])?)
+        } else {
+            None
+        };
+        let rms_norm_q8_1 = if use_dp4a_dec {
+            Some(ctx.pipeline("rms_norm_q8_1", 256, SPV_RMS_NORM_Q8_1, 5, 12, &[256])?)
         } else {
             None
         };
@@ -2045,6 +2100,7 @@ impl LlamaVkRunner {
                 &[64, emb_dt, 1],
             )?,
             rms_norm: ctx.pipeline("rms_norm", 0, SPV_RMS_NORM, 3, 12, &[256])?,
+            rms_norm_q8_1,
             qk_norm: ctx.pipeline("qk_norm", 0, SPV_QK_NORM, 2, 8, &[64])?,
             add_bias: ctx.pipeline("add_bias", 256, SPV_ADD_BIAS_AXPY, 3, 20, &[256])?,
             rope_dec: ctx.pipeline(rope_dec_name, 0, rope_spv, 7, 32, &[64, 0])?,
@@ -2104,8 +2160,8 @@ impl LlamaVkRunner {
         };
 
         // 4. Allocate static descriptor pool, command pool, pre-bound descriptor sets.
-        let max_sets = (n_layers as u32) * 56 + 60;
-        let max_desc = max_sets * 10;
+        let max_sets = (n_layers as u32) * 64 + 64;
+        let max_desc = max_sets * 12;
         let d = &ctx.inner.device;
         // SAFETY: `d` is a valid logical device and `ctx.inner.queue_family` is its compute queue family.
         let (desc_pool, cmd_pool, cbs, fence) = unsafe {
@@ -2403,20 +2459,41 @@ impl LlamaVkRunner {
                 Binding::Arena(s_xb),
             ],
         )?;
-        let alloc_gemv_call =
-            |mat: &VkMat,
-             x_slice: VkSlice,
-             y_slice: VkSlice,
-             add_residual: bool|
-             -> Result<(Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]), VulkanError> {
+        let output_norm_dec_set =
+            if let (Some(p_nq), Some(xq), Some(xd)) = (&pipes.rms_norm_q8_1, s_xq, s_xd) {
+                alloc_set(
+                    p_nq,
+                    &[
+                        Binding::Arena(s_x),
+                        Binding::Arena(p_output_norm.slice),
+                        Binding::Arena(s_xb),
+                        Binding::Arena(xq),
+                        Binding::Arena(xd),
+                    ],
+                )?
+            } else {
+                output_norm_set
+            };
+        type GemvCall = (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 4]);
+        let alloc_gemv_call = |mat: &VkMat,
+                               x_slice: VkSlice,
+                               y_slice: VkSlice,
+                               add_residual: bool,
+                               allow_dp4a: bool|
+         -> Result<(GemvCall, bool), VulkanError> {
+            if allow_dp4a
+                && use_dp4a_dec
+                && mat.cols.is_multiple_of(32)
+                && let (Some(xq), Some(xd)) = (s_xq, s_xd)
+            {
                 if let Some(d_slice) = mat.soa_d {
                     let wg = 128u32;
                     let nr = 4u32;
                     let p = ctx.pipeline(
-                        "gemv_res_q4_0_soa",
+                        "gemv_res_q4_0_soa_dp4a",
                         wg | (nr << 16),
-                        SPV_GEMV_RES_Q4_0_SOA,
-                        4,
+                        SPV_GEMV_RES_Q4_0_SOA_DP4A,
+                        5,
                         16,
                         &[wg, nr],
                     )?;
@@ -2425,28 +2502,84 @@ impl LlamaVkRunner {
                         &[
                             Binding::Arena(mat.slice),
                             Binding::Arena(d_slice),
-                            Binding::Arena(x_slice),
+                            Binding::Arena(xq),
+                            Binding::Arena(xd),
                             Binding::Arena(y_slice),
                         ],
                     )?;
                     let rows_per_wg = (wg / sg).max(1) * nr;
                     let groups = (mat.rows as u32).div_ceil(rows_per_wg);
                     let push = [mat.cols as u32, mat.rows as u32, u32::from(add_residual), 0];
-                    Ok((p, set, groups, push))
-                } else {
-                    let (p, g, mut push) = gemv_pipe_for(mat)?;
-                    push[2] = u32::from(add_residual);
+                    return Ok(((p, set, groups, push), true));
+                }
+                if matches!(
+                    mat.dtype,
+                    DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q5K
+                ) {
+                    let dt = dtype_code(mat.dtype)?;
+                    let nr = gemv_nr(mat.dtype);
+                    let wg = 128u32;
+                    let key = dt | (nr << 8) | (wg << 16);
+                    let p =
+                        ctx.pipeline("gemv_dp4a", key, SPV_GEMV_DP4A, 4, 16, &[wg, dt, nr, 1])?;
                     let set = alloc_set(
                         &p,
                         &[
                             Binding::Arena(mat.slice),
-                            Binding::Arena(x_slice),
+                            Binding::Arena(xq),
+                            Binding::Arena(xd),
                             Binding::Arena(y_slice),
                         ],
                     )?;
-                    Ok((p, set, g, push))
+                    let rows_per_wg = (wg / sg).max(1) * nr;
+                    let groups = (mat.rows as u32).div_ceil(rows_per_wg);
+                    let push = [
+                        mat.cols as u32,
+                        mat.rows as u32,
+                        u32::from(add_residual),
+                        (mat.row_bytes / 2) as u32,
+                    ];
+                    return Ok(((p, set, groups, push), true));
                 }
-            };
+            }
+            if let Some(d_slice) = mat.soa_d {
+                let wg = 128u32;
+                let nr = 4u32;
+                let p = ctx.pipeline(
+                    "gemv_res_q4_0_soa",
+                    wg | (nr << 16),
+                    SPV_GEMV_RES_Q4_0_SOA,
+                    4,
+                    16,
+                    &[wg, nr],
+                )?;
+                let set = alloc_set(
+                    &p,
+                    &[
+                        Binding::Arena(mat.slice),
+                        Binding::Arena(d_slice),
+                        Binding::Arena(x_slice),
+                        Binding::Arena(y_slice),
+                    ],
+                )?;
+                let rows_per_wg = (wg / sg).max(1) * nr;
+                let groups = (mat.rows as u32).div_ceil(rows_per_wg);
+                let push = [mat.cols as u32, mat.rows as u32, u32::from(add_residual), 0];
+                Ok(((p, set, groups, push), false))
+            } else {
+                let (p, g, mut push) = gemv_pipe_for(mat)?;
+                push[2] = u32::from(add_residual);
+                let set = alloc_set(
+                    &p,
+                    &[
+                        Binding::Arena(mat.slice),
+                        Binding::Arena(x_slice),
+                        Binding::Arena(y_slice),
+                    ],
+                )?;
+                Ok(((p, set, g, push), false))
+            }
+        };
 
         let attn_reduce_set = if let (Some(p_red), Some(s_ml), Some(s_o)) =
             (&pipes.attn_dec_reduce, s_attn_split_ml, s_attn_split_o)
@@ -2462,7 +2595,8 @@ impl LlamaVkRunner {
         } else {
             None
         };
-        let lm_head_dec = alloc_gemv_call(&out_mat, s_xb, logits_dev, false)?;
+        let (lm_head_dec, lm_head_dec_q8) =
+            alloc_gemv_call(&out_mat, s_xb, logits_dev, false, true)?;
         let output_bias_set = match p_output_bias {
             Some(ref pob) => Some(alloc_set(
                 &pipes.add_bias,
@@ -2519,8 +2653,121 @@ impl LlamaVkRunner {
                     Binding::Arena(s_xb),
                 ],
             )?;
+            let attn_norm_dec_set =
+                if let (Some(p_nq), Some(xq), Some(xd)) = (&pipes.rms_norm_q8_1, s_xq, s_xd) {
+                    alloc_set(
+                        p_nq,
+                        &[
+                            Binding::Arena(s_x),
+                            Binding::Arena(pl.attn_norm.slice),
+                            Binding::Arena(s_xb),
+                            Binding::Arena(xq),
+                            Binding::Arena(xd),
+                        ],
+                    )?
+                } else {
+                    attn_norm_set
+                };
 
-            let qkv_dec = if let (Some(qd), Some(kd), Some(vd)) =
+            let qkv_dec = if use_dp4a_dec
+                && let (Some(xq), Some(xd)) = (s_xq, s_xd)
+                && let (Some(qd), Some(kd), Some(vd)) =
+                    (pl.wq.mat.soa_d, pl.wk.mat.soa_d, pl.wv.mat.soa_d)
+                && pl.wq.mat.rows.is_multiple_of(2)
+                && pl.wk.mat.rows.is_multiple_of(2)
+            {
+                let wg = 128u32;
+                let nr = if pl.wq.mat.rows.is_multiple_of(4) && pl.wk.mat.rows.is_multiple_of(4) {
+                    4u32
+                } else {
+                    2u32
+                };
+                let pipe = ctx.pipeline(
+                    "gemv_qkv_q4_0_soa_dp4a",
+                    wg | (nr << 16),
+                    SPV_GEMV_QKV_Q4_0_SOA_DP4A,
+                    11,
+                    16,
+                    &[wg, nr],
+                )?;
+                let set = alloc_set(
+                    &pipe,
+                    &[
+                        Binding::Arena(pl.wq.slice),
+                        Binding::Arena(qd),
+                        Binding::Arena(pl.wk.slice),
+                        Binding::Arena(kd),
+                        Binding::Arena(pl.wv.slice),
+                        Binding::Arena(vd),
+                        Binding::Arena(xq),
+                        Binding::Arena(xd),
+                        Binding::Arena(s_q),
+                        Binding::Arena(s_k),
+                        Binding::Arena(s_v),
+                    ],
+                )?;
+                let total_rows = (pl.wq.mat.rows + pl.wk.mat.rows + pl.wv.mat.rows) as u32;
+                let rows_per_wg = (wg / sg).max(1) * nr;
+                DecodeQkvSets::Fused {
+                    pipe,
+                    set,
+                    groups_x: total_rows.div_ceil(rows_per_wg),
+                    push: [
+                        pl.wq.mat.cols as u32,
+                        pl.wq.mat.rows as u32,
+                        pl.wk.mat.rows as u32,
+                        pl.wv.mat.rows as u32,
+                    ],
+                }
+            } else if use_dp4a_dec
+                && let (Some(xq), Some(xd)) = (s_xq, s_xd)
+                && pl.wq.mat.dtype == DType::Q4_0
+                && pl.wk.mat.dtype == DType::Q4_0
+                && pl.wv.mat.dtype == DType::Q4_0
+                && pl.wq.mat.rows.is_multiple_of(2)
+                && pl.wk.mat.rows.is_multiple_of(2)
+            {
+                let wg = 128u32;
+                let nr = if pl.wq.mat.rows.is_multiple_of(4) && pl.wk.mat.rows.is_multiple_of(4) {
+                    4u32
+                } else {
+                    2u32
+                };
+                let pipe = ctx.pipeline(
+                    "gemv_qkv_q4_0_dp4a",
+                    wg | (nr << 16),
+                    SPV_GEMV_QKV_Q4_0_DP4A,
+                    8,
+                    16,
+                    &[wg, nr],
+                )?;
+                let set = alloc_set(
+                    &pipe,
+                    &[
+                        Binding::Arena(pl.wq.slice),
+                        Binding::Arena(pl.wk.slice),
+                        Binding::Arena(pl.wv.slice),
+                        Binding::Arena(xq),
+                        Binding::Arena(xd),
+                        Binding::Arena(s_q),
+                        Binding::Arena(s_k),
+                        Binding::Arena(s_v),
+                    ],
+                )?;
+                let total_rows = (pl.wq.mat.rows + pl.wk.mat.rows + pl.wv.mat.rows) as u32;
+                let rows_per_wg = (wg / sg).max(1) * nr;
+                DecodeQkvSets::Fused {
+                    pipe,
+                    set,
+                    groups_x: total_rows.div_ceil(rows_per_wg),
+                    push: [
+                        pl.wq.mat.cols as u32,
+                        pl.wq.mat.rows as u32,
+                        pl.wk.mat.rows as u32,
+                        pl.wv.mat.rows as u32,
+                    ],
+                }
+            } else if let (Some(qd), Some(kd), Some(vd)) =
                 (pl.wq.mat.soa_d, pl.wk.mat.soa_d, pl.wv.mat.soa_d)
                 && pl.wq.mat.rows.is_multiple_of(2)
                 && pl.wk.mat.rows.is_multiple_of(2)
@@ -2614,9 +2861,9 @@ impl LlamaVkRunner {
                 }
             } else {
                 DecodeQkvSets::Separate {
-                    wq: alloc_gemv_call(&pl.wq.mat, s_xb, s_q, false)?,
-                    wk: alloc_gemv_call(&pl.wk.mat, s_xb, s_k, false)?,
-                    wv: alloc_gemv_call(&pl.wv.mat, s_xb, s_v, false)?,
+                    wq: alloc_gemv_call(&pl.wq.mat, s_xb, s_q, false, true)?.0,
+                    wk: alloc_gemv_call(&pl.wk.mat, s_xb, s_k, false, true)?.0,
+                    wv: alloc_gemv_call(&pl.wv.mat, s_xb, s_v, false, true)?.0,
                 }
             };
 
@@ -2735,7 +2982,8 @@ impl LlamaVkRunner {
                 )?,
             };
 
-            let (p_wo, s_wo, g_wo, push_wo) = alloc_gemv_call(&pl.wo.mat, s_xb, s_x, true)?;
+            let ((p_wo, s_wo, g_wo, push_wo), wo_dec_q8) =
+                alloc_gemv_call(&pl.wo.mat, s_xb, s_x, true, true)?;
             let wo_batch = make_batch_gemm(pl.wo.mat, s_xb, s_x)?;
 
             let ffn_norm_set = alloc_set(
@@ -2746,6 +2994,21 @@ impl LlamaVkRunner {
                     Binding::Arena(s_xb),
                 ],
             )?;
+            let ffn_norm_dec_set =
+                if let (Some(p_nq), Some(xq), Some(xd)) = (&pipes.rms_norm_q8_1, s_xq, s_xd) {
+                    alloc_set(
+                        p_nq,
+                        &[
+                            Binding::Arena(s_x),
+                            Binding::Arena(pl.ffn_norm.slice),
+                            Binding::Arena(s_xb),
+                            Binding::Arena(xq),
+                            Binding::Arena(xd),
+                        ],
+                    )?
+                } else {
+                    ffn_norm_set
+                };
 
             let (ffn_plan, gate_up_weight_bytes, down_weight_bytes) = match &pl.ffn {
                 PendingLayerFfn::Dense {
@@ -2754,8 +3017,8 @@ impl LlamaVkRunner {
                     w_down,
                 } => {
                     let ffn_dec_sep = {
-                        let g_call = alloc_gemv_call(&w_gate.mat, s_xb, s_hb, false)?;
-                        let u_call = alloc_gemv_call(&w_up.mat, s_xb, s_hb2, false)?;
+                        let g_call = alloc_gemv_call(&w_gate.mat, s_xb, s_hb, false, true)?.0;
+                        let u_call = alloc_gemv_call(&w_up.mat, s_xb, s_hb2, false, true)?.0;
                         let silu_set = alloc_set(
                             &pipes.silu_mul,
                             &[Binding::Arena(s_hb), Binding::Arena(s_hb2)],
@@ -2763,7 +3026,72 @@ impl LlamaVkRunner {
                         (g_call, u_call, silu_set)
                     };
 
-                    let ffn_dec = if let (Some(gd), Some(ud)) = (w_gate.mat.soa_d, w_up.mat.soa_d) {
+                    let ffn_dec = if use_dp4a_dec
+                        && let (Some(xq), Some(xd)) = (s_xq, s_xd)
+                        && let (Some(gd), Some(ud)) = (w_gate.mat.soa_d, w_up.mat.soa_d)
+                    {
+                        let wg = 128u32;
+                        let nr = 2u32;
+                        let pipe = ctx.pipeline(
+                            "gemv_pair_silu_q4_0_soa_dp4a",
+                            wg | (nr << 16),
+                            SPV_GEMV_PAIR_SILU_Q4_0_SOA_DP4A,
+                            7,
+                            8,
+                            &[wg, nr],
+                        )?;
+                        let set = alloc_set(
+                            &pipe,
+                            &[
+                                Binding::Arena(w_gate.slice),
+                                Binding::Arena(gd),
+                                Binding::Arena(w_up.slice),
+                                Binding::Arena(ud),
+                                Binding::Arena(xq),
+                                Binding::Arena(xd),
+                                Binding::Arena(s_hb),
+                            ],
+                        )?;
+                        let rows_per_wg = (wg / sg).max(1) * nr;
+                        DecodeFfnSets::FusedPairSilu {
+                            pipe,
+                            set,
+                            groups_x: (w_gate.mat.rows as u32).div_ceil(rows_per_wg),
+                            push: [w_gate.mat.cols as u32, w_gate.mat.rows as u32],
+                        }
+                    } else if use_dp4a_dec
+                        && let (Some(xq), Some(xd)) = (s_xq, s_xd)
+                        && w_gate.mat.dtype == DType::Q4_0
+                        && w_up.mat.dtype == DType::Q4_0
+                    {
+                        let wg = 128u32;
+                        let nr = 2u32;
+                        let pipe = ctx.pipeline(
+                            "gemv_pair_silu_q4_0_dp4a",
+                            wg | (nr << 16),
+                            SPV_GEMV_PAIR_SILU_Q4_0_DP4A,
+                            5,
+                            8,
+                            &[wg, nr],
+                        )?;
+                        let set = alloc_set(
+                            &pipe,
+                            &[
+                                Binding::Arena(w_gate.slice),
+                                Binding::Arena(w_up.slice),
+                                Binding::Arena(xq),
+                                Binding::Arena(xd),
+                                Binding::Arena(s_hb),
+                            ],
+                        )?;
+                        let rows_per_wg = (wg / sg).max(1) * nr;
+                        DecodeFfnSets::FusedPairSilu {
+                            pipe,
+                            set,
+                            groups_x: (w_gate.mat.rows as u32).div_ceil(rows_per_wg),
+                            push: [w_gate.mat.cols as u32, w_gate.mat.rows as u32],
+                        }
+                    } else if let (Some(gd), Some(ud)) = (w_gate.mat.soa_d, w_up.mat.soa_d) {
                         let wg = 128u32;
                         let nr = 2u32;
                         let pipe = ctx.pipeline(
@@ -2878,7 +3206,8 @@ impl LlamaVkRunner {
                         }
                     };
 
-                    let down_dec = alloc_gemv_call(&w_down.mat, s_hb, s_x, true)?;
+                    let (down_dec, down_dec_q8) =
+                        alloc_gemv_call(&w_down.mat, s_hb, s_x, true, true)?;
                     let down_batch = make_batch_gemm(w_down.mat, s_hb, s_x)?;
                     let gu_bytes = w_gate.mat.byte_len() + w_up.mat.byte_len();
                     let dn_bytes = w_down.mat.byte_len();
@@ -2889,6 +3218,7 @@ impl LlamaVkRunner {
                             ffn_batch,
                             ffn_batch_sep,
                             down_dec,
+                            down_dec_q8,
                             down_batch,
                         },
                         gu_bytes,
@@ -2899,7 +3229,8 @@ impl LlamaVkRunner {
                     let ms = moe_scratch
                         .as_ref()
                         .expect("moe_scratch allocated when MoE layers present");
-                    let router_dec = alloc_gemv_call(&m.gate_inp.mat, s_xb, ms.logits, false)?;
+                    let router_dec =
+                        alloc_gemv_call(&m.gate_inp.mat, s_xb, ms.logits, false, true)?.0;
                     let router_batch = make_batch_gemm(m.gate_inp.mat, s_xb, ms.logits)?;
                     let router_bias_set = mk_bias_set(&m.gate_inp_bias, ms.logits)?;
                     let epb_slice = m.exp_probs_b.as_ref().map_or(ms.logits, |b| b.slice);
@@ -3027,21 +3358,24 @@ impl LlamaVkRunner {
                     )?;
 
                     let shared_expert = if let Some(ref sh) = m.shared_expert {
-                        let gate_dec = alloc_gemv_call(&sh.w_gate.mat, s_xb, s_hb, false)?;
-                        let up_dec = alloc_gemv_call(&sh.w_up.mat, s_xb, s_hb2, false)?;
+                        let gate_dec = alloc_gemv_call(&sh.w_gate.mat, s_xb, s_hb, false, true)?.0;
+                        let up_dec = alloc_gemv_call(&sh.w_up.mat, s_xb, s_hb2, false, true)?.0;
                         let gate_batch = make_batch_gemm(sh.w_gate.mat, s_xb, s_hb)?;
                         let up_batch = make_batch_gemm(sh.w_up.mat, s_xb, s_hb2)?;
                         let sh_silu_set = alloc_set(
                             &pipes.silu_mul,
                             &[Binding::Arena(s_hb), Binding::Arena(s_hb2)],
                         )?;
-                        let (down_dec, down_batch, gate_inp_1d) =
+                        let ((down_dec, down_dec_q8), down_batch, gate_inp_1d) =
                             if let Some(ref gi) = sh.w_gate_inp_1d {
                                 let sh_out = ms.shexp_out.expect("shexp_out allocated");
                                 let sh_gate = ms.shexp_gate.expect("shexp_gate allocated");
-                                let dd = alloc_gemv_call(&sh.w_down.mat, s_hb, sh_out, false)?;
+                                let dd =
+                                    alloc_gemv_call(&sh.w_down.mat, s_hb, sh_out, false, true)?;
                                 let db = make_batch_gemm(sh.w_down.mat, s_hb, sh_out)?;
-                                let gi_dec = alloc_gemv_call(&gi.mat, s_xb, sh_gate, false)?;
+                                // `s_hb` quantization overwrites `(xq, xd)` before `gi_dec`, so keep 1-row `gi_dec` on `s_xb`!
+                                let gi_dec =
+                                    alloc_gemv_call(&gi.mat, s_xb, sh_gate, false, false)?.0;
                                 let gi_batch = make_batch_gemm(gi.mat, s_xb, sh_gate)?;
                                 let gi_red = alloc_set(
                                     &pipes.moe_reduce,
@@ -3053,7 +3387,7 @@ impl LlamaVkRunner {
                                 )?;
                                 (dd, db, Some((gi_dec, gi_batch, gi_red)))
                             } else {
-                                let dd = alloc_gemv_call(&sh.w_down.mat, s_hb, s_x, true)?;
+                                let dd = alloc_gemv_call(&sh.w_down.mat, s_hb, s_x, true, true)?;
                                 let db = make_batch_gemm(sh.w_down.mat, s_hb, s_x)?;
                                 (dd, db, None)
                             };
@@ -3062,6 +3396,7 @@ impl LlamaVkRunner {
                             gate_dec,
                             up_dec,
                             down_dec,
+                            down_dec_q8,
                             gate_batch,
                             up_batch,
                             down_batch,
@@ -3111,6 +3446,7 @@ impl LlamaVkRunner {
             layers.push(LayerPlan {
                 idx: il,
                 attn_norm_set,
+                attn_norm_dec_set,
                 qkv_dec,
                 wq_batch,
                 wk_batch,
@@ -3126,8 +3462,10 @@ impl LlamaVkRunner {
                 attn_dec_set,
                 attn_batch_set,
                 wo_dec: (p_wo, s_wo, g_wo, push_wo),
+                wo_dec_q8,
                 wo_batch,
                 ffn_norm_set,
+                ffn_norm_dec_set,
                 ffn: ffn_plan,
                 qkv_weight_bytes: pl.wq.mat.byte_len()
                     + pl.wk.mat.byte_len()
@@ -3178,8 +3516,10 @@ impl LlamaVkRunner {
             quant_xb_set,
             quant_hb_set,
             output_norm_set,
+            output_norm_dec_set,
             attn_reduce_set,
             lm_head_dec,
+            lm_head_dec_q8,
             output_bias_set,
             argmax_set,
             layers,
@@ -3303,6 +3643,20 @@ impl LlamaVkRunner {
             }
         }
         Ok(())
+    }
+
+    fn cmd_decode_norm(
+        &self,
+        cb: vk::CommandBuffer,
+        set: vk::DescriptorSet,
+        push: &[u32],
+    ) -> Result<(), VulkanError> {
+        let pipe = self
+            .pipes
+            .rms_norm_q8_1
+            .as_ref()
+            .unwrap_or(&self.pipes.rms_norm);
+        self.cmd_dispatch_set(cb, pipe, set, push, 1, 1, true)
     }
 
     fn cmd_add_bias(
@@ -3529,6 +3883,7 @@ impl LlamaVkRunner {
                     1,
                     true,
                 )?;
+                self.cmd_quant_if_needed(cb, self.quant_hb_set, 1, sh.n_ff_shexp, sh.down_dec_q8)?;
                 self.cmd_dispatch_set(
                     cb,
                     &sh.down_dec.0,
@@ -3717,15 +4072,7 @@ impl LlamaVkRunner {
             let wu_n = format!("{ltag}.ffn_up.weight");
             let wd_n = format!("{ltag}.ffn_down.weight");
 
-            self.cmd_dispatch_set(
-                cb,
-                &self.pipes.rms_norm,
-                layer.attn_norm_set,
-                &norm_push,
-                1,
-                1,
-                true,
-            )?;
+            self.cmd_decode_norm(cb, layer.attn_norm_dec_set, &norm_push)?;
 
             match &layer.qkv_dec {
                 DecodeQkvSets::Fused {
@@ -3821,6 +4168,7 @@ impl LlamaVkRunner {
                 )?;
             }
 
+            self.cmd_quant_if_needed(cb, self.quant_xb_set, 1, q_dim, layer.wo_dec_q8)?;
             self.cmd_dispatch_set(
                 cb,
                 &layer.wo_dec.0,
@@ -3835,21 +4183,14 @@ impl LlamaVkRunner {
                 self.cmd_add_bias(cb, bos, self.cfg.n_embd, 1, true)?;
             }
 
-            self.cmd_dispatch_set(
-                cb,
-                &self.pipes.rms_norm,
-                layer.ffn_norm_set,
-                &norm_push,
-                1,
-                1,
-                true,
-            )?;
+            self.cmd_decode_norm(cb, layer.ffn_norm_dec_set, &norm_push)?;
 
             match &layer.ffn {
                 LayerFfnPlan::Dense {
                     ffn_dec,
                     ffn_dec_sep,
                     down_dec,
+                    down_dec_q8,
                     ..
                 } => {
                     let force_sep = self.lora.has_linear(&wg_n) || self.lora.has_linear(&wu_n);
@@ -3898,6 +4239,13 @@ impl LlamaVkRunner {
                         }
                     }
 
+                    self.cmd_quant_if_needed(
+                        cb,
+                        self.quant_hb_set,
+                        1,
+                        self.cfg.n_ff,
+                        *down_dec_q8,
+                    )?;
                     self.cmd_dispatch_set(
                         cb,
                         &down_dec.0,
@@ -3916,15 +4264,7 @@ impl LlamaVkRunner {
         }
 
         if compute_logits {
-            self.cmd_dispatch_set(
-                cb,
-                &self.pipes.rms_norm,
-                self.output_norm_set,
-                &norm_push,
-                1,
-                1,
-                true,
-            )?;
+            self.cmd_decode_norm(cb, self.output_norm_dec_set, &norm_push)?;
             let lm = &self.lm_head_dec;
             if greedy_argmax {
                 self.cmd_dispatch_set(cb, &lm.0, lm.1, &lm.3, lm.2, 1, true)?;
@@ -4544,15 +4884,20 @@ impl LlamaVkRunner {
 
             if is_last_chunk && compute_last_logits {
                 let last_x_off = ((b - 1) * self.cfg.n_embd) as u32;
-                self.cmd_dispatch_set(
-                    cb,
-                    &self.pipes.rms_norm,
-                    self.output_norm_set,
-                    &[self.cfg.n_embd as u32, last_x_off, eps_bits],
-                    1,
-                    1,
-                    true,
-                )?;
+                let out_norm_push = [self.cfg.n_embd as u32, last_x_off, eps_bits];
+                if self.lm_head_dec_q8 {
+                    self.cmd_decode_norm(cb, self.output_norm_dec_set, &out_norm_push)?;
+                } else {
+                    self.cmd_dispatch_set(
+                        cb,
+                        &self.pipes.rms_norm,
+                        self.output_norm_set,
+                        &out_norm_push,
+                        1,
+                        1,
+                        true,
+                    )?;
+                }
                 let lm = &self.lm_head_dec;
                 let need_post_lm_bar =
                     self.lora.has_linear("output.weight") || self.output_bias_set.is_some();
@@ -4799,15 +5144,7 @@ impl LlamaVkRunner {
                 spans.push((0, q_cb_start, prev));
 
                 for layer in &self.layers {
-                    self.cmd_dispatch_set(
-                        cb,
-                        &self.pipes.rms_norm,
-                        layer.attn_norm_set,
-                        &norm_push,
-                        1,
-                        1,
-                        true,
-                    )?;
+                    self.cmd_decode_norm(cb, layer.attn_norm_dec_set, &norm_push)?;
                     let cur = mark(cb);
                     spans.push((1, prev, cur));
                     prev = cur;
@@ -4917,6 +5254,7 @@ impl LlamaVkRunner {
                     spans.push((5, prev, cur));
                     prev = cur;
 
+                    self.cmd_quant_if_needed(cb, self.quant_xb_set, 1, q_dim, layer.wo_dec_q8)?;
                     self.cmd_dispatch_set(
                         cb,
                         &layer.wo_dec.0,
@@ -4930,22 +5268,17 @@ impl LlamaVkRunner {
                     spans.push((6, prev, cur));
                     prev = cur;
 
-                    self.cmd_dispatch_set(
-                        cb,
-                        &self.pipes.rms_norm,
-                        layer.ffn_norm_set,
-                        &norm_push,
-                        1,
-                        1,
-                        true,
-                    )?;
+                    self.cmd_decode_norm(cb, layer.ffn_norm_dec_set, &norm_push)?;
                     let cur = mark(cb);
                     spans.push((7, prev, cur));
                     prev = cur;
 
                     match &layer.ffn {
                         LayerFfnPlan::Dense {
-                            ffn_dec, down_dec, ..
+                            ffn_dec,
+                            down_dec,
+                            down_dec_q8,
+                            ..
                         } => {
                             match ffn_dec {
                                 DecodeFfnSets::FusedPairSilu {
@@ -4979,6 +5312,13 @@ impl LlamaVkRunner {
                             spans.push((8, prev, cur));
                             prev = cur;
 
+                            self.cmd_quant_if_needed(
+                                cb,
+                                self.quant_hb_set,
+                                1,
+                                self.cfg.n_ff,
+                                *down_dec_q8,
+                            )?;
                             self.cmd_dispatch_set(
                                 cb,
                                 &down_dec.0,
@@ -5001,15 +5341,7 @@ impl LlamaVkRunner {
                     }
                 }
 
-                self.cmd_dispatch_set(
-                    cb,
-                    &self.pipes.rms_norm,
-                    self.output_norm_set,
-                    &norm_push,
-                    1,
-                    1,
-                    true,
-                )?;
+                self.cmd_decode_norm(cb, self.output_norm_dec_set, &norm_push)?;
                 let lm = &self.lm_head_dec;
                 self.cmd_dispatch_set(cb, &lm.0, lm.1, &lm.3, lm.2, 1, true)?;
                 self.cmd_dispatch_set(

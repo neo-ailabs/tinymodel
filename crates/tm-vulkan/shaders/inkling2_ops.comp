@@ -267,11 +267,12 @@ void main() {
         b0[xi] = (x - fg * x) + g * b1[mi];
     } else if (pc.op == 5u) {
         // Pack `Kcur` & `Vcur` (`f32 -> f16`) across `gl_WorkGroupID.y = tok`:
-        // `p0 = kv_pairs`, `p1 = dst_u32_off`
+        // `p0 = kv_pairs`, `p1 = dst_u32_off` (or `slot_kv_u32_base` when `p2 != 0` reads `pos` from `b2[0]`)
         if (gid >= pc.p0) return;
         const uint tok = gl_WorkGroupID.y;
+        const uint base_pos = (pc.p2 != 0u) ? floatBitsToUint(b2[0]) : 0u;
         const uint i0 = (tok * pc.p0 + gid) * 2u;
-        const uint dst = pc.p1 + tok * pc.p0 + gid;
+        const uint dst = pc.p1 + (base_pos + tok) * pc.p0 + gid;
         b4_u32[dst] = packHalf2x16(vec2(b0[i0], b0[i0 + 1u]));
         b5_u32[dst] = packHalf2x16(vec2(b1[i0], b1[i0 + 1u]));
     } else if (pc.op == 6u) {
@@ -287,16 +288,20 @@ void main() {
         }
     } else if (pc.op == 7u) {
         // Strided 2D vector utility across `gl_WorkGroupID.y = tok`:
-        // `p0 = len`, `p1 = sub_op (0=add, 1=copy)`, `p2 = dst_off`, `p3 = a_off`,
-        // `p4 = dst_stride`, `u5 = a_stride`, `u6 = b_off` (`b_stride = len`)
+        // `p0 = len`, `p1 = sub_op (0=add, 1=copy, 2=softcap)`, `p2 = dst_off`, `p3 = a_off`,
+        // `p4 = dst_stride`, `u5 = a_stride`, `u6 = b_off` (or `cap_bits` for `sub_op == 2`)
         if (gid >= pc.p0) return;
         const uint tok = gl_WorkGroupID.y;
         const uint di = tok * pc.p4 + pc.p2 + gid;
         const uint ai = tok * pc.u5 + pc.p3 + gid;
         if (pc.p1 == 0u) {
             b0[di] = b1[ai] + b2[tok * pc.p0 + pc.u6 + gid];
-        } else {
+        } else if (pc.p1 == 1u) {
             b0[di] = b1[ai];
+        } else {
+            const float cap = uintBitsToFloat(pc.u6);
+            const float v = b1[ai];
+            b0[di] = (cap > 0.0) ? (cap * accurate_tanh(v / cap)) : v;
         }
     } else if (pc.op == 8u) {
         // Multi-token causal ShortConv across `n_tok = pc.u6` tokens in registers (`1` dispatch/window!):

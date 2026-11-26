@@ -573,7 +573,7 @@ fn vk_mixed_quant_decode_vs_batch_and_cpu_kl_parity() {
             let c_top = argmax(cpu_state.logits());
             let cl = cpu_state.logits();
             assert!(
-                g_top == c_top || (cl[g_top as usize] - cl[c_top as usize]).abs() <= 5e-2,
+                g_top == c_top || (cl[g_top as usize] - cl[c_top as usize]).abs() <= 0.16,
                 "quant {arch} step={pos} top-1 mismatch: vk={g_top} cpu={c_top}"
             );
         }
@@ -584,12 +584,27 @@ fn vk_mixed_quant_decode_vs_batch_and_cpu_kl_parity() {
         );
 
         // Batched 35-token prefill (`gemm_tiled` + `gemm_kquant`) MUST match 35 sequential
-        // pre-recorded decode steps (`gemv_res` + `gemv_qkv_q4_0` + `gemv_pair_silu_q4_0`).
-        // Allow 5e-5 for FP32 FMA reduction-order differences on NVIDIA Turing (`sm_75`).
+        // FP32 fallback decode steps (`gemv_res` + `gemv_qkv_q4_0` + `gemv_pair_silu_q4_0`),
+        // and default `Auto` (`dp4a` `Q8_1` when supported) decode MUST match within `Q8_1` tolerance.
         let dec_final = vk_dec.logits().to_vec();
         let bat_final = vk_bat.forward_batch(&batch_ids, 0, true).unwrap();
-        let norm: f32 = dec_final.iter().map(|v| v.abs()).sum::<f32>().max(1.0);
-        for (i, (&b, &d)) in bat_final.iter().zip(dec_final.iter()).enumerate() {
+        let kl_auto_vs_fb = kl_div(&dec_final, bat_final);
+        assert!(
+            kl_auto_vs_fb < 3e-3,
+            "quant {arch} Auto decode(35) vs Fallback batch(35) KL too high: {kl_auto_vs_fb:.3e}"
+        );
+        let ctx_fb_dec = get_ctx_or_skip().unwrap();
+        ctx_fb_dec.set_prefill_mode(VkPrefillMode::Fallback);
+        let mut vk_dec_fb =
+            LlamaVkRunner::from_gguf_with_context(ctx_fb_dec, gguf.clone(), 64).unwrap();
+        for (pos, &tok) in batch_ids.iter().enumerate() {
+            let _ = vk_dec_fb
+                .forward_token(tok, pos, pos + 1 == batch_ids.len())
+                .unwrap();
+        }
+        let dec_fb_final = vk_dec_fb.logits().to_vec();
+        let norm: f32 = dec_fb_final.iter().map(|v| v.abs()).sum::<f32>().max(1.0);
+        for (i, (&b, &d)) in bat_final.iter().zip(dec_fb_final.iter()).enumerate() {
             let rel = (b - d).abs() / norm;
             assert!(
                 rel <= 5e-5,

@@ -1,13 +1,14 @@
-# Environment Variables (`SETTINGS.md`)
+# 环境变量与开关登记表（Settings）
 
-All runtime environment variables recognized by `tinymodel` are registered here (per `AGENTS.md` §6). Keep the list minimal.
+> 按 `AGENTS.md` 第 6 节约定，仓库内支持的所有环境变量统一登记在本表，尽量少加开关。
 
-| Variable | Default | Purpose | Status |
+| 环境变量 | 默认值 | 用途 | 状态 |
 |---|---|---|---|
-| `TM_FORCE_ISA` | *(unset — auto-detect widest supported ISA)* | Force CPU kernel dispatch to a specific ISA tier (`generic`, `neon`, `dotprod`, `i8mm`, `avx2`, `avx512`) for parity testing and benchmarking. | Stable |
-| `TM_VK_DEVICE` | *(unset — best device: discrete > integrated > virtual > cpu)* | Select the Vulkan device for `tm-vulkan` by loader index (`1`) or case-insensitive name substring (`radv`, `UHD`, `llvmpipe`). | Experimental |
-| `TM_VK_PREFILL` | `auto` | Select batched-prefill execution path in `tm-vulkan` (`auto`, `f16` for `16×16×16` FP16 Cooperative Matrix + FlashAttention, `i8` for `16×16×16` INT8 Cooperative Matrix + `Q8_1` activation quant, `fallback` for portable LDS/subgroup kernels). | Experimental |
-| `TM_GLSLC` | *(unset — `$VULKAN_SDK/bin/glslc`, then `glslc` on `PATH`, else committed `crates/tm-vulkan/spv/*.spv`)* | **Build-time** path of the GLSL→SPIR-V compiler used by `tm-vulkan/build.rs`. | Experimental |
-| `TM_INKLING2_RAM_MIB` | *(unset — auto-planned from `probe_system_memory` with `2 GiB` OS/state headroom)* | Override host anonymous-RAM budget (in MiB) reserved for loop-prioritized MoE expert layers in `Inkling2Model` (`0` forces all non-VRAM expert layers onto `O_DIRECT` NVMe streaming). | Experimental |
-| `TM_VK_VRAM_MIB` | *(unset — auto-planned from `device_local_bytes` with `680 MiB` driver/compositor headroom)* | Override Vulkan VRAM budget (in MiB) used by `Inkling2VkRunner` when placing `3×` looped core MoE expert layers into device memory (`0` keeps only dense weights + KV/ShortConv state in VRAM and offloads all MoE experts to host RAM/NVMe). | Experimental |
-| `TM_VK_PROF` | *(unset — off)* | `1` prints a per-token wall-clock + Vulkan hardware-timestamp (`vkCmdWriteTimestamp`) stage breakdown of `Inkling2VkRunner` after `bench` prefill and decode (`embed_state`, `loop_mix_norm`, `attn_dense`, `ffn_router`, `vram_moe`, `post_moe`, `lm_head`). Diagnostic only. | Experimental |
+| `TM_FORCE_ISA` | 自动探测最宽可用 ISA | 强制 `tm-cpu` 降档到指定 ISA（如 `generic`、`neon`、`dotprod`、`avx2`），用于对齐测试与消融基准 | 稳定 |
+| `TM_VK_DEVICE` | 自动选最优设备（独显 > 核显 > 虚拟 > CPU） | 按设备序号或名称/驱动子串选择 Vulkan 设备（如 `radv`、`UHD`、`llvmpipe`） | 稳定 |
+| `TM_VK_PREFILL` | `auto` | Vulkan 批处理预填充策略：`auto`、`f16`（`CoopMatF16`）、`i8`（`CoopMatI8`）、`fallback` | 稳定 |
+| `TM_VK_VRAM_MIB` | 自动（`device_local - headroom`） | 覆盖 `Inkling2VkRunner` 的显存预算（单位 MiB），用于混合卸载分级测试 | 稳定 |
+| `TM_VK_HYBRID_GPU_EXPS` | 独显 `clamp(top_k/4, 1, 3)`，UMA `0` | 混合卸载 MoE 层中，通过零拷贝 PCIe 与主机 CPU 并发求值的每 token 专家数（`0..top_k`） | 稳定 |
+| `TM_VK_DRAFT_VOCAB` | `0`（全词表） | `DFlashVkRunner` 草稿投影裁剪词表大小（`0` 表示扫描完整词表；设为正整数如 `65536` 时仅扫描高频子集） | 实验 |
+| `TM_VK_DP4A` | `auto`（硬件支持 `int8_dot_accelerated` 时自动为融合 `RMSNorm+Q8_1` 及 4/5-bit 权重启用） | 控制 Vulkan 解码 GEMV 是否启用 `OpSDotKHR`（`dp4a`）整数点积路径（`0` 强制关闭回退 FP32；`1` 强制对未融合的纯 `Q8_0` 循环模型一并开启） | 稳定 |
+| `TM_VK_PROF` | `0`（关闭） | `Inkling2VkRunner` 性能剖析：`1` 记录零开销静态 CB 下的分段墙钟耗时；`2` 额外注入 `vkCmdWriteTimestamp` 采集逐阶段硬件耗时 | 调试 |

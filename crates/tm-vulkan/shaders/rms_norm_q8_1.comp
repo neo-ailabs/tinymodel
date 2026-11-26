@@ -1,0 +1,144 @@
+#version 450
+// Fused single-workgroup `RMSNorm + Q8_1` activation quantizer (`1` workgroup of `256` threads per token).
+// Computes `y[i] = x[i] * inversesqrt(mean(x^2) + eps) * w[i]` AND packs `y` into `Q8_1`
+// (`q8_packed` 8x int32 + `d_sum` `vec2(d, sum_y)` per 32-element block) in ONE global-memory pass!
+// Subgroup-portable across gl_SubgroupSize in {8, 16, 32, 64}, with zero-workgroup-barrier fast path for sg == 32.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(constant_id = 0) const uint WG = 256;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer InX    { float x[]; };
+layout(std430, binding = 1) readonly buffer Weight { float w[]; };
+layout(std430, binding = 2) writeonly buffer OutY  { float y[]; };
+layout(std430, binding = 3) writeonly buffer OutQ  { int q8_packed[]; };
+layout(std430, binding = 4) writeonly buffer OutD  { vec2 d_sum[]; };
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint x_offset;
+    float eps;
+} pc;
+
+shared float sg_sums[32];
+shared float sh_val[8][32];
+shared float sh_abs[8][32];
+shared float sh_sum[8][32];
+
+int pack_i8x4(int b0, int b1, int b2, int b3) {
+    uint u = (uint(b0) & 0xFFu)
+           | ((uint(b1) & 0xFFu) << 8u)
+           | ((uint(b2) & 0xFFu) << 16u)
+           | ((uint(b3) & 0xFFu) << 24u);
+    return int(u);
+}
+
+void main() {
+    const uint t = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint xb = pc.x_offset + t * pc.n;
+    const uint yb = t * pc.n;
+
+    float ss = 0.0;
+    for (uint i = tid; i < pc.n; i += WG) {
+        const float v = x[xb + i];
+        ss = fma(v, v, ss);
+    }
+    ss = subgroupAdd(ss);
+    if (subgroupElect()) {
+        sg_sums[gl_SubgroupID] = ss;
+    }
+    barrier();
+
+    if (tid == 0u) {
+        float total = 0.0;
+        for (uint s = 0u; s < gl_NumSubgroups; ++s) {
+            total += sg_sums[s];
+        }
+        sg_sums[0] = inversesqrt(total / float(pc.n) + pc.eps);
+    }
+    barrier();
+
+    const float scale = sg_sums[0];
+    const uint nb = pc.n >> 5u;
+    const uint qb_tok = t * nb;
+
+    if (gl_SubgroupSize == 32u) {
+        const uint blk_local = gl_SubgroupID;
+        const uint lane32 = gl_SubgroupInvocationID;
+        for (uint blk = blk_local; blk < nb; blk += 8u) {
+            const uint idx = (blk << 5u) + lane32;
+            const float yn = x[xb + idx] * scale * w[idx];
+            y[yb + idx] = yn;
+            const float amax = subgroupMax(abs(yn));
+            const float sum_y = subgroupAdd(yn);
+            sh_val[blk_local][lane32] = yn;
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+
+            const float d = amax / 127.0;
+            const float inv_d = (amax > 0.0) ? (127.0 / amax) : 0.0;
+            const uint gblk = qb_tok + blk;
+            if (lane32 == 0u) {
+                d_sum[gblk] = vec2(d, sum_y);
+            }
+            if (lane32 < 8u) {
+                const uint k = lane32 << 2u;
+                const int q0 = clamp(int(roundEven(sh_val[blk_local][k + 0u] * inv_d)), -127, 127);
+                const int q1 = clamp(int(roundEven(sh_val[blk_local][k + 1u] * inv_d)), -127, 127);
+                const int q2 = clamp(int(roundEven(sh_val[blk_local][k + 2u] * inv_d)), -127, 127);
+                const int q3 = clamp(int(roundEven(sh_val[blk_local][k + 3u] * inv_d)), -127, 127);
+                q8_packed[gblk * 8u + lane32] = pack_i8x4(q0, q1, q2, q3);
+            }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+        }
+        return;
+    }
+
+    const uint blk_local = tid >> 5u;
+    const uint lane32 = tid & 31u;
+    for (uint b0 = 0u; b0 < nb; b0 += 8u) {
+        const uint blk = b0 + blk_local;
+        float yn = 0.0;
+        if (blk < nb) {
+            const uint idx = (blk << 5u) + lane32;
+            yn = x[xb + idx] * scale * w[idx];
+            y[yb + idx] = yn;
+        }
+        sh_val[blk_local][lane32] = yn;
+        sh_abs[blk_local][lane32] = abs(yn);
+        sh_sum[blk_local][lane32] = yn;
+        barrier();
+
+        for (uint stride = 16u; stride > 0u; stride >>= 1u) {
+            if (lane32 < stride) {
+                sh_abs[blk_local][lane32] = max(sh_abs[blk_local][lane32], sh_abs[blk_local][lane32 + stride]);
+                sh_sum[blk_local][lane32] += sh_sum[blk_local][lane32 + stride];
+            }
+            barrier();
+        }
+
+        if (blk < nb) {
+            const float amax = sh_abs[blk_local][0];
+            const float sum_y = sh_sum[blk_local][0];
+            const float d = amax / 127.0;
+            const float inv_d = (amax > 0.0) ? (127.0 / amax) : 0.0;
+            const uint gblk = qb_tok + blk;
+            if (lane32 == 0u) {
+                d_sum[gblk] = vec2(d, sum_y);
+            }
+            if (lane32 < 8u) {
+                const uint k = lane32 * 4u;
+                const int q0 = clamp(int(roundEven(sh_val[blk_local][k + 0u] * inv_d)), -127, 127);
+                const int q1 = clamp(int(roundEven(sh_val[blk_local][k + 1u] * inv_d)), -127, 127);
+                const int q2 = clamp(int(roundEven(sh_val[blk_local][k + 2u] * inv_d)), -127, 127);
+                const int q3 = clamp(int(roundEven(sh_val[blk_local][k + 3u] * inv_d)), -127, 127);
+                q8_packed[gblk * 8u + lane32] = pack_i8x4(q0, q1, q2, q3);
+            }
+        }
+        barrier();
+    }
+}

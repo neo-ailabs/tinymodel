@@ -1447,10 +1447,11 @@ impl<'a> Inkling2Model<'a> {
     ) {
         let n_embd = self.cfg.n_embd;
         let n_ff = self.cfg.n_ff_exp;
-        let top_k = self.cfg.n_expert_used;
+        assert!((1..=MAX_INKLING2_WINDOW).contains(&window_len));
+        let top_k = top_ids_win.len() / window_len;
+        assert!(top_k <= self.cfg.n_expert_used);
         let beta = self.cfg.situ_beta;
         let lb = self.cfg.situ_linear_beta;
-        assert!((1..=MAX_INKLING2_WINDOW).contains(&window_len));
         assert_eq!(cur_normed_win.len(), window_len * n_embd);
         assert_eq!(top_ids_win.len(), window_len * top_k);
         assert_eq!(top_weights_win.len(), window_len * top_k);

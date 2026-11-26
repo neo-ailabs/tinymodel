@@ -40,8 +40,8 @@ const VENDOR_INTEL: u32 = 0x8086;
 const STAGING_BYTES: u64 = 64 << 20;
 const DESC_POOL_SETS: u32 = 65536;
 const DESC_POOL_BUFFERS: u32 = 65536 * 8;
-const CACHE_DESC_SETS: u32 = 16384;
-const CACHE_DESC_BUFFERS: u32 = 16384 * 8;
+const CACHE_DESC_SETS: u32 = 32768;
+const CACHE_DESC_BUFFERS: u32 = 32768 * 10;
 const MAX_CACHED_BINDINGS: usize = 12;
 
 static NEXT_BUF_ID: AtomicU64 = AtomicU64::new(1);
@@ -218,6 +218,33 @@ pub(crate) struct PreparedCb {
 pub(crate) struct InFlightCb {
     pub(crate) slot_idx: usize,
     pub(crate) rec_ns: u64,
+    submit_t0: std::time::Instant,
+}
+
+/// A pre-recorded reusable command buffer (`0.00 ms` per-token CPU recording!).
+pub(crate) struct BakedCb {
+    inner: Arc<Inner>,
+    pool: vk::CommandPool,
+    pub(crate) cb: vk::CommandBuffer,
+    fence: vk::Fence,
+}
+
+impl Drop for BakedCb {
+    fn drop(&mut self) {
+        let d = &self.inner.device;
+        // SAFETY: `pool` and `fence` were created from `self.inner.device`; waiting on `fence`
+        // (or device idle if needed) ensures no submitted GPU work still uses `cb`.
+        unsafe {
+            let _ = d.device_wait_idle();
+            d.destroy_fence(self.fence, None);
+            d.destroy_command_pool(self.pool, None);
+        }
+    }
+}
+
+/// An in-flight submission of a [`BakedCb`].
+pub(crate) struct InFlightBaked {
+    fence: vk::Fence,
     submit_t0: std::time::Instant,
 }
 
@@ -1712,6 +1739,151 @@ impl VulkanContext {
         let prep = self.prepare_cb(0, f)?;
         let inf = self.submit_prepared(prep)?;
         self.wait_in_flight(inf)
+    }
+
+    /// Pre-records a reusable primary command buffer (`vk::CommandBufferUsageFlags::empty()`)
+    /// backed exclusively by persistent cached descriptor sets, eliminating per-step CPU
+    /// command-buffer recording overhead (`0.00 ms/tok` on subsequent `submit_baked` calls).
+    pub(crate) fn bake_cb<F>(&self, f: F) -> Result<(BakedCb, u64), VulkanError>
+    where
+        F: FnOnce(&mut Recorder<'_>) -> Result<(), VulkanError>,
+    {
+        let d = &self.inner.device;
+        let qf = self.inner.queue_family;
+        // SAFETY: valid device; any error path cleans up `fence` and `pool`.
+        let (pool, cb, fence) = unsafe {
+            let pool = d
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(qf),
+                    None,
+                )
+                .ctx("vkCreateCommandPool(baked)")?;
+            let cb = match d.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            ) {
+                Ok(v) => v[0],
+                Err(code) => {
+                    d.destroy_command_pool(pool, None);
+                    return Err(VulkanError::Vk {
+                        call: "vkAllocateCommandBuffers(baked)",
+                        code,
+                    });
+                }
+            };
+            let fence = match d.create_fence(&vk::FenceCreateInfo::default(), None) {
+                Ok(f) => f,
+                Err(code) => {
+                    d.destroy_command_pool(pool, None);
+                    return Err(VulkanError::Vk {
+                        call: "vkCreateFence(baked)",
+                        code,
+                    });
+                }
+            };
+            (pool, cb, fence)
+        };
+
+        let baked = BakedCb {
+            inner: self.inner.clone(),
+            pool,
+            cb,
+            fence,
+        };
+
+        let transient_pool = {
+            let e = self.exec.lock().map_err(|_| VulkanError::NoDevice)?;
+            e.slots[0].desc_pool
+        };
+
+        // SAFETY: `cb` is newly allocated and recorded with HOST->COMPUTE prologue and COMPUTE->HOST epilogue barriers.
+        unsafe {
+            d.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default())
+                .ctx("vkBeginCommandBuffer(baked)")?;
+            let host_in = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_READ)];
+            d.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &host_in,
+                &[],
+                &[],
+            );
+        }
+
+        let mut dc_guard = self.desc_cache.lock().map_err(|_| VulkanError::NoDevice)?;
+        let mut rec = Recorder {
+            ctx: self,
+            cb,
+            desc_pool: transient_pool,
+            desc_cache: &mut dc_guard,
+            last_pipeline: vk::Pipeline::null(),
+            used_transient_descs: false,
+        };
+        let t_rec = std::time::Instant::now();
+        let r = f(&mut rec);
+        let rec_ns = t_rec.elapsed().as_nanos() as u64;
+        let used_transient = rec.used_transient_descs;
+        drop(dc_guard);
+
+        // SAFETY: finish recording `cb`.
+        unsafe {
+            let host_out = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)];
+            d.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &host_out,
+                &[],
+                &[],
+            );
+            d.end_command_buffer(cb).ctx("vkEndCommandBuffer(baked)")?;
+        }
+        r?;
+        if used_transient {
+            return Err(VulkanError::InvalidDimensions(
+                "BakedCb overflowed persistent descriptor cache".to_string(),
+            ));
+        }
+        Ok((baked, rec_ns))
+    }
+
+    /// Submits a pre-recorded [`BakedCb`] and returns immediately without waiting.
+    pub(crate) fn submit_baked(&self, baked: &BakedCb) -> Result<InFlightBaked, VulkanError> {
+        let cbs = [baked.cb];
+        let submit = [vk::SubmitInfo::default().command_buffers(&cbs)];
+        let submit_t0 = std::time::Instant::now();
+        // SAFETY: caller guarantees `baked` is not currently in flight; `baked.fence` is unsignaled.
+        unsafe {
+            self.inner
+                .device
+                .queue_submit(self.inner.queue, &submit, baked.fence)
+                .ctx("vkQueueSubmit(baked)")?;
+        }
+        Ok(InFlightBaked {
+            fence: baked.fence,
+            submit_t0,
+        })
+    }
+
+    /// Waits for an [`InFlightBaked`] submission and resets its fence, returning elapsed `ns`.
+    pub(crate) fn wait_baked(&self, inf: InFlightBaked) -> Result<u64, VulkanError> {
+        let d = &self.inner.device;
+        // SAFETY: `inf.fence` was signaled by `submit_baked` and is reset upon completion.
+        unsafe {
+            d.wait_for_fences(&[inf.fence], true, u64::MAX)
+                .ctx("vkWaitForFences(baked)")?;
+            d.reset_fences(&[inf.fence]).ctx("vkResetFences(baked)")?;
+        }
+        Ok(inf.submit_t0.elapsed().as_nanos() as u64)
     }
 }
 
