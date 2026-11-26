@@ -241,12 +241,12 @@ void main() {
             }
         }
     } else {
+        // Coalesced 32-bit F32 GEMV (`1` 32-bit `w32` load per element instead of split `u16` loads).
         for (uint k = lane; k < pc.n_in; k += sg_size) {
             const float xv = x[k];
             for (uint r = 0u; r < NR; ++r) {
-                const uint idx = row_b[r] + 2u * k;
-                const uint bits = uint(w16[idx]) | (uint(w16[idx + 1u]) << 16u);
-                acc[r] = fma(uintBitsToFloat(bits), xv, acc[r]);
+                const uint idx32 = (row_b[r] >> 1u) + k;
+                acc[r] = fma(uintBitsToFloat(w32[idx32]), xv, acc[r]);
             }
         }
     }

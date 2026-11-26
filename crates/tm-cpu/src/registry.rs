@@ -45,6 +45,8 @@ pub type GemmIQ4NLFn = fn(&[BlockIQ4NL], &[BlockQ8_0], &mut [f32], usize, usize,
 pub type DotF32F16Fn = fn(&[f32], &[u16]) -> f32;
 pub type DotF32Bf16Fn = fn(&[f32], &[u16]) -> f32;
 pub type DotF32Q8_0Fn = fn(&[f32], &[BlockQ8_0]) -> f32;
+pub type GemvF32Q8_0Fn = fn(&[BlockQ8_0], &[f32], &mut [f32], usize, usize);
+pub type GemmF32Q8_0Fn = fn(&[BlockQ8_0], &[f32], &mut [f32], usize, usize, usize);
 pub type AxpyF32Fn = fn(&mut [f32], f32, &[f32]);
 pub type AxpyF32F16Fn = fn(&mut [f32], f32, &[u16]);
 pub type AxpyF32Q8_0Fn = fn(&mut [f32], f32, &[BlockQ8_0]);
@@ -98,6 +100,8 @@ pub struct KernelTable {
     pub dot_f32_f16: DotF32F16Fn,
     pub dot_f32_bf16: DotF32Bf16Fn,
     pub dot_f32_q8_0: DotF32Q8_0Fn,
+    pub gemv_f32_q8_0: GemvF32Q8_0Fn,
+    pub gemm_f32_q8_0: GemmF32Q8_0Fn,
     pub axpy_f32: AxpyF32Fn,
     pub axpy_f32_f16: AxpyF32F16Fn,
     pub axpy_f32_q8_0: AxpyF32Q8_0Fn,
@@ -147,6 +151,8 @@ const GENERIC_TABLE: KernelTable = KernelTable {
     dot_f32_f16: generic::dot_f32_f16,
     dot_f32_bf16: generic::dot_f32_bf16,
     dot_f32_q8_0: generic::dot_f32_q8_0,
+    gemv_f32_q8_0: generic::gemv_f32_q8_0,
+    gemm_f32_q8_0: generic::gemm_f32_q8_0,
     axpy_f32: generic::axpy_f32,
     axpy_f32_f16: generic::axpy_f32_f16,
     axpy_f32_q8_0: generic::axpy_f32_q8_0,
@@ -907,6 +913,42 @@ mod aarch64_wrappers {
         unsafe { lut::dotprod_gemm_iq4_nl_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
     }
 
+    fn neon_gemv_f32_q8_0(
+        w: &[BlockQ8_0],
+        x: &[f32],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        assert_eq!(w.len(), rows * cols_blocks);
+        assert_eq!(out.len(), rows);
+        for (r, dst) in out.iter_mut().enumerate() {
+            *dst = neon_dot_f32_q8_0(x, &w[r * cols_blocks..(r + 1) * cols_blocks]);
+        }
+    }
+
+    fn neon_gemm_f32_q8_0(
+        w: &[BlockQ8_0],
+        x: &[f32],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        let cols = cols_blocks * tm_core::QK8_0;
+        assert_eq!(x.len(), n_tokens * cols);
+        assert_eq!(out.len(), n_tokens * rows);
+        for t in 0..n_tokens {
+            neon_gemv_f32_q8_0(
+                w,
+                &x[t * cols..(t + 1) * cols],
+                &mut out[t * rows..(t + 1) * rows],
+                rows,
+                cols_blocks,
+            );
+        }
+    }
+
     pub const NEON_V80_TABLE: KernelTable = KernelTable {
         isa: Isa::NeonV80,
         vec_dot_q4_0_q8_0: neon_v80_vec_dot,
@@ -942,6 +984,8 @@ mod aarch64_wrappers {
         dot_f32_f16: neon_dot_f32_f16,
         dot_f32_bf16: neon_dot_f32_bf16,
         dot_f32_q8_0: neon_dot_f32_q8_0,
+        gemv_f32_q8_0: neon_gemv_f32_q8_0,
+        gemm_f32_q8_0: neon_gemm_f32_q8_0,
         axpy_f32: neon_axpy_f32,
         axpy_f32_f16: neon_axpy_f32_f16,
         axpy_f32_q8_0: neon_axpy_f32_q8_0,
@@ -992,6 +1036,8 @@ mod aarch64_wrappers {
         dot_f32_f16: neon_dot_f32_f16,
         dot_f32_bf16: neon_dot_f32_bf16,
         dot_f32_q8_0: neon_dot_f32_q8_0,
+        gemv_f32_q8_0: neon_gemv_f32_q8_0,
+        gemm_f32_q8_0: neon_gemm_f32_q8_0,
         axpy_f32: neon_axpy_f32,
         axpy_f32_f16: neon_axpy_f32_f16,
         axpy_f32_q8_0: neon_axpy_f32_q8_0,
@@ -1042,6 +1088,8 @@ mod aarch64_wrappers {
         dot_f32_f16: neon_dot_f32_f16,
         dot_f32_bf16: neon_dot_f32_bf16,
         dot_f32_q8_0: neon_dot_f32_q8_0,
+        gemv_f32_q8_0: neon_gemv_f32_q8_0,
+        gemm_f32_q8_0: neon_gemm_f32_q8_0,
         axpy_f32: neon_axpy_f32,
         axpy_f32_f16: neon_axpy_f32_f16,
         axpy_f32_q8_0: neon_axpy_f32_q8_0,
@@ -1113,6 +1161,27 @@ mod x86_64_wrappers {
     ) {
         // SAFETY: `AVX512_TABLE` is only selected after runtime `avx512f+bw+vl` detection.
         unsafe { avx512::gemm_q8_0_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+    fn avx512_gemv_f32_q8_0(
+        w: &[BlockQ8_0],
+        x: &[f32],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: `AVX512_TABLE` is only selected after runtime `avx512f+bw+vl+fma` detection.
+        unsafe { avx512::gemv_f32_q8_0(w, x, out, rows, cols_blocks) }
+    }
+    fn avx512_gemm_f32_q8_0(
+        w: &[BlockQ8_0],
+        x: &[f32],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: `AVX512_TABLE` is only selected after runtime `avx512f+bw+vl+fma` detection.
+        unsafe { avx512::gemm_f32_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
     }
 
     fn avx2_vec_dot_q4_0(x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
@@ -1194,6 +1263,27 @@ mod x86_64_wrappers {
         // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
         unsafe { avx2::dot_f32_q8_0(q, k_q8) }
     }
+    fn avx2_gemv_f32_q8_0(
+        w: &[BlockQ8_0],
+        x: &[f32],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::gemv_f32_q8_0(w, x, out, rows, cols_blocks) }
+    }
+    fn avx2_gemm_f32_q8_0(
+        w: &[BlockQ8_0],
+        x: &[f32],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::gemm_f32_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
+    }
     fn avx2_axpy_f32_q8_0(out: &mut [f32], w: f32, v_q8: &[BlockQ8_0]) {
         // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
         unsafe { avx2::axpy_f32_q8_0(out, w, v_q8) }
@@ -1274,6 +1364,8 @@ mod x86_64_wrappers {
         dot_f32_f16: generic::dot_f32_f16,
         dot_f32_bf16: avx2_dot_f32_bf16,
         dot_f32_q8_0: avx2_dot_f32_q8_0,
+        gemv_f32_q8_0: avx2_gemv_f32_q8_0,
+        gemm_f32_q8_0: avx2_gemm_f32_q8_0,
         axpy_f32: generic::axpy_f32,
         axpy_f32_f16: generic::axpy_f32_f16,
         axpy_f32_q8_0: avx2_axpy_f32_q8_0,
@@ -1296,6 +1388,8 @@ mod x86_64_wrappers {
         vec_dot_q8_0_q8_0: avx512_vec_dot_q8_0,
         gemv_q8_0_q8_0: avx512_gemv_q8_0,
         gemm_q8_0_q8_0: avx512_gemm_q8_0,
+        gemv_f32_q8_0: avx512_gemv_f32_q8_0,
+        gemm_f32_q8_0: avx512_gemm_f32_q8_0,
         ..AVX2_TABLE
     };
 }

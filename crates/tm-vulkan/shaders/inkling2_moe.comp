@@ -70,26 +70,38 @@ void main() {
         }
         barrier();
 
-        if (tid == 0u) {
+        // Warp-parallel top-k selection across subgroup 0 (`0-ULP` tie-breaking on lowest `e`).
+        if (gl_SubgroupID == 0u) {
+            const uint lane = gl_SubgroupInvocationID;
+            const uint sg = gl_SubgroupSize;
             float sum_w = 0.0;
             for (uint k = 0u; k < top_k; ++k) {
-                uint best_e = 0u;
-                float best_v = -1.0e30;
-                for (uint e = 0u; e < n_exp; ++e) {
-                    if (s_sel[e] > best_v) {
-                        best_v = s_sel[e];
-                        best_e = e;
+                float local_v = -3.0e38;
+                uint local_e = 0xFFFFFFFFu;
+                for (uint e = lane; e < n_exp; e += sg) {
+                    const float v = s_sel[e];
+                    if (v > local_v) {
+                        local_v = v;
+                        local_e = e;
                     }
                 }
-                s_sel[best_e] = -2.0e30;
-                top_ids[k] = best_e;
+                const float best_v = subgroupMax(local_v);
+                const uint cand_e = (local_v == best_v) ? local_e : 0xFFFFFFFFu;
+                const uint best_e = subgroupMin(cand_e);
                 const float pw = s_probs[best_e];
-                top_weights[k] = pw;
                 sum_w += pw;
+                if (lane == 0u) {
+                    s_sel[best_e] = -3.4e38;
+                    top_ids[k] = best_e;
+                    top_weights[k] = pw;
+                }
+                subgroupMemoryBarrierShared();
             }
-            const float inv_sum = uintBitsToFloat(pc.u6) / (sum_w + 1.0e-20);
-            for (uint k = 0u; k < top_k; ++k) {
-                top_weights[k] *= inv_sum;
+            if (lane == 0u) {
+                const float inv_sum = uintBitsToFloat(pc.u6) / (sum_w + 1.0e-20);
+                for (uint k = 0u; k < top_k; ++k) {
+                    top_weights[k] *= inv_sum;
+                }
             }
         }
     } else if (pc.op == 1u) {

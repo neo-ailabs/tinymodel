@@ -100,7 +100,78 @@ fn bench_q4_0_gemv() {
     );
 }
 
+fn bench_f32_q8_0_gemv_gemm() {
+    let rows = 1024usize;
+    let cols_blocks = 32usize;
+    let cols = cols_blocks * 32;
+    let n_tok = 8usize;
+    let iters = 200usize;
+    let w = vec![
+        BlockQ8_0 {
+            d: f32_to_f16(0.125),
+            qs: [5; 32],
+        };
+        rows * cols_blocks
+    ];
+    let x: Vec<f32> = (0..n_tok * cols)
+        .map(|i| ((i as f32) * 0.03).sin())
+        .collect();
+    let mut out_v = vec![0.0f32; rows];
+    let mut out_m = vec![0.0f32; n_tok * rows];
+    let kt = active_kernels();
+
+    for _ in 0..16 {
+        (kt.gemv_f32_q8_0)(
+            black_box(&w),
+            black_box(&x[..cols]),
+            &mut out_v,
+            rows,
+            cols_blocks,
+        );
+        (kt.gemm_f32_q8_0)(
+            black_box(&w),
+            black_box(&x),
+            &mut out_m,
+            rows,
+            cols_blocks,
+            n_tok,
+        );
+    }
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        (kt.gemv_f32_q8_0)(
+            black_box(&w),
+            black_box(&x[..cols]),
+            &mut out_v,
+            rows,
+            cols_blocks,
+        );
+    }
+    let secs_v = t0.elapsed().as_secs_f64();
+    let gbps_v = ((iters * rows * cols_blocks * 34) as f64) / secs_v / 1e9;
+
+    let t1 = Instant::now();
+    for _ in 0..iters {
+        (kt.gemm_f32_q8_0)(
+            black_box(&w),
+            black_box(&x),
+            &mut out_m,
+            rows,
+            cols_blocks,
+            n_tok,
+        );
+    }
+    let secs_m = t1.elapsed().as_secs_f64();
+    let gflops_m = ((iters * 2 * n_tok * rows * cols) as f64) / secs_m / 1e9;
+    println!(
+        "gemv_f32_q8_0 (isa={}): {gbps_v:.1} GB/s | gemm_f32_q8_0 (m={n_tok}): {gflops_m:.1} GFLOP/s (sink={:.2})",
+        kt.isa.name(),
+        out_v[0] + out_m[0]
+    );
+}
+
 fn main() {
     bench_mamba2_scan();
     bench_q4_0_gemv();
+    bench_f32_q8_0_gemv_gemm();
 }

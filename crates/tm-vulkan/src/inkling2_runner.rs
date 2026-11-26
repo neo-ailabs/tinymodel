@@ -192,7 +192,26 @@ pub type HostMoeFn<'a> = dyn FnMut(usize, &[f32], &[usize], &[f32], &mut [f32]) 
 /// `(ip, window_len, cur_normed_win, top_ids_win, top_weights_win, moe_out_win)`.
 pub type HostMoeWindowFn<'a> = dyn FnMut(usize, usize, &[f32], &[usize], &[f32], &mut [f32]) + 'a;
 
-/// Wall-clock phase accumulators for `TM_VK_PROF=1` (host-side `Instant`, no GPU timestamp queries).
+const N_PROF_STAGES: usize = 7;
+const PROF_STAGE_NAMES: [&str; N_PROF_STAGES] = [
+    "embed_state",
+    "loop_mix_norm",
+    "attn_dense",
+    "ffn_router",
+    "vram_moe",
+    "post_moe",
+    "lm_head",
+];
+const STAGE_EMBED_STATE: usize = 0;
+const STAGE_LOOP_MIX_NORM: usize = 1;
+const STAGE_ATTN_DENSE: usize = 2;
+const STAGE_FFN_ROUTER: usize = 3;
+const STAGE_VRAM_MOE: usize = 4;
+const STAGE_POST_MOE: usize = 5;
+const STAGE_LM_HEAD: usize = 6;
+const MAX_PROF_QUERIES: u32 = 8192;
+
+/// Wall-clock + hardware timestamp phase accumulators for `TM_VK_PROF=1`.
 #[derive(Debug, Default, Clone, Copy)]
 struct Inkling2Prof {
     tokens: u64,
@@ -201,10 +220,65 @@ struct Inkling2Prof {
     gpu_record_ns: u64,
     /// `vkQueueSubmit` + GPU execution + `vkWaitForFences` (submit wall minus record).
     gpu_wait_ns: u64,
+    /// Total GPU hardware execution span (`BOTTOM_OF_PIPE - TOP_OF_PIPE` via `vkCmdWriteTimestamp`).
+    gpu_hw_ns: u64,
+    /// Per-stage GPU hardware timestamps (`PROF_STAGE_NAMES`).
+    stage_gpu_ns: [u64; N_PROF_STAGES],
     host_moe_calls: u64,
     host_moe_ns: u64,
     /// Mapped-memory bridge reads/writes around host MoE.
     bridge_ns: u64,
+}
+
+struct TsRecorder<'a> {
+    qp: ash::vk::QueryPool,
+    next_q: u32,
+    prev_q: u32,
+    spans: &'a mut Vec<(usize, u32, u32)>,
+}
+
+impl<'a> TsRecorder<'a> {
+    fn begin(
+        rec: &Recorder<'_>,
+        qp: Option<ash::vk::QueryPool>,
+        spans: &'a mut Vec<(usize, u32, u32)>,
+    ) -> Option<Self> {
+        let qp = qp?;
+        spans.clear();
+        let d = &rec.ctx.inner.device;
+        // SAFETY: `qp` has `MAX_PROF_QUERIES` slots and `rec.cb` is actively recording.
+        unsafe {
+            d.cmd_reset_query_pool(rec.cb, qp, 0, MAX_PROF_QUERIES);
+            d.cmd_write_timestamp(rec.cb, ash::vk::PipelineStageFlags::TOP_OF_PIPE, qp, 0);
+        }
+        Some(Self {
+            qp,
+            next_q: 1,
+            prev_q: 0,
+            spans,
+        })
+    }
+
+    #[inline]
+    fn mark(opt: &mut Option<Self>, rec: &Recorder<'_>, stage: usize) {
+        if let Some(t) = opt.as_mut()
+            && t.next_q < MAX_PROF_QUERIES
+        {
+            let cur = t.next_q;
+            t.next_q += 1;
+            // SAFETY: `cur < MAX_PROF_QUERIES` and `rec.cb` is actively recording.
+            unsafe {
+                rec.ctx.inner.device.cmd_write_timestamp(
+                    rec.cb,
+                    ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    t.qp,
+                    cur,
+                );
+            }
+            t.spans.push((stage, t.prev_q, cur));
+            t.prev_q = cur;
+        }
+    }
 }
 
 /// End-to-end / Hybrid Vulkan runner for `inkling2` & `inkling2_loop`.
@@ -213,6 +287,9 @@ pub struct Inkling2VkRunner {
     pub cfg: Inkling2VkConfig,
     prof_on: bool,
     prof: Inkling2Prof,
+    prof_qp: Option<ash::vk::QueryPool>,
+    prof_ts_buf: Vec<u64>,
+    prof_spans: Vec<(usize, u32, u32)>,
     vram_expert_mask: Vec<bool>,
     vram_total_bytes: u64,
     weights_mode_label: String,
@@ -1264,10 +1341,41 @@ impl Inkling2VkRunner {
             format!("hybrid-vram{n_vram_exps}/{n_phys}exps")
         };
 
+        let prof_on = std::env::var("TM_VK_PROF").is_ok_and(|v| v == "1");
+        let prof_qp = if prof_on && info.timestamp_compute {
+            // SAFETY: Valid device; destroyed in `Inkling2VkRunner::drop`.
+            unsafe {
+                ctx.inner
+                    .device
+                    .create_query_pool(
+                        &ash::vk::QueryPoolCreateInfo::default()
+                            .query_type(ash::vk::QueryType::TIMESTAMP)
+                            .query_count(MAX_PROF_QUERIES),
+                        None,
+                    )
+                    .ok()
+            }
+        } else {
+            None
+        };
+        let prof_ts_buf = if prof_qp.is_some() {
+            vec![0u64; MAX_PROF_QUERIES as usize]
+        } else {
+            Vec::new()
+        };
+        let prof_spans = if prof_qp.is_some() {
+            Vec::with_capacity(MAX_PROF_QUERIES as usize)
+        } else {
+            Vec::new()
+        };
+
         Ok(Self {
             ctx,
-            prof_on: std::env::var("TM_VK_PROF").is_ok_and(|v| v == "1"),
+            prof_on,
             prof: Inkling2Prof::default(),
+            prof_qp,
+            prof_ts_buf,
+            prof_spans,
             vram_expert_mask,
             vram_total_bytes,
             weights_mode_label,
@@ -1381,7 +1489,7 @@ impl Inkling2VkRunner {
         let t = p.tokens as f64;
         let ms = |ns: u64| ns as f64 / 1e6 / t;
         let total = p.gpu_record_ns + p.gpu_wait_ns + p.host_moe_ns + p.bridge_ns;
-        Some(format!(
+        let mut out = format!(
             "[inkling2 prof] {} tok: submits/tok={:.1} | gpu_record={:.2} ms | gpu_submit+exec+wait={:.2} ms | host_moe={:.2} ms ({:.1} calls/tok) | bridge={:.2} ms | sum={:.2} ms/tok",
             p.tokens,
             p.gpu_submits as f64 / t,
@@ -1391,15 +1499,62 @@ impl Inkling2VkRunner {
             p.host_moe_calls as f64 / t,
             ms(p.bridge_ns),
             ms(total),
-        ))
+        );
+        if p.gpu_hw_ns > 0 {
+            let gap_ns = p.gpu_wait_ns.saturating_sub(p.gpu_hw_ns);
+            out.push_str(&format!(
+                "\n  [gpu_hw] exec={:.2} ms/tok (submit+fence_gap={:.2} ms)",
+                ms(p.gpu_hw_ns),
+                ms(gap_ns),
+            ));
+            for (name, &ns) in PROF_STAGE_NAMES.iter().zip(p.stage_gpu_ns.iter()) {
+                out.push_str(&format!(" | {name}={:.2}", ms(ns)));
+            }
+            out.push_str(" ms/tok");
+        }
+        Some(out)
     }
 
-    /// Accumulates one `ctx.run_timed` submission into the `TM_VK_PROF=1` counters.
-    fn prof_add_submit(&mut self, (rec_ns, total_ns): (u64, u64)) {
-        if self.prof_on {
-            self.prof.gpu_submits += 1;
-            self.prof.gpu_record_ns += rec_ns;
-            self.prof.gpu_wait_ns += total_ns.saturating_sub(rec_ns);
+    /// Accumulates one `ctx.run_timed` submission + optional hardware timestamp spans into `self.prof`.
+    fn prof_finish_submit(
+        &mut self,
+        (rec_ns, total_ns): (u64, u64),
+        next_q: u32,
+        spans: &[(usize, u32, u32)],
+    ) {
+        if !self.prof_on {
+            return;
+        }
+        self.prof.gpu_submits += 1;
+        self.prof.gpu_record_ns += rec_ns;
+        self.prof.gpu_wait_ns += total_ns.saturating_sub(rec_ns);
+        if let Some(qp) = self.prof_qp
+            && next_q > 1
+        {
+            let q_cnt = next_q as usize;
+            // SAFETY: `ctx.run_timed` already waited on the submission fence, and `q_cnt <= MAX_PROF_QUERIES`.
+            let ok = unsafe {
+                self.ctx
+                    .inner
+                    .device
+                    .get_query_pool_results(
+                        qp,
+                        0,
+                        &mut self.prof_ts_buf[..q_cnt],
+                        ash::vk::QueryResultFlags::TYPE_64 | ash::vk::QueryResultFlags::WAIT,
+                    )
+                    .is_ok()
+            };
+            if ok {
+                let period = self.ctx.info().timestamp_period_ns as f64;
+                let total_ticks = self.prof_ts_buf[q_cnt - 1].wrapping_sub(self.prof_ts_buf[0]);
+                self.prof.gpu_hw_ns += ((total_ticks as f64) * period) as u64;
+                for &(st, q0, q1) in spans {
+                    let dt =
+                        self.prof_ts_buf[q1 as usize].wrapping_sub(self.prof_ts_buf[q0 as usize]);
+                    self.prof.stage_gpu_ns[st] += ((dt as f64) * period) as u64;
+                }
+            }
         }
     }
 
@@ -1741,6 +1896,22 @@ impl Inkling2VkRunner {
         )
     }
 
+    fn dispatch_gemv_nb(
+        &self,
+        rec: &mut Recorder<'_>,
+        mat: &VkDenseMat,
+        x: &VkBuffer,
+        y: &VkBuffer,
+    ) -> Result<(), VulkanError> {
+        let p = self.gemv_pipe(mat.dtype_code)?;
+        rec.dispatch_nb(
+            &p,
+            &[&mat.buf, x, y],
+            &[mat.cols as u32, mat.rows as u32, 0, mat.row_u16s],
+            self.gemv_groups(mat.rows),
+        )
+    }
+
     fn run_token_internal(
         &mut self,
         token_id: u32,
@@ -1848,8 +2019,13 @@ impl Inkling2VkRunner {
             let mut blocks_len = 0usize;
             let mut prelude_blocks_len = 0usize;
             let mut bank_len = 0usize;
+            let qp = self.prof_qp;
+            let mut spans = core::mem::take(&mut self.prof_spans);
+            let mut n_queries = 0u32;
             let sub_t = self.ctx.run_timed(|rec| {
+                let mut ts = TsRecorder::begin(rec, qp, &mut spans);
                 self.record_embed_and_norm(rec)?;
+                TsRecorder::mark(&mut ts, rec, STAGE_EMBED_STATE);
                 for st in &schedule {
                     self.record_pre_step_transitions(
                         rec,
@@ -1868,13 +2044,20 @@ impl Inkling2VkRunner {
                         st.pass > 0,
                         &mut blocks_len,
                         bank_len,
+                        &mut ts,
                     )?;
                     self.record_vram_moe(rec, st.ip)?;
+                    TsRecorder::mark(&mut ts, rec, STAGE_VRAM_MOE);
                     self.record_layer_post_moe(rec, st.il, st.ip, true)?;
+                    TsRecorder::mark(&mut ts, rec, STAGE_POST_MOE);
                 }
-                self.record_output_stage(rec, blocks_len, compute_logits, compute_argmax)
+                self.record_output_stage(rec, blocks_len, compute_logits, compute_argmax)?;
+                TsRecorder::mark(&mut ts, rec, STAGE_LM_HEAD);
+                n_queries = ts.map_or(0, |t| t.next_q);
+                Ok(())
             })?;
-            self.prof_add_submit(sub_t);
+            self.prof_finish_submit(sub_t, n_queries, &spans);
+            self.prof_spans = spans;
             return Ok(());
         }
 
@@ -1889,13 +2072,19 @@ impl Inkling2VkRunner {
 
         while cursor < schedule.len() {
             let mut stop_for_host_ip: Option<(usize, usize)> = None;
+            let qp = self.prof_qp;
+            let mut spans = core::mem::take(&mut self.prof_spans);
+            let mut n_queries = 0u32;
             let sub_t = self.ctx.run_timed(|rec| {
+                let mut ts = TsRecorder::begin(rec, qp, &mut spans);
                 if need_embed {
                     self.record_embed_and_norm(rec)?;
+                    TsRecorder::mark(&mut ts, rec, STAGE_EMBED_STATE);
                     need_embed = false;
                 }
                 if let Some((prev_il, prev_ip)) = pending_post_moe.take() {
                     self.record_layer_post_moe(rec, prev_il, prev_ip, false)?;
+                    TsRecorder::mark(&mut ts, rec, STAGE_POST_MOE);
                 }
                 while cursor < schedule.len() {
                     let st = schedule[cursor];
@@ -1916,11 +2105,14 @@ impl Inkling2VkRunner {
                         st.pass > 0,
                         &mut blocks_len,
                         bank_len,
+                        &mut ts,
                     )?;
                     cursor += 1;
                     if self.layers[st.ip].vram_experts.is_some() {
                         self.record_vram_moe(rec, st.ip)?;
+                        TsRecorder::mark(&mut ts, rec, STAGE_VRAM_MOE);
                         self.record_layer_post_moe(rec, st.il, st.ip, true)?;
+                        TsRecorder::mark(&mut ts, rec, STAGE_POST_MOE);
                     } else {
                         stop_for_host_ip = Some((st.il, st.ip));
                         break;
@@ -1928,10 +2120,13 @@ impl Inkling2VkRunner {
                 }
                 if stop_for_host_ip.is_none() {
                     self.record_output_stage(rec, blocks_len, compute_logits, compute_argmax)?;
+                    TsRecorder::mark(&mut ts, rec, STAGE_LM_HEAD);
                 }
+                n_queries = ts.map_or(0, |t| t.next_q);
                 Ok(())
             })?;
-            self.prof_add_submit(sub_t);
+            self.prof_finish_submit(sub_t, n_queries, &spans);
+            self.prof_spans = spans;
 
             if let Some((h_il, h_ip)) = stop_for_host_ip {
                 let t_br0 = std::time::Instant::now();
@@ -1985,11 +2180,20 @@ impl Inkling2VkRunner {
         }
 
         if let Some((last_il, last_ip)) = pending_post_moe.take() {
+            let qp = self.prof_qp;
+            let mut spans = core::mem::take(&mut self.prof_spans);
+            let mut n_queries = 0u32;
             let sub_t = self.ctx.run_timed(|rec| {
+                let mut ts = TsRecorder::begin(rec, qp, &mut spans);
                 self.record_layer_post_moe(rec, last_il, last_ip, false)?;
-                self.record_output_stage(rec, blocks_len, compute_logits, compute_argmax)
+                TsRecorder::mark(&mut ts, rec, STAGE_POST_MOE);
+                self.record_output_stage(rec, blocks_len, compute_logits, compute_argmax)?;
+                TsRecorder::mark(&mut ts, rec, STAGE_LM_HEAD);
+                n_queries = ts.map_or(0, |t| t.next_q);
+                Ok(())
             })?;
-            self.prof_add_submit(sub_t);
+            self.prof_finish_submit(sub_t, n_queries, &spans);
+            self.prof_spans = spans;
         }
 
         Ok(())
@@ -2041,6 +2245,33 @@ impl Inkling2VkRunner {
             return Ok(());
         }
         rec.dispatch(
+            &self.pipe_ops,
+            &[
+                dst,
+                src,
+                &self.dummy_buf,
+                &self.dummy_buf,
+                &self.dummy_buf,
+                &self.dummy_buf,
+            ],
+            &[6, len as u32, 1, dst_off, src_off, 0, 0, 0],
+            self.elem_groups(len),
+        )
+    }
+
+    fn record_vec_copy_nb(
+        &self,
+        rec: &mut Recorder<'_>,
+        dst: &VkBuffer,
+        dst_off: u32,
+        src: &VkBuffer,
+        src_off: u32,
+        len: usize,
+    ) -> Result<(), VulkanError> {
+        if len == 0 {
+            return Ok(());
+        }
+        rec.dispatch_nb(
             &self.pipe_ops,
             &[
                 dst,
@@ -2132,8 +2363,8 @@ impl Inkling2VkRunner {
         msg_off: u32,
     ) -> Result<(), VulkanError> {
         let n_embd = self.cfg.n_embd as u32;
-        // `ctrl_in[0..n_embd] = rms_norm_unit(cur, 1e-6)`
-        rec.dispatch(
+        // `ctrl_in[0..n_embd] = rms_norm_unit(cur, 1e-6)` and `ctrl_in[n_embd..2*n_embd] = rms_norm_unit(msg, 1e-6)`
+        rec.dispatch_nb(
             &self.pipe_ops,
             &[
                 cur_buf,
@@ -2146,7 +2377,6 @@ impl Inkling2VkRunner {
             &[0, n_embd, cur_off, 0, 0, 1e-6f32.to_bits(), 0, 0],
             1,
         )?;
-        // `ctrl_in[n_embd..2*n_embd] = rms_norm_unit(msg, 1e-6)`
         rec.dispatch(
             &self.pipe_ops,
             &[
@@ -2166,7 +2396,7 @@ impl Inkling2VkRunner {
             &self.ctrl_in_buf,
             &self.ctrl_g_buf,
         )?;
-        self.dispatch_gemv(
+        self.dispatch_gemv_nb(
             rec,
             &loop_w.ctrl_gain[ctrl],
             &self.ctrl_g_buf,
@@ -2204,6 +2434,7 @@ impl Inkling2VkRunner {
         has_messages: bool,
         blocks_len: &mut usize,
         bank_len: usize,
+        ts: &mut Option<TsRecorder<'_>>,
     ) -> Result<(), VulkanError> {
         self.record_layer_pre_moe_into(
             rec,
@@ -2217,6 +2448,7 @@ impl Inkling2VkRunner {
             &self.ffn_normed_bridge,
             &self.top_ids_bridge,
             &self.top_weights_bridge,
+            ts,
         )
     }
 
@@ -2234,6 +2466,7 @@ impl Inkling2VkRunner {
         ffn_norm_dst: &VkBuffer,
         top_ids_dst: &VkBuffer,
         top_w_dst: &VkBuffer,
+        ts: &mut Option<TsRecorder<'_>>,
     ) -> Result<(), VulkanError> {
         let n_embd = self.cfg.n_embd;
         let swa = self.cfg.is_swa[ip];
@@ -2355,28 +2588,29 @@ impl Inkling2VkRunner {
                 .into_iter()
                 .enumerate()
             {
-                rec.dispatch(
-                    &self.pipe_ops,
-                    &[
-                        &self.inputs_buf,
-                        dst_b,
-                        &self.f32_params,
-                        &self.dummy_buf,
-                        &self.dummy_buf,
-                        &self.dummy_buf,
-                    ],
-                    &[
-                        0,
-                        n_embd as u32,
-                        (j * n_embd) as u32,
-                        0,
-                        1,
-                        self.cfg.rms_eps.to_bits(),
-                        0,
-                        layer.attn_norm_off,
-                    ],
+                let args = [
+                    0,
+                    n_embd as u32,
+                    (j * n_embd) as u32,
+                    0,
                     1,
-                )?;
+                    self.cfg.rms_eps.to_bits(),
+                    0,
+                    layer.attn_norm_off,
+                ];
+                let bufs = [
+                    &self.inputs_buf,
+                    dst_b,
+                    &self.f32_params,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                ];
+                if j < 2 {
+                    rec.dispatch_nb(&self.pipe_ops, &bufs, &args, 1)?;
+                } else {
+                    rec.dispatch(&self.pipe_ops, &bufs, &args, 1)?;
+                }
             }
         } else if swa {
             rec.dispatch(
@@ -2401,7 +2635,7 @@ impl Inkling2VkRunner {
                 ],
                 1,
             )?;
-            self.record_vec_copy(rec, &self.k_in_buf, 0, &self.q_in_buf, 0, n_embd)?;
+            self.record_vec_copy_nb(rec, &self.k_in_buf, 0, &self.q_in_buf, 0, n_embd)?;
             self.record_vec_copy(rec, &self.v_in_buf, 0, &self.q_in_buf, 0, n_embd)?;
         } else {
             let pairs = [
@@ -2410,48 +2644,51 @@ impl Inkling2VkRunner {
                 (2usize, &self.v_in_buf, layer.v_inp_norm_off),
             ];
             for (j, dst_b, norm_off) in pairs {
-                rec.dispatch(
-                    &self.pipe_ops,
-                    &[
-                        &self.inputs_buf,
-                        dst_b,
-                        &self.f32_params,
-                        &self.dummy_buf,
-                        &self.dummy_buf,
-                        &self.dummy_buf,
-                    ],
-                    &[
-                        0,
-                        n_embd as u32,
-                        (j * n_embd) as u32,
-                        0,
-                        1,
-                        self.cfg.rms_eps.to_bits(),
-                        0,
-                        norm_off,
-                    ],
+                let args = [
+                    0,
+                    n_embd as u32,
+                    (j * n_embd) as u32,
+                    0,
                     1,
-                )?;
+                    self.cfg.rms_eps.to_bits(),
+                    0,
+                    norm_off,
+                ];
+                let bufs = [
+                    &self.inputs_buf,
+                    dst_b,
+                    &self.f32_params,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                ];
+                if j < 2 {
+                    rec.dispatch_nb(&self.pipe_ops, &bufs, &args, 1)?;
+                } else {
+                    rec.dispatch(&self.pipe_ops, &bufs, &args, 1)?;
+                }
             }
         }
+        TsRecorder::mark(ts, rec, STAGE_LOOP_MIX_NORM);
 
-        // Self-Attention projections
-        self.dispatch_gemv(rec, &layer.wq, &self.q_in_buf, &self.q_buf)?;
-        self.dispatch_gemv(rec, &layer.wk, &self.k_in_buf, &self.k_buf)?;
-        self.dispatch_gemv(rec, &layer.wv, &self.v_in_buf, &self.v_buf)?;
-        self.dispatch_gemv(rec, &layer.attn_rel, &self.q_in_buf, &self.r_buf)?;
-        self.dispatch_gemv(rec, &layer.attn_sink_proj, &self.q_in_buf, &self.sinks_buf)?;
-        self.dispatch_gemv(rec, &layer.wqkv_gate, &self.q_in_buf, &self.gate_buf)?;
-
-        if !swa {
+        // Self-Attention projections (all read `q_in`/`k_in`/`v_in` and write disjoint buffers)
+        self.dispatch_gemv_nb(rec, &layer.wq, &self.q_in_buf, &self.q_buf)?;
+        self.dispatch_gemv_nb(rec, &layer.wk, &self.k_in_buf, &self.k_buf)?;
+        self.dispatch_gemv_nb(rec, &layer.wv, &self.v_in_buf, &self.v_buf)?;
+        self.dispatch_gemv_nb(rec, &layer.attn_rel, &self.q_in_buf, &self.r_buf)?;
+        self.dispatch_gemv_nb(rec, &layer.attn_sink_proj, &self.q_in_buf, &self.sinks_buf)?;
+        if swa {
+            self.dispatch_gemv(rec, &layer.wqkv_gate, &self.q_in_buf, &self.gate_buf)?;
+        } else {
+            self.dispatch_gemv_nb(rec, &layer.wqkv_gate, &self.q_in_buf, &self.gate_buf)?;
             let kp = layer.attn_k_conv_proj.as_ref().expect("k_conv_proj");
             let vp = layer.attn_v_conv_proj.as_ref().expect("v_conv_proj");
-            self.dispatch_gemv(rec, kp, &self.k_in_buf, &self.k_dyn_buf)?;
+            self.dispatch_gemv_nb(rec, kp, &self.k_in_buf, &self.k_dyn_buf)?;
             self.dispatch_gemv(rec, vp, &self.v_in_buf, &self.v_dyn_buf)?;
         }
 
         let dyn_heads = if swa { 0u32 } else { nh_kv as u32 };
-        rec.dispatch(
+        rec.dispatch_nb(
             &self.pipe_ops,
             &[
                 &self.k_buf,
@@ -2497,8 +2734,8 @@ impl Inkling2VkRunner {
         )?;
 
         let tau_eff = if swa { 1.0f32 } else { tau };
-        // Qcur clip + optional tau
-        rec.dispatch(
+        // Qcur clip + Kcur clip + Vcur unit-RMSNorm + Rcur clip (4 disjoint buffers, 1 barrier)
+        rec.dispatch_nb(
             &self.pipe_ops,
             &[
                 &self.q_buf,
@@ -2520,8 +2757,7 @@ impl Inkling2VkRunner {
             ],
             nh as u32,
         )?;
-        // Kcur clip
-        rec.dispatch(
+        rec.dispatch_nb(
             &self.pipe_ops,
             &[
                 &self.k_buf,
@@ -2543,8 +2779,7 @@ impl Inkling2VkRunner {
             ],
             nh_kv as u32,
         )?;
-        // Vcur per-head unit RMSNorm (`v_buf` -> `v_in_buf` scratch, then pack to F16 KV cache!)
-        rec.dispatch(
+        rec.dispatch_nb(
             &self.pipe_ops,
             &[
                 &self.v_buf,
@@ -2557,7 +2792,6 @@ impl Inkling2VkRunner {
             &[0, hd as u32, 0, 0, 0, self.cfg.rms_eps.to_bits(), 0, 0],
             nh_kv as u32,
         )?;
-        // Rcur clip + optional tau
         rec.dispatch(
             &self.pipe_ops,
             &[
@@ -2681,6 +2915,7 @@ impl Inkling2VkRunner {
         }
 
         self.record_vec_copy(rec, &self.ffn_inp_buf, 0, &self.cur_buf, 0, n_embd)?;
+        TsRecorder::mark(ts, rec, STAGE_ATTN_DENSE);
 
         // FFN `mix` + optional `control(FFN)` + `ffn_norm` -> writes directly into `ffn_normed_bridge`!
         rec.dispatch(
@@ -2771,7 +3006,9 @@ impl Inkling2VkRunner {
                 0,
             ],
             1,
-        )
+        )?;
+        TsRecorder::mark(ts, rec, STAGE_FFN_ROUTER);
+        Ok(())
     }
 
     fn record_vram_moe(&self, rec: &mut Recorder<'_>, ip: usize) -> Result<(), VulkanError> {
@@ -3164,8 +3401,8 @@ impl Inkling2VkRunner {
         let n_embd = self.cfg.n_embd;
         let max_b = self.cfg.max_depth_blocks();
         let base = (tok_i * self.per_tok_state_f32s) as u32;
-        self.record_vec_copy(rec, &self.cur_buf, 0, &self.win_state_buf, base, n_embd)?;
-        self.record_vec_copy(
+        self.record_vec_copy_nb(rec, &self.cur_buf, 0, &self.win_state_buf, base, n_embd)?;
+        self.record_vec_copy_nb(
             rec,
             &self.ffn_inp_buf,
             0,
@@ -3173,7 +3410,7 @@ impl Inkling2VkRunner {
             base + n_embd as u32,
             n_embd,
         )?;
-        self.record_vec_copy(
+        self.record_vec_copy_nb(
             rec,
             &self.prelude_buf,
             0,
@@ -3181,7 +3418,7 @@ impl Inkling2VkRunner {
             base + (2 * n_embd) as u32,
             n_embd,
         )?;
-        self.record_vec_copy(
+        self.record_vec_copy_nb(
             rec,
             &self.bank_out_buf,
             0,
@@ -3190,7 +3427,7 @@ impl Inkling2VkRunner {
             n_embd,
         )?;
         if blocks_len > 0 {
-            self.record_vec_copy(
+            self.record_vec_copy_nb(
                 rec,
                 &self.blocks_buf,
                 0,
@@ -3200,7 +3437,7 @@ impl Inkling2VkRunner {
             )?;
         }
         if prelude_blocks_len > 0 {
-            self.record_vec_copy(
+            self.record_vec_copy_nb(
                 rec,
                 &self.prelude_blocks_buf,
                 0,
@@ -3210,7 +3447,7 @@ impl Inkling2VkRunner {
             )?;
         }
         if bank_len > 0 {
-            self.record_vec_copy(
+            self.record_vec_copy_nb(
                 rec,
                 &self.bank_buf,
                 0,
@@ -3219,6 +3456,7 @@ impl Inkling2VkRunner {
                 bank_len * n_embd,
             )?;
         }
+        rec.barrier();
         Ok(())
     }
 
@@ -3233,8 +3471,8 @@ impl Inkling2VkRunner {
         let n_embd = self.cfg.n_embd;
         let max_b = self.cfg.max_depth_blocks();
         let base = (tok_i * self.per_tok_state_f32s) as u32;
-        self.record_vec_copy(rec, &self.win_state_buf, base, &self.cur_buf, 0, n_embd)?;
-        self.record_vec_copy(
+        self.record_vec_copy_nb(rec, &self.win_state_buf, base, &self.cur_buf, 0, n_embd)?;
+        self.record_vec_copy_nb(
             rec,
             &self.win_state_buf,
             base + n_embd as u32,
@@ -3242,7 +3480,7 @@ impl Inkling2VkRunner {
             0,
             n_embd,
         )?;
-        self.record_vec_copy(
+        self.record_vec_copy_nb(
             rec,
             &self.win_state_buf,
             base + (2 * n_embd) as u32,
@@ -3250,7 +3488,7 @@ impl Inkling2VkRunner {
             0,
             n_embd,
         )?;
-        self.record_vec_copy(
+        self.record_vec_copy_nb(
             rec,
             &self.win_state_buf,
             base + (3 * n_embd) as u32,
@@ -3259,7 +3497,7 @@ impl Inkling2VkRunner {
             n_embd,
         )?;
         if blocks_len > 0 {
-            self.record_vec_copy(
+            self.record_vec_copy_nb(
                 rec,
                 &self.win_state_buf,
                 base + (4 * n_embd) as u32,
@@ -3269,7 +3507,7 @@ impl Inkling2VkRunner {
             )?;
         }
         if prelude_blocks_len > 0 {
-            self.record_vec_copy(
+            self.record_vec_copy_nb(
                 rec,
                 &self.win_state_buf,
                 base + ((4 + max_b) * n_embd) as u32,
@@ -3279,7 +3517,7 @@ impl Inkling2VkRunner {
             )?;
         }
         if bank_len > 0 {
-            self.record_vec_copy(
+            self.record_vec_copy_nb(
                 rec,
                 &self.win_state_buf,
                 base + ((4 + 2 * max_b) * n_embd) as u32,
@@ -3288,6 +3526,7 @@ impl Inkling2VkRunner {
                 bank_len * n_embd,
             )?;
         }
+        rec.barrier();
         Ok(())
     }
 
@@ -3397,7 +3636,11 @@ impl Inkling2VkRunner {
 
         while cursor < schedule.len() {
             let mut stop_for_host_ip: Option<(usize, usize)> = None;
+            let qp = self.prof_qp;
+            let mut spans = core::mem::take(&mut self.prof_spans);
+            let mut n_queries = 0u32;
             let sub_t = self.ctx.run_timed(|rec| {
+                let mut ts = TsRecorder::begin(rec, qp, &mut spans);
                 if need_embed {
                     for tok_i in 0..w {
                         self.record_buf_copy_bytes(
@@ -3447,6 +3690,7 @@ impl Inkling2VkRunner {
                             n_embd,
                         )?;
                     }
+                    TsRecorder::mark(&mut ts, rec, STAGE_EMBED_STATE);
                     need_embed = false;
                 }
 
@@ -3494,6 +3738,7 @@ impl Inkling2VkRunner {
                             n_embd,
                         )?;
                     }
+                    TsRecorder::mark(&mut ts, rec, STAGE_POST_MOE);
                 }
 
                 let max_visits_per_cb = (256 / w.max(1)).clamp(1, 64);
@@ -3540,6 +3785,7 @@ impl Inkling2VkRunner {
                                 n_embd,
                             )?;
                         }
+                        TsRecorder::mark(&mut ts, rec, STAGE_EMBED_STATE);
 
                         if in_vram && w == 1 {
                             self.record_layer_pre_moe(
@@ -3551,6 +3797,7 @@ impl Inkling2VkRunner {
                                 st.pass > 0,
                                 &mut b_t,
                                 bk_t,
+                                &mut ts,
                             )?;
                             if save_conv_snapshots && attn_conv_len_f32 > 0 {
                                 let snap_dst = tok_i * self.total_conv_f32s + attn_conv_off_f32;
@@ -3564,6 +3811,7 @@ impl Inkling2VkRunner {
                                 )?;
                             }
                             self.record_vram_moe(rec, st.ip)?;
+                            TsRecorder::mark(&mut ts, rec, STAGE_VRAM_MOE);
                             self.record_layer_post_moe(rec, st.il, st.ip, true)?;
                             if save_conv_snapshots && ffn_conv_len_f32 > 0 {
                                 let snap_dst = tok_i * self.total_conv_f32s + ffn_conv_off_f32;
@@ -3576,6 +3824,8 @@ impl Inkling2VkRunner {
                                     ffn_conv_len_f32,
                                 )?;
                             }
+                            self.record_save_tok_state(rec, tok_i, b_t, pb_t, bk_t)?;
+                            TsRecorder::mark(&mut ts, rec, STAGE_POST_MOE);
                         } else {
                             self.record_layer_pre_moe_into(
                                 rec,
@@ -3589,6 +3839,7 @@ impl Inkling2VkRunner {
                                 &self.wo_out_buf,
                                 &self.top_ids_tmp_buf,
                                 &self.top_weights_tmp_buf,
+                                &mut ts,
                             )?;
                             if save_conv_snapshots && attn_conv_len_f32 > 0 {
                                 let snap_dst = tok_i * self.total_conv_f32s + attn_conv_off_f32;
@@ -3625,9 +3876,10 @@ impl Inkling2VkRunner {
                                 0,
                                 (top_k * 4) as u64,
                             );
+                            self.record_save_tok_state(rec, tok_i, b_t, pb_t, bk_t)?;
+                            TsRecorder::mark(&mut ts, rec, STAGE_EMBED_STATE);
                         }
 
-                        self.record_save_tok_state(rec, tok_i, b_t, pb_t, bk_t)?;
                         next_b = b_t;
                         next_pb = pb_t;
                         next_bk = bk_t;
@@ -3635,6 +3887,7 @@ impl Inkling2VkRunner {
 
                     if in_vram && w > 1 {
                         self.record_vram_moe_window(rec, st.ip, w)?;
+                        TsRecorder::mark(&mut ts, rec, STAGE_VRAM_MOE);
                         for tok_i in 0..w {
                             let base = (tok_i * self.per_tok_state_f32s) as u32;
                             self.record_vec_copy(
@@ -3674,6 +3927,7 @@ impl Inkling2VkRunner {
                                 n_embd,
                             )?;
                         }
+                        TsRecorder::mark(&mut ts, rec, STAGE_POST_MOE);
                     }
 
                     blocks_len = next_b;
@@ -3697,10 +3951,13 @@ impl Inkling2VkRunner {
                         compute_all_argmax,
                         dspark_target_visits,
                     )?;
+                    TsRecorder::mark(&mut ts, rec, STAGE_LM_HEAD);
                 }
+                n_queries = ts.map_or(0, |t| t.next_q);
                 Ok(())
             })?;
-            self.prof_add_submit(sub_t);
+            self.prof_finish_submit(sub_t, n_queries, &spans);
+            self.prof_spans = spans;
 
             if let Some((h_il, h_ip)) = stop_for_host_ip {
                 let t_br0 = std::time::Instant::now();
@@ -3758,7 +4015,11 @@ impl Inkling2VkRunner {
             let ffn_conv_off_f32 =
                 self.slot_conv_bases[last_il] as usize + (2 * prev_kv_dim + n_embd) * hist_len;
             let ffn_conv_len_f32 = n_embd * hist_len;
+            let qp = self.prof_qp;
+            let mut spans = core::mem::take(&mut self.prof_spans);
+            let mut n_queries = 0u32;
             let sub_t = self.ctx.run_timed(|rec| {
+                let mut ts = TsRecorder::begin(rec, qp, &mut spans);
                 for tok_i in 0..w {
                     let base = (tok_i * self.per_tok_state_f32s) as u32;
                     self.record_vec_copy(
@@ -3791,6 +4052,7 @@ impl Inkling2VkRunner {
                     }
                     self.record_vec_copy(rec, &self.win_state_buf, base, &self.cur_buf, 0, n_embd)?;
                 }
+                TsRecorder::mark(&mut ts, rec, STAGE_POST_MOE);
                 self.record_window_outputs(
                     rec,
                     w,
@@ -3798,9 +4060,13 @@ impl Inkling2VkRunner {
                     compute_last_logits,
                     compute_all_argmax,
                     dspark_target_visits,
-                )
+                )?;
+                TsRecorder::mark(&mut ts, rec, STAGE_LM_HEAD);
+                n_queries = ts.map_or(0, |t| t.next_q);
+                Ok(())
             })?;
-            self.prof_add_submit(sub_t);
+            self.prof_finish_submit(sub_t, n_queries, &spans);
+            self.prof_spans = spans;
         }
 
         Ok(())
@@ -3863,6 +4129,18 @@ impl Inkling2VkRunner {
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for Inkling2VkRunner {
+    fn drop(&mut self) {
+        if let Some(qp) = self.prof_qp.take() {
+            // SAFETY: Wait idle before destroying query pool created from `self.ctx.inner.device`.
+            unsafe {
+                let _ = self.ctx.inner.device.device_wait_idle();
+                self.ctx.inner.device.destroy_query_pool(qp, None);
+            }
+        }
     }
 }
 

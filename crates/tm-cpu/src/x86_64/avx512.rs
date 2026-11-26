@@ -7,7 +7,7 @@
 //! as Ice Lake / Sapphire Rapids / Zen 4 / Zen 5 all get full 512-bit throughput.
 
 use core::arch::x86_64::*;
-use tm_core::{BlockQ4_0, BlockQ8_0, f16_to_f32};
+use tm_core::{BlockQ4_0, BlockQ8_0, QK8_0, f16_to_f32};
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 #[inline]
@@ -547,6 +547,318 @@ pub unsafe fn gemm_q4_0_q8_0(
                 r += 1;
             }
             t0 += bt;
+        }
+    }
+}
+
+#[target_feature(enable = "avx512f,avx512vl")]
+#[inline]
+unsafe fn hsum2x2_8wide_pairwise_ps(p01: __m512, p23: __m512) -> __m128 {
+    let a0 = _mm512_castps512_ps256(p01);
+    let a1 = _mm256_castsi256_ps(_mm512_extracti64x4_epi64::<1>(_mm512_castps_si512(p01)));
+    let a2 = _mm512_castps512_ps256(p23);
+    let a3 = _mm256_castsi256_ps(_mm512_extracti64x4_epi64::<1>(_mm512_castps_si512(p23)));
+    let s4_0 = _mm_add_ps(_mm256_castps256_ps128(a0), _mm256_extractf128_ps::<1>(a0));
+    let s4_1 = _mm_add_ps(_mm256_castps256_ps128(a1), _mm256_extractf128_ps::<1>(a1));
+    let s4_2 = _mm_add_ps(_mm256_castps256_ps128(a2), _mm256_extractf128_ps::<1>(a2));
+    let s4_3 = _mm_add_ps(_mm256_castps256_ps128(a3), _mm256_extractf128_ps::<1>(a3));
+    let h01 = _mm_hadd_ps(s4_0, s4_1);
+    let h23 = _mm_hadd_ps(s4_2, s4_3);
+    _mm_hadd_ps(h01, h23)
+}
+
+/// 8-row shared-activation `AVX-512` `gemv_f32_q8_0` (`0-ULP` bit-exact with `generic::gemv_f32_q8_0`).
+///
+/// Pairs two rows' 8-element slices into each 512-bit ZMM FMA (`4` ZMM accumulators = `8` rows),
+/// preserving the exact 8-wide `c = 0..4` FMA chain and pairwise reduction of `generic::dot_f32_q8_0`.
+///
+/// # Safety
+/// Caller must ensure `avx512f`, `avx512bw`, `avx512vl`, and `fma` CPU features are supported.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,fma")]
+pub unsafe fn gemv_f32_q8_0(
+    w: &[BlockQ8_0],
+    x: &[f32],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), cols_blocks * QK8_0);
+    assert_eq!(out.len(), rows);
+
+    let mut r = 0usize;
+    // SAFETY: Row and block bounds are asserted above.
+    unsafe {
+        while r + 8 <= rows {
+            let w0 = &w[r * cols_blocks..(r + 1) * cols_blocks];
+            let w1 = &w[(r + 1) * cols_blocks..(r + 2) * cols_blocks];
+            let w2 = &w[(r + 2) * cols_blocks..(r + 3) * cols_blocks];
+            let w3 = &w[(r + 3) * cols_blocks..(r + 4) * cols_blocks];
+            let w4 = &w[(r + 4) * cols_blocks..(r + 5) * cols_blocks];
+            let w5 = &w[(r + 5) * cols_blocks..(r + 6) * cols_blocks];
+            let w6 = &w[(r + 6) * cols_blocks..(r + 7) * cols_blocks];
+            let w7 = &w[(r + 7) * cols_blocks..(r + 8) * cols_blocks];
+            let mut tot0 = _mm_setzero_ps();
+            let mut tot1 = _mm_setzero_ps();
+
+            for ib in 0..cols_blocks {
+                let b0 = w0.get_unchecked(ib);
+                let b1 = w1.get_unchecked(ib);
+                let b2 = w2.get_unchecked(ib);
+                let b3 = w3.get_unchecked(ib);
+                let b4 = w4.get_unchecked(ib);
+                let b5 = w5.get_unchecked(ib);
+                let b6 = w6.get_unchecked(ib);
+                let b7 = w7.get_unchecked(ib);
+                let q_ptr = x.as_ptr().add(ib * QK8_0);
+
+                let mut acc01 = _mm512_setzero_ps();
+                let mut acc23 = _mm512_setzero_ps();
+                let mut acc45 = _mm512_setzero_ps();
+                let mut acc67 = _mm512_setzero_ps();
+
+                for c in 0..4 {
+                    let off = c * 8;
+                    let q256 = _mm256_loadu_ps(q_ptr.add(off));
+                    let q512 = _mm512_insertf32x8::<1>(_mm512_castps256_ps512(q256), q256);
+
+                    let k01 = _mm_unpacklo_epi64(
+                        _mm_loadl_epi64(b0.qs.as_ptr().add(off) as *const __m128i),
+                        _mm_loadl_epi64(b1.qs.as_ptr().add(off) as *const __m128i),
+                    );
+                    let k23 = _mm_unpacklo_epi64(
+                        _mm_loadl_epi64(b2.qs.as_ptr().add(off) as *const __m128i),
+                        _mm_loadl_epi64(b3.qs.as_ptr().add(off) as *const __m128i),
+                    );
+                    let k45 = _mm_unpacklo_epi64(
+                        _mm_loadl_epi64(b4.qs.as_ptr().add(off) as *const __m128i),
+                        _mm_loadl_epi64(b5.qs.as_ptr().add(off) as *const __m128i),
+                    );
+                    let k67 = _mm_unpacklo_epi64(
+                        _mm_loadl_epi64(b6.qs.as_ptr().add(off) as *const __m128i),
+                        _mm_loadl_epi64(b7.qs.as_ptr().add(off) as *const __m128i),
+                    );
+
+                    acc01 =
+                        _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(k01)), q512, acc01);
+                    acc23 =
+                        _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(k23)), q512, acc23);
+                    acc45 =
+                        _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(k45)), q512, acc45);
+                    acc67 =
+                        _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(k67)), q512, acc67);
+                }
+
+                let bsum0 = hsum2x2_8wide_pairwise_ps(acc01, acc23);
+                let bsum1 = hsum2x2_8wide_pairwise_ps(acc45, acc67);
+                let d0 = _mm_set_ps(
+                    f16_to_f32(b3.d),
+                    f16_to_f32(b2.d),
+                    f16_to_f32(b1.d),
+                    f16_to_f32(b0.d),
+                );
+                let d1 = _mm_set_ps(
+                    f16_to_f32(b7.d),
+                    f16_to_f32(b6.d),
+                    f16_to_f32(b5.d),
+                    f16_to_f32(b4.d),
+                );
+                tot0 = _mm_fmadd_ps(bsum0, d0, tot0);
+                tot1 = _mm_fmadd_ps(bsum1, d1, tot1);
+            }
+
+            _mm_storeu_ps(out.as_mut_ptr().add(r), tot0);
+            _mm_storeu_ps(out.as_mut_ptr().add(r + 4), tot1);
+            r += 8;
+        }
+
+        if r < rows {
+            super::avx2::gemv_f32_q8_0(
+                &w[r * cols_blocks..],
+                x,
+                &mut out[r..],
+                rows - r,
+                cols_blocks,
+            );
+        }
+    }
+}
+
+/// Multi-token L1-pinned `4 rows x 4 tokens` `AVX-512` `gemm_f32_q8_0` (`0-ULP` bit-exact).
+///
+/// Steps `r` by 4 in the outer loop (`< 10 KiB` of weights pinned in L1D cache across all tokens)
+/// and processes `4` tokens per inner pass using `8` 512-bit ZMM accumulators (`4 rows x 2 token-pairs`),
+/// converting each `BlockQ8_0` from `i8` to `f32` **once** across all 4 tokens!
+///
+/// # Safety
+/// Caller must ensure `avx512f`, `avx512bw`, `avx512vl`, and `fma` CPU features are supported.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,fma")]
+pub unsafe fn gemm_f32_q8_0(
+    w: &[BlockQ8_0],
+    x: &[f32],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+    n_tokens: usize,
+) {
+    let cols = cols_blocks * QK8_0;
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), n_tokens * cols);
+    assert_eq!(out.len(), n_tokens * rows);
+
+    if n_tokens == 0 {
+        return;
+    }
+    if n_tokens == 1 {
+        // SAFETY: Same target features guaranteed by caller.
+        unsafe { gemv_f32_q8_0(w, x, out, rows, cols_blocks) };
+        return;
+    }
+
+    let mut r = 0usize;
+    // SAFETY: Row, block, and token bounds are asserted above.
+    unsafe {
+        while r + 4 <= rows {
+            let w0 = &w[r * cols_blocks..(r + 1) * cols_blocks];
+            let w1 = &w[(r + 1) * cols_blocks..(r + 2) * cols_blocks];
+            let w2 = &w[(r + 2) * cols_blocks..(r + 3) * cols_blocks];
+            let w3 = &w[(r + 3) * cols_blocks..(r + 4) * cols_blocks];
+
+            let mut t0 = 0usize;
+            while t0 + 4 <= n_tokens {
+                let x0 = x.as_ptr().add(t0 * cols);
+                let x1 = x.as_ptr().add((t0 + 1) * cols);
+                let x2 = x.as_ptr().add((t0 + 2) * cols);
+                let x3 = x.as_ptr().add((t0 + 3) * cols);
+
+                // `tot_r[i]` holds `[sum(r_i, t0), sum(r_i, t1), sum(r_i, t2), sum(r_i, t3)]`
+                let mut tot0 = _mm_setzero_ps();
+                let mut tot1 = _mm_setzero_ps();
+                let mut tot2 = _mm_setzero_ps();
+                let mut tot3 = _mm_setzero_ps();
+
+                for ib in 0..cols_blocks {
+                    let b0 = w0.get_unchecked(ib);
+                    let b1 = w1.get_unchecked(ib);
+                    let b2 = w2.get_unchecked(ib);
+                    let b3 = w3.get_unchecked(ib);
+                    let base = ib * QK8_0;
+
+                    let mut a0_01 = _mm512_setzero_ps();
+                    let mut a0_23 = _mm512_setzero_ps();
+                    let mut a1_01 = _mm512_setzero_ps();
+                    let mut a1_23 = _mm512_setzero_ps();
+                    let mut a2_01 = _mm512_setzero_ps();
+                    let mut a2_23 = _mm512_setzero_ps();
+                    let mut a3_01 = _mm512_setzero_ps();
+                    let mut a3_23 = _mm512_setzero_ps();
+
+                    for c in 0..4 {
+                        let off = c * 8;
+                        let q0 = _mm256_loadu_ps(x0.add(base + off));
+                        let q1 = _mm256_loadu_ps(x1.add(base + off));
+                        let q2 = _mm256_loadu_ps(x2.add(base + off));
+                        let q3 = _mm256_loadu_ps(x3.add(base + off));
+                        let q01 = _mm512_insertf32x8::<1>(_mm512_castps256_ps512(q0), q1);
+                        let q23 = _mm512_insertf32x8::<1>(_mm512_castps256_ps512(q2), q3);
+
+                        let k0_256 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                            b0.qs.as_ptr().add(off) as *const __m128i,
+                        )));
+                        let k1_256 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                            b1.qs.as_ptr().add(off) as *const __m128i,
+                        )));
+                        let k2_256 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                            b2.qs.as_ptr().add(off) as *const __m128i,
+                        )));
+                        let k3_256 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                            b3.qs.as_ptr().add(off) as *const __m128i,
+                        )));
+
+                        let k0 = _mm512_insertf32x8::<1>(_mm512_castps256_ps512(k0_256), k0_256);
+                        let k1 = _mm512_insertf32x8::<1>(_mm512_castps256_ps512(k1_256), k1_256);
+                        let k2 = _mm512_insertf32x8::<1>(_mm512_castps256_ps512(k2_256), k2_256);
+                        let k3 = _mm512_insertf32x8::<1>(_mm512_castps256_ps512(k3_256), k3_256);
+
+                        a0_01 = _mm512_fmadd_ps(k0, q01, a0_01);
+                        a0_23 = _mm512_fmadd_ps(k0, q23, a0_23);
+                        a1_01 = _mm512_fmadd_ps(k1, q01, a1_01);
+                        a1_23 = _mm512_fmadd_ps(k1, q23, a1_23);
+                        a2_01 = _mm512_fmadd_ps(k2, q01, a2_01);
+                        a2_23 = _mm512_fmadd_ps(k2, q23, a2_23);
+                        a3_01 = _mm512_fmadd_ps(k3, q01, a3_01);
+                        a3_23 = _mm512_fmadd_ps(k3, q23, a3_23);
+                    }
+
+                    tot0 = _mm_fmadd_ps(
+                        hsum2x2_8wide_pairwise_ps(a0_01, a0_23),
+                        _mm_set1_ps(f16_to_f32(b0.d)),
+                        tot0,
+                    );
+                    tot1 = _mm_fmadd_ps(
+                        hsum2x2_8wide_pairwise_ps(a1_01, a1_23),
+                        _mm_set1_ps(f16_to_f32(b1.d)),
+                        tot1,
+                    );
+                    tot2 = _mm_fmadd_ps(
+                        hsum2x2_8wide_pairwise_ps(a2_01, a2_23),
+                        _mm_set1_ps(f16_to_f32(b2.d)),
+                        tot2,
+                    );
+                    tot3 = _mm_fmadd_ps(
+                        hsum2x2_8wide_pairwise_ps(a3_01, a3_23),
+                        _mm_set1_ps(f16_to_f32(b3.d)),
+                        tot3,
+                    );
+                }
+
+                // 4x4 transpose from `(row, token)` to contiguous `(token, row)` stores
+                let tmp0 = _mm_unpacklo_ps(tot0, tot1);
+                let tmp1 = _mm_unpackhi_ps(tot0, tot1);
+                let tmp2 = _mm_unpacklo_ps(tot2, tot3);
+                let tmp3 = _mm_unpackhi_ps(tot2, tot3);
+                _mm_storeu_ps(
+                    out.as_mut_ptr().add(t0 * rows + r),
+                    _mm_movelh_ps(tmp0, tmp2),
+                );
+                _mm_storeu_ps(
+                    out.as_mut_ptr().add((t0 + 1) * rows + r),
+                    _mm_movehl_ps(tmp2, tmp0),
+                );
+                _mm_storeu_ps(
+                    out.as_mut_ptr().add((t0 + 2) * rows + r),
+                    _mm_movelh_ps(tmp1, tmp3),
+                );
+                _mm_storeu_ps(
+                    out.as_mut_ptr().add((t0 + 3) * rows + r),
+                    _mm_movehl_ps(tmp3, tmp1),
+                );
+                t0 += 4;
+            }
+
+            while t0 < n_tokens {
+                let xt = &x[t0 * cols..(t0 + 1) * cols];
+                let dst = &mut out[t0 * rows + r..t0 * rows + r + 4];
+                super::avx2::gemv_f32_q8_0(
+                    &w[r * cols_blocks..(r + 4) * cols_blocks],
+                    xt,
+                    dst,
+                    4,
+                    cols_blocks,
+                );
+                t0 += 1;
+            }
+
+            r += 4;
+        }
+
+        while r < rows {
+            let w_row = &w[r * cols_blocks..(r + 1) * cols_blocks];
+            for t in 0..n_tokens {
+                let xt = &x[t * cols..(t + 1) * cols];
+                *out.get_unchecked_mut(t * rows + r) = super::avx2::dot_f32_q8_0(xt, w_row);
+            }
+            r += 1;
         }
     }
 }

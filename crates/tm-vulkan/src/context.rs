@@ -1443,6 +1443,30 @@ impl VulkanContext {
 }
 
 impl Recorder<'_> {
+    /// Records a compute→compute/transfer memory barrier.
+    pub(crate) fn barrier(&mut self) {
+        let d = &self.ctx.inner.device;
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(
+                vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_READ,
+            );
+        // SAFETY: `self.cb` is actively recording.
+        unsafe {
+            d.cmd_pipeline_barrier(
+                self.cb,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+        }
+    }
+
     /// Records one 1D dispatch followed by a compute→compute/transfer memory barrier.
     pub(crate) fn dispatch(
         &mut self,
@@ -1451,7 +1475,19 @@ impl Recorder<'_> {
         push: &[u32],
         groups: u32,
     ) -> Result<(), VulkanError> {
-        self.dispatch_xy(p, bufs, push, groups, 1)
+        self.dispatch_xy_inner(p, bufs, push, groups, 1, true)
+    }
+
+    /// Records one 1D dispatch **without** a trailing barrier (caller must emit [`Self::barrier`]
+    /// or a barriered [`Self::dispatch`] before reading outputs).
+    pub(crate) fn dispatch_nb(
+        &mut self,
+        p: &Pipeline,
+        bufs: &[&VkBuffer],
+        push: &[u32],
+        groups: u32,
+    ) -> Result<(), VulkanError> {
+        self.dispatch_xy_inner(p, bufs, push, groups, 1, false)
     }
 
     /// Records one 2D dispatch `(gx, gy, 1)` followed by a compute→compute/transfer barrier.
@@ -1462,6 +1498,18 @@ impl Recorder<'_> {
         push: &[u32],
         gx: u32,
         gy: u32,
+    ) -> Result<(), VulkanError> {
+        self.dispatch_xy_inner(p, bufs, push, gx, gy, true)
+    }
+
+    fn dispatch_xy_inner(
+        &mut self,
+        p: &Pipeline,
+        bufs: &[&VkBuffer],
+        push: &[u32],
+        gx: u32,
+        gy: u32,
+        emit_barrier: bool,
     ) -> Result<(), VulkanError> {
         if bufs.len() as u32 != p.n_bindings {
             return Err(VulkanError::InvalidDimensions(format!(
@@ -1537,22 +1585,9 @@ impl Recorder<'_> {
                 );
             }
             d.cmd_dispatch(self.cb, gx, gy, 1);
-            let barrier = vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(
-                    vk::AccessFlags::SHADER_READ
-                        | vk::AccessFlags::SHADER_WRITE
-                        | vk::AccessFlags::TRANSFER_READ,
-                );
-            d.cmd_pipeline_barrier(
-                self.cb,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[barrier],
-                &[],
-                &[],
-            );
+        }
+        if emit_barrier {
+            self.barrier();
         }
         Ok(())
     }

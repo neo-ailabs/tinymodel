@@ -672,6 +672,40 @@ pub fn dot_f32_q8_0(q: &[f32], k_q8: &[BlockQ8_0]) -> f32 {
     total
 }
 
+/// Scalar `BlockQ8_0 x f32` GEMV (`out[r] = dot_f32_q8_0(x, W[r])`).
+pub fn gemv_f32_q8_0(w: &[BlockQ8_0], x: &[f32], out: &mut [f32], rows: usize, cols_blocks: usize) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), cols_blocks * QK8_0);
+    assert_eq!(out.len(), rows);
+    for (r, dst) in out.iter_mut().enumerate() {
+        *dst = dot_f32_q8_0(x, &w[r * cols_blocks..(r + 1) * cols_blocks]);
+    }
+}
+
+/// Scalar multi-token shared-weight `BlockQ8_0 x f32` GEMM (`out[t * rows + r] = dot_f32_q8_0(x[t], W[r])`).
+pub fn gemm_f32_q8_0(
+    w: &[BlockQ8_0],
+    x: &[f32],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+    n_tokens: usize,
+) {
+    let cols = cols_blocks * QK8_0;
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), n_tokens * cols);
+    assert_eq!(out.len(), n_tokens * rows);
+    for t in 0..n_tokens {
+        gemv_f32_q8_0(
+            w,
+            &x[t * cols..(t + 1) * cols],
+            &mut out[t * rows..(t + 1) * rows],
+            rows,
+            cols_blocks,
+        );
+    }
+}
+
 /// Scalar `out[d] += w * dequant(v_q8[d])` (for `Q8_0` quantized V cache aggregation),
 /// matching NEON `vfmaq_f32` bit-for-bit.
 #[inline]

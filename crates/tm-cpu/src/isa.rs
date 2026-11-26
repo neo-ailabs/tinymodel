@@ -46,6 +46,10 @@ pub struct Caps {
     pub dotprod: bool,
     pub i8mm: bool,
     pub avx2: bool,
+    /// `AVX-512 F + BW + VL + FMA` (Skylake-X and newer).
+    pub avx512f: bool,
+    /// `AVX-512 VNNI` (Cascade Lake / Ice Lake / Sapphire Rapids / Zen 4+, which have dual 512-bit
+    /// execution without Skylake-X's single-port FMA512 + Heavy License frequency throttling).
     pub avx512_vnni: bool,
 }
 
@@ -58,22 +62,25 @@ pub fn detect_caps() -> Caps {
             dotprod: std::arch::is_aarch64_feature_detected!("dotprod"),
             i8mm: std::arch::is_aarch64_feature_detected!("i8mm"),
             avx2: false,
+            avx512f: false,
             avx512_vnni: false,
         }
     }
     #[cfg(target_arch = "x86_64")]
     {
+        let avx2 = std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma");
+        let avx512f = avx2
+            && std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl");
         Caps {
             neon: false,
             dotprod: false,
             i8mm: false,
-            avx2: std::arch::is_x86_feature_detected!("avx2")
-                && std::arch::is_x86_feature_detected!("fma"),
-            avx512_vnni: std::arch::is_x86_feature_detected!("avx2")
-                && std::arch::is_x86_feature_detected!("fma")
-                && std::arch::is_x86_feature_detected!("avx512f")
-                && std::arch::is_x86_feature_detected!("avx512bw")
-                && std::arch::is_x86_feature_detected!("avx512vl"),
+            avx2,
+            avx512f,
+            avx512_vnni: avx512f && std::arch::is_x86_feature_detected!("avx512vnni"),
         }
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -90,11 +97,12 @@ pub fn isa_supported(isa: Isa, caps: Caps) -> bool {
         Isa::NeonDotprod => caps.neon && caps.dotprod,
         Isa::NeonI8mm => caps.neon && caps.dotprod && caps.i8mm,
         Isa::Avx2 => caps.avx2,
-        Isa::Avx512 => caps.avx512_vnni,
+        Isa::Avx512 => caps.avx512f,
     }
 }
 
-/// Returns the widest ISA supported by `caps`.
+/// Returns the fastest ISA supported by `caps` (auto-selects `Avx512` only when `avx512_vnni` is
+/// present so Skylake-X cloud CPUs avoid single-port FMA512 + Heavy License downclocking).
 pub fn best_isa(caps: Caps) -> Isa {
     if caps.i8mm && caps.dotprod && caps.neon {
         Isa::NeonI8mm

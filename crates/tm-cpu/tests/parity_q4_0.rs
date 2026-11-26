@@ -928,3 +928,101 @@ fn l1_parity_mamba2_scan_and_relu2_bit_exact_all_isas() {
         r1.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn l1_parity_gemv_and_gemm_f32_q8_0_bit_exact_all_isas() {
+    let mut rng = Rng(0x55AA_33CC_9966_F00D);
+    let rand_f32 = |r: &mut Rng| -> f32 { (r.next_u64() & 0xFFFF) as f32 / 16384.0 - 2.0 };
+    let isas = supported_isas();
+    let pool1 = ThreadPool::new(1);
+    let pool4 = ThreadPool::new(4);
+
+    for &cols_blocks in &[1usize, 3, 8] {
+        let cols = cols_blocks * 32;
+        for &rows in &[1usize, 4, 5, 8, 13, 19] {
+            let w: Vec<BlockQ8_0> = (0..rows * cols_blocks)
+                .map(|_| {
+                    let mut qs = [0i8; 32];
+                    for q in &mut qs {
+                        *q = rng.next_i8();
+                    }
+                    BlockQ8_0 {
+                        d: rng.arbitrary_scale(),
+                        qs,
+                    }
+                })
+                .collect();
+
+            for &n_tok in &[1usize, 2, 3, 4, 5, 9, 67] {
+                let x: Vec<f32> = (0..n_tok * cols).map(|_| rand_f32(&mut rng)).collect();
+                let mut ref_out = vec![0.0f32; n_tok * rows];
+                if n_tok == 1 {
+                    generic::gemv_f32_q8_0(&w, &x, &mut ref_out, rows, cols_blocks);
+                } else {
+                    generic::gemm_f32_q8_0(&w, &x, &mut ref_out, rows, cols_blocks, n_tok);
+                }
+                let ref_bits: Vec<u32> = ref_out.iter().map(|v| v.to_bits()).collect();
+
+                for &isa in &isas {
+                    let kt = select_kernels(isa);
+                    let mut got = vec![0.0f32; n_tok * rows];
+                    if n_tok == 1 {
+                        (kt.gemv_f32_q8_0)(&w, &x, &mut got, rows, cols_blocks);
+                    } else {
+                        (kt.gemm_f32_q8_0)(&w, &x, &mut got, rows, cols_blocks, n_tok);
+                    }
+                    assert_eq!(
+                        got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        ref_bits,
+                        "f32_q8_0 kernel 0-ULP mismatch for isa={} rows={rows} cb={cols_blocks} n_tok={n_tok}",
+                        isa.name()
+                    );
+
+                    // Also verify parallel `matvec_batch_f32_unquant_act` (4 threads) matches 1-thread `generic` bit-for-bit!
+                    let w_bytes: &[u8] = unsafe {
+                        core::slice::from_raw_parts(
+                            w.as_ptr() as *const u8,
+                            w.len() * core::mem::size_of::<BlockQ8_0>(),
+                        )
+                    };
+                    let mut scratch1 = tm_cpu::MatvecScratch::new(cols);
+                    let mut scratch4 = tm_cpu::MatvecScratch::new(cols);
+                    let mut got_p1 = vec![0.0f32; n_tok * rows];
+                    let mut got_p4 = vec![0.0f32; n_tok * rows];
+                    tm_cpu::matvec_batch_f32_unquant_act(
+                        &pool1,
+                        kt,
+                        tm_core::DType::Q8_0,
+                        w_bytes,
+                        &x,
+                        n_tok,
+                        &mut scratch1,
+                        &mut got_p1,
+                        rows,
+                        cols,
+                    );
+                    tm_cpu::matvec_batch_f32_unquant_act(
+                        &pool4,
+                        kt,
+                        tm_core::DType::Q8_0,
+                        w_bytes,
+                        &x,
+                        n_tok,
+                        &mut scratch4,
+                        &mut got_p4,
+                        rows,
+                        cols,
+                    );
+                    assert_eq!(
+                        got_p1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        ref_bits
+                    );
+                    assert_eq!(
+                        got_p4.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        ref_bits
+                    );
+                }
+            }
+        }
+    }
+}
