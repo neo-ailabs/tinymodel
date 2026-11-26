@@ -1170,6 +1170,118 @@ impl VulkanContext {
         }
     }
 
+    /// Imports a writable (`PROT_READ | PROT_WRITE`), page/2MiB-aligned anonymous host memory
+    /// backing (`HugePageBytes`) zero-copy into Vulkan via `VK_EXT_external_memory_host`
+    /// (`HOST_ALLOCATION_EXT`), allowing discrete GPUs (e.g. Tesla T4, Radeon RX 9060 XT) and
+    /// UMA GPUs to stream host-resident MoE experts directly over PCIe/UMA into TensorCore /
+    /// tiled compute shaders with `0` extra host RAM and `0` `DEVICE_LOCAL` VRAM!
+    ///
+    /// Unlike `PROT_READ` file `mmap`, `HugePageBytes` is writable anonymous memory, so Linux
+    /// DRM/NVIDIA `get_user_pages(FOLL_WRITE)` pinning succeeds cleanly on all drivers.
+    pub(crate) fn try_import_host_rw_pinned(&self, aligned_data: &[u8]) -> Option<VkBuffer> {
+        if !self.info.external_memory_host || self.force_slab_copy() {
+            return None;
+        }
+        let ext_host = self.inner.ext_host.as_ref()?;
+        let align = self.info.external_memory_host_align as usize;
+        if align == 0 || !align.is_power_of_two() || aligned_data.is_empty() {
+            return None;
+        }
+        let ptr_addr = aligned_data.as_ptr() as usize;
+        if !ptr_addr.is_multiple_of(align) || !aligned_data.len().is_multiple_of(align) {
+            return None;
+        }
+        let import_len = aligned_data.len() as u64;
+        let max_buf = self
+            .info
+            .max_alloc_bytes
+            .min(self.info.max_storage_buffer_range);
+        if import_len > max_buf {
+            return None;
+        }
+
+        let d = &self.inner.device;
+        // SAFETY: `aligned_data` is backed by an immutable `Arc<HugePageBytes>` (`PROT_READ | PROT_WRITE`,
+        // `2 MiB` aligned & padded) stored alongside the returned `VkBuffer` and dropped strictly AFTER
+        // `VkBuffer` destroys its `VkBuffer` + `VkDeviceMemory` handles.
+        unsafe {
+            let mut ptr_props = vk::MemoryHostPointerPropertiesEXT::default();
+            if (ext_host.fp().get_memory_host_pointer_properties_ext)(
+                ext_host.device(),
+                vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
+                aligned_data.as_ptr() as *const core::ffi::c_void,
+                &mut ptr_props,
+            ) != vk::Result::SUCCESS
+            {
+                return None;
+            }
+
+            let mut ext_buf_ci = vk::ExternalMemoryBufferCreateInfo::default()
+                .handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+            let buf_ci = vk::BufferCreateInfo::default()
+                .size(import_len)
+                .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .push_next(&mut ext_buf_ci);
+            let buf = d.create_buffer(&buf_ci, None).ok()?;
+            let req = d.get_buffer_memory_requirements(buf);
+            if req.size > import_len || req.size > self.info.max_alloc_bytes {
+                d.destroy_buffer(buf, None);
+                return None;
+            }
+            let allowed = req.memory_type_bits & ptr_props.memory_type_bits;
+            let ty = match self
+                .find_memory_type(
+                    allowed,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_CACHED,
+                    "imported host rw buffer",
+                )
+                .or_else(|_| {
+                    self.find_memory_type(
+                        allowed,
+                        vk::MemoryPropertyFlags::empty(),
+                        vk::MemoryPropertyFlags::HOST_CACHED,
+                        "imported host rw buffer",
+                    )
+                }) {
+                Ok(t) => t,
+                Err(_) => {
+                    d.destroy_buffer(buf, None);
+                    return None;
+                }
+            };
+
+            let mut import_info = vk::ImportMemoryHostPointerInfoEXT::default()
+                .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT)
+                .host_pointer(aligned_data.as_ptr() as *mut core::ffi::c_void);
+            let alloc_ci = vk::MemoryAllocateInfo::default()
+                .allocation_size(import_len)
+                .memory_type_index(ty)
+                .push_next(&mut import_info);
+            let mem = match d.allocate_memory(&alloc_ci, None) {
+                Ok(m) => m,
+                Err(_) => {
+                    d.destroy_buffer(buf, None);
+                    return None;
+                }
+            };
+            if d.bind_buffer_memory(buf, mem, 0).is_err() {
+                d.destroy_buffer(buf, None);
+                d.free_memory(mem, None);
+                return None;
+            }
+            Some(VkBuffer {
+                inner: self.inner.clone(),
+                id: NEXT_BUF_ID.fetch_add(1, Ordering::Relaxed),
+                buf,
+                mem,
+                size: import_len,
+                mapped: None,
+            })
+        }
+    }
+
     /// Allocates a zero-initialized device-local buffer.
     pub fn alloc_buffer(&self, bytes: u64) -> Result<VkBuffer, VulkanError> {
         let b = self.create_buffer(bytes, false)?;

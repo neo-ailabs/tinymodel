@@ -1513,6 +1513,11 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
                     host_moe_only: true,
                 },
             )?;
+            for ip in 0..hm.cfg.n_layers_phys {
+                if let Some((gu_pin, gu_len, dn_pin, dn_len)) = hm.host_importable_expert_pins(ip) {
+                    let _ = runner.register_host_moe_layer(ip, gu_pin, gu_len, dn_pin, dn_len);
+                }
+            }
             let hs = tm_models::Inkling2State::new_host_moe_only(&hm);
             Some((hm, hs))
         } else {
@@ -1995,6 +2000,11 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
                     host_moe_only: true,
                 },
             )?;
+            for ip in 0..hm.cfg.n_layers_phys {
+                if let Some((gu_pin, gu_len, dn_pin, dn_len)) = hm.host_importable_expert_pins(ip) {
+                    let _ = runner.register_host_moe_layer(ip, gu_pin, gu_len, dn_pin, dn_len);
+                }
+            }
             let hs = tm_models::Inkling2State::new_host_moe_only(&hm);
             Some((hm, hs))
         } else {

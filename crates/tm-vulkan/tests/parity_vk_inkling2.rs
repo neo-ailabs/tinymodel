@@ -154,6 +154,11 @@ fn parity_vk_inkling2_pure_gpu_and_3tier_hybrid() {
     )
     .unwrap();
     assert!(host_model.stats.nvme_direct_expert_layers >= 4);
+    for ip in 0..host_model.cfg.n_layers_phys {
+        if let Some((gu_pin, gu_len, dn_pin, dn_len)) = host_model.host_importable_expert_pins(ip) {
+            let _ = hybrid_runner.register_host_moe_layer(ip, gu_pin, gu_len, dn_pin, dn_len);
+        }
+    }
     let mut host_state = Inkling2State::new(&host_model, 64);
     let pool = ThreadPool::new(4);
     let kt = active_kernels();

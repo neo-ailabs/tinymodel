@@ -149,6 +149,13 @@ struct VkVramExperts {
     down_expert_u16s: u32,
 }
 
+struct VkImportedExperts {
+    // Field drop order is safety-critical: `vexp` (`VkBuffer`s) MUST drop BEFORE `_gu_pin`/`_dn_pin`!
+    vexp: VkVramExperts,
+    _gu_pin: Arc<dyn AsRef<[u8]> + Send + Sync>,
+    _dn_pin: Arc<dyn AsRef<[u8]> + Send + Sync>,
+}
+
 struct VkLoopLayer {
     msg_query_off: u32,
     ctrl_down: [VkDenseMat; LOOP_CTRL_COUNT],
@@ -183,11 +190,12 @@ struct VkInklingLayer {
     ffn_norm_off: u32,
     exp_probs_b_off: Option<u32>,
     vram_experts: Option<VkVramExperts>,
+    host_imported_experts: Option<VkImportedExperts>,
 }
 
 /// Maximum number of tokens evaluated in lockstep per `forward_window_hybrid` pass
-/// (covers `32`-token prompt prefill chunks and `DSpark` `block_size == 8` verification windows!).
-pub const MAX_INKLING2_VK_WINDOW: usize = 128;
+/// (covers `256`-token prompt prefill chunks and `DSpark` `block_size == 8` verification windows!).
+pub const MAX_INKLING2_VK_WINDOW: usize = 256;
 /// Maximum speculative rollback window with `save_conv_snapshots == true` (`DSpark` `block_size == 8`).
 pub const MAX_INKLING2_SPEC_WINDOW: usize = 8;
 
@@ -434,6 +442,7 @@ pub struct Inkling2VkRunner {
     pipe_sigmoid_mul: Arc<Pipeline>,
     pipe_moe_ops: Arc<Pipeline>,
     pipe_moe_grouped: Option<Arc<Pipeline>>,
+    moe_grouped_bm: usize,
     moe_grouped_bn: usize,
     pipe_argmax: Arc<Pipeline>,
     gemv_pipes: [Arc<Pipeline>; 6],
@@ -1190,6 +1199,7 @@ impl Inkling2VkRunner {
                 ffn_norm_off,
                 exp_probs_b_off,
                 vram_experts,
+                host_imported_experts: None,
             });
         }
 
@@ -1398,7 +1408,7 @@ impl Inkling2VkRunner {
         let win_top_weights_dev_buf =
             ctx.alloc_buffer((MAX_INKLING2_VK_WINDOW * cfg.n_expert_used * 4).max(16) as u64)?;
         let win_moe_out_dev_buf = ctx.alloc_buffer((MAX_INKLING2_VK_WINDOW * n_embd * 4) as u64)?;
-        let moe_tiles_buf = ctx.alloc_buffer(16384)?;
+        let moe_tiles_buf = ctx.alloc_buffer(65536)?;
         let exp_gate_up_buf =
             ctx.alloc_buffer((MAX_INKLING2_VK_WINDOW * cfg.n_expert_used * 2 * n_ff * 4) as u64)?;
         let exp_hidden_buf =
@@ -1584,7 +1594,7 @@ impl Inkling2VkRunner {
             (32usize, 64usize)
         };
 
-        let (pipe_moe_grouped, moe_grouped_bn) = if use_cm_f16 {
+        let (pipe_moe_grouped, moe_grouped_bm, moe_grouped_bn) = if use_cm_f16 {
             (
                 Some(ctx.pipeline(
                     "inkling2_moe_grp_cm",
@@ -1594,7 +1604,8 @@ impl Inkling2VkRunner {
                     20,
                     &[128],
                 )?),
-                128usize,
+                64usize,
+                64usize,
             )
         } else if 128 >= sg && 128 <= max_wg {
             (
@@ -1606,10 +1617,11 @@ impl Inkling2VkRunner {
                     20,
                     &[128],
                 )?),
+                16usize,
                 64usize,
             )
         } else {
-            (None, 64usize)
+            (None, 16usize, 64usize)
         };
 
         let n_vram_exps = vram_expert_mask.iter().filter(|&&b| b).count();
@@ -1764,6 +1776,7 @@ impl Inkling2VkRunner {
             pipe_sigmoid_mul,
             pipe_moe_ops,
             pipe_moe_grouped,
+            moe_grouped_bm,
             moe_grouped_bn,
             pipe_argmax,
             gemv_pipes,
@@ -1885,6 +1898,72 @@ impl Inkling2VkRunner {
 
     pub fn has_host_offload_layers(&self) -> bool {
         self.vram_expert_mask.iter().any(|&v| !v)
+    }
+
+    /// Zero-copy imports a host-RAM `HugePageBytes` `Q8_0` expert layer (`ip`) into Vulkan via
+    /// `VK_EXT_external_memory_host` so multi-token prefill (`W >= 8`, `!save_conv_snapshots`)
+    /// executes `inkling2_moe_grouped_cm` / `inkling2_moe_grouped` directly over PCIe/UMA (`0`
+    /// extra host RAM, `0` `DEVICE_LOCAL` VRAM, `1` command buffer across all 48 visits!), while
+    /// single-token decode (`W == 1`) continues using high-bandwidth host DDR4 `AVX2` kernels.
+    pub fn register_host_moe_layer(
+        &mut self,
+        ip: usize,
+        gate_up_pin: Arc<dyn AsRef<[u8]> + Send + Sync>,
+        gate_up_logical_bytes: usize,
+        down_pin: Arc<dyn AsRef<[u8]> + Send + Sync>,
+        down_logical_bytes: usize,
+    ) -> bool {
+        if ip >= self.cfg.n_layers_phys || self.layers[ip].vram_experts.is_some() {
+            return false;
+        }
+        let n_embd = self.cfg.n_embd;
+        let n_ff = self.cfg.n_ff_exp;
+        let n_exp = self.cfg.n_expert;
+        let gu_row_bytes = DType::Q8_0.row_bytes(n_embd);
+        let dn_row_bytes = DType::Q8_0.row_bytes(n_ff);
+        let exp_gu_bytes = gu_row_bytes * (2 * n_ff) * n_exp;
+        let exp_dn_bytes = dn_row_bytes * n_embd * n_exp;
+        if gate_up_logical_bytes != exp_gu_bytes || down_logical_bytes != exp_dn_bytes {
+            return false;
+        }
+        let gu_aligned = (*gate_up_pin).as_ref();
+        let dn_aligned = (*down_pin).as_ref();
+        if gu_aligned.len() < exp_gu_bytes || dn_aligned.len() < exp_dn_bytes {
+            return false;
+        }
+        let Some(gu_buf) = self.ctx.try_import_host_rw_pinned(gu_aligned) else {
+            return false;
+        };
+        let Some(dn_buf) = self.ctx.try_import_host_rw_pinned(dn_aligned) else {
+            return false;
+        };
+        let gu_row_u16s = (gu_row_bytes / 2) as u32;
+        let dn_row_u16s = (dn_row_bytes / 2) as u32;
+        self.layers[ip].host_imported_experts = Some(VkImportedExperts {
+            vexp: VkVramExperts {
+                gate_up: gu_buf,
+                gate_up_row_u16s: gu_row_u16s,
+                gate_up_expert_u16s: gu_row_u16s * (2 * n_ff as u32),
+                down: dn_buf,
+                down_row_u16s: dn_row_u16s,
+                down_expert_u16s: dn_row_u16s * (n_embd as u32),
+            },
+            _gu_pin: gate_up_pin,
+            _dn_pin: down_pin,
+        });
+        let n_vram = self.vram_expert_mask.iter().filter(|&&b| b).count();
+        let n_ext = self
+            .layers
+            .iter()
+            .filter(|l| l.host_imported_experts.is_some())
+            .count();
+        if n_ext > 0 {
+            self.weights_mode_label = format!(
+                "hybrid-vram{n_vram}+ext{n_ext}/{}exps",
+                self.cfg.n_layers_phys
+            );
+        }
+        true
     }
 
     /// Zeroes out all 48 KV + ShortConv states on the GPU.
@@ -3627,9 +3706,21 @@ impl Inkling2VkRunner {
         )
     }
 
-    /// Batched `w`-token VRAM MoE using GPU expert-grouped `BM=16` TensorCore (`CoopMat F16`) or
-    /// LDS-tiled `Q8_0` GEMM when `w >= 4`, reading each active expert's weights once per 16
-    /// routed tokens instead of once per token!
+    #[inline]
+    fn window_gpu_experts(&self, ip: usize, allow_host_imported: bool) -> Option<&VkVramExperts> {
+        let layer = &self.layers[ip];
+        layer.vram_experts.as_ref().or_else(|| {
+            if allow_host_imported {
+                layer.host_imported_experts.as_ref().map(|h| &h.vexp)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Batched `w`-token VRAM / Zero-Copy PCIe MoE using GPU expert-grouped `BM=16` TensorCore
+    /// (`CoopMat F16`) or LDS-tiled `Q8_0` GEMM when `w >= 4`, reading each active expert's
+    /// weights once per 16 routed tokens instead of once per token!
     #[allow(clippy::too_many_arguments)]
     fn record_vram_moe_window(
         &self,
@@ -3645,6 +3736,20 @@ impl Inkling2VkRunner {
             .vram_experts
             .as_ref()
             .expect("record_vram_moe_window requires vram_experts");
+        self.record_moe_window_with(rec, vexp, w, x_win_buf, top_ids_buf, top_w_buf, out_win_buf)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_moe_window_with(
+        &self,
+        rec: &mut Recorder<'_>,
+        vexp: &VkVramExperts,
+        w: usize,
+        x_win_buf: &VkBuffer,
+        top_ids_buf: &VkBuffer,
+        top_w_buf: &VkBuffer,
+        out_win_buf: &VkBuffer,
+    ) -> Result<(), VulkanError> {
         let n_embd = self.cfg.n_embd;
         let n_ff = self.cfg.n_ff_exp;
         let top_k = self.cfg.n_expert_used;
@@ -3655,10 +3760,11 @@ impl Inkling2VkRunner {
             && n_ff.is_multiple_of(32)
             && let Some(ref p_grp) = self.pipe_moe_grouped
         {
+            let bm = self.moe_grouped_bm;
             let bn = self.moe_grouped_bn;
-            let max_tiles = total_k.min(self.cfg.n_expert + total_k.div_ceil(16)) as u32;
+            let max_tiles = total_k.min(self.cfg.n_expert + total_k.div_ceil(bm)) as u32;
 
-            // 1. Build `BM=16` expert-grouped tile descriptors on GPU (`1` workgroup)
+            // 1. Build `BM` expert-grouped tile descriptors on GPU (`1` workgroup)
             rec.dispatch(
                 &self.pipe_moe_ops,
                 &[
@@ -3669,7 +3775,16 @@ impl Inkling2VkRunner {
                     top_w_buf,
                     &self.moe_tiles_buf,
                 ],
-                &[4, self.cfg.n_expert as u32, total_k as u32, 16, 0, 0, 0, 0],
+                &[
+                    4,
+                    self.cfg.n_expert as u32,
+                    total_k as u32,
+                    bm as u32,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
                 1,
             )?;
             // 2. Expert-grouped `gate_up` (`CoopMat F16` on T4/RDNA4, `LDS Tiled` fallback)
@@ -4281,7 +4396,12 @@ impl Inkling2VkRunner {
         )
     }
 
-    fn build_window_segments(&self, max_visits_per_cb: usize, out: &mut [GpuSegSpec; 64]) -> usize {
+    fn build_window_segments(
+        &self,
+        allow_host_imported: bool,
+        max_visits_per_cb: usize,
+        out: &mut [GpuSegSpec; 64],
+    ) -> usize {
         let mut n_segs = 0usize;
         let mut cursor = 0usize;
         let mut need_embed = true;
@@ -4302,7 +4422,10 @@ impl Inkling2VkRunner {
                 self.advance_depth_counts(st, &mut b, &mut pb, &mut bk);
                 cursor += 1;
                 visits_in_cb += 1;
-                if self.layers[st.ip].vram_experts.is_none() {
+                if self
+                    .window_gpu_experts(st.ip, allow_host_imported)
+                    .is_none()
+                {
                     stop_host = Some((st.il, st.ip));
                     break;
                 }
@@ -4502,8 +4625,16 @@ impl Inkling2VkRunner {
         let mut prelude_blocks_len = seg.init_pb;
         let mut bank_len = seg.init_bk;
 
+        let allow_host_imported = can_batch_gemm
+            && self.pipe_moe_grouped.is_some()
+            && self.cfg.n_ff_exp.is_multiple_of(32);
+
         for &st in &self.schedule[seg.start_cur..seg.end_cur] {
             let in_vram = self.layers[st.ip].vram_experts.is_some();
+            let batch_gpu_vexp = self.window_gpu_experts(
+                st.ip,
+                allow_host_imported && self.cfg.q_dim(st.ip).is_multiple_of(32),
+            );
             let kv_dim = self.cfg.kv_dim(st.ip);
             let attn_conv_off_f32 = self.slot_conv_bases[st.il] as usize;
             let attn_conv_len_f32 = (2 * kv_dim + n_embd) * hist_len;
@@ -4527,16 +4658,16 @@ impl Inkling2VkRunner {
                     start_pos,
                     tap_slot,
                     n_taps,
-                    in_vram,
+                    batch_gpu_vexp.is_some(),
                     &mut next_b,
                     &mut next_pb,
                     &mut next_bk,
                     ts,
                 )?;
-                if in_vram {
-                    self.record_vram_moe_window(
+                if let Some(vexp) = batch_gpu_vexp {
+                    self.record_moe_window_with(
                         rec,
-                        st.ip,
+                        vexp,
                         w,
                         &self.win_ffn_norm_buf,
                         &self.win_top_ids_dev_buf,
@@ -4787,6 +4918,10 @@ impl Inkling2VkRunner {
             && self.cfg.shortconv_l_cache <= 9
             && self.ctx.info().subgroup_size <= 128
             && self.ctx.info().max_workgroup_invocations >= 128;
+        let allow_host_imported = can_batch_gemm
+            && self.pipe_moe_grouped.is_some()
+            && self.cfg.n_ff_exp.is_multiple_of(32)
+            && (0..self.cfg.n_layers_phys).all(|ip| self.cfg.q_dim(ip).is_multiple_of(32));
         let max_visits_per_cb = if can_batch_gemm {
             64usize
         } else {
@@ -4805,7 +4940,7 @@ impl Inkling2VkRunner {
             init_bk: 0,
             end_b: 0,
         }; 64];
-        let n_segs = self.build_window_segments(max_visits_per_cb, &mut segs);
+        let n_segs = self.build_window_segments(allow_host_imported, max_visits_per_cb, &mut segs);
         if n_segs == 0 {
             return Ok(());
         }

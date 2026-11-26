@@ -14,7 +14,8 @@ pub mod aarch64;
 pub mod x86_64;
 
 pub use affinity::{
-    CpuTopology, HugePageBytes, detected_topology, recommended_threads, release_mmap_page_cache,
+    CpuTopology, HugePageAlignedPin, HugePageBytes, detected_topology, recommended_threads,
+    release_mmap_page_cache,
 };
 pub use isa::{Caps, Isa, best_isa, detect_caps, effective_isa};
 pub use ops::{

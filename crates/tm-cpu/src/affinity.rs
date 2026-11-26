@@ -251,6 +251,31 @@ impl HugePageBytes {
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.buf[self.pad..self.pad + self.len]
     }
+
+    /// Returns the `2 MiB`-aligned backing slice rounded up to the `2 MiB` page boundary
+    /// (`>= self.len`), safe for `VK_EXT_external_memory_host` (`vkGetBufferMemoryRequirements`
+    /// 4 KiB / 64 KiB rounding).
+    #[inline]
+    pub fn aligned_backing_slice(&self) -> &[u8] {
+        if self.len == 0 {
+            return &[];
+        }
+        const HP_ALIGN: usize = 2 * 1024 * 1024;
+        let aligned_len = self.len.next_multiple_of(HP_ALIGN);
+        &self.buf[self.pad..self.pad + aligned_len]
+    }
+}
+
+/// Reference-counted `2 MiB`-aligned host backing pin implementing `AsRef<[u8]>` over the full
+/// `2 MiB`-aligned region so Vulkan `VK_EXT_external_memory_host` buffers keep the host pages
+/// alive until `vkFreeMemory` completes.
+pub struct HugePageAlignedPin(pub std::sync::Arc<HugePageBytes>);
+
+impl AsRef<[u8]> for HugePageAlignedPin {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.0.aligned_backing_slice()
+    }
 }
 
 /// Advises the OS kernel (`MADV_DONTNEED`) that read-only file-backed `mmap` pages fully contained

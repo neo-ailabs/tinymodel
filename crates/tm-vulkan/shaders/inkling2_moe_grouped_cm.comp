@@ -1,11 +1,13 @@
 #version 450
-// Vulkan Cooperative Matrix (`16x16x16 f16*f16+f32->f32`, `BM=16, BN=128, WG=128`) expert-grouped
-// `Q8_0` MoE GEMM for TensorCore / WMMA GPUs (NVIDIA Turing/Ampere/Ada/Blackwell, AMD RDNA3/4).
-// Each 128-thread workgroup (`4` warps) shares `16` routed tokens across `128` expert rows (`2`
-// `16x16` CoopMat tiles = `16` VGPRs per thread, `16.8 KB` shared memory -> 3 concurrent WGs/SM!).
+// Vulkan Cooperative Matrix (`16x16x16 f16*f16+f32->f32`, adaptive `BM=16..64, BN=64, WG=128`)
+// expert-grouped `Q8_0` MoE GEMM for TensorCore / WMMA GPUs (NVIDIA Turing+, AMD RDNA3/4).
+//
+// Each 128-thread workgroup (`4` warps) shares up to `64` routed tokens (`num_m16 = 1..4` active
+// `16`-token sub-tiles) across `64` expert rows (`15.5 KiB` shared memory -> 4 concurrent WGs/SM!),
+// eliminating duplicate PCIe / GDDR6 expert re-reads on Zipf hot experts (`w = 64..128`) while
+// executing only `num_m16` HMMA tiles on sparse experts (`tile_cnt <= 16`)!
 
 #extension GL_EXT_control_flow_attributes : enable
-#extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_memory_scope_semantics : require
@@ -14,7 +16,7 @@
 layout(constant_id = 0) const uint WG = 128;
 layout(local_size_x_id = 0) in;
 
-layout(std430, binding = 0) readonly buffer W16   { uint16_t w16[]; };
+layout(std430, binding = 0) readonly buffer W32   { uint     w32[]; };
 layout(std430, binding = 1) readonly buffer X4    { vec4     x4[]; };
 layout(std430, binding = 2) readonly buffer Tiles { uint     tiles[]; };
 layout(std430, binding = 3) buffer          OutY  { float    y[]; };
@@ -30,26 +32,24 @@ layout(push_constant) uniform PC {
 const uint SH_STRIDE = 20u;    // 16 f16vec2 (32 f16) + 4 f16vec2 bank-skew
 const uint STAGE_STRIDE = 20u; // 16 floats + 4 floats bank-skew
 
-shared uint    s_slots[16];
-shared uint    s_xrows[16];
-shared f16vec2 X_sh[16u * SH_STRIDE];
-shared f16vec2 W_sh[128u * SH_STRIDE];
+shared uint    s_slots[64];
+shared uint    s_xrows[64];
+shared f16vec2 X_sh[64u * SH_STRIDE];
+shared f16vec2 W_sh[64u * SH_STRIDE];
 shared float   stage_sh[4u * 16u * STAGE_STRIDE];
-
-int sbyte_lo(uint u16) { return bitfieldExtract(int(u16), 0, 8); }
-int sbyte_hi(uint u16) { return bitfieldExtract(int(u16), 8, 8); }
 
 void main() {
     const uint tile_idx = gl_WorkGroupID.y;
     if (tile_idx >= tiles[0]) return;
 
-    const uint r0 = gl_WorkGroupID.x * 128u;
+    const uint r0 = gl_WorkGroupID.x * 64u;
     if (r0 >= pc.n_out) return;
 
     const uint tb = 4u + tile_idx * 4u;
     const uint e_id = tiles[tb + 0u];
     const uint start_pos = tiles[tb + 1u];
     const uint tile_cnt = tiles[tb + 2u];
+    const uint num_m16 = (tile_cnt + 15u) >> 4u; // 1..4 workgroup-uniform active M-tiles
     const uint exp_base = e_id * pc.expert_u16s;
 
     const uint tid = gl_LocalInvocationID.x;
@@ -57,7 +57,7 @@ void main() {
     const uint lane = gl_SubgroupInvocationID;
     const uint sg_size = gl_SubgroupSize;
 
-    if (tid < 16u) {
+    if (tid < 64u) {
         if (tid < tile_cnt) {
             const uint sl = tiles[2048u + start_pos + tid];
             s_slots[tid] = sl;
@@ -69,44 +69,70 @@ void main() {
     }
     barrier();
 
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> sums[2];
-    sums[0] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
-    sums[1] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> sums[4];
+    [[unroll]] for (uint mp = 0u; mp < 4u; ++mp) {
+        sums[mp] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    }
 
-    const uint x_m = tid >> 3u;     // 0..15 (128 threads -> 16 rows x 8 vec4 cols!)
-    const uint x_col4 = tid & 7u;   // 0..7
+    const uint x_row16 = tid >> 3u;   // 0..15 (128 threads -> 16 rows x 8 vec4 cols per M-tile)
+    const uint x_col4 = tid & 7u;     // 0..7
     const uint n_in4 = pc.n_in >> 2u;
 
-    const uint w_load_n = tid >> 2u; // 0..31 (4 passes -> 128 rows)
+    const uint w_load_n = tid >> 2u;  // 0..31 (2 passes -> 64 rows)
     const uint sub = tid & 3u;
     const uint nb = pc.n_in >> 5u;
 
     for (uint ib = 0u; ib < nb; ++ib) {
-        // 128 threads load all 16 x 32 activations in a single coalesced wave!
-        const uint sh_idx = x_m * SH_STRIDE + x_col4 * 2u;
-        if (x_m < tile_cnt) {
-            const vec4 v = x4[s_xrows[x_m] * n_in4 + ib * 8u + x_col4];
-            X_sh[sh_idx + 0u] = f16vec2(v.xy);
-            X_sh[sh_idx + 1u] = f16vec2(v.zw);
-        } else {
-            X_sh[sh_idx + 0u] = f16vec2(float16_t(0.0));
-            X_sh[sh_idx + 1u] = f16vec2(float16_t(0.0));
+        for (uint mp = 0u; mp < num_m16; ++mp) {
+            const uint xm = mp * 16u + x_row16;
+            const uint sh_idx = xm * SH_STRIDE + x_col4 * 2u;
+            if (xm < tile_cnt) {
+                const vec4 v = x4[s_xrows[xm] * n_in4 + ib * 8u + x_col4];
+                X_sh[sh_idx + 0u] = f16vec2(v.xy);
+                X_sh[sh_idx + 1u] = f16vec2(v.zw);
+            } else {
+                X_sh[sh_idx + 0u] = f16vec2(float16_t(0.0));
+                X_sh[sh_idx + 1u] = f16vec2(float16_t(0.0));
+            }
         }
 
-        [[unroll]] for (uint rp = 0u; rp < 4u; ++rp) {
+        [[unroll]] for (uint rp = 0u; rp < 2u; ++rp) {
             const uint n = rp * 32u + w_load_n;
             const uint sh_base = n * SH_STRIDE;
             if (r0 + n < pc.n_out) {
                 const uint b = exp_base + (r0 + n) * pc.row_u16s + ib * 17u;
-                const float d = unpackHalf2x16(uint(w16[b])).x;
-                [[unroll]] for (uint i = 0u; i < 4u; ++i) {
-                    const uint j = sub * 4u + i;
-                    const uint u = uint(w16[b + 1u + j]);
-                    W_sh[sh_base + j] = f16vec2(
-                        float16_t(float(sbyte_lo(u)) * d),
-                        float16_t(float(sbyte_hi(u)) * d)
-                    );
+                const uint dw = w32[b >> 1u];
+                const float d = ((b & 1u) == 0u) ? unpackHalf2x16(dw).x : unpackHalf2x16(dw).y;
+                const uint q = b + 1u + sub * 4u;
+                const uint q32 = q >> 1u;
+                uint q0, q1;
+                if ((q & 1u) == 0u) {
+                    q0 = w32[q32];
+                    q1 = w32[q32 + 1u];
+                } else {
+                    const uint w0 = w32[q32];
+                    const uint w1 = w32[q32 + 1u];
+                    const uint w2 = w32[q32 + 2u];
+                    q0 = (w0 >> 16u) | (w1 << 16u);
+                    q1 = (w1 >> 16u) | (w2 << 16u);
                 }
+                const uint j0 = sh_base + sub * 4u;
+                W_sh[j0 + 0u] = f16vec2(
+                    float16_t(float(bitfieldExtract(int(q0),  0, 8)) * d),
+                    float16_t(float(bitfieldExtract(int(q0),  8, 8)) * d)
+                );
+                W_sh[j0 + 1u] = f16vec2(
+                    float16_t(float(bitfieldExtract(int(q0), 16, 8)) * d),
+                    float16_t(float(bitfieldExtract(int(q0), 24, 8)) * d)
+                );
+                W_sh[j0 + 2u] = f16vec2(
+                    float16_t(float(bitfieldExtract(int(q1),  0, 8)) * d),
+                    float16_t(float(bitfieldExtract(int(q1),  8, 8)) * d)
+                );
+                W_sh[j0 + 3u] = f16vec2(
+                    float16_t(float(bitfieldExtract(int(q1), 16, 8)) * d),
+                    float16_t(float(bitfieldExtract(int(q1), 24, 8)) * d)
+                );
             } else {
                 [[unroll]] for (uint i = 0u; i < 4u; ++i) {
                     W_sh[sh_base + sub * 4u + i] = f16vec2(float16_t(0.0));
@@ -117,19 +143,24 @@ void main() {
         barrier();
 
         [[unroll]] for (uint k16 = 0u; k16 < 32u; k16 += 16u) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA;
-            coopMatLoad(matA, X_sh, k16 >> 1u, SH_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
-
-            [[unroll]] for (uint cm_n = 0u; cm_n < 2u; ++cm_n) {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+            coopMatLoad(
+                matB,
+                W_sh,
+                (sg * 16u) * SH_STRIDE + (k16 >> 1u),
+                SH_STRIDE,
+                gl_CooperativeMatrixLayoutColumnMajor
+            );
+            for (uint mp = 0u; mp < num_m16; ++mp) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA;
                 coopMatLoad(
-                    matB,
-                    W_sh,
-                    (sg * 32u + cm_n * 16u) * SH_STRIDE + (k16 >> 1u),
+                    matA,
+                    X_sh,
+                    (mp * 16u) * SH_STRIDE + (k16 >> 1u),
                     SH_STRIDE,
-                    gl_CooperativeMatrixLayoutColumnMajor
+                    gl_CooperativeMatrixLayoutRowMajor
                 );
-                sums[cm_n] = coopMatMulAdd(matA, matB, sums[cm_n]);
+                sums[mp] = coopMatMulAdd(matA, matB, sums[mp]);
             }
         }
 
@@ -137,15 +168,16 @@ void main() {
     }
 
     const uint sg_stage = sg * 16u * STAGE_STRIDE;
-    [[unroll]] for (uint cm_n = 0u; cm_n < 2u; ++cm_n) {
-        coopMatStore(sums[cm_n], stage_sh, sg_stage, STAGE_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+    for (uint mp = 0u; mp < num_m16; ++mp) {
+        coopMatStore(sums[mp], stage_sh, sg_stage, STAGE_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
         controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
         for (uint idx = lane; idx < 256u; idx += sg_size) {
-            const uint m = idx >> 4u;
+            const uint m_in_16 = idx >> 4u;
+            const uint m = mp * 16u + m_in_16;
             const uint c = idx & 15u;
-            const uint gn = r0 + sg * 32u + cm_n * 16u + c;
+            const uint gn = r0 + sg * 16u + c;
             if (m < tile_cnt && gn < pc.n_out) {
-                y[s_slots[m] * pc.n_out + gn] = stage_sh[sg_stage + m * STAGE_STRIDE + c];
+                y[s_slots[m] * pc.n_out + gn] = stage_sh[sg_stage + m_in_16 * STAGE_STRIDE + c];
             }
         }
         controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);

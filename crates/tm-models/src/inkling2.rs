@@ -17,19 +17,21 @@
 //!   so `25.91 GiB` `Inkling-2-Mini-Q8_0.gguf` runs at full precision on 16 GB RAM hosts without
 //!   Linux page-cache duplication or swap thrashing.
 
+use std::sync::Arc;
+
 use tm_core::{DType, KvType, QK8_0, dequantize_row_bytes, probe_system_memory};
 use tm_cpu::{
-    HugePageBytes, KernelTable, MAX_CPU_BATCH, MatvecScratch, ThreadPool, matmul_f32,
-    matvec_batch_f32_unquant_act, matvec_f32, matvec_f32_unquant_act, release_mmap_page_cache,
-    rms_norm, rms_norm_unit_inplace, softcap_inplace_parallel,
+    HugePageAlignedPin, HugePageBytes, KernelTable, MAX_CPU_BATCH, MatvecScratch, ThreadPool,
+    matmul_f32, matvec_batch_f32_unquant_act, matvec_f32, matvec_f32_unquant_act,
+    release_mmap_page_cache, rms_norm, rms_norm_unit_inplace, softcap_inplace_parallel,
 };
 use tm_gguf::{DirectTensorReader, GgufError, GgufFile, PageAlignedSlot};
 
 use crate::llama::ModelError;
 use crate::state::{LayerState, MAX_SPEC_WINDOW, SpecVerifyBuf, decode_embedding_row};
 
-/// Maximum multi-token lockstep window for `eval_moe_experts_window_f32` (`DSpark` verify + 128-tok prefill).
-pub const MAX_INKLING2_WINDOW: usize = 128;
+/// Maximum multi-token lockstep window for `eval_moe_experts_window_f32` (`DSpark` verify + 256-tok prefill).
+pub const MAX_INKLING2_WINDOW: usize = 256;
 
 /// Controller indices for `inkling2_loop` cross-pass messages (`inkling2-loop.cpp:48-50`).
 pub const LOOP_CTRL_Q: usize = 0;
@@ -189,7 +191,7 @@ pub struct Inkling2PlacementStats {
 pub enum BytesBacking<'a> {
     Borrowed(&'a [u8]),
     Owned(Vec<u8>),
-    HugePage(HugePageBytes),
+    HugePage(Arc<HugePageBytes>),
 }
 
 impl<'a> BytesBacking<'a> {
@@ -1120,11 +1122,11 @@ impl<'a> Inkling2Model<'a> {
                     &ltag,
                     &[n_ff, n_embd, n_exp],
                 )?;
-                let (gu_backing, dn_backing) = if skip_dense && gu_bytes.len() >= 2 * 1024 * 1024 {
-                    // Hybrid GPU+CPU mode on large MoE checkpoints: stage host experts into
-                    // `2 MiB` `MADV_HUGEPAGE` anonymous memory and immediately release the `4 KiB`
-                    // file-backed page cache (`MADV_DONTNEED`) to eliminate nested KVM EPT / TLB
-                    // misses without duplicating host RAM!
+                let (gu_backing, dn_backing) = if skip_dense {
+                    // Hybrid GPU+CPU mode: stage host experts into `2 MiB` `MADV_HUGEPAGE`
+                    // anonymous memory (enabling both zero-TLB-miss CPU `AVX2` decode AND zero-copy
+                    // `VK_EXT_external_memory_host` PCIe TensorCore prefill!) and immediately
+                    // release the `4 KiB` file-backed page cache (`MADV_DONTNEED`).
                     let mut gu_hp = HugePageBytes::new_zeroed(gu_bytes.len());
                     gu_hp.as_mut_slice().copy_from_slice(gu_bytes);
                     release_mmap_page_cache(gu_bytes);
@@ -1133,7 +1135,10 @@ impl<'a> Inkling2Model<'a> {
                     release_mmap_page_cache(dn_bytes);
                     stats.ram_owned_expert_layers += 1;
                     stats.ram_owned_bytes += (gu_bytes.len() + dn_bytes.len()) as u64;
-                    (BytesBacking::HugePage(gu_hp), BytesBacking::HugePage(dn_hp))
+                    (
+                        BytesBacking::HugePage(Arc::new(gu_hp)),
+                        BytesBacking::HugePage(Arc::new(dn_hp)),
+                    )
                 } else {
                     stats.ram_mmap_expert_layers += 1;
                     (
@@ -1166,12 +1171,15 @@ impl<'a> Inkling2Model<'a> {
                     &[n_ff, n_embd, n_exp],
                 )?;
                 let dn_dt = dn_info.dtype;
-                let (gu_backing, dn_backing) = if gu_len >= 2 * 1024 * 1024 {
+                let (gu_backing, dn_backing) = if skip_dense || gu_len >= 2 * 1024 * 1024 {
                     let mut gu_hp = HugePageBytes::new_zeroed(gu_len);
                     rdr.read_exact_uncached(gu_off, gu_hp.as_mut_slice(), &mut io_slot)?;
                     let mut dn_hp = HugePageBytes::new_zeroed(dn_len);
                     rdr.read_exact_uncached(dn_off, dn_hp.as_mut_slice(), &mut io_slot)?;
-                    (BytesBacking::HugePage(gu_hp), BytesBacking::HugePage(dn_hp))
+                    (
+                        BytesBacking::HugePage(Arc::new(gu_hp)),
+                        BytesBacking::HugePage(Arc::new(dn_hp)),
+                    )
                 } else {
                     let mut gu_owned = vec![0u8; gu_len];
                     rdr.read_exact_uncached(gu_off, &mut gu_owned, &mut io_slot)?;
@@ -1387,6 +1395,36 @@ impl<'a> Inkling2Model<'a> {
         }
     }
 
+    /// Returns `(gate_up_pin, gate_up_logical_bytes, down_pin, down_logical_bytes)` if physical
+    /// layer `ip` holds `Q8_0` experts in `2 MiB`-aligned anonymous `HugePageBytes`, enabling
+    /// zero-copy `VK_EXT_external_memory_host` GPU TensorCore prefill without extra RAM/VRAM!
+    #[allow(clippy::type_complexity)]
+    pub fn host_importable_expert_pins(
+        &self,
+        ip: usize,
+    ) -> Option<(
+        Arc<dyn AsRef<[u8]> + Send + Sync>,
+        usize,
+        Arc<dyn AsRef<[u8]> + Send + Sync>,
+        usize,
+    )> {
+        match self.layers.get(ip)?.experts {
+            ExpertLayerStore::InMemory {
+                gate_up: BytesBacking::HugePage(ref gu_hp),
+                gate_up_dtype: DType::Q8_0,
+                down: BytesBacking::HugePage(ref dn_hp),
+                down_dtype: DType::Q8_0,
+                ..
+            } => Some((
+                Arc::new(HugePageAlignedPin(Arc::clone(gu_hp))),
+                gu_hp.as_slice().len(),
+                Arc::new(HugePageAlignedPin(Arc::clone(dn_hp))),
+                dn_hp.as_slice().len(),
+            )),
+            _ => None,
+        }
+    }
+
     /// Evaluates selected MoE experts across a window of `window_len` (`1 <= W <= MAX_SPEC_WINDOW`)
     /// tokens simultaneously by **grouping unique expert IDs** (`0..n_expert`), so every requested
     /// NVMe `O_DIRECT` or Host RAM expert is read **at most once** across all `W` tokens while
@@ -1434,13 +1472,13 @@ impl<'a> Inkling2Model<'a> {
             return;
         }
 
-        // Build deduplicated expert table (`n_uniq <= n_expert`, 128-bit token mask per unique expert)
+        // Build deduplicated expert table (`n_uniq <= n_expert`, 256-bit token mask per unique expert)
         // with zero heap allocations (`AGENTS.md` Rule #4).
         const MAX_UNIQ_EXPS: usize = 512;
         let n_expert = self.cfg.n_expert;
         assert!(n_expert <= MAX_UNIQ_EXPS);
         let mut uniq_exps = [0usize; MAX_UNIQ_EXPS];
-        let mut uniq_mask = [[0u64; 2]; MAX_UNIQ_EXPS];
+        let mut uniq_mask = [[0u64; 4]; MAX_UNIQ_EXPS];
         let mut exp_to_u = [u16::MAX; MAX_UNIQ_EXPS];
         let mut uniq_kslot = [[0u8; MAX_INKLING2_WINDOW]; MAX_UNIQ_EXPS];
         let mut n_uniq = 0usize;
@@ -1469,7 +1507,10 @@ impl<'a> Inkling2Model<'a> {
         let mut uniq_mcnt = [0usize; MAX_UNIQ_EXPS];
         let mut order = [0usize; MAX_UNIQ_EXPS];
         for u in 0..n_uniq {
-            uniq_mcnt[u] = (uniq_mask[u][0].count_ones() + uniq_mask[u][1].count_ones()) as usize;
+            uniq_mcnt[u] = (uniq_mask[u][0].count_ones()
+                + uniq_mask[u][1].count_ones()
+                + uniq_mask[u][2].count_ones()
+                + uniq_mask[u][3].count_ones()) as usize;
             order[u] = u;
         }
         order[..n_uniq]
