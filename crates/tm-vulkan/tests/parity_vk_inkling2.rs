@@ -314,10 +314,10 @@ fn parity_vk_inkling2_pure_gpu_and_3tier_hybrid() {
     );
 
     // 4. Batched-GEMM prefill window (`W = 10 >= 8`, `save_conv_snapshots = false`):
-    //    Repeat the 7-token sequence to 10 tokens (`[5,12,29,41,7,63,18,5,12,29]`), verify that
-    //    `forward_window_hybrid` (using `gemm_tiled` + 2D router top-k) matches sequential
-    //    single-token `forward_token_hybrid` on both pure-GPU and 3-tier hybrid runners!
-    let toks10 = [5u32, 12, 29, 41, 7, 63, 18, 5, 12, 29];
+    //    Extend the 7-token sequence to 10 tokens (`[5,12,29,41,7,63,18,15,2,3]`, `min_router_margin > 6e-3`),
+    //    verifying `forward_window_hybrid` (2D batched prefill + grouped MoE) matches sequential
+    //    single-token `forward_token_hybrid` across all 10 tokens on both pure-GPU and 3-tier hybrid runners!
+    let toks10 = [5u32, 12, 29, 41, 7, 63, 18, 15, 2, 3];
     runner.reset_state().unwrap();
     for (s, &tid) in toks10.iter().enumerate() {
         let _ = runner.forward_token(tid, s, s + 1 == toks10.len()).unwrap();
@@ -330,9 +330,31 @@ fn parity_vk_inkling2_pure_gpu_and_3tier_hybrid() {
     runner.reset_state().unwrap();
     let mut win10_am = [0u32; 10];
     let win_pure_last = runner
-        .forward_window_hybrid(&toks10, 0, true, false, &[], None, Some(&mut win10_am))
+        .forward_window_hybrid(
+            &toks10,
+            0,
+            true,
+            false,
+            &tap_visits,
+            None,
+            Some(&mut win10_am),
+        )
         .unwrap()
         .to_vec();
+    let mut taps10 = vec![0.0f32; 10 * tap_visits.len() * 64];
+    runner
+        .read_dspark_taps(10, tap_visits.len(), &mut taps10)
+        .unwrap();
+    for s in 0..4 {
+        let base_a = s * tap_visits.len() * 64;
+        let base_b = s * tap_visits.len() * 64;
+        for d in 0..(tap_visits.len() * 64) {
+            assert!(
+                (taps10[base_a + d] - taps_read[base_b + d]).abs() < 5e-3,
+                "W=10 batched tap mismatch vs W=4 tap at tok {s} dim {d}"
+            );
+        }
+    }
     assert_eq!(argmax(&win_pure_last), argmax(&seq_pure_last));
     let mut max_diff_w10_pure = 0.0f32;
     for (&a, &b) in win_pure_last.iter().zip(seq_pure_last.iter()) {
@@ -385,6 +407,7 @@ fn parity_vk_inkling2_pure_gpu_and_3tier_hybrid() {
             .unwrap()
             .to_vec()
     };
+    assert_eq!(win10_hyb_am, win10_am);
     assert_eq!(argmax(&win_hyb_last), argmax(&seq_pure_last));
     let mut max_diff_w10_hyb = 0.0f32;
     for (&a, &b) in win_hyb_last.iter().zip(seq_pure_last.iter()) {

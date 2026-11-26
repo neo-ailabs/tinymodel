@@ -76,11 +76,18 @@ void main() {
     const uint gid = gl_GlobalInvocationID.x;
 
     if (pc.op == 0u) {
-        // RMSNorm: `p0 = dim`, `p1 = in_off`, `p2 = out_off`, `p3 = has_weight`, `u5 = eps_bits`, `p4 = w_off`
+        // RMSNorm: `p0 = dim`, `p1 = in_off`, `p2 = out_off | (out_mult << 24)`, `p3 = has_weight`,
+        // `u5 = eps_bits`, `u6 = in_tok_stride` when `gl_NumWorkGroups.y > 1`, `p4 = w_off`.
         const uint row = gl_WorkGroupID.x;
+        const uint tok = gl_WorkGroupID.y;
         const uint dim = pc.p0;
-        const uint in_base = pc.p1 + row * dim;
-        const uint out_base = pc.p2 + row * dim;
+        const uint def_stride = gl_NumWorkGroups.x * dim;
+        const uint out_mult = pc.p2 >> 24u;
+        const uint out_off = pc.p2 & 0xFFFFFFu;
+        const uint in_tok_stride = (pc.u6 != 0u) ? pc.u6 : def_stride;
+        const uint out_tok_stride = (out_mult != 0u) ? (out_mult * dim) : def_stride;
+        const uint in_base = tok * in_tok_stride + pc.p1 + row * dim;
+        const uint out_base = tok * out_tok_stride + out_off + row * dim;
         const float eps = uintBitsToFloat(pc.u5);
         float ss = 0.0;
         for (uint i = tid; i < dim; i += WG) {
@@ -99,17 +106,20 @@ void main() {
             }
         }
     } else if (pc.op == 1u) {
-        // Per-head L2 clip: `p0 = dim`, `p1 = has_scale`, `p2 = scale_off`, `u5 = thresh_bits`, `u6 = tau_bits`
+        // Per-head L2 clip: `p0 = dim`, `p1 = has_scale`, `p2 = scale_off`, `u5 = thresh_bits`,
+        // `u6 = tau_bits` (or `b2[tok]` when `p4 != 0`), `gl_WorkGroupID.y = tok`.
         const uint h = gl_WorkGroupID.x;
+        const uint tok = gl_WorkGroupID.y;
         const uint dim = pc.p0;
-        const uint base = h * dim;
+        const uint w_base = h * dim;
+        const uint base = (tok * gl_NumWorkGroups.x + h) * dim;
         const float thresh = uintBitsToFloat(pc.u5);
-        const float tau = uintBitsToFloat(pc.u6);
+        const float tau = (pc.p4 != 0u) ? b2[tok] : uintBitsToFloat(pc.u6);
         float ss = 0.0;
         for (uint i = tid; i < dim; i += WG) {
             float v = b0[base + i];
             if (pc.p1 != 0u) {
-                v *= b1[pc.p2 + base + i];
+                v *= b1[pc.p2 + w_base + i];
                 b0[base + i] = v;
             }
             ss = fma(v, v, ss);
@@ -165,25 +175,29 @@ void main() {
         const float inv_scale = inversesqrt(float(mult * n_conv + 1u));
         b0[c] = (cur_c + acc) * inv_scale;
     } else if (pc.op == 3u) {
-        // Depth-attention `mix`: `p0 = n_embd`, `p1 = n_blocks`, `p2 = query_off`, `p3 = out_off`
+        // Depth-attention `mix`: `p0 = n_embd`, `p1 = n_blocks`, `p2 = query_off`, `p3 = out_off`,
+        // `p4 = state_tok_stride`, `u5 = blocks_sub_off`, `u6 = cur_sub_off`, `gl_WorkGroupID.y = tok`.
         const uint q_idx = gl_WorkGroupID.x;
+        const uint tok = gl_WorkGroupID.y;
         const uint n_embd = pc.p0;
         const uint n_blocks = pc.p1;
         const uint m = n_blocks + 1u;
         const uint q_base = pc.p2 + q_idx * n_embd;
+        const uint blk_tok_base = tok * pc.p4 + pc.u5;
+        const uint cur_tok_base = tok * pc.p4 + pc.u6;
         const float scale = inversesqrt(float(n_embd));
 
         for (uint r = 0u; r < m; ++r) {
             float ss = 0.0;
             if (r < n_blocks) {
-                const uint sb = (n_blocks - 1u - r) * n_embd;
+                const uint sb = blk_tok_base + (n_blocks - 1u - r) * n_embd;
                 for (uint i = tid; i < n_embd; i += WG) {
                     const float v = b0[sb + i];
                     ss = fma(v, v, ss);
                 }
             } else {
                 for (uint i = tid; i < n_embd; i += WG) {
-                    const float v = b1[i];
+                    const float v = b1[cur_tok_base + i];
                     ss = fma(v, v, ss);
                 }
             }
@@ -195,13 +209,13 @@ void main() {
 
             float dq = 0.0;
             if (r < n_blocks) {
-                const uint sb = (n_blocks - 1u - r) * n_embd;
+                const uint sb = blk_tok_base + (n_blocks - 1u - r) * n_embd;
                 for (uint i = tid; i < n_embd; i += WG) {
                     dq = fma(b0[sb + i] * inv, b2[q_base + i], dq);
                 }
             } else {
                 for (uint i = tid; i < n_embd; i += WG) {
-                    dq = fma(b1[i] * inv, b2[q_base + i], dq);
+                    dq = fma(b1[cur_tok_base + i] * inv, b2[q_base + i], dq);
                 }
             }
             const float sc = wg_reduce_sum(dq, tid) * scale;
@@ -229,27 +243,37 @@ void main() {
         }
         barrier();
 
-        const uint out_base = pc.p3 + q_idx * n_embd;
+        const uint out_base = pc.p3 + (tok * gl_NumWorkGroups.x + q_idx) * n_embd;
         for (uint i = tid; i < n_embd; i += WG) {
             float acc = 0.0;
             for (uint r = 0u; r < n_blocks; ++r) {
-                const uint sb = (n_blocks - 1u - r) * n_embd;
+                const uint sb = blk_tok_base + (n_blocks - 1u - r) * n_embd;
                 acc = fma(s_scores[r], b0[sb + i] * s_inv_rms[r], acc);
             }
-            acc = fma(s_scores[n_blocks], b1[i] * s_inv_rms[n_blocks], acc);
+            acc = fma(s_scores[n_blocks], b1[cur_tok_base + i] * s_inv_rms[n_blocks], acc);
             b3[out_base + i] = acc;
         }
     } else if (pc.op == 4u) {
+        // Cross-pass gated controller (`gl_WorkGroupID.y = tok`):
+        // `p0 = n_embd`, `p1 = cur_off`, `p2 = msg_off`, `p3 = cur_tok_stride`, `u5 = msg_tok_stride`
         if (gid >= pc.p0) return;
-        const float x = b0[pc.p1 + gid];
-        const float g = accurate_tanh(b2[gid]);
-        const float fg = accurate_tanh(b3[gid]);
-        b0[pc.p1 + gid] = (x - fg * x) + g * b1[pc.p2 + gid];
+        const uint tok = gl_WorkGroupID.y;
+        const uint xi = tok * pc.p3 + pc.p1 + gid;
+        const uint mi = tok * pc.u5 + pc.p2 + gid;
+        const uint gi = tok * pc.p0 + gid;
+        const float x = b0[xi];
+        const float g = accurate_tanh(b2[gi]);
+        const float fg = accurate_tanh(b3[gi]);
+        b0[xi] = (x - fg * x) + g * b1[mi];
     } else if (pc.op == 5u) {
+        // Pack `Kcur` & `Vcur` (`f32 -> f16`) across `gl_WorkGroupID.y = tok`:
+        // `p0 = kv_pairs`, `p1 = dst_u32_off`
         if (gid >= pc.p0) return;
-        const uint i0 = gid * 2u;
-        b4_u32[pc.p1 + gid] = packHalf2x16(vec2(b0[i0], b0[i0 + 1u]));
-        b5_u32[pc.p1 + gid] = packHalf2x16(vec2(b1[i0], b1[i0 + 1u]));
+        const uint tok = gl_WorkGroupID.y;
+        const uint i0 = (tok * pc.p0 + gid) * 2u;
+        const uint dst = pc.p1 + tok * pc.p0 + gid;
+        b4_u32[dst] = packHalf2x16(vec2(b0[i0], b0[i0 + 1u]));
+        b5_u32[dst] = packHalf2x16(vec2(b1[i0], b1[i0 + 1u]));
     } else if (pc.op == 6u) {
         if (gid >= pc.p0) return;
         if (pc.p1 == 0u) {
@@ -260,6 +284,80 @@ void main() {
             const float cap = uintBitsToFloat(pc.u5);
             const float v = b1[pc.p3 + gid];
             b0[pc.p2 + gid] = (cap > 0.0) ? (cap * accurate_tanh(v / cap)) : v;
+        }
+    } else if (pc.op == 7u) {
+        // Strided 2D vector utility across `gl_WorkGroupID.y = tok`:
+        // `p0 = len`, `p1 = sub_op (0=add, 1=copy)`, `p2 = dst_off`, `p3 = a_off`,
+        // `p4 = dst_stride`, `u5 = a_stride`, `u6 = b_off` (`b_stride = len`)
+        if (gid >= pc.p0) return;
+        const uint tok = gl_WorkGroupID.y;
+        const uint di = tok * pc.p4 + pc.p2 + gid;
+        const uint ai = tok * pc.u5 + pc.p3 + gid;
+        if (pc.p1 == 0u) {
+            b0[di] = b1[ai] + b2[tok * pc.p0 + pc.u6 + gid];
+        } else {
+            b0[di] = b1[ai];
+        }
+    } else if (pc.op == 8u) {
+        // Multi-token causal ShortConv across `n_tok = pc.u6` tokens in registers (`1` dispatch/window!):
+        // `p0 = n_channels`, `p1 = n_conv (<= 9)`, `p2 = chan_offset`, `p3 = dyn_heads`,
+        // `u5 = weight_off`, `u6 = n_tok`, `p4 = slot_hist_base`
+        if (gid >= pc.p0) return;
+        const uint n_channels = pc.p0;
+        const uint n_conv = pc.p1;
+        const uint hist_len = n_conv - 1u;
+        const uint chan_offset = pc.p2;
+        const uint dyn_heads = pc.p3;
+        const uint weight_off = pc.u5;
+        const uint n_tok = pc.u6;
+        const uint slot_hist_base = pc.p4;
+
+        const uint c = gid;
+        const uint h_off = slot_hist_base + (chan_offset + c) * hist_len;
+        const uint w_off = weight_off + c * n_conv;
+        const uint mult = (dyn_heads > 0u) ? 2u : 1u;
+        const float inv_scale = inversesqrt(float(mult * n_conv + 1u));
+        const uint ch_per_head = (dyn_heads > 0u) ? (n_channels / dyn_heads) : 1u;
+        const uint h_idx = c / ch_per_head;
+        const uint dyn_tok_stride = dyn_heads * n_conv;
+
+        float hist[8];
+        float w_stat[9];
+        for (uint k = 0u; k < hist_len; ++k) {
+            hist[k] = b3[h_off + k];
+            w_stat[k] = b1[w_off + k];
+        }
+        w_stat[hist_len] = b1[w_off + hist_len];
+
+        for (uint tok = 0u; tok < n_tok; ++tok) {
+            const uint idx = tok * n_channels + c;
+            const float cur_c = b0[idx];
+            float acc = 0.0;
+            for (uint k = 0u; k < hist_len; ++k) {
+                acc = fma(hist[k], w_stat[k], acc);
+            }
+            acc = fma(cur_c, w_stat[hist_len], acc);
+
+            if (dyn_heads > 0u) {
+                const uint tap_base = tok * dyn_tok_stride + h_idx * n_conv;
+                float dyn_acc = cur_c * b2[tap_base];
+                for (uint lag = 1u; lag < n_conv; ++lag) {
+                    dyn_acc = fma(hist[hist_len - lag], b2[tap_base + lag], dyn_acc);
+                }
+                acc += dyn_acc;
+            }
+
+            for (uint k = 0u; k + 1u < hist_len; ++k) {
+                hist[k] = hist[k + 1u];
+            }
+            if (hist_len > 0u) {
+                hist[hist_len - 1u] = cur_c;
+            }
+            b0[idx] = (cur_c + acc) * inv_scale;
+        }
+
+        for (uint k = 0u; k < hist_len; ++k) {
+            b3[h_off + k] = hist[k];
         }
     }
 }

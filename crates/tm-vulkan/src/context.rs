@@ -2,8 +2,33 @@
 
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+#[derive(Default)]
+pub(crate) struct FxHasher(u64);
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(b)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+type FxBuildHasher = BuildHasherDefault<FxHasher>;
 
 use ash::vk;
 use ash::vk::Handle;
@@ -170,17 +195,35 @@ pub(crate) struct Pipeline {
     pub(crate) name: &'static str,
 }
 
-struct Exec {
+struct ExecSlot {
     pool: vk::CommandPool,
     cb: vk::CommandBuffer,
     fence: vk::Fence,
     desc_pool: vk::DescriptorPool,
+    dirty_desc: bool,
+}
+
+struct Exec {
+    slots: [ExecSlot; 2],
     staging: Option<VkBuffer>,
+}
+
+/// A command buffer recorded on the CPU (`prepare_cb`) and ready for zero-latency `submit_prepared`.
+pub(crate) struct PreparedCb {
+    pub(crate) slot_idx: usize,
+    pub(crate) rec_ns: u64,
+}
+
+/// A submitted command buffer currently executing on the GPU (`wait_in_flight`).
+pub(crate) struct InFlightCb {
+    pub(crate) slot_idx: usize,
+    pub(crate) rec_ns: u64,
+    submit_t0: std::time::Instant,
 }
 
 pub(crate) struct DescCache {
     pool: vk::DescriptorPool,
-    map: HashMap<(u64, [u64; MAX_CACHED_BINDINGS]), vk::DescriptorSet>,
+    map: HashMap<(u64, [u64; MAX_CACHED_BINDINGS]), vk::DescriptorSet, FxBuildHasher>,
 }
 
 /// One recorded dispatch-batch; created by [`VulkanContext::run`].
@@ -190,6 +233,7 @@ pub(crate) struct Recorder<'a> {
     desc_pool: vk::DescriptorPool,
     desc_cache: &'a mut DescCache,
     last_pipeline: vk::Pipeline,
+    used_transient_descs: bool,
 }
 
 /// The selected Vulkan device, its compute queue, and a pipeline cache.
@@ -769,7 +813,7 @@ impl VulkanContext {
         Ok((probe, pdev, device, queue))
     }
 
-    fn create_exec(inner: &Arc<Inner>, queue_family: u32) -> Result<Exec, VulkanError> {
+    fn create_exec_slot(inner: &Arc<Inner>, queue_family: u32) -> Result<ExecSlot, VulkanError> {
         let d = &inner.device;
         // SAFETY: valid device; created objects are destroyed in `VulkanContext::drop`.
         unsafe {
@@ -804,14 +848,23 @@ impl VulkanContext {
                     None,
                 )
                 .ctx("vkCreateDescriptorPool")?;
-            Ok(Exec {
+            Ok(ExecSlot {
                 pool,
                 cb,
                 fence,
                 desc_pool,
-                staging: None,
+                dirty_desc: false,
             })
         }
+    }
+
+    fn create_exec(inner: &Arc<Inner>, queue_family: u32) -> Result<Exec, VulkanError> {
+        let s0 = Self::create_exec_slot(inner, queue_family)?;
+        let s1 = Self::create_exec_slot(inner, queue_family)?;
+        Ok(Exec {
+            slots: [s0, s1],
+            staging: None,
+        })
     }
 
     fn create_desc_cache(inner: &Arc<Inner>) -> Result<DescCache, VulkanError> {
@@ -832,7 +885,7 @@ impl VulkanContext {
         };
         Ok(DescCache {
             pool,
-            map: HashMap::with_capacity(1024),
+            map: HashMap::with_capacity_and_hasher(2048, FxBuildHasher::default()),
         })
     }
 
@@ -876,6 +929,13 @@ impl VulkanContext {
         if size > limit {
             return Err(VulkanError::BufferTooLarge { bytes: size, limit });
         }
+        // Pad device-local storage buffers by >= 4 bytes (rounded to 4B) so 32-bit `w32[]` loads
+        // at the end of odd-u16 quantized blocks (`BlockQ8_0` = 34B) never cross `VkBuffer` bounds.
+        let vk_size = if host_visible {
+            size
+        } else {
+            (size.saturating_add(7) & !3).min(limit).max(size)
+        };
         let d = &self.inner.device;
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::TRANSFER_SRC
@@ -885,7 +945,7 @@ impl VulkanContext {
             let buf = d
                 .create_buffer(
                     &vk::BufferCreateInfo::default()
-                        .size(size)
+                        .size(vk_size)
                         .usage(usage)
                         .sharing_mode(vk::SharingMode::EXCLUSIVE),
                     None,
@@ -1406,25 +1466,30 @@ impl VulkanContext {
         self.run_timed(f).map(|_| ())
     }
 
-    /// Same as [`Self::run`], returning `(record_ns, total_ns)` wall-clock timings
-    /// (`record_ns` = time inside `f`; `total_ns` = whole call incl. submit + fence wait).
-    pub(crate) fn run_timed<F>(&self, f: F) -> Result<(u64, u64), VulkanError>
+    /// Records commands via `f` into slot `slot_idx` (`0` or `1`) **without** submitting yet,
+    /// allowing CPU recording of segment `s + 1` in `slot_idx = 1 - cur` to overlap GPU execution
+    /// of segment `s` in `cur`.
+    pub(crate) fn prepare_cb<F>(&self, slot_idx: usize, f: F) -> Result<PreparedCb, VulkanError>
     where
         F: FnOnce(&mut Recorder<'_>) -> Result<(), VulkanError>,
     {
-        let t_total = std::time::Instant::now();
-        let (cb, fence, desc_pool) = {
-            let e = self.exec.lock().map_err(|_| VulkanError::NoDevice)?;
-            (e.cb, e.fence, e.desc_pool)
+        let (cb, desc_pool, was_dirty) = {
+            let mut e = self.exec.lock().map_err(|_| VulkanError::NoDevice)?;
+            let s = &mut e.slots[slot_idx];
+            let dirty = s.dirty_desc;
+            s.dirty_desc = false;
+            (s.cb, s.desc_pool, dirty)
         };
         let d = &self.inner.device;
-        // SAFETY: single-threaded use of the command buffer is enforced by taking `&self`
-        // in synchronous calls only (each call waits for completion before returning).
+        // SAFETY: caller guarantees `slots[slot_idx]` has no in-flight GPU work (`wait_in_flight`
+        // completed for any prior submission on `slot_idx`).
         unsafe {
             d.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
                 .ctx("vkResetCommandBuffer")?;
-            d.reset_descriptor_pool(desc_pool, vk::DescriptorPoolResetFlags::empty())
-                .ctx("vkResetDescriptorPool")?;
+            if was_dirty {
+                d.reset_descriptor_pool(desc_pool, vk::DescriptorPoolResetFlags::empty())
+                    .ctx("vkResetDescriptorPool")?;
+            }
             d.begin_command_buffer(
                 cb,
                 &vk::CommandBufferBeginInfo::default()
@@ -1453,15 +1518,19 @@ impl VulkanContext {
             desc_pool,
             desc_cache: &mut dc_guard,
             last_pipeline: vk::Pipeline::null(),
+            used_transient_descs: false,
         };
         let t_rec = std::time::Instant::now();
         let r = f(&mut rec);
         let rec_ns = t_rec.elapsed().as_nanos() as u64;
+        let used_transient = rec.used_transient_descs;
         drop(dc_guard);
-        // SAFETY: as above; the fence is unsignaled (reset after every wait).
+        if used_transient {
+            let mut e = self.exec.lock().map_err(|_| VulkanError::NoDevice)?;
+            e.slots[slot_idx].dirty_desc = true;
+        }
+        // SAFETY: `cb` is recording; record explicit `HOST_READ` epilogue barrier before ending.
         unsafe {
-            // Vulkan 1.2 §7.9: `vkWaitForFences` alone does not flush discrete GPU L2/Mall caches
-            // (`SHADER_WRITE | TRANSFER_WRITE`) to `HOST_READ`; record an explicit epilogue barrier.
             let host_out = [vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::HOST_READ)];
@@ -1475,16 +1544,62 @@ impl VulkanContext {
                 &[],
             );
             d.end_command_buffer(cb).ctx("vkEndCommandBuffer")?;
-            r?;
-            let cbs = [cb];
-            let submit = [vk::SubmitInfo::default().command_buffers(&cbs)];
-            d.queue_submit(self.inner.queue, &submit, fence)
+        }
+        r?;
+        Ok(PreparedCb { slot_idx, rec_ns })
+    }
+
+    /// Submits a previously prepared command buffer to the compute queue and returns immediately.
+    pub(crate) fn submit_prepared(&self, prep: PreparedCb) -> Result<InFlightCb, VulkanError> {
+        let (cb, fence) = {
+            let e = self.exec.lock().map_err(|_| VulkanError::NoDevice)?;
+            let s = &e.slots[prep.slot_idx];
+            (s.cb, s.fence)
+        };
+        let cbs = [cb];
+        let submit = [vk::SubmitInfo::default().command_buffers(&cbs)];
+        let submit_t0 = std::time::Instant::now();
+        // SAFETY: `cb` is in the executable state, no other submission uses `fence`, and queue
+        // submissions are serialized on the caller thread.
+        unsafe {
+            self.inner
+                .device
+                .queue_submit(self.inner.queue, &submit, fence)
                 .ctx("vkQueueSubmit")?;
+        }
+        Ok(InFlightCb {
+            slot_idx: prep.slot_idx,
+            rec_ns: prep.rec_ns,
+            submit_t0,
+        })
+    }
+
+    /// Waits for an in-flight command buffer to complete and returns `(record_ns, total_ns)`.
+    pub(crate) fn wait_in_flight(&self, inf: InFlightCb) -> Result<(u64, u64), VulkanError> {
+        let fence = {
+            let e = self.exec.lock().map_err(|_| VulkanError::NoDevice)?;
+            e.slots[inf.slot_idx].fence
+        };
+        let d = &self.inner.device;
+        // SAFETY: `fence` was signaled by `submit_prepared` and is reset upon completion.
+        unsafe {
             d.wait_for_fences(&[fence], true, u64::MAX)
                 .ctx("vkWaitForFences")?;
             d.reset_fences(&[fence]).ctx("vkResetFences")?;
         }
-        Ok((rec_ns, t_total.elapsed().as_nanos() as u64))
+        let wait_ns = inf.submit_t0.elapsed().as_nanos() as u64;
+        Ok((inf.rec_ns, inf.rec_ns.saturating_add(wait_ns)))
+    }
+
+    /// Same as [`Self::run`], returning `(record_ns, total_ns)` wall-clock timings
+    /// (`record_ns` = time inside `f`; `total_ns` = whole call incl. submit + fence wait).
+    pub(crate) fn run_timed<F>(&self, f: F) -> Result<(u64, u64), VulkanError>
+    where
+        F: FnOnce(&mut Recorder<'_>) -> Result<(), VulkanError>,
+    {
+        let prep = self.prepare_cb(0, f)?;
+        let inf = self.submit_prepared(prep)?;
+        self.wait_in_flight(inf)
     }
 }
 
@@ -1641,10 +1756,13 @@ impl Recorder<'_> {
                 };
                 if target_pool.is_some() {
                     self.desc_cache.map.insert(key, new_set);
+                } else {
+                    self.used_transient_descs = true;
                 }
                 new_set
             }
         } else {
+            self.used_transient_descs = true;
             let infos: Vec<vk::DescriptorBufferInfo> = bufs
                 .iter()
                 .map(|b| vk::DescriptorBufferInfo {
@@ -1738,9 +1856,11 @@ impl Drop for VulkanContext {
             }
             if let Ok(mut e) = self.exec.lock() {
                 e.staging = None;
-                d.destroy_descriptor_pool(e.desc_pool, None);
-                d.destroy_fence(e.fence, None);
-                d.destroy_command_pool(e.pool, None);
+                for s in &e.slots {
+                    d.destroy_descriptor_pool(s.desc_pool, None);
+                    d.destroy_fence(s.fence, None);
+                    d.destroy_command_pool(s.pool, None);
+                }
             }
         }
     }

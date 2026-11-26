@@ -1,0 +1,141 @@
+#version 450
+// Subgroup-portable LDS-tiled (`BM=16, BN=64, BK=32`, `WG=128`) expert-grouped `Q8_0 x F32` MoE GEMM.
+// Reads each active expert's `Q8_0` weights ONCE per `BM=16` routed tokens instead of once per token!
+//
+// Bindings:
+//   0: `w16`     - expert `Q8_0` weight bank (`[n_exp, n_out, n_in]`)
+//   1: `x4`      - input activations (`[w, n_in]` if `shared_x_top_k != 0`, else `[w * top_k, n_in]`)
+//   2: `tiles`   - tile table built by `inkling2_moe.comp (op == 4)`
+//   3: `y`       - output buffer (`[w * top_k, n_out]`)
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(constant_id = 0) const uint WG = 128;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer W16   { uint16_t w16[]; };
+layout(std430, binding = 1) readonly buffer X4    { vec4     x4[]; };
+layout(std430, binding = 2) readonly buffer Tiles { uint     tiles[]; };
+layout(std430, binding = 3) buffer          OutY  { float    y[]; };
+
+layout(push_constant) uniform PC {
+    uint n_in;
+    uint n_out;
+    uint row_u16s;
+    uint expert_u16s;
+    uint shared_x_top_k;
+} pc;
+
+shared uint  s_slots[16];
+shared uint  s_xrows[16];
+shared float X_sh[16][33];
+shared float W_sh[32][65];
+
+int sbyte_lo(uint u16) { return bitfieldExtract(int(u16), 0, 8); }
+int sbyte_hi(uint u16) { return bitfieldExtract(int(u16), 8, 8); }
+
+void store_row4(uint slot, uint gn0, vec4 c) {
+    const uint yb = slot * pc.n_out + gn0;
+    if (gn0 + 0u < pc.n_out) y[yb + 0u] = c.x;
+    if (gn0 + 1u < pc.n_out) y[yb + 1u] = c.y;
+    if (gn0 + 2u < pc.n_out) y[yb + 2u] = c.z;
+    if (gn0 + 3u < pc.n_out) y[yb + 3u] = c.w;
+}
+
+void main() {
+    const uint tile_idx = gl_WorkGroupID.y;
+    if (tile_idx >= tiles[0]) return;
+
+    const uint r0 = gl_WorkGroupID.x * 64u;
+    if (r0 >= pc.n_out) return;
+
+    const uint tb = 4u + tile_idx * 4u;
+    const uint e_id = tiles[tb + 0u];
+    const uint start_pos = tiles[tb + 1u];
+    const uint tile_cnt = tiles[tb + 2u];
+    const uint exp_base = e_id * pc.expert_u16s;
+
+    const uint tid = gl_LocalInvocationID.x;
+    if (tid < 16u) {
+        if (tid < tile_cnt) {
+            const uint sl = tiles[2048u + start_pos + tid];
+            s_slots[tid] = sl;
+            s_xrows[tid] = (pc.shared_x_top_k != 0u) ? (sl / pc.shared_x_top_k) : sl;
+        } else {
+            s_slots[tid] = 0u;
+            s_xrows[tid] = 0u;
+        }
+    }
+    barrier();
+
+    // X loader (`tid < 64` -> `16 rows x 4 sub-lanes`, 8 floats per sub-lane)
+    const uint x_m = tid >> 2u;
+    const uint sub = tid & 3u;
+    const uint load_col = sub * 8u;
+    const uint n_in4 = pc.n_in >> 2u;
+
+    // 8 x 16 compute tile (`tm = 0..14` step 2, `rn = 0..60` step 4) -> 2x4 = 8 outputs/thread
+    const uint tm = (tid >> 4u) * 2u;
+    const uint rn = (tid & 15u) * 4u;
+
+    vec4 c0 = vec4(0.0);
+    vec4 c1 = vec4(0.0);
+
+    const uint nb = pc.n_in >> 5u;
+    for (uint ib = 0u; ib < nb; ++ib) {
+        if (tid < 64u) {
+            if (x_m < tile_cnt) {
+                const uint x4_off = s_xrows[x_m] * n_in4 + ib * 8u + sub * 2u;
+                const vec4 v0 = x4[x4_off + 0u];
+                const vec4 v1 = x4[x4_off + 1u];
+                X_sh[x_m][load_col + 0u] = v0.x; X_sh[x_m][load_col + 1u] = v0.y;
+                X_sh[x_m][load_col + 2u] = v0.z; X_sh[x_m][load_col + 3u] = v0.w;
+                X_sh[x_m][load_col + 4u] = v1.x; X_sh[x_m][load_col + 5u] = v1.y;
+                X_sh[x_m][load_col + 6u] = v1.z; X_sh[x_m][load_col + 7u] = v1.w;
+            } else {
+                [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+                    X_sh[x_m][load_col + j] = 0.0;
+                }
+            }
+        }
+
+        const uint w_row = tid >> 2u; // 0..31
+        [[unroll]] for (uint rp = 0u; rp < 2u; ++rp) {
+            const uint lr = rp * 32u + w_row;
+            if (r0 + lr < pc.n_out) {
+                const uint b = exp_base + (r0 + lr) * pc.row_u16s + ib * 17u;
+                const float d = unpackHalf2x16(uint(w16[b])).x;
+                [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+                    const uint j = sub * 4u + i;
+                    const uint u = uint(w16[b + 1u + j]);
+                    W_sh[2u * j][lr]      = float(sbyte_lo(u)) * d;
+                    W_sh[2u * j + 1u][lr] = float(sbyte_hi(u)) * d;
+                }
+            } else {
+                [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+                    W_sh[load_col + j][lr] = 0.0;
+                }
+            }
+        }
+
+        barrier();
+
+        for (uint k = 0u; k < 32u; ++k) {
+            const float x0 = X_sh[tm + 0u][k];
+            const float x1 = X_sh[tm + 1u][k];
+            const vec4 w = vec4(W_sh[k][rn + 0u], W_sh[k][rn + 1u], W_sh[k][rn + 2u], W_sh[k][rn + 3u]);
+            c0 = fma(vec4(x0), w, c0);
+            c1 = fma(vec4(x1), w, c1);
+        }
+
+        barrier();
+    }
+
+    if (tm + 0u < tile_cnt) {
+        store_row4(s_slots[tm + 0u], r0 + rn, c0);
+    }
+    if (tm + 1u < tile_cnt) {
+        store_row4(s_slots[tm + 1u], r0 + rn, c1);
+    }
+}

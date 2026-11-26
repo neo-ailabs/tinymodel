@@ -14,11 +14,14 @@ layout(constant_id = 1) const uint NR = 4;
 layout(local_size_x_id = 0) in;
 
 layout(std430, binding = 0) readonly buffer W16Buf   { uint16_t w16[]; };
+layout(std430, binding = 0) readonly buffer W32Buf   { uint     w32[]; };
 layout(std430, binding = 1) readonly buffer InXBuf   { float x[]; };
+layout(std430, binding = 1) readonly buffer InX4Buf  { vec4  x4[]; };
 layout(std430, binding = 2) readonly buffer BiasBuf  { float bias_or_w[]; };
 layout(std430, binding = 3) buffer          TopIdBuf { uint  top_ids[]; };
 layout(std430, binding = 4) buffer          TopWBuf  { float top_weights[]; };
 layout(std430, binding = 5) buffer          OutYBuf  { float y[]; };
+layout(std430, binding = 5) buffer          OutU32   { uint  y_u32[]; };
 
 layout(push_constant) uniform PC {
     uint op;
@@ -53,6 +56,8 @@ float accurate_tanh(float x) {
 
 shared float s_probs[256];
 shared float s_sel[256];
+shared uint  s_cnt[256];
+shared uint  s_off[256];
 
 void main() {
     const uint tid = gl_LocalInvocationID.x;
@@ -136,22 +141,24 @@ void main() {
         const uint sub_lane = lane & 7u;
         const uint step_blk = sg_size >> 3u;
         const uint q_u16_off = 1u + (sub_lane << 1u);
-        const uint e0 = sub_lane << 2u;
+        const uint x4_base = x_base >> 2u;
 
         for (uint ib = sub_blk; ib < nb; ib += step_blk) {
-            const uint xb = x_base + ib * 32u + e0;
-            const vec4 xv = vec4(x[xb], x[xb + 1u], x[xb + 2u], x[xb + 3u]);
+            const vec4 xv = x4[x4_base + ib * 8u + sub_lane];
             const uint blk_u16 = ib * 17u;
             for (uint r = 0u; r < NR; ++r) {
                 const uint b = row_b[r] + blk_u16;
-                const float d = unpackHalf2x16(uint(w16[b])).x;
-                const uint u0 = uint(w16[b + q_u16_off]);
-                const uint u1 = uint(w16[b + q_u16_off + 1u]);
+                const uint dw = w32[b >> 1u];
+                const float d = ((b & 1u) == 0u) ? unpackHalf2x16(dw).x : unpackHalf2x16(dw).y;
+                const uint q = b + q_u16_off;
+                const uint q32 = ((q & 1u) == 0u)
+                    ? w32[q >> 1u]
+                    : ((w32[q >> 1u] >> 16u) | (w32[(q >> 1u) + 1u] << 16u));
                 const vec4 q4 = vec4(
-                    float(bitfieldExtract(int(u0), 0, 8)),
-                    float(bitfieldExtract(int(u0), 8, 8)),
-                    float(bitfieldExtract(int(u1), 0, 8)),
-                    float(bitfieldExtract(int(u1), 8, 8))
+                    float(bitfieldExtract(int(q32), 0, 8)),
+                    float(bitfieldExtract(int(q32), 8, 8)),
+                    float(bitfieldExtract(int(q32), 16, 8)),
+                    float(bitfieldExtract(int(q32), 24, 8))
                 );
                 acc[r] = fma(d, dot(q4, xv), acc[r]);
             }
@@ -191,5 +198,56 @@ void main() {
             acc = fma(top_weights[tk_base + k], x[(tk_base + k) * n_embd + gid], acc);
         }
         y[tok * n_embd + gid] = acc;
+    } else if (pc.op == 4u) {
+        // Build expert-grouped `BM`-row tile descriptors on GPU (`1` workgroup of `WG` threads):
+        //   `p0 = n_exp (<= 256)`, `p1 = total_k (w * top_k <= 1024)`, `p2 = bm (16)`
+        //   `y_u32[0] = num_tiles`
+        //   `y_u32[4 + t*4 + 0..2] = (e_id, start_pos, tile_cnt)`
+        //   `y_u32[2048 + pos] = slot` (`0 .. total_k`)
+        const uint n_exp = pc.p0;
+        const uint total_k = pc.p1;
+        const uint bm = pc.p2;
+        for (uint e = tid; e < n_exp; e += WG) {
+            s_cnt[e] = 0u;
+        }
+        barrier();
+
+        for (uint s = tid; s < total_k; s += WG) {
+            const uint e = top_ids[s];
+            if (e < n_exp) {
+                atomicAdd(s_cnt[e], 1u);
+            }
+        }
+        barrier();
+
+        if (tid == 0u) {
+            uint off = 0u;
+            uint nt = 0u;
+            for (uint e = 0u; e < n_exp; ++e) {
+                const uint c = s_cnt[e];
+                s_off[e] = off;
+                s_cnt[e] = 0u;
+                for (uint m0 = 0u; m0 < c; m0 += bm) {
+                    const uint tc = min(bm, c - m0);
+                    const uint tb = 4u + nt * 4u;
+                    y_u32[tb + 0u] = e;
+                    y_u32[tb + 1u] = off + m0;
+                    y_u32[tb + 2u] = tc;
+                    y_u32[tb + 3u] = 0u;
+                    nt += 1u;
+                }
+                off += c;
+            }
+            y_u32[0] = nt;
+        }
+        barrier();
+
+        for (uint s = tid; s < total_k; s += WG) {
+            const uint e = top_ids[s];
+            if (e < n_exp) {
+                const uint pos = s_off[e] + atomicAdd(s_cnt[e], 1u);
+                y_u32[2048u + pos] = s;
+            }
+        }
     }
 }
