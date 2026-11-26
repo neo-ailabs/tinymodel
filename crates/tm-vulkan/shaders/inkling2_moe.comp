@@ -101,7 +101,7 @@ void main() {
 
         const uint e_id = top_ids[k];
         const uint exp_base = e_id * pc.p3;
-        const uint x_base = (pc.p4 != 0u) ? 0u : (k * pc.p0);
+        const uint x_base = (pc.p4 != 0u) ? ((k / pc.p4) * pc.p0) : (k * pc.p0);
 
         const uint lane = gl_SubgroupInvocationID;
         const uint sg_size = gl_SubgroupSize;
@@ -164,15 +164,17 @@ void main() {
         const float act_u = (lb > 0.0) ? (lb * accurate_tanh(u / lb)) : u;
         y[gid] = act_g * act_u;
     } else if (pc.op == 3u) {
-        // Weighted expert reduction: `p0 = n_embd`, `p1 = top_k`
-        // `x` = exp_down `[top_k, n_embd]`, `top_weights` = weights `[top_k]`, `y` = moe_out `[n_embd]`
+        // Weighted expert reduction: `p0 = n_embd`, `p1 = top_k`, `gl_WorkGroupID.y = tok (0..w)`
+        // `x` = exp_down `[w * top_k, n_embd]`, `top_weights` = `[w * top_k]`, `y` = `[w, n_embd]`
         if (gid >= pc.p0) return;
         const uint n_embd = pc.p0;
         const uint top_k = pc.p1;
+        const uint tok = gl_WorkGroupID.y;
+        const uint tk_base = tok * top_k;
         float acc = 0.0;
         for (uint k = 0u; k < top_k; ++k) {
-            acc = fma(top_weights[k], x[k * n_embd + gid], acc);
+            acc = fma(top_weights[tk_base + k], x[(tk_base + k) * n_embd + gid], acc);
         }
-        y[gid] = acc;
+        y[tok * n_embd + gid] = acc;
     }
 }

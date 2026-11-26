@@ -1167,9 +1167,12 @@ impl Inkling2VkRunner {
         let gate_buf = ctx.alloc_buffer((max_q_dim * 4) as u64)?;
         let wo_out_buf = ctx.alloc_buffer((n_embd * 4) as u64)?;
         let router_logits_buf = ctx.alloc_buffer((n_exp * 4) as u64)?;
-        let exp_gate_up_buf = ctx.alloc_buffer((cfg.n_expert_used * 2 * n_ff * 4) as u64)?;
-        let exp_hidden_buf = ctx.alloc_buffer((cfg.n_expert_used * n_ff * 4) as u64)?;
-        let exp_down_buf = ctx.alloc_buffer((cfg.n_expert_used * n_embd * 4) as u64)?;
+        let exp_gate_up_buf =
+            ctx.alloc_buffer((MAX_INKLING2_VK_WINDOW * cfg.n_expert_used * 2 * n_ff * 4) as u64)?;
+        let exp_hidden_buf =
+            ctx.alloc_buffer((MAX_INKLING2_VK_WINDOW * cfg.n_expert_used * n_ff * 4) as u64)?;
+        let exp_down_buf =
+            ctx.alloc_buffer((MAX_INKLING2_VK_WINDOW * cfg.n_expert_used * n_embd * 4) as u64)?;
         let logits_padded_buf = ctx.alloc_buffer((cfg.vocab_padded * 4) as u64)?;
         let logits_buf = ctx.create_host_buffer((cfg.vocab_size * 4) as u64)?;
         let argmax_buf = ctx.create_host_buffer(16)?;
@@ -2728,7 +2731,7 @@ impl Inkling2VkRunner {
                 (2 * n_ff) as u32,
                 vexp.gate_up_row_u16s,
                 vexp.gate_up_expert_u16s,
-                1,
+                top_k as u32,
                 0,
                 0,
             ],
@@ -2795,6 +2798,112 @@ impl Inkling2VkRunner {
             ],
             &[3, n_embd as u32, top_k as u32, 0, 0, 0, 0, 0],
             n_embd.div_ceil(self.moe_wg as usize) as u32,
+        )
+    }
+
+    /// Batched `w`-token VRAM MoE (`4` dispatches total across all `w` tokens instead of `4 * w`).
+    fn record_vram_moe_window(
+        &self,
+        rec: &mut Recorder<'_>,
+        ip: usize,
+        w: usize,
+    ) -> Result<(), VulkanError> {
+        let vexp = self.layers[ip]
+            .vram_experts
+            .as_ref()
+            .expect("record_vram_moe_window requires vram_experts");
+        let n_embd = self.cfg.n_embd;
+        let n_ff = self.cfg.n_ff_exp;
+        let top_k = self.cfg.n_expert_used;
+        let total_k = w * top_k;
+        let sg = self.ctx.info().subgroup_size;
+        let rows_per_wg = ((self.moe_wg / sg) * self.moe_nr) as usize;
+
+        // 1. Batched indexed `gate_up` `Q8_0` GEMV (`[2 * n_ff]` rows x `w * top_k` slots)
+        rec.dispatch_xy(
+            &self.pipe_moe_ops,
+            &[
+                &vexp.gate_up,
+                &self.ffn_normed_bridge,
+                &self.dummy_buf,
+                &self.top_ids_bridge,
+                &self.top_weights_bridge,
+                &self.exp_gate_up_buf,
+            ],
+            &[
+                1,
+                n_embd as u32,
+                (2 * n_ff) as u32,
+                vexp.gate_up_row_u16s,
+                vexp.gate_up_expert_u16s,
+                top_k as u32,
+                0,
+                0,
+            ],
+            (2 * n_ff).div_ceil(rows_per_wg) as u32,
+            total_k as u32,
+        )?;
+        // 2. Batched SiTU-GLU (`[w * top_k * n_ff]`)
+        rec.dispatch(
+            &self.pipe_moe_ops,
+            &[
+                &self.dummy_buf,
+                &self.exp_gate_up_buf,
+                &self.dummy_buf,
+                &self.top_ids_bridge,
+                &self.top_weights_bridge,
+                &self.exp_hidden_buf,
+            ],
+            &[
+                2,
+                (total_k * n_ff) as u32,
+                n_ff as u32,
+                0,
+                0,
+                0,
+                self.cfg.situ_beta.to_bits(),
+                self.cfg.situ_linear_beta.to_bits(),
+            ],
+            (total_k * n_ff).div_ceil(self.moe_wg as usize) as u32,
+        )?;
+        // 3. Batched indexed `down` `Q8_0` GEMV (`[n_embd]` rows x `w * top_k` slots)
+        rec.dispatch_xy(
+            &self.pipe_moe_ops,
+            &[
+                &vexp.down,
+                &self.exp_hidden_buf,
+                &self.dummy_buf,
+                &self.top_ids_bridge,
+                &self.top_weights_bridge,
+                &self.exp_down_buf,
+            ],
+            &[
+                1,
+                n_ff as u32,
+                n_embd as u32,
+                vexp.down_row_u16s,
+                vexp.down_expert_u16s,
+                0,
+                0,
+                0,
+            ],
+            n_embd.div_ceil(rows_per_wg) as u32,
+            total_k as u32,
+        )?;
+        // 4. Batched weighted reduction into `moe_out_bridge` (`[w, n_embd]`)
+        rec.dispatch_xy(
+            &self.pipe_moe_ops,
+            &[
+                &self.dummy_buf,
+                &self.exp_down_buf,
+                &self.dummy_buf,
+                &self.top_ids_bridge,
+                &self.top_weights_bridge,
+                &self.moe_out_bridge,
+            ],
+            &[3, n_embd as u32, top_k as u32, 0, 0, 0, 0, 0],
+            n_embd.div_ceil(self.moe_wg as usize) as u32,
+            w as u32,
         )
     }
 
@@ -3358,7 +3467,7 @@ impl Inkling2VkRunner {
                             )?;
                         }
 
-                        if in_vram {
+                        if in_vram && w == 1 {
                             self.record_layer_pre_moe(
                                 rec,
                                 st.il,
@@ -3448,6 +3557,49 @@ impl Inkling2VkRunner {
                         next_b = b_t;
                         next_pb = pb_t;
                         next_bk = bk_t;
+                    }
+
+                    if in_vram && w > 1 {
+                        self.record_vram_moe_window(rec, st.ip, w)?;
+                        for tok_i in 0..w {
+                            let base = (tok_i * self.per_tok_state_f32s) as u32;
+                            self.record_vec_copy(
+                                rec,
+                                &self.ffn_inp_buf,
+                                0,
+                                &self.win_state_buf,
+                                base + n_embd as u32,
+                                n_embd,
+                            )?;
+                            self.record_vec_copy(
+                                rec,
+                                &self.wo_out_buf,
+                                0,
+                                &self.moe_out_bridge,
+                                (tok_i * n_embd) as u32,
+                                n_embd,
+                            )?;
+                            self.record_layer_post_moe(rec, st.il, st.ip, true)?;
+                            if save_conv_snapshots && ffn_conv_len_f32 > 0 {
+                                let snap_dst = tok_i * self.total_conv_f32s + ffn_conv_off_f32;
+                                self.record_vec_copy(
+                                    rec,
+                                    &self.conv_snapshots_buf,
+                                    snap_dst as u32,
+                                    &self.conv_hist,
+                                    ffn_conv_off_f32 as u32,
+                                    ffn_conv_len_f32,
+                                )?;
+                            }
+                            self.record_vec_copy(
+                                rec,
+                                &self.win_state_buf,
+                                base,
+                                &self.cur_buf,
+                                0,
+                                n_embd,
+                            )?;
+                        }
                     }
 
                     blocks_len = next_b;
