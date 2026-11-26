@@ -573,8 +573,8 @@ unsafe fn hsum2x2_8wide_pairwise_ps(p01: __m512, p23: __m512) -> __m128 {
 /// preserving the exact 8-wide `c = 0..4` FMA chain and pairwise reduction of `generic::dot_f32_q8_0`.
 ///
 /// # Safety
-/// Caller must ensure `avx512f`, `avx512bw`, `avx512vl`, and `fma` CPU features are supported.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,fma")]
+/// Caller must ensure `avx512f`, `avx512bw`, `avx512vl`, `fma`, and `f16c` CPU features are supported.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,fma,f16c")]
 pub unsafe fn gemv_f32_q8_0(
     w: &[BlockQ8_0],
     x: &[f32],
@@ -691,8 +691,8 @@ pub unsafe fn gemv_f32_q8_0(
 /// converting each `BlockQ8_0` from `i8` to `f32` **once** across all 4 tokens!
 ///
 /// # Safety
-/// Caller must ensure `avx512f`, `avx512bw`, `avx512vl`, and `fma` CPU features are supported.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,fma")]
+/// Caller must ensure `avx512f`, `avx512bw`, `avx512vl`, `fma`, and `f16c` CPU features are supported.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,fma,f16c")]
 pub unsafe fn gemm_f32_q8_0(
     w: &[BlockQ8_0],
     x: &[f32],

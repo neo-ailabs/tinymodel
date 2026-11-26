@@ -26,6 +26,7 @@ use crate::kernels::{dtype_code, normalize_vk_mat_bytes};
 
 const SPV_EMBED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/embed.spv"));
 const SPV_GEMV_RES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_res.spv"));
+const SPV_GEMM_TILED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_tiled.spv"));
 const SPV_SIGMOID_MUL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sigmoid_mul.spv"));
 const SPV_ARGMAX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/argmax.spv"));
 const SPV_INKLING2_OPS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/inkling2_ops.spv"));
@@ -334,10 +335,10 @@ pub struct Inkling2VkRunner {
     k_in_buf: VkBuffer,
     v_in_buf: VkBuffer,
     messages_buf: VkBuffer,
-    ctrl_in_buf: VkBuffer,
-    ctrl_g_buf: VkBuffer,
-    ctrl_gain_buf: VkBuffer,
-    ctrl_forget_buf: VkBuffer,
+    ctrl_in_bufs: [VkBuffer; 3],
+    ctrl_g_bufs: [VkBuffer; 3],
+    ctrl_gain_bufs: [VkBuffer; 3],
+    ctrl_forget_bufs: [VkBuffer; 3],
     q_buf: VkBuffer,
     k_buf: VkBuffer,
     v_buf: VkBuffer,
@@ -349,6 +350,23 @@ pub struct Inkling2VkRunner {
     gate_buf: VkBuffer,
     wo_out_buf: VkBuffer,
     router_logits_buf: VkBuffer,
+    // Batched `w`-token prefill `DEVICE_LOCAL` buffers (`gemm_tiled` + 2D router)
+    win_q_in_buf: VkBuffer,
+    win_k_in_buf: VkBuffer,
+    win_v_in_buf: VkBuffer,
+    win_q_buf: VkBuffer,
+    win_k_buf: VkBuffer,
+    win_v_buf: VkBuffer,
+    win_r_buf: VkBuffer,
+    win_sinks_buf: VkBuffer,
+    win_gate_buf: VkBuffer,
+    win_k_dyn_buf: VkBuffer,
+    win_v_dyn_buf: VkBuffer,
+    win_attn_vec_buf: VkBuffer,
+    win_wo_out_buf: VkBuffer,
+    win_ffn_norm_buf: VkBuffer,
+    win_router_logits_buf: VkBuffer,
+    win_moe_out_dev_buf: VkBuffer,
     exp_gate_up_buf: VkBuffer,
     exp_hidden_buf: VkBuffer,
     exp_down_buf: VkBuffer,
@@ -1246,10 +1264,26 @@ impl Inkling2VkRunner {
         let k_in_buf = ctx.alloc_buffer((n_embd * 4) as u64)?;
         let v_in_buf = ctx.alloc_buffer((n_embd * 4) as u64)?;
         let messages_buf = ctx.alloc_buffer((LOOP_CTRL_COUNT * n_embd * 4) as u64)?;
-        let ctrl_in_buf = ctx.alloc_buffer((2 * n_embd * 4) as u64)?;
-        let ctrl_g_buf = ctx.alloc_buffer((cfg.gate_rank.max(1) * 4) as u64)?;
-        let ctrl_gain_buf = ctx.alloc_buffer((n_embd * 4) as u64)?;
-        let ctrl_forget_buf = ctx.alloc_buffer((n_embd * 4) as u64)?;
+        let ctrl_in_bufs = [
+            ctx.alloc_buffer((2 * n_embd * 4) as u64)?,
+            ctx.alloc_buffer((2 * n_embd * 4) as u64)?,
+            ctx.alloc_buffer((2 * n_embd * 4) as u64)?,
+        ];
+        let ctrl_g_bufs = [
+            ctx.alloc_buffer((cfg.gate_rank.max(1) * 4) as u64)?,
+            ctx.alloc_buffer((cfg.gate_rank.max(1) * 4) as u64)?,
+            ctx.alloc_buffer((cfg.gate_rank.max(1) * 4) as u64)?,
+        ];
+        let ctrl_gain_bufs = [
+            ctx.alloc_buffer((n_embd * 4) as u64)?,
+            ctx.alloc_buffer((n_embd * 4) as u64)?,
+            ctx.alloc_buffer((n_embd * 4) as u64)?,
+        ];
+        let ctrl_forget_bufs = [
+            ctx.alloc_buffer((n_embd * 4) as u64)?,
+            ctx.alloc_buffer((n_embd * 4) as u64)?,
+            ctx.alloc_buffer((n_embd * 4) as u64)?,
+        ];
         let q_buf = ctx.alloc_buffer((max_q_dim * 4) as u64)?;
         let k_buf = ctx.alloc_buffer((max_kv_dim * 4) as u64)?;
         let v_buf = ctx.alloc_buffer((max_kv_dim * 4) as u64)?;
@@ -1261,6 +1295,29 @@ impl Inkling2VkRunner {
         let gate_buf = ctx.alloc_buffer((max_q_dim * 4) as u64)?;
         let wo_out_buf = ctx.alloc_buffer((n_embd * 4) as u64)?;
         let router_logits_buf = ctx.alloc_buffer((n_exp * 4) as u64)?;
+        let win_q_in_buf = ctx.alloc_buffer((MAX_INKLING2_VK_WINDOW * n_embd * 4) as u64)?;
+        let win_k_in_buf = ctx.alloc_buffer((MAX_INKLING2_VK_WINDOW * n_embd * 4) as u64)?;
+        let win_v_in_buf = ctx.alloc_buffer((MAX_INKLING2_VK_WINDOW * n_embd * 4) as u64)?;
+        let win_q_buf = ctx.alloc_buffer((MAX_INKLING2_VK_WINDOW * max_q_dim * 4) as u64)?;
+        let win_k_buf = ctx.alloc_buffer((MAX_INKLING2_VK_WINDOW * max_kv_dim * 4) as u64)?;
+        let win_v_buf = ctx.alloc_buffer((MAX_INKLING2_VK_WINDOW * max_kv_dim * 4) as u64)?;
+        let win_r_buf = ctx
+            .alloc_buffer((MAX_INKLING2_VK_WINDOW * max_nh * cfg.n_relative * 4).max(16) as u64)?;
+        let win_sinks_buf =
+            ctx.alloc_buffer((MAX_INKLING2_VK_WINDOW * max_nh * 4).max(16) as u64)?;
+        let win_gate_buf = ctx.alloc_buffer((MAX_INKLING2_VK_WINDOW * max_q_dim * 4) as u64)?;
+        let win_k_dyn_buf = ctx.alloc_buffer(
+            (MAX_INKLING2_VK_WINDOW * cfg.shortconv_l_cache * max_nh_kv * 4).max(16) as u64,
+        )?;
+        let win_v_dyn_buf = ctx.alloc_buffer(
+            (MAX_INKLING2_VK_WINDOW * cfg.shortconv_l_cache * max_nh_kv * 4).max(16) as u64,
+        )?;
+        let win_attn_vec_buf = ctx.alloc_buffer((MAX_INKLING2_VK_WINDOW * max_q_dim * 4) as u64)?;
+        let win_wo_out_buf = ctx.alloc_buffer((MAX_INKLING2_VK_WINDOW * n_embd * 4) as u64)?;
+        let win_ffn_norm_buf = ctx.alloc_buffer((MAX_INKLING2_VK_WINDOW * n_embd * 4) as u64)?;
+        let win_router_logits_buf =
+            ctx.alloc_buffer((MAX_INKLING2_VK_WINDOW * n_exp * 4).max(16) as u64)?;
+        let win_moe_out_dev_buf = ctx.alloc_buffer((MAX_INKLING2_VK_WINDOW * n_embd * 4) as u64)?;
         let exp_gate_up_buf =
             ctx.alloc_buffer((MAX_INKLING2_VK_WINDOW * cfg.n_expert_used * 2 * n_ff * 4) as u64)?;
         let exp_hidden_buf =
@@ -1322,7 +1379,7 @@ impl Inkling2VkRunner {
         )?;
         let pipe_argmax = ctx.pipeline("inkling2_argmax", 256, SPV_ARGMAX, 2, 4, &[256])?;
 
-        // Warm-cache GEMV pipelines for every encountered dtype (`Q8_0`, `F32`, etc.)
+        // Warm-cache GEMV and tiled GEMM pipelines for every encountered dtype (`Q8_0`, `F32`, etc.)
         for dt_code in [0u32, 1, 2, 3, 4, 5] {
             let _ = ctx.pipeline(
                 "gemv_res",
@@ -1332,6 +1389,18 @@ impl Inkling2VkRunner {
                 16,
                 &[gemv_wg, dt_code, gemv_nr],
             )?;
+        }
+        if 128 >= sg && 128 <= max_wg {
+            for dt_code in [0u32, 1, 2, 5] {
+                let _ = ctx.pipeline(
+                    "gemm_tiled",
+                    dt_code,
+                    SPV_GEMM_TILED,
+                    3,
+                    20,
+                    &[128, dt_code],
+                )?;
+            }
         }
 
         let n_vram_exps = vram_expert_mask.iter().filter(|&&b| b).count();
@@ -1417,10 +1486,10 @@ impl Inkling2VkRunner {
             k_in_buf,
             v_in_buf,
             messages_buf,
-            ctrl_in_buf,
-            ctrl_g_buf,
-            ctrl_gain_buf,
-            ctrl_forget_buf,
+            ctrl_in_bufs,
+            ctrl_g_bufs,
+            ctrl_gain_bufs,
+            ctrl_forget_bufs,
             q_buf,
             k_buf,
             v_buf,
@@ -1432,6 +1501,22 @@ impl Inkling2VkRunner {
             gate_buf,
             wo_out_buf,
             router_logits_buf,
+            win_q_in_buf,
+            win_k_in_buf,
+            win_v_in_buf,
+            win_q_buf,
+            win_k_buf,
+            win_v_buf,
+            win_r_buf,
+            win_sinks_buf,
+            win_gate_buf,
+            win_k_dyn_buf,
+            win_v_dyn_buf,
+            win_attn_vec_buf,
+            win_wo_out_buf,
+            win_ffn_norm_buf,
+            win_router_logits_buf,
+            win_moe_out_dev_buf,
             exp_gate_up_buf,
             exp_hidden_buf,
             exp_down_buf,
@@ -1912,6 +1997,65 @@ impl Inkling2VkRunner {
         )
     }
 
+    fn gemm_tiled_pipe(&self, dt_code: u32) -> Result<Arc<Pipeline>, VulkanError> {
+        self.ctx.pipeline(
+            "gemm_tiled",
+            dt_code,
+            SPV_GEMM_TILED,
+            3,
+            20,
+            &[128, dt_code],
+        )
+    }
+
+    fn dispatch_gemm(
+        &self,
+        rec: &mut Recorder<'_>,
+        mat: &VkDenseMat,
+        x_win: &VkBuffer,
+        y_win: &VkBuffer,
+        n_tok: usize,
+    ) -> Result<(), VulkanError> {
+        let p = self.gemm_tiled_pipe(mat.dtype_code)?;
+        rec.dispatch_xy(
+            &p,
+            &[&mat.buf, x_win, y_win],
+            &[
+                mat.cols as u32,
+                mat.rows as u32,
+                n_tok as u32,
+                0,
+                mat.row_u16s,
+            ],
+            mat.rows.div_ceil(64) as u32,
+            n_tok.div_ceil(32) as u32,
+        )
+    }
+
+    fn dispatch_gemm_nb(
+        &self,
+        rec: &mut Recorder<'_>,
+        mat: &VkDenseMat,
+        x_win: &VkBuffer,
+        y_win: &VkBuffer,
+        n_tok: usize,
+    ) -> Result<(), VulkanError> {
+        let p = self.gemm_tiled_pipe(mat.dtype_code)?;
+        rec.dispatch_xy_nb(
+            &p,
+            &[&mat.buf, x_win, y_win],
+            &[
+                mat.cols as u32,
+                mat.rows as u32,
+                n_tok as u32,
+                0,
+                mat.row_u16s,
+            ],
+            mat.rows.div_ceil(64) as u32,
+            n_tok.div_ceil(32) as u32,
+        )
+    }
+
     fn run_token_internal(
         &mut self,
         token_id: u32,
@@ -2035,7 +2179,7 @@ impl Inkling2VkRunner {
                         &mut prelude_blocks_len,
                         &mut bank_len,
                     )?;
-                    self.record_layer_pre_moe(
+                    self.record_layer_pre_moe_into(
                         rec,
                         st.il,
                         st.ip,
@@ -2044,9 +2188,18 @@ impl Inkling2VkRunner {
                         st.pass > 0,
                         &mut blocks_len,
                         bank_len,
+                        &self.wo_out_buf,
+                        &self.top_ids_tmp_buf,
+                        &self.top_weights_tmp_buf,
                         &mut ts,
                     )?;
-                    self.record_vram_moe(rec, st.ip)?;
+                    self.record_vram_moe_from(
+                        rec,
+                        st.ip,
+                        &self.wo_out_buf,
+                        &self.top_ids_tmp_buf,
+                        &self.top_weights_tmp_buf,
+                    )?;
                     TsRecorder::mark(&mut ts, rec, STAGE_VRAM_MOE);
                     self.record_layer_post_moe(rec, st.il, st.ip, true)?;
                     TsRecorder::mark(&mut ts, rec, STAGE_POST_MOE);
@@ -2088,6 +2241,7 @@ impl Inkling2VkRunner {
                 }
                 while cursor < schedule.len() {
                     let st = schedule[cursor];
+                    let in_vram = self.layers[st.ip].vram_experts.is_some();
                     self.record_pre_step_transitions(
                         rec,
                         st.save_prelude_before,
@@ -2096,24 +2250,47 @@ impl Inkling2VkRunner {
                         &mut prelude_blocks_len,
                         &mut bank_len,
                     )?;
-                    self.record_layer_pre_moe(
-                        rec,
-                        st.il,
-                        st.ip,
-                        pos,
-                        tau,
-                        st.pass > 0,
-                        &mut blocks_len,
-                        bank_len,
-                        &mut ts,
-                    )?;
-                    cursor += 1;
-                    if self.layers[st.ip].vram_experts.is_some() {
-                        self.record_vram_moe(rec, st.ip)?;
+                    if in_vram {
+                        // Keep 100% of VRAM-resident MoE inputs (`x`, `top_ids`, `top_weights`) in
+                        // `DEVICE_LOCAL` buffers so discrete GPUs never read over PCIe!
+                        self.record_layer_pre_moe_into(
+                            rec,
+                            st.il,
+                            st.ip,
+                            pos,
+                            tau,
+                            st.pass > 0,
+                            &mut blocks_len,
+                            bank_len,
+                            &self.wo_out_buf,
+                            &self.top_ids_tmp_buf,
+                            &self.top_weights_tmp_buf,
+                            &mut ts,
+                        )?;
+                        cursor += 1;
+                        self.record_vram_moe_from(
+                            rec,
+                            st.ip,
+                            &self.wo_out_buf,
+                            &self.top_ids_tmp_buf,
+                            &self.top_weights_tmp_buf,
+                        )?;
                         TsRecorder::mark(&mut ts, rec, STAGE_VRAM_MOE);
                         self.record_layer_post_moe(rec, st.il, st.ip, true)?;
                         TsRecorder::mark(&mut ts, rec, STAGE_POST_MOE);
                     } else {
+                        self.record_layer_pre_moe(
+                            rec,
+                            st.il,
+                            st.ip,
+                            pos,
+                            tau,
+                            st.pass > 0,
+                            &mut blocks_len,
+                            bank_len,
+                            &mut ts,
+                        )?;
+                        cursor += 1;
                         stop_for_host_ip = Some((st.il, st.ip));
                         break;
                     }
@@ -2363,12 +2540,16 @@ impl Inkling2VkRunner {
         msg_off: u32,
     ) -> Result<(), VulkanError> {
         let n_embd = self.cfg.n_embd as u32;
+        let cin = &self.ctrl_in_bufs[0];
+        let cg = &self.ctrl_g_bufs[0];
+        let cgain = &self.ctrl_gain_bufs[0];
+        let cforget = &self.ctrl_forget_bufs[0];
         // `ctrl_in[0..n_embd] = rms_norm_unit(cur, 1e-6)` and `ctrl_in[n_embd..2*n_embd] = rms_norm_unit(msg, 1e-6)`
         rec.dispatch_nb(
             &self.pipe_ops,
             &[
                 cur_buf,
-                &self.ctrl_in_buf,
+                cin,
                 &self.dummy_buf,
                 &self.dummy_buf,
                 &self.dummy_buf,
@@ -2381,7 +2562,7 @@ impl Inkling2VkRunner {
             &self.pipe_ops,
             &[
                 &self.messages_buf,
-                &self.ctrl_in_buf,
+                cin,
                 &self.dummy_buf,
                 &self.dummy_buf,
                 &self.dummy_buf,
@@ -2390,37 +2571,100 @@ impl Inkling2VkRunner {
             &[0, n_embd, msg_off, n_embd, 0, 1e-6f32.to_bits(), 0, 0],
             1,
         )?;
-        self.dispatch_gemv(
-            rec,
-            &loop_w.ctrl_down[ctrl],
-            &self.ctrl_in_buf,
-            &self.ctrl_g_buf,
-        )?;
-        self.dispatch_gemv_nb(
-            rec,
-            &loop_w.ctrl_gain[ctrl],
-            &self.ctrl_g_buf,
-            &self.ctrl_gain_buf,
-        )?;
-        self.dispatch_gemv(
-            rec,
-            &loop_w.ctrl_forget[ctrl],
-            &self.ctrl_g_buf,
-            &self.ctrl_forget_buf,
-        )?;
+        self.dispatch_gemv(rec, &loop_w.ctrl_down[ctrl], cin, cg)?;
+        self.dispatch_gemv_nb(rec, &loop_w.ctrl_gain[ctrl], cg, cgain)?;
+        self.dispatch_gemv(rec, &loop_w.ctrl_forget[ctrl], cg, cforget)?;
         rec.dispatch(
             &self.pipe_ops,
             &[
                 cur_buf,
                 &self.messages_buf,
-                &self.ctrl_gain_buf,
-                &self.ctrl_forget_buf,
+                cgain,
+                cforget,
                 &self.dummy_buf,
                 &self.dummy_buf,
             ],
             &[4, n_embd, cur_off, msg_off, 0, 0, 0, 0],
             self.elem_groups(self.cfg.n_embd),
         )
+    }
+
+    /// Executes all 3 cross-pass loop controllers (`Q, K, V`) concurrently in 4 barrier waves
+    /// instead of 12 serial waves (`3x` SM occupancy on `ctrl_down`).
+    fn record_controls_qkv(
+        &self,
+        rec: &mut Recorder<'_>,
+        loop_w: &VkLoopLayer,
+    ) -> Result<(), VulkanError> {
+        let n_embd = self.cfg.n_embd as u32;
+        for j in 0..3 {
+            let off = (j as u32) * n_embd;
+            let cin = &self.ctrl_in_bufs[j];
+            rec.dispatch_nb(
+                &self.pipe_ops,
+                &[
+                    &self.inputs_buf,
+                    cin,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                ],
+                &[0, n_embd, off, 0, 0, 1e-6f32.to_bits(), 0, 0],
+                1,
+            )?;
+            let args_m = [0, n_embd, off, n_embd, 0, 1e-6f32.to_bits(), 0, 0];
+            let bufs_m = [
+                &self.messages_buf,
+                cin,
+                &self.dummy_buf,
+                &self.dummy_buf,
+                &self.dummy_buf,
+                &self.dummy_buf,
+            ];
+            if j < 2 {
+                rec.dispatch_nb(&self.pipe_ops, &bufs_m, &args_m, 1)?;
+            } else {
+                rec.dispatch(&self.pipe_ops, &bufs_m, &args_m, 1)?;
+            }
+        }
+        for j in 0..3 {
+            let cd = &loop_w.ctrl_down[LOOP_CTRL_Q + j];
+            if j < 2 {
+                self.dispatch_gemv_nb(rec, cd, &self.ctrl_in_bufs[j], &self.ctrl_g_bufs[j])?;
+            } else {
+                self.dispatch_gemv(rec, cd, &self.ctrl_in_bufs[j], &self.ctrl_g_bufs[j])?;
+            }
+        }
+        for j in 0..3 {
+            let cg = &loop_w.ctrl_gain[LOOP_CTRL_Q + j];
+            let cf = &loop_w.ctrl_forget[LOOP_CTRL_Q + j];
+            self.dispatch_gemv_nb(rec, cg, &self.ctrl_g_bufs[j], &self.ctrl_gain_bufs[j])?;
+            if j < 2 {
+                self.dispatch_gemv_nb(rec, cf, &self.ctrl_g_bufs[j], &self.ctrl_forget_bufs[j])?;
+            } else {
+                self.dispatch_gemv(rec, cf, &self.ctrl_g_bufs[j], &self.ctrl_forget_bufs[j])?;
+            }
+        }
+        let groups = self.elem_groups(self.cfg.n_embd);
+        for j in 0..3 {
+            let off = (j as u32) * n_embd;
+            let bufs = [
+                &self.inputs_buf,
+                &self.messages_buf,
+                &self.ctrl_gain_bufs[j],
+                &self.ctrl_forget_bufs[j],
+                &self.dummy_buf,
+                &self.dummy_buf,
+            ];
+            let args = [4, n_embd, off, off, 0, 0, 0, 0];
+            if j < 2 {
+                rec.dispatch_nb(&self.pipe_ops, &bufs, &args, groups)?;
+            } else {
+                rec.dispatch(&self.pipe_ops, &bufs, &args, groups)?;
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2570,16 +2814,7 @@ impl Inkling2VkRunner {
 
         if has_messages {
             let loop_w = &self.loop_layers[ip - self.cfg.core_start];
-            for j in 0..3 {
-                self.record_control(
-                    rec,
-                    loop_w,
-                    LOOP_CTRL_Q + j,
-                    &self.inputs_buf,
-                    (j * n_embd) as u32,
-                    (j * n_embd) as u32,
-                )?;
-            }
+            self.record_controls_qkv(rec, loop_w)?;
         }
 
         // Input RMSNorm into `q_in_buf`, `k_in_buf`, `v_in_buf`
@@ -3011,7 +3246,14 @@ impl Inkling2VkRunner {
         Ok(())
     }
 
-    fn record_vram_moe(&self, rec: &mut Recorder<'_>, ip: usize) -> Result<(), VulkanError> {
+    fn record_vram_moe_from(
+        &self,
+        rec: &mut Recorder<'_>,
+        ip: usize,
+        x_buf: &VkBuffer,
+        top_ids_buf: &VkBuffer,
+        top_w_buf: &VkBuffer,
+    ) -> Result<(), VulkanError> {
         let vexp = self.layers[ip]
             .vram_experts
             .as_ref()
@@ -3027,10 +3269,10 @@ impl Inkling2VkRunner {
             &self.pipe_moe_ops,
             &[
                 &vexp.gate_up,
-                &self.ffn_normed_bridge,
+                x_buf,
                 &self.dummy_buf,
-                &self.top_ids_bridge,
-                &self.top_weights_bridge,
+                top_ids_buf,
+                top_w_buf,
                 &self.exp_gate_up_buf,
             ],
             &[
@@ -3053,8 +3295,8 @@ impl Inkling2VkRunner {
                 &self.dummy_buf,
                 &self.exp_gate_up_buf,
                 &self.dummy_buf,
-                &self.top_ids_bridge,
-                &self.top_weights_bridge,
+                top_ids_buf,
+                top_w_buf,
                 &self.exp_hidden_buf,
             ],
             &[
@@ -3076,8 +3318,8 @@ impl Inkling2VkRunner {
                 &vexp.down,
                 &self.exp_hidden_buf,
                 &self.dummy_buf,
-                &self.top_ids_bridge,
-                &self.top_weights_bridge,
+                top_ids_buf,
+                top_w_buf,
                 &self.exp_down_buf,
             ],
             &[
@@ -3100,8 +3342,8 @@ impl Inkling2VkRunner {
                 &self.dummy_buf,
                 &self.exp_down_buf,
                 &self.dummy_buf,
-                &self.top_ids_bridge,
-                &self.top_weights_bridge,
+                top_ids_buf,
+                top_w_buf,
                 &self.wo_out_buf,
             ],
             &[3, n_embd as u32, top_k as u32, 0, 0, 0, 0, 0],
@@ -3115,6 +3357,8 @@ impl Inkling2VkRunner {
         rec: &mut Recorder<'_>,
         ip: usize,
         w: usize,
+        x_win_buf: &VkBuffer,
+        out_win_buf: &VkBuffer,
     ) -> Result<(), VulkanError> {
         let vexp = self.layers[ip]
             .vram_experts
@@ -3132,7 +3376,7 @@ impl Inkling2VkRunner {
             &self.pipe_moe_ops,
             &[
                 &vexp.gate_up,
-                &self.ffn_normed_bridge,
+                x_win_buf,
                 &self.dummy_buf,
                 &self.top_ids_bridge,
                 &self.top_weights_bridge,
@@ -3198,7 +3442,7 @@ impl Inkling2VkRunner {
             n_embd.div_ceil(rows_per_wg) as u32,
             total_k as u32,
         )?;
-        // 4. Batched weighted reduction into `moe_out_bridge` (`[w, n_embd]`)
+        // 4. Batched weighted reduction into `out_win_buf` (`[w, n_embd]`)
         rec.dispatch_xy(
             &self.pipe_moe_ops,
             &[
@@ -3207,7 +3451,7 @@ impl Inkling2VkRunner {
                 &self.dummy_buf,
                 &self.top_ids_bridge,
                 &self.top_weights_bridge,
-                &self.moe_out_bridge,
+                out_win_buf,
             ],
             &[3, n_embd as u32, top_k as u32, 0, 0, 0, 0, 0],
             n_embd.div_ceil(self.moe_wg as usize) as u32,
@@ -3741,7 +3985,16 @@ impl Inkling2VkRunner {
                     TsRecorder::mark(&mut ts, rec, STAGE_POST_MOE);
                 }
 
-                let max_visits_per_cb = (256 / w.max(1)).clamp(1, 64);
+                let can_batch_gemm = w >= 8
+                    && !save_conv_snapshots
+                    && n_embd.is_multiple_of(32)
+                    && self.ctx.info().subgroup_size <= 128
+                    && self.ctx.info().max_workgroup_invocations >= 128;
+                let max_visits_per_cb = if can_batch_gemm {
+                    (512 / w.max(1)).clamp(4, 64)
+                } else {
+                    (256 / w.max(1)).clamp(1, 64)
+                };
                 let mut visits_in_cb = 0usize;
                 while cursor < schedule.len() {
                     if visits_in_cb >= max_visits_per_cb {
@@ -3760,174 +4013,249 @@ impl Inkling2VkRunner {
                     let mut next_pb = prelude_blocks_len;
                     let mut next_bk = bank_len;
 
-                    for (tok_i, &tau_t) in taus.iter().enumerate().take(w) {
-                        let mut b_t = blocks_len;
-                        let mut pb_t = prelude_blocks_len;
-                        let mut bk_t = bank_len;
-
-                        self.record_load_tok_state(rec, tok_i, b_t, pb_t, bk_t)?;
-                        self.record_pre_step_transitions(
+                    if can_batch_gemm && self.cfg.q_dim(st.ip).is_multiple_of(32) {
+                        self.record_visit_batched_gemm(
                             rec,
+                            st.il,
+                            st.ip,
+                            st.pass > 0,
                             st.save_prelude_before,
                             st.reset_pass_before,
-                            &mut b_t,
-                            &mut pb_t,
-                            &mut bk_t,
+                            w,
+                            start_pos,
+                            &taus[..w],
+                            tap_slot,
+                            n_taps,
+                            in_vram,
+                            &mut next_b,
+                            &mut next_pb,
+                            &mut next_bk,
+                            &mut ts,
                         )?;
-
-                        if let Some(t_pos) = tap_slot {
-                            self.record_vec_copy(
+                        if in_vram {
+                            self.record_vram_moe_window(
                                 rec,
-                                &self.dspark_taps_buf,
-                                ((tok_i * n_taps + t_pos) * n_embd) as u32,
-                                &self.cur_buf,
-                                0,
-                                n_embd,
-                            )?;
-                        }
-                        TsRecorder::mark(&mut ts, rec, STAGE_EMBED_STATE);
-
-                        if in_vram && w == 1 {
-                            self.record_layer_pre_moe(
-                                rec,
-                                st.il,
                                 st.ip,
-                                start_pos + tok_i,
-                                tau_t,
-                                st.pass > 0,
-                                &mut b_t,
-                                bk_t,
-                                &mut ts,
+                                w,
+                                &self.win_ffn_norm_buf,
+                                &self.win_moe_out_dev_buf,
                             )?;
-                            if save_conv_snapshots && attn_conv_len_f32 > 0 {
-                                let snap_dst = tok_i * self.total_conv_f32s + attn_conv_off_f32;
-                                self.record_vec_copy(
-                                    rec,
-                                    &self.conv_snapshots_buf,
-                                    snap_dst as u32,
-                                    &self.conv_hist,
-                                    attn_conv_off_f32 as u32,
-                                    attn_conv_len_f32,
-                                )?;
-                            }
-                            self.record_vram_moe(rec, st.ip)?;
                             TsRecorder::mark(&mut ts, rec, STAGE_VRAM_MOE);
-                            self.record_layer_post_moe(rec, st.il, st.ip, true)?;
-                            if save_conv_snapshots && ffn_conv_len_f32 > 0 {
-                                let snap_dst = tok_i * self.total_conv_f32s + ffn_conv_off_f32;
+                            for tok_i in 0..w {
+                                let base = (tok_i * self.per_tok_state_f32s) as u32;
+                                self.record_vec_copy_nb(
+                                    rec,
+                                    &self.ffn_inp_buf,
+                                    0,
+                                    &self.win_state_buf,
+                                    base + n_embd as u32,
+                                    n_embd,
+                                )?;
                                 self.record_vec_copy(
                                     rec,
-                                    &self.conv_snapshots_buf,
-                                    snap_dst as u32,
-                                    &self.conv_hist,
-                                    ffn_conv_off_f32 as u32,
-                                    ffn_conv_len_f32,
+                                    &self.wo_out_buf,
+                                    0,
+                                    &self.win_moe_out_dev_buf,
+                                    (tok_i * n_embd) as u32,
+                                    n_embd,
+                                )?;
+                                self.record_layer_post_moe(rec, st.il, st.ip, true)?;
+                                self.record_vec_copy(
+                                    rec,
+                                    &self.win_state_buf,
+                                    base,
+                                    &self.cur_buf,
+                                    0,
+                                    n_embd,
                                 )?;
                             }
-                            self.record_save_tok_state(rec, tok_i, b_t, pb_t, bk_t)?;
                             TsRecorder::mark(&mut ts, rec, STAGE_POST_MOE);
-                        } else {
-                            self.record_layer_pre_moe_into(
+                        }
+                    } else {
+                        for (tok_i, &tau_t) in taus.iter().enumerate().take(w) {
+                            let mut b_t = blocks_len;
+                            let mut pb_t = prelude_blocks_len;
+                            let mut bk_t = bank_len;
+
+                            self.record_load_tok_state(rec, tok_i, b_t, pb_t, bk_t)?;
+                            self.record_pre_step_transitions(
                                 rec,
-                                st.il,
-                                st.ip,
-                                start_pos + tok_i,
-                                tau_t,
-                                st.pass > 0,
+                                st.save_prelude_before,
+                                st.reset_pass_before,
                                 &mut b_t,
-                                bk_t,
-                                &self.wo_out_buf,
-                                &self.top_ids_tmp_buf,
-                                &self.top_weights_tmp_buf,
-                                &mut ts,
+                                &mut pb_t,
+                                &mut bk_t,
                             )?;
-                            if save_conv_snapshots && attn_conv_len_f32 > 0 {
-                                let snap_dst = tok_i * self.total_conv_f32s + attn_conv_off_f32;
+
+                            if let Some(t_pos) = tap_slot {
                                 self.record_vec_copy(
                                     rec,
-                                    &self.conv_snapshots_buf,
-                                    snap_dst as u32,
-                                    &self.conv_hist,
-                                    attn_conv_off_f32 as u32,
-                                    attn_conv_len_f32,
+                                    &self.dspark_taps_buf,
+                                    ((tok_i * n_taps + t_pos) * n_embd) as u32,
+                                    &self.cur_buf,
+                                    0,
+                                    n_embd,
                                 )?;
                             }
-                            self.record_vec_copy(
-                                rec,
-                                &self.ffn_normed_bridge,
-                                (tok_i * n_embd) as u32,
-                                &self.wo_out_buf,
-                                0,
-                                n_embd,
-                            )?;
-                            self.record_buf_copy_bytes(
-                                rec,
-                                &self.top_ids_bridge,
-                                (tok_i * top_k * 4) as u64,
-                                &self.top_ids_tmp_buf,
-                                0,
-                                (top_k * 4) as u64,
-                            );
-                            self.record_buf_copy_bytes(
-                                rec,
-                                &self.top_weights_bridge,
-                                (tok_i * top_k * 4) as u64,
-                                &self.top_weights_tmp_buf,
-                                0,
-                                (top_k * 4) as u64,
-                            );
-                            self.record_save_tok_state(rec, tok_i, b_t, pb_t, bk_t)?;
                             TsRecorder::mark(&mut ts, rec, STAGE_EMBED_STATE);
-                        }
 
-                        next_b = b_t;
-                        next_pb = pb_t;
-                        next_bk = bk_t;
-                    }
-
-                    if in_vram && w > 1 {
-                        self.record_vram_moe_window(rec, st.ip, w)?;
-                        TsRecorder::mark(&mut ts, rec, STAGE_VRAM_MOE);
-                        for tok_i in 0..w {
-                            let base = (tok_i * self.per_tok_state_f32s) as u32;
-                            self.record_vec_copy(
-                                rec,
-                                &self.ffn_inp_buf,
-                                0,
-                                &self.win_state_buf,
-                                base + n_embd as u32,
-                                n_embd,
-                            )?;
-                            self.record_vec_copy(
-                                rec,
-                                &self.wo_out_buf,
-                                0,
-                                &self.moe_out_bridge,
-                                (tok_i * n_embd) as u32,
-                                n_embd,
-                            )?;
-                            self.record_layer_post_moe(rec, st.il, st.ip, true)?;
-                            if save_conv_snapshots && ffn_conv_len_f32 > 0 {
-                                let snap_dst = tok_i * self.total_conv_f32s + ffn_conv_off_f32;
+                            if in_vram && w == 1 {
+                                self.record_layer_pre_moe_into(
+                                    rec,
+                                    st.il,
+                                    st.ip,
+                                    start_pos + tok_i,
+                                    tau_t,
+                                    st.pass > 0,
+                                    &mut b_t,
+                                    bk_t,
+                                    &self.wo_out_buf,
+                                    &self.top_ids_tmp_buf,
+                                    &self.top_weights_tmp_buf,
+                                    &mut ts,
+                                )?;
+                                if save_conv_snapshots && attn_conv_len_f32 > 0 {
+                                    let snap_dst = tok_i * self.total_conv_f32s + attn_conv_off_f32;
+                                    self.record_vec_copy(
+                                        rec,
+                                        &self.conv_snapshots_buf,
+                                        snap_dst as u32,
+                                        &self.conv_hist,
+                                        attn_conv_off_f32 as u32,
+                                        attn_conv_len_f32,
+                                    )?;
+                                }
+                                self.record_vram_moe_from(
+                                    rec,
+                                    st.ip,
+                                    &self.wo_out_buf,
+                                    &self.top_ids_tmp_buf,
+                                    &self.top_weights_tmp_buf,
+                                )?;
+                                TsRecorder::mark(&mut ts, rec, STAGE_VRAM_MOE);
+                                self.record_layer_post_moe(rec, st.il, st.ip, true)?;
+                                if save_conv_snapshots && ffn_conv_len_f32 > 0 {
+                                    let snap_dst = tok_i * self.total_conv_f32s + ffn_conv_off_f32;
+                                    self.record_vec_copy(
+                                        rec,
+                                        &self.conv_snapshots_buf,
+                                        snap_dst as u32,
+                                        &self.conv_hist,
+                                        ffn_conv_off_f32 as u32,
+                                        ffn_conv_len_f32,
+                                    )?;
+                                }
+                                self.record_save_tok_state(rec, tok_i, b_t, pb_t, bk_t)?;
+                                TsRecorder::mark(&mut ts, rec, STAGE_POST_MOE);
+                            } else {
+                                self.record_layer_pre_moe_into(
+                                    rec,
+                                    st.il,
+                                    st.ip,
+                                    start_pos + tok_i,
+                                    tau_t,
+                                    st.pass > 0,
+                                    &mut b_t,
+                                    bk_t,
+                                    &self.wo_out_buf,
+                                    &self.top_ids_tmp_buf,
+                                    &self.top_weights_tmp_buf,
+                                    &mut ts,
+                                )?;
+                                if save_conv_snapshots && attn_conv_len_f32 > 0 {
+                                    let snap_dst = tok_i * self.total_conv_f32s + attn_conv_off_f32;
+                                    self.record_vec_copy(
+                                        rec,
+                                        &self.conv_snapshots_buf,
+                                        snap_dst as u32,
+                                        &self.conv_hist,
+                                        attn_conv_off_f32 as u32,
+                                        attn_conv_len_f32,
+                                    )?;
+                                }
                                 self.record_vec_copy(
                                     rec,
-                                    &self.conv_snapshots_buf,
-                                    snap_dst as u32,
-                                    &self.conv_hist,
-                                    ffn_conv_off_f32 as u32,
-                                    ffn_conv_len_f32,
+                                    &self.ffn_normed_bridge,
+                                    (tok_i * n_embd) as u32,
+                                    &self.wo_out_buf,
+                                    0,
+                                    n_embd,
+                                )?;
+                                self.record_buf_copy_bytes(
+                                    rec,
+                                    &self.top_ids_bridge,
+                                    (tok_i * top_k * 4) as u64,
+                                    &self.top_ids_tmp_buf,
+                                    0,
+                                    (top_k * 4) as u64,
+                                );
+                                self.record_buf_copy_bytes(
+                                    rec,
+                                    &self.top_weights_bridge,
+                                    (tok_i * top_k * 4) as u64,
+                                    &self.top_weights_tmp_buf,
+                                    0,
+                                    (top_k * 4) as u64,
+                                );
+                                self.record_save_tok_state(rec, tok_i, b_t, pb_t, bk_t)?;
+                                TsRecorder::mark(&mut ts, rec, STAGE_EMBED_STATE);
+                            }
+
+                            next_b = b_t;
+                            next_pb = pb_t;
+                            next_bk = bk_t;
+                        }
+
+                        if in_vram && w > 1 {
+                            self.record_vram_moe_window(
+                                rec,
+                                st.ip,
+                                w,
+                                &self.ffn_normed_bridge,
+                                &self.moe_out_bridge,
+                            )?;
+                            TsRecorder::mark(&mut ts, rec, STAGE_VRAM_MOE);
+                            for tok_i in 0..w {
+                                let base = (tok_i * self.per_tok_state_f32s) as u32;
+                                self.record_vec_copy(
+                                    rec,
+                                    &self.ffn_inp_buf,
+                                    0,
+                                    &self.win_state_buf,
+                                    base + n_embd as u32,
+                                    n_embd,
+                                )?;
+                                self.record_vec_copy(
+                                    rec,
+                                    &self.wo_out_buf,
+                                    0,
+                                    &self.moe_out_bridge,
+                                    (tok_i * n_embd) as u32,
+                                    n_embd,
+                                )?;
+                                self.record_layer_post_moe(rec, st.il, st.ip, true)?;
+                                if save_conv_snapshots && ffn_conv_len_f32 > 0 {
+                                    let snap_dst = tok_i * self.total_conv_f32s + ffn_conv_off_f32;
+                                    self.record_vec_copy(
+                                        rec,
+                                        &self.conv_snapshots_buf,
+                                        snap_dst as u32,
+                                        &self.conv_hist,
+                                        ffn_conv_off_f32 as u32,
+                                        ffn_conv_len_f32,
+                                    )?;
+                                }
+                                self.record_vec_copy(
+                                    rec,
+                                    &self.win_state_buf,
+                                    base,
+                                    &self.cur_buf,
+                                    0,
+                                    n_embd,
                                 )?;
                             }
-                            self.record_vec_copy(
-                                rec,
-                                &self.win_state_buf,
-                                base,
-                                &self.cur_buf,
-                                0,
-                                n_embd,
-                            )?;
+                            TsRecorder::mark(&mut ts, rec, STAGE_POST_MOE);
                         }
-                        TsRecorder::mark(&mut ts, rec, STAGE_POST_MOE);
                     }
 
                     blocks_len = next_b;
@@ -4128,6 +4456,777 @@ impl Inkling2VkRunner {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// Evaluates pre-MoE dense operations across `w >= 8` prefill tokens using `32x64x32` tiled
+    /// `gemm_tiled` projections (reading each layer's dense weights once per 32 tokens instead of
+    /// `w` times) and a single 2D `pipe_moe_ops(op=0)` router dispatch.
+    #[allow(clippy::too_many_arguments)]
+    fn record_visit_batched_gemm(
+        &self,
+        rec: &mut Recorder<'_>,
+        il: usize,
+        ip: usize,
+        has_messages: bool,
+        save_prelude_before: bool,
+        reset_pass_before: bool,
+        w: usize,
+        start_pos: usize,
+        taus: &[f32],
+        tap_slot: Option<usize>,
+        n_taps: usize,
+        in_vram: bool,
+        blocks_len: &mut usize,
+        prelude_blocks_len: &mut usize,
+        bank_len: &mut usize,
+        ts: &mut Option<TsRecorder<'_>>,
+    ) -> Result<(), VulkanError> {
+        let n_embd = self.cfg.n_embd;
+        let swa = self.cfg.is_swa[ip];
+        let nh = self.cfg.n_head(ip);
+        let nh_kv = self.cfg.n_head_kv(ip);
+        let hd = self.cfg.head_dim;
+        let q_dim = nh * hd;
+        let kv_dim = nh_kv * hd;
+        let n_rel = self.cfg.n_relative;
+        let n_conv = self.cfg.shortconv_l_cache;
+        let extent = self.cfg.rel_extent_for(ip);
+        let slot_conv_base = self.slot_conv_bases[il];
+        let layer = &self.layers[ip];
+
+        let init_b = *blocks_len;
+        let init_pb = *prelude_blocks_len;
+        let init_bk = *bank_len;
+        let mut post_tr_b = init_b;
+        let mut post_tr_pb = init_pb;
+        let mut post_tr_bk = init_bk;
+
+        // Phase 1: Per-token depth mix + loop controller(Q,K,V) + input RMSNorm -> `win_{q,k,v}_in_buf`
+        for tok_i in 0..w {
+            let mut b_t = init_b;
+            let mut pb_t = init_pb;
+            let mut bk_t = init_bk;
+            self.record_load_tok_state(rec, tok_i, b_t, pb_t, bk_t)?;
+            self.record_pre_step_transitions(
+                rec,
+                save_prelude_before,
+                reset_pass_before,
+                &mut b_t,
+                &mut pb_t,
+                &mut bk_t,
+            )?;
+            if let Some(t_pos) = tap_slot {
+                self.record_vec_copy(
+                    rec,
+                    &self.dspark_taps_buf,
+                    ((tok_i * n_taps + t_pos) * n_embd) as u32,
+                    &self.cur_buf,
+                    0,
+                    n_embd,
+                )?;
+            }
+            if has_messages {
+                let loop_w = &self.loop_layers[ip - self.cfg.core_start];
+                rec.dispatch(
+                    &self.pipe_ops,
+                    &[
+                        &self.bank_buf,
+                        &self.bank_out_buf,
+                        &self.f32_params,
+                        &self.messages_buf,
+                        &self.dummy_buf,
+                        &self.dummy_buf,
+                    ],
+                    &[
+                        3,
+                        n_embd as u32,
+                        bk_t as u32,
+                        loop_w.msg_query_off,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    LOOP_CTRL_COUNT as u32,
+                )?;
+            }
+            // Stash `inp_sa = cur` inside `ffn_inp_buf` slot of `win_state_buf` until Phase 5!
+            self.record_vec_copy(rec, &self.ffn_inp_buf, 0, &self.cur_buf, 0, n_embd)?;
+
+            if let Some(rq_off) = layer.attn_res_query_off {
+                if swa {
+                    rec.dispatch(
+                        &self.pipe_ops,
+                        &[
+                            &self.blocks_buf,
+                            &self.cur_buf,
+                            &self.f32_params,
+                            &self.inputs_buf,
+                            &self.dummy_buf,
+                            &self.dummy_buf,
+                        ],
+                        &[3, n_embd as u32, b_t as u32, rq_off, 0, 0, 0, 0],
+                        1,
+                    )?;
+                    self.record_vec_copy_nb(
+                        rec,
+                        &self.inputs_buf,
+                        n_embd as u32,
+                        &self.inputs_buf,
+                        0,
+                        n_embd,
+                    )?;
+                    self.record_vec_copy(
+                        rec,
+                        &self.inputs_buf,
+                        (2 * n_embd) as u32,
+                        &self.inputs_buf,
+                        0,
+                        n_embd,
+                    )?;
+                } else {
+                    rec.dispatch(
+                        &self.pipe_ops,
+                        &[
+                            &self.blocks_buf,
+                            &self.cur_buf,
+                            &self.f32_params,
+                            &self.inputs_buf,
+                            &self.dummy_buf,
+                            &self.dummy_buf,
+                        ],
+                        &[3, n_embd as u32, b_t as u32, rq_off, 0, 0, 0, 0],
+                        3,
+                    )?;
+                }
+            } else {
+                self.record_vec_copy_nb(rec, &self.inputs_buf, 0, &self.cur_buf, 0, n_embd)?;
+                self.record_vec_copy_nb(
+                    rec,
+                    &self.inputs_buf,
+                    n_embd as u32,
+                    &self.cur_buf,
+                    0,
+                    n_embd,
+                )?;
+                self.record_vec_copy(
+                    rec,
+                    &self.inputs_buf,
+                    (2 * n_embd) as u32,
+                    &self.cur_buf,
+                    0,
+                    n_embd,
+                )?;
+            }
+
+            if has_messages {
+                let loop_w = &self.loop_layers[ip - self.cfg.core_start];
+                self.record_controls_qkv(rec, loop_w)?;
+            }
+
+            let out_off = (tok_i * n_embd) as u32;
+            if swa && has_messages {
+                for (j, dst_b) in [&self.win_q_in_buf, &self.win_k_in_buf, &self.win_v_in_buf]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let args = [
+                        0,
+                        n_embd as u32,
+                        (j * n_embd) as u32,
+                        out_off,
+                        1,
+                        self.cfg.rms_eps.to_bits(),
+                        0,
+                        layer.attn_norm_off,
+                    ];
+                    let bufs = [
+                        &self.inputs_buf,
+                        dst_b,
+                        &self.f32_params,
+                        &self.dummy_buf,
+                        &self.dummy_buf,
+                        &self.dummy_buf,
+                    ];
+                    if j < 2 {
+                        rec.dispatch_nb(&self.pipe_ops, &bufs, &args, 1)?;
+                    } else {
+                        rec.dispatch(&self.pipe_ops, &bufs, &args, 1)?;
+                    }
+                }
+            } else if swa {
+                rec.dispatch(
+                    &self.pipe_ops,
+                    &[
+                        &self.inputs_buf,
+                        &self.win_q_in_buf,
+                        &self.f32_params,
+                        &self.dummy_buf,
+                        &self.dummy_buf,
+                        &self.dummy_buf,
+                    ],
+                    &[
+                        0,
+                        n_embd as u32,
+                        0,
+                        out_off,
+                        1,
+                        self.cfg.rms_eps.to_bits(),
+                        0,
+                        layer.attn_norm_off,
+                    ],
+                    1,
+                )?;
+                self.record_vec_copy_nb(
+                    rec,
+                    &self.win_k_in_buf,
+                    out_off,
+                    &self.win_q_in_buf,
+                    out_off,
+                    n_embd,
+                )?;
+                self.record_vec_copy(
+                    rec,
+                    &self.win_v_in_buf,
+                    out_off,
+                    &self.win_q_in_buf,
+                    out_off,
+                    n_embd,
+                )?;
+            } else {
+                let pairs = [
+                    (0usize, &self.win_q_in_buf, layer.q_inp_norm_off),
+                    (1usize, &self.win_k_in_buf, layer.k_inp_norm_off),
+                    (2usize, &self.win_v_in_buf, layer.v_inp_norm_off),
+                ];
+                for (j, dst_b, norm_off) in pairs {
+                    let args = [
+                        0,
+                        n_embd as u32,
+                        (j * n_embd) as u32,
+                        out_off,
+                        1,
+                        self.cfg.rms_eps.to_bits(),
+                        0,
+                        norm_off,
+                    ];
+                    let bufs = [
+                        &self.inputs_buf,
+                        dst_b,
+                        &self.f32_params,
+                        &self.dummy_buf,
+                        &self.dummy_buf,
+                        &self.dummy_buf,
+                    ];
+                    if j < 2 {
+                        rec.dispatch_nb(&self.pipe_ops, &bufs, &args, 1)?;
+                    } else {
+                        rec.dispatch(&self.pipe_ops, &bufs, &args, 1)?;
+                    }
+                }
+            }
+
+            self.record_save_tok_state(rec, tok_i, b_t, pb_t, bk_t)?;
+            post_tr_b = b_t;
+            post_tr_pb = pb_t;
+            post_tr_bk = bk_t;
+        }
+        TsRecorder::mark(ts, rec, STAGE_LOOP_MIX_NORM);
+
+        // Phase 2: Batched QKV / Rel / Sink / Gate (+ dynamic ShortConv tap) GEMMs across ALL `w` tokens!
+        self.dispatch_gemm_nb(rec, &layer.wq, &self.win_q_in_buf, &self.win_q_buf, w)?;
+        self.dispatch_gemm_nb(rec, &layer.wk, &self.win_k_in_buf, &self.win_k_buf, w)?;
+        self.dispatch_gemm_nb(rec, &layer.wv, &self.win_v_in_buf, &self.win_v_buf, w)?;
+        self.dispatch_gemm_nb(rec, &layer.attn_rel, &self.win_q_in_buf, &self.win_r_buf, w)?;
+        self.dispatch_gemm_nb(
+            rec,
+            &layer.attn_sink_proj,
+            &self.win_q_in_buf,
+            &self.win_sinks_buf,
+            w,
+        )?;
+        if swa {
+            self.dispatch_gemm(
+                rec,
+                &layer.wqkv_gate,
+                &self.win_q_in_buf,
+                &self.win_gate_buf,
+                w,
+            )?;
+        } else {
+            self.dispatch_gemm_nb(
+                rec,
+                &layer.wqkv_gate,
+                &self.win_q_in_buf,
+                &self.win_gate_buf,
+                w,
+            )?;
+            let kp = layer.attn_k_conv_proj.as_ref().expect("k_conv_proj");
+            let vp = layer.attn_v_conv_proj.as_ref().expect("v_conv_proj");
+            self.dispatch_gemm_nb(rec, kp, &self.win_k_in_buf, &self.win_k_dyn_buf, w)?;
+            self.dispatch_gemm(rec, vp, &self.win_v_in_buf, &self.win_v_dyn_buf, w)?;
+        }
+
+        // Phase 3: Causal K/V ShortConv + Clip + KV Pack + RelAttn across `tok_i in 0..w`
+        let dyn_heads = if swa { 0u32 } else { nh_kv as u32 };
+        let dyn_len = n_conv * nh_kv;
+        for (tok_i, &tau) in taus.iter().enumerate().take(w) {
+            let pos = start_pos + tok_i;
+            self.record_vec_copy_nb(
+                rec,
+                &self.q_buf,
+                0,
+                &self.win_q_buf,
+                (tok_i * q_dim) as u32,
+                q_dim,
+            )?;
+            self.record_vec_copy_nb(
+                rec,
+                &self.k_buf,
+                0,
+                &self.win_k_buf,
+                (tok_i * kv_dim) as u32,
+                kv_dim,
+            )?;
+            self.record_vec_copy_nb(
+                rec,
+                &self.v_buf,
+                0,
+                &self.win_v_buf,
+                (tok_i * kv_dim) as u32,
+                kv_dim,
+            )?;
+            self.record_vec_copy_nb(
+                rec,
+                &self.r_buf,
+                0,
+                &self.win_r_buf,
+                (tok_i * nh * n_rel) as u32,
+                nh * n_rel,
+            )?;
+            if swa {
+                self.record_vec_copy(
+                    rec,
+                    &self.sinks_buf,
+                    0,
+                    &self.win_sinks_buf,
+                    (tok_i * nh) as u32,
+                    nh,
+                )?;
+            } else {
+                self.record_vec_copy_nb(
+                    rec,
+                    &self.sinks_buf,
+                    0,
+                    &self.win_sinks_buf,
+                    (tok_i * nh) as u32,
+                    nh,
+                )?;
+                self.record_vec_copy_nb(
+                    rec,
+                    &self.k_dyn_buf,
+                    0,
+                    &self.win_k_dyn_buf,
+                    (tok_i * dyn_len) as u32,
+                    dyn_len,
+                )?;
+                self.record_vec_copy(
+                    rec,
+                    &self.v_dyn_buf,
+                    0,
+                    &self.win_v_dyn_buf,
+                    (tok_i * dyn_len) as u32,
+                    dyn_len,
+                )?;
+            }
+
+            rec.dispatch_nb(
+                &self.pipe_ops,
+                &[
+                    &self.k_buf,
+                    &self.f32_params,
+                    &self.k_dyn_buf,
+                    &self.conv_hist,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                ],
+                &[
+                    2,
+                    kv_dim as u32,
+                    n_conv as u32,
+                    0,
+                    dyn_heads,
+                    layer.k_conv_off,
+                    0,
+                    slot_conv_base,
+                ],
+                self.elem_groups(kv_dim),
+            )?;
+            rec.dispatch(
+                &self.pipe_ops,
+                &[
+                    &self.v_buf,
+                    &self.f32_params,
+                    &self.v_dyn_buf,
+                    &self.conv_hist,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                ],
+                &[
+                    2,
+                    kv_dim as u32,
+                    n_conv as u32,
+                    kv_dim as u32,
+                    dyn_heads,
+                    layer.v_conv_off,
+                    0,
+                    slot_conv_base,
+                ],
+                self.elem_groups(kv_dim),
+            )?;
+
+            let tau_eff = if swa { 1.0f32 } else { tau };
+            rec.dispatch_nb(
+                &self.pipe_ops,
+                &[
+                    &self.q_buf,
+                    &self.f32_params,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                ],
+                &[
+                    1,
+                    hd as u32,
+                    1,
+                    layer.q_clip_off,
+                    0,
+                    self.cfg.qk_clip.to_bits(),
+                    tau_eff.to_bits(),
+                    0,
+                ],
+                nh as u32,
+            )?;
+            rec.dispatch_nb(
+                &self.pipe_ops,
+                &[
+                    &self.k_buf,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                ],
+                &[
+                    1,
+                    hd as u32,
+                    0,
+                    0,
+                    0,
+                    self.cfg.qk_clip.to_bits(),
+                    1.0f32.to_bits(),
+                    0,
+                ],
+                nh_kv as u32,
+            )?;
+            rec.dispatch_nb(
+                &self.pipe_ops,
+                &[
+                    &self.v_buf,
+                    &self.v_in_buf,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                ],
+                &[0, hd as u32, 0, 0, 0, self.cfg.rms_eps.to_bits(), 0, 0],
+                nh_kv as u32,
+            )?;
+            rec.dispatch(
+                &self.pipe_ops,
+                &[
+                    &self.r_buf,
+                    &self.f32_params,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                ],
+                &[
+                    1,
+                    n_rel as u32,
+                    1,
+                    layer.rel_clip_off,
+                    0,
+                    self.cfg.relative_clip.to_bits(),
+                    tau_eff.to_bits(),
+                    0,
+                ],
+                nh as u32,
+            )?;
+
+            let kv_pairs = kv_dim / 2;
+            let dst_u32_off = self.slot_kv_u32_bases[il] + (pos * kv_pairs) as u32;
+            rec.dispatch(
+                &self.pipe_ops,
+                &[
+                    &self.k_buf,
+                    &self.v_in_buf,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                    &self.k_cache,
+                    &self.v_cache,
+                ],
+                &[5, kv_pairs as u32, dst_u32_off, 0, 0, 0, 0, 0],
+                self.elem_groups(kv_pairs),
+            )?;
+
+            let kv_start = if swa {
+                (pos + 1).saturating_sub(self.cfg.n_swa)
+            } else {
+                0
+            };
+            rec.dispatch(
+                &self.pipe_rel_attn,
+                &[
+                    &self.q_buf,
+                    &self.r_buf,
+                    &self.f32_params,
+                    &self.sinks_buf,
+                    &self.k_cache,
+                    &self.v_cache,
+                    &self.attn_vec_buf,
+                ],
+                &[
+                    (nh as u32) | ((nh_kv as u32) << 16),
+                    (hd as u32) | ((n_rel as u32) << 16),
+                    extent as u32,
+                    pos as u32,
+                    kv_start as u32,
+                    self.slot_kv_vec4_bases[il],
+                    layer.rel_bias_off,
+                ],
+                nh as u32,
+            )?;
+
+            self.record_vec_copy(
+                rec,
+                &self.win_attn_vec_buf,
+                (tok_i * q_dim) as u32,
+                &self.attn_vec_buf,
+                0,
+                q_dim,
+            )?;
+        }
+
+        // Phase 4: Batched `sigmoid_mul` + Batched `wo` GEMM across ALL `w` tokens!
+        rec.dispatch(
+            &self.pipe_sigmoid_mul,
+            &[&self.win_attn_vec_buf, &self.win_gate_buf],
+            &[(w * q_dim) as u32],
+            self.elem_groups(w * q_dim),
+        )?;
+        self.dispatch_gemm(
+            rec,
+            &layer.wo,
+            &self.win_attn_vec_buf,
+            &self.win_wo_out_buf,
+            w,
+        )?;
+        TsRecorder::mark(ts, rec, STAGE_ATTN_DENSE);
+
+        // Phase 5: Causal `attn_post_conv` + Block Residual + FFN Mix/Control/Norm -> `win_ffn_norm_buf`
+        let mut final_b = post_tr_b;
+        for tok_i in 0..w {
+            let mut b_t = post_tr_b;
+            self.record_load_tok_state(rec, tok_i, b_t, post_tr_pb, post_tr_bk)?;
+            self.record_vec_copy(
+                rec,
+                &self.wo_out_buf,
+                0,
+                &self.win_wo_out_buf,
+                (tok_i * n_embd) as u32,
+                n_embd,
+            )?;
+            rec.dispatch(
+                &self.pipe_ops,
+                &[
+                    &self.wo_out_buf,
+                    &self.f32_params,
+                    &self.dummy_buf,
+                    &self.conv_hist,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                ],
+                &[
+                    2,
+                    n_embd as u32,
+                    n_conv as u32,
+                    (2 * kv_dim) as u32,
+                    0,
+                    layer.attn_post_conv_off,
+                    0,
+                    slot_conv_base,
+                ],
+                self.elem_groups(n_embd),
+            )?;
+
+            // `ffn_inp_buf` currently holds `inp_sa` saved during Phase 1!
+            if ip.is_multiple_of(self.cfg.attn_res_block_size) {
+                self.record_vec_copy_nb(
+                    rec,
+                    &self.blocks_buf,
+                    (b_t * n_embd) as u32,
+                    &self.ffn_inp_buf,
+                    0,
+                    n_embd,
+                )?;
+                b_t += 1;
+                self.record_vec_copy(rec, &self.cur_buf, 0, &self.wo_out_buf, 0, n_embd)?;
+            } else {
+                self.record_vec_add(
+                    rec,
+                    &self.cur_buf,
+                    &self.ffn_inp_buf,
+                    &self.wo_out_buf,
+                    n_embd,
+                )?;
+            }
+            self.record_vec_copy(rec, &self.ffn_inp_buf, 0, &self.cur_buf, 0, n_embd)?;
+
+            rec.dispatch(
+                &self.pipe_ops,
+                &[
+                    &self.blocks_buf,
+                    &self.cur_buf,
+                    &self.f32_params,
+                    &self.inp_sa_buf,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                ],
+                &[
+                    3,
+                    n_embd as u32,
+                    b_t as u32,
+                    layer.ffn_res_query_off,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+                1,
+            )?;
+            if has_messages {
+                let loop_w = &self.loop_layers[ip - self.cfg.core_start];
+                rec.dispatch(
+                    &self.pipe_ops,
+                    &[
+                        &self.bank_buf,
+                        &self.bank_out_buf,
+                        &self.f32_params,
+                        &self.messages_buf,
+                        &self.dummy_buf,
+                        &self.dummy_buf,
+                    ],
+                    &[
+                        3,
+                        n_embd as u32,
+                        post_tr_bk as u32,
+                        loop_w.msg_query_off,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    LOOP_CTRL_COUNT as u32,
+                )?;
+                self.record_control(
+                    rec,
+                    loop_w,
+                    LOOP_CTRL_FFN,
+                    &self.inp_sa_buf,
+                    0,
+                    (LOOP_CTRL_FFN * n_embd) as u32,
+                )?;
+            }
+            rec.dispatch(
+                &self.pipe_ops,
+                &[
+                    &self.inp_sa_buf,
+                    &self.win_ffn_norm_buf,
+                    &self.f32_params,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                ],
+                &[
+                    0,
+                    n_embd as u32,
+                    0,
+                    (tok_i * n_embd) as u32,
+                    1,
+                    self.cfg.rms_eps.to_bits(),
+                    0,
+                    layer.ffn_norm_off,
+                ],
+                1,
+            )?;
+            self.record_save_tok_state(rec, tok_i, b_t, post_tr_pb, post_tr_bk)?;
+            final_b = b_t;
+        }
+
+        // Phase 6: Batched `ffn_gate_inp` Router GEMM + single 2D `top_k` dispatch across ALL `w` tokens!
+        self.dispatch_gemm(
+            rec,
+            &layer.ffn_gate_inp,
+            &self.win_ffn_norm_buf,
+            &self.win_router_logits_buf,
+            w,
+        )?;
+        let (has_b, b_off) = match layer.exp_probs_b_off {
+            Some(off) => (1u32, off),
+            None => (0u32, 0u32),
+        };
+        rec.dispatch_xy(
+            &self.pipe_moe_ops,
+            &[
+                &self.dummy_buf,
+                &self.win_router_logits_buf,
+                &self.f32_params,
+                &self.top_ids_bridge,
+                &self.top_weights_bridge,
+                &self.dummy_buf,
+            ],
+            &[
+                0,
+                self.cfg.n_expert as u32,
+                self.cfg.n_expert_used as u32,
+                has_b,
+                b_off,
+                0,
+                self.cfg.expert_weights_scale.to_bits(),
+                0,
+            ],
+            1,
+            w as u32,
+        )?;
+        if !in_vram {
+            self.record_buf_copy_bytes(
+                rec,
+                &self.ffn_normed_bridge,
+                0,
+                &self.win_ffn_norm_buf,
+                0,
+                (w * n_embd * 4) as u64,
+            );
+        }
+        TsRecorder::mark(ts, rec, STAGE_FFN_ROUTER);
+
+        *blocks_len = final_b;
+        *prelude_blocks_len = post_tr_pb;
+        *bank_len = post_tr_bk;
         Ok(())
     }
 }

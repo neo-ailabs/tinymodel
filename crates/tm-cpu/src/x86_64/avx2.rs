@@ -844,11 +844,14 @@ unsafe fn hsum4_8wide_pairwise_ps(a0: __m256, a1: __m256, a2: __m256, a3: __m256
     _mm_hadd_ps(p01, p23)
 }
 
-/// 4-row shared-activation `AVX2 + FMA` `gemv_f32_q8_0` (`0-ULP` bit-exact with `generic::gemv_f32_q8_0`).
+/// 8-row shared-activation `AVX2 + FMA + F16C` `gemv_f32_q8_0` (`0-ULP` bit-exact with `generic::gemv_f32_q8_0`).
+///
+/// Uses 8 YMM accumulators to share `x` loads across 8 rows simultaneously and converts all 8
+/// `f16` block scales in a single hardware `VCVTPH2PS` instruction (`_mm256_cvtph_ps`).
 ///
 /// # Safety
-/// Caller must ensure `avx2` and `fma` CPU features are supported.
-#[target_feature(enable = "avx2,fma")]
+/// Caller must ensure `avx2`, `fma`, and `f16c` CPU features are supported.
+#[target_feature(enable = "avx2,fma,f16c")]
 pub unsafe fn gemv_f32_q8_0(
     w: &[BlockQ8_0],
     x: &[f32],
@@ -863,6 +866,119 @@ pub unsafe fn gemv_f32_q8_0(
     let mut r = 0usize;
     // SAFETY: Row and block bounds are asserted above.
     unsafe {
+        while r + 8 <= rows {
+            let w0 = &w[r * cols_blocks..(r + 1) * cols_blocks];
+            let w1 = &w[(r + 1) * cols_blocks..(r + 2) * cols_blocks];
+            let w2 = &w[(r + 2) * cols_blocks..(r + 3) * cols_blocks];
+            let w3 = &w[(r + 3) * cols_blocks..(r + 4) * cols_blocks];
+            let w4 = &w[(r + 4) * cols_blocks..(r + 5) * cols_blocks];
+            let w5 = &w[(r + 5) * cols_blocks..(r + 6) * cols_blocks];
+            let w6 = &w[(r + 6) * cols_blocks..(r + 7) * cols_blocks];
+            let w7 = &w[(r + 7) * cols_blocks..(r + 8) * cols_blocks];
+            let mut tot0 = _mm_setzero_ps();
+            let mut tot1 = _mm_setzero_ps();
+
+            for ib in 0..cols_blocks {
+                let b0 = w0.get_unchecked(ib);
+                let b1 = w1.get_unchecked(ib);
+                let b2 = w2.get_unchecked(ib);
+                let b3 = w3.get_unchecked(ib);
+                let b4 = w4.get_unchecked(ib);
+                let b5 = w5.get_unchecked(ib);
+                let b6 = w6.get_unchecked(ib);
+                let b7 = w7.get_unchecked(ib);
+                let q_ptr = x.as_ptr().add(ib * QK8_0);
+                let mut acc0 = _mm256_setzero_ps();
+                let mut acc1 = _mm256_setzero_ps();
+                let mut acc2 = _mm256_setzero_ps();
+                let mut acc3 = _mm256_setzero_ps();
+                let mut acc4 = _mm256_setzero_ps();
+                let mut acc5 = _mm256_setzero_ps();
+                let mut acc6 = _mm256_setzero_ps();
+                let mut acc7 = _mm256_setzero_ps();
+
+                for c in 0..4 {
+                    let off = c * 8;
+                    let q_ps = _mm256_loadu_ps(q_ptr.add(off));
+                    acc0 = _mm256_fmadd_ps(
+                        _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                            b0.qs.as_ptr().add(off) as *const __m128i,
+                        ))),
+                        q_ps,
+                        acc0,
+                    );
+                    acc1 = _mm256_fmadd_ps(
+                        _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                            b1.qs.as_ptr().add(off) as *const __m128i,
+                        ))),
+                        q_ps,
+                        acc1,
+                    );
+                    acc2 = _mm256_fmadd_ps(
+                        _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                            b2.qs.as_ptr().add(off) as *const __m128i,
+                        ))),
+                        q_ps,
+                        acc2,
+                    );
+                    acc3 = _mm256_fmadd_ps(
+                        _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                            b3.qs.as_ptr().add(off) as *const __m128i,
+                        ))),
+                        q_ps,
+                        acc3,
+                    );
+                    acc4 = _mm256_fmadd_ps(
+                        _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                            b4.qs.as_ptr().add(off) as *const __m128i,
+                        ))),
+                        q_ps,
+                        acc4,
+                    );
+                    acc5 = _mm256_fmadd_ps(
+                        _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                            b5.qs.as_ptr().add(off) as *const __m128i,
+                        ))),
+                        q_ps,
+                        acc5,
+                    );
+                    acc6 = _mm256_fmadd_ps(
+                        _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                            b6.qs.as_ptr().add(off) as *const __m128i,
+                        ))),
+                        q_ps,
+                        acc6,
+                    );
+                    acc7 = _mm256_fmadd_ps(
+                        _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(
+                            b7.qs.as_ptr().add(off) as *const __m128i,
+                        ))),
+                        q_ps,
+                        acc7,
+                    );
+                }
+
+                let d8 = _mm256_cvtph_ps(_mm_set_epi16(
+                    b7.d as i16,
+                    b6.d as i16,
+                    b5.d as i16,
+                    b4.d as i16,
+                    b3.d as i16,
+                    b2.d as i16,
+                    b1.d as i16,
+                    b0.d as i16,
+                ));
+                let bsum0 = hsum4_8wide_pairwise_ps(acc0, acc1, acc2, acc3);
+                let bsum1 = hsum4_8wide_pairwise_ps(acc4, acc5, acc6, acc7);
+                tot0 = _mm_fmadd_ps(bsum0, _mm256_castps256_ps128(d8), tot0);
+                tot1 = _mm_fmadd_ps(bsum1, _mm256_extractf128_ps::<1>(d8), tot1);
+            }
+
+            _mm_storeu_ps(out.as_mut_ptr().add(r), tot0);
+            _mm_storeu_ps(out.as_mut_ptr().add(r + 4), tot1);
+            r += 8;
+        }
+
         while r + 4 <= rows {
             let w0 = &w[r * cols_blocks..(r + 1) * cols_blocks];
             let w1 = &w[(r + 1) * cols_blocks..(r + 2) * cols_blocks];
@@ -903,12 +1019,16 @@ pub unsafe fn gemv_f32_q8_0(
                 }
 
                 let bsum4 = hsum4_8wide_pairwise_ps(acc0, acc1, acc2, acc3);
-                let d4 = _mm_set_ps(
-                    f16_to_f32(b3.d),
-                    f16_to_f32(b2.d),
-                    f16_to_f32(b1.d),
-                    f16_to_f32(b0.d),
-                );
+                let d4 = _mm_cvtph_ps(_mm_set_epi16(
+                    0,
+                    0,
+                    0,
+                    0,
+                    b3.d as i16,
+                    b2.d as i16,
+                    b1.d as i16,
+                    b0.d as i16,
+                ));
                 tot4 = _mm_fmadd_ps(bsum4, d4, tot4);
             }
 
@@ -924,14 +1044,14 @@ pub unsafe fn gemv_f32_q8_0(
     }
 }
 
-/// Multi-token L1-pinned `4 rows x 2 tokens` `AVX2 + FMA` `gemm_f32_q8_0` (`0-ULP` bit-exact).
+/// Multi-token L1-pinned `4 rows x 2 tokens` `AVX2 + FMA + F16C` `gemm_f32_q8_0` (`0-ULP` bit-exact).
 ///
 /// Steps `r` by 4 in the outer loop so 4 weight rows (`< 10 KiB`) remain L1D-resident across all
 /// `n_tokens`, avoiding L1D thrashing when `n_tokens` is large.
 ///
 /// # Safety
-/// Caller must ensure `avx2` and `fma` CPU features are supported.
-#[target_feature(enable = "avx2,fma")]
+/// Caller must ensure `avx2`, `fma`, and `f16c` CPU features are supported.
+#[target_feature(enable = "avx2,fma,f16c")]
 pub unsafe fn gemm_f32_q8_0(
     w: &[BlockQ8_0],
     x: &[f32],
@@ -1011,12 +1131,16 @@ pub unsafe fn gemm_f32_q8_0(
                         a3_t1 = _mm256_fmadd_ps(k3, q_t1, a3_t1);
                     }
 
-                    let d4 = _mm_set_ps(
-                        f16_to_f32(b3.d),
-                        f16_to_f32(b2.d),
-                        f16_to_f32(b1.d),
-                        f16_to_f32(b0.d),
-                    );
+                    let d4 = _mm_cvtph_ps(_mm_set_epi16(
+                        0,
+                        0,
+                        0,
+                        0,
+                        b3.d as i16,
+                        b2.d as i16,
+                        b1.d as i16,
+                        b0.d as i16,
+                    ));
                     let s_t0 = hsum4_8wide_pairwise_ps(a0_t0, a1_t0, a2_t0, a3_t0);
                     let s_t1 = hsum4_8wide_pairwise_ps(a0_t1, a1_t1, a2_t1, a3_t1);
                     tot_t0 = _mm_fmadd_ps(s_t0, d4, tot_t0);

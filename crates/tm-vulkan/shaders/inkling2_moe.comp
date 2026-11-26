@@ -59,12 +59,15 @@ void main() {
     const uint gid = gl_GlobalInvocationID.x;
 
     if (pc.op == 0u) {
-        // Router top-k: `p0 = n_expert (<= 256)`, `p1 = top_k`, `p2 = has_bias`, `p3 = bias_off`, `f0 = w_scale`
-        // `x` = router_logits, `bias_or_w` = exp_probs_b, writes `top_ids` & `top_weights`
+        // Router top-k: `p0 = n_expert (<= 256)`, `p1 = top_k`, `p2 = has_bias`, `p3 = bias_off`, `u6 = w_scale_bits`
+        // `gl_WorkGroupID.y = tok_i` (`0` in single-token mode, `0..w` in batched window mode)
+        const uint tok = gl_WorkGroupID.y;
         const uint n_exp = pc.p0;
         const uint top_k = pc.p1;
+        const uint x_off = tok * n_exp;
+        const uint out_off = tok * top_k;
         for (uint e = tid; e < n_exp; e += WG) {
-            const float p = 1.0 / (1.0 + exp(-x[e]));
+            const float p = 1.0 / (1.0 + exp(-x[x_off + e]));
             s_probs[e] = p;
             s_sel[e] = p + ((pc.p2 != 0u) ? bias_or_w[pc.p3 + e] : 0.0);
         }
@@ -92,15 +95,15 @@ void main() {
                 sum_w += pw;
                 if (lane == 0u) {
                     s_sel[best_e] = -3.4e38;
-                    top_ids[k] = best_e;
-                    top_weights[k] = pw;
+                    top_ids[out_off + k] = best_e;
+                    top_weights[out_off + k] = pw;
                 }
                 subgroupMemoryBarrierShared();
             }
             if (lane == 0u) {
                 const float inv_sum = uintBitsToFloat(pc.u6) / (sum_w + 1.0e-20);
                 for (uint k = 0u; k < top_k; ++k) {
-                    top_weights[k] *= inv_sum;
+                    top_weights[out_off + k] *= inv_sum;
                 }
             }
         }

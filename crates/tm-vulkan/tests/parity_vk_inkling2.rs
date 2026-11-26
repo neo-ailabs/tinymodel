@@ -313,5 +313,87 @@ fn parity_vk_inkling2_pure_gpu_and_3tier_hybrid() {
         "post-rollback step 4 max_diff {max_diff_rb} >= 5e-3"
     );
 
+    // 4. Batched-GEMM prefill window (`W = 10 >= 8`, `save_conv_snapshots = false`):
+    //    Repeat the 7-token sequence to 10 tokens (`[5,12,29,41,7,63,18,5,12,29]`), verify that
+    //    `forward_window_hybrid` (using `gemm_tiled` + 2D router top-k) matches sequential
+    //    single-token `forward_token_hybrid` on both pure-GPU and 3-tier hybrid runners!
+    let toks10 = [5u32, 12, 29, 41, 7, 63, 18, 5, 12, 29];
+    runner.reset_state().unwrap();
+    for (s, &tid) in toks10.iter().enumerate() {
+        let _ = runner.forward_token(tid, s, s + 1 == toks10.len()).unwrap();
+    }
+    let seq_pure_last = runner
+        .forward_batch_hybrid(&[], toks10.len(), false, None)
+        .unwrap()
+        .to_vec();
+
+    runner.reset_state().unwrap();
+    let mut win10_am = [0u32; 10];
+    let win_pure_last = runner
+        .forward_window_hybrid(&toks10, 0, true, false, &[], None, Some(&mut win10_am))
+        .unwrap()
+        .to_vec();
+    assert_eq!(argmax(&win_pure_last), argmax(&seq_pure_last));
+    let mut max_diff_w10_pure = 0.0f32;
+    for (&a, &b) in win_pure_last.iter().zip(seq_pure_last.iter()) {
+        max_diff_w10_pure = max_diff_w10_pure.max((a - b).abs());
+    }
+    assert!(
+        max_diff_w10_pure < 5e-3,
+        "pure-GPU W=10 batched GEMM max_diff {max_diff_w10_pure} >= 5e-3"
+    );
+    for s in 0..7 {
+        assert_eq!(win10_am[s], argmax(&ref_logits[s]));
+    }
+
+    hybrid_runner.reset_state().unwrap();
+    let mut win10_hyb_am = [0u32; 10];
+    let win_hyb_last = {
+        let mut cb_win = |ip: usize,
+                          w_len: usize,
+                          cur_win: &[f32],
+                          ids_win: &[usize],
+                          w_win: &[f32],
+                          out_win: &mut [f32]| {
+            let (serial_pool, expert_slots, mv_scratch, win_slot_outs) =
+                host_state.host_moe_window_parts_mut();
+            host_model.eval_moe_experts_window_f32(
+                ip,
+                w_len,
+                cur_win,
+                ids_win,
+                w_win,
+                &pool,
+                serial_pool,
+                kt,
+                expert_slots,
+                mv_scratch,
+                win_slot_outs,
+                out_win,
+            );
+        };
+        hybrid_runner
+            .forward_window_hybrid(
+                &toks10,
+                0,
+                true,
+                false,
+                &[],
+                Some(&mut cb_win),
+                Some(&mut win10_hyb_am),
+            )
+            .unwrap()
+            .to_vec()
+    };
+    assert_eq!(argmax(&win_hyb_last), argmax(&seq_pure_last));
+    let mut max_diff_w10_hyb = 0.0f32;
+    for (&a, &b) in win_hyb_last.iter().zip(seq_pure_last.iter()) {
+        max_diff_w10_hyb = max_diff_w10_hyb.max((a - b).abs());
+    }
+    assert!(
+        max_diff_w10_hyb < 5e-3,
+        "3-tier hybrid W=10 batched GEMM max_diff {max_diff_w10_hyb} >= 5e-3"
+    );
+
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }

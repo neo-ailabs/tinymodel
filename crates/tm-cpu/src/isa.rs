@@ -69,7 +69,8 @@ pub fn detect_caps() -> Caps {
     #[cfg(target_arch = "x86_64")]
     {
         let avx2 = std::arch::is_x86_feature_detected!("avx2")
-            && std::arch::is_x86_feature_detected!("fma");
+            && std::arch::is_x86_feature_detected!("fma")
+            && std::arch::is_x86_feature_detected!("f16c");
         let avx512f = avx2
             && std::arch::is_x86_feature_detected!("avx512f")
             && std::arch::is_x86_feature_detected!("avx512bw")

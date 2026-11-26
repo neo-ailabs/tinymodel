@@ -2,9 +2,11 @@
 
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ash::vk;
+use ash::vk::Handle;
 
 use crate::{VkResultExt, VulkanError};
 
@@ -13,6 +15,11 @@ const VENDOR_INTEL: u32 = 0x8086;
 const STAGING_BYTES: u64 = 64 << 20;
 const DESC_POOL_SETS: u32 = 65536;
 const DESC_POOL_BUFFERS: u32 = 65536 * 8;
+const CACHE_DESC_SETS: u32 = 16384;
+const CACHE_DESC_BUFFERS: u32 = 16384 * 8;
+const MAX_CACHED_BINDINGS: usize = 12;
+
+static NEXT_BUF_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Batched prefill kernel selection policy for [`VulkanContext`] / [`crate::LlamaVkRunner`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +125,7 @@ impl Drop for Inner {
 /// A device buffer (storage + transfer usage). Device-local unless created as host-visible.
 pub struct VkBuffer {
     inner: Arc<Inner>,
+    pub(crate) id: u64,
     pub(crate) buf: vk::Buffer,
     mem: vk::DeviceMemory,
     size: u64,
@@ -170,11 +178,18 @@ struct Exec {
     staging: Option<VkBuffer>,
 }
 
+pub(crate) struct DescCache {
+    pool: vk::DescriptorPool,
+    map: HashMap<(u64, [u64; MAX_CACHED_BINDINGS]), vk::DescriptorSet>,
+}
+
 /// One recorded dispatch-batch; created by [`VulkanContext::run`].
 pub(crate) struct Recorder<'a> {
     pub(crate) ctx: &'a VulkanContext,
     pub(crate) cb: vk::CommandBuffer,
     desc_pool: vk::DescriptorPool,
+    desc_cache: &'a mut DescCache,
+    last_pipeline: vk::Pipeline,
 }
 
 /// The selected Vulkan device, its compute queue, and a pipeline cache.
@@ -182,6 +197,7 @@ pub struct VulkanContext {
     pub(crate) inner: Arc<Inner>,
     info: DeviceInfo,
     exec: Mutex<Exec>,
+    desc_cache: Mutex<DescCache>,
     pub(crate) pipelines: Mutex<HashMap<(&'static str, u32), Arc<Pipeline>>>,
     pub(crate) gemv_cfg: Mutex<(u32, u32)>,
     prefill_mode: Mutex<VkPrefillMode>,
@@ -560,10 +576,12 @@ impl VulkanContext {
                     ext_host,
                 });
                 let exec = Self::create_exec(&inner, queue_family)?;
+                let desc_cache = Self::create_desc_cache(&inner)?;
                 Ok(Self {
                     inner,
                     info: pdev_probe.info,
                     exec: Mutex::new(exec),
+                    desc_cache: Mutex::new(desc_cache),
                     pipelines: Mutex::new(HashMap::new()),
                     gemv_cfg: Mutex::new((
                         crate::kernels::DEFAULT_GEMV_WG,
@@ -796,6 +814,28 @@ impl VulkanContext {
         }
     }
 
+    fn create_desc_cache(inner: &Arc<Inner>) -> Result<DescCache, VulkanError> {
+        let d = &inner.device;
+        let sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: CACHE_DESC_BUFFERS,
+        }];
+        // SAFETY: valid device; destroyed in `VulkanContext::drop`.
+        let pool = unsafe {
+            d.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(CACHE_DESC_SETS)
+                    .pool_sizes(&sizes),
+                None,
+            )
+            .ctx("vkCreateDescriptorPool(cache)")?
+        };
+        Ok(DescCache {
+            pool,
+            map: HashMap::with_capacity(1024),
+        })
+    }
+
     pub fn info(&self) -> &DeviceInfo {
         &self.info
     }
@@ -918,6 +958,7 @@ impl VulkanContext {
             };
             let mut out = VkBuffer {
                 inner: self.inner.clone(),
+                id: NEXT_BUF_ID.fetch_add(1, Ordering::Relaxed),
                 buf,
                 mem,
                 size,
@@ -1060,6 +1101,7 @@ impl VulkanContext {
             }
             Some(VkBuffer {
                 inner: self.inner.clone(),
+                id: NEXT_BUF_ID.fetch_add(1, Ordering::Relaxed),
                 buf,
                 mem,
                 size: import_len as u64,
@@ -1404,14 +1446,18 @@ impl VulkanContext {
                 &[],
             );
         }
+        let mut dc_guard = self.desc_cache.lock().map_err(|_| VulkanError::NoDevice)?;
         let mut rec = Recorder {
             ctx: self,
             cb,
             desc_pool,
+            desc_cache: &mut dc_guard,
+            last_pipeline: vk::Pipeline::null(),
         };
         let t_rec = std::time::Instant::now();
         let r = f(&mut rec);
         let rec_ns = t_rec.elapsed().as_nanos() as u64;
+        drop(dc_guard);
         // SAFETY: as above; the fence is unsignaled (reset after every wait).
         unsafe {
             // Vulkan 1.2 §7.9: `vkWaitForFences` alone does not flush discrete GPU L2/Mall caches
@@ -1502,6 +1548,18 @@ impl Recorder<'_> {
         self.dispatch_xy_inner(p, bufs, push, gx, gy, true)
     }
 
+    /// Records one 2D dispatch `(gx, gy, 1)` **without** a trailing barrier.
+    pub(crate) fn dispatch_xy_nb(
+        &mut self,
+        p: &Pipeline,
+        bufs: &[&VkBuffer],
+        push: &[u32],
+        gx: u32,
+        gy: u32,
+    ) -> Result<(), VulkanError> {
+        self.dispatch_xy_inner(p, bufs, push, gx, gy, false)
+    }
+
     fn dispatch_xy_inner(
         &mut self,
         p: &Pipeline,
@@ -1534,39 +1592,106 @@ impl Recorder<'_> {
             )));
         }
         let d = &self.ctx.inner.device;
-        let infos: Vec<vk::DescriptorBufferInfo> = bufs
-            .iter()
-            .map(|b| vk::DescriptorBufferInfo {
-                buffer: b.buf,
-                offset: 0,
-                range: vk::WHOLE_SIZE,
-            })
-            .collect();
-        let push_bytes: Vec<u8> = push.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        // SAFETY: the pipeline, layout and buffers are valid for the lifetime of this
-        // recording; descriptor set is freshly allocated from the per-run pool.
-        unsafe {
-            let layouts = [p.set_layout];
-            let set = d
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(self.desc_pool)
-                        .set_layouts(&layouts),
-                )
-                .ctx("vkAllocateDescriptorSets")?[0];
-            let writes: Vec<vk::WriteDescriptorSet> = infos
+        let nb = bufs.len();
+
+        // Fast persistent `(set_layout, buffer_ids)` descriptor-set cache with zero heap allocations:
+        let set = if nb <= MAX_CACHED_BINDINGS {
+            let mut key_ids = [0u64; MAX_CACHED_BINDINGS];
+            for (dst_id, b) in key_ids.iter_mut().zip(bufs.iter()) {
+                *dst_id = b.id;
+            }
+            let key = (p.set_layout.as_raw(), key_ids);
+            if let Some(&cached_set) = self.desc_cache.map.get(&key) {
+                cached_set
+            } else {
+                let target_pool = if self.desc_cache.map.len() < (CACHE_DESC_SETS as usize) {
+                    Some(self.desc_cache.pool)
+                } else {
+                    None
+                };
+                let alloc_pool = target_pool.unwrap_or(self.desc_pool);
+                let mut infos = [vk::DescriptorBufferInfo::default(); MAX_CACHED_BINDINGS];
+                let mut writes = [vk::WriteDescriptorSet::default(); MAX_CACHED_BINDINGS];
+                for (i, b) in bufs.iter().enumerate() {
+                    infos[i] = vk::DescriptorBufferInfo {
+                        buffer: b.buf,
+                        offset: 0,
+                        range: vk::WHOLE_SIZE,
+                    };
+                }
+                // SAFETY: `p.set_layout` and all buffers in `bufs` are valid; `infos` outlives `update_descriptor_sets`.
+                let new_set = unsafe {
+                    let layouts = [p.set_layout];
+                    let s = d
+                        .allocate_descriptor_sets(
+                            &vk::DescriptorSetAllocateInfo::default()
+                                .descriptor_pool(alloc_pool)
+                                .set_layouts(&layouts),
+                        )
+                        .ctx("vkAllocateDescriptorSets")?[0];
+                    for i in 0..nb {
+                        writes[i] = vk::WriteDescriptorSet::default()
+                            .dst_set(s)
+                            .dst_binding(i as u32)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(core::slice::from_ref(&infos[i]));
+                    }
+                    d.update_descriptor_sets(&writes[..nb], &[]);
+                    s
+                };
+                if target_pool.is_some() {
+                    self.desc_cache.map.insert(key, new_set);
+                }
+                new_set
+            }
+        } else {
+            let infos: Vec<vk::DescriptorBufferInfo> = bufs
                 .iter()
-                .enumerate()
-                .map(|(i, info)| {
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(set)
-                        .dst_binding(i as u32)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .buffer_info(core::slice::from_ref(info))
+                .map(|b| vk::DescriptorBufferInfo {
+                    buffer: b.buf,
+                    offset: 0,
+                    range: vk::WHOLE_SIZE,
                 })
                 .collect();
-            d.update_descriptor_sets(&writes, &[]);
-            d.cmd_bind_pipeline(self.cb, vk::PipelineBindPoint::COMPUTE, p.pipeline);
+            // SAFETY: valid layout and transient `desc_pool`.
+            unsafe {
+                let layouts = [p.set_layout];
+                let s = d
+                    .allocate_descriptor_sets(
+                        &vk::DescriptorSetAllocateInfo::default()
+                            .descriptor_pool(self.desc_pool)
+                            .set_layouts(&layouts),
+                    )
+                    .ctx("vkAllocateDescriptorSets")?[0];
+                let writes: Vec<vk::WriteDescriptorSet> = infos
+                    .iter()
+                    .enumerate()
+                    .map(|(i, info)| {
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(s)
+                            .dst_binding(i as u32)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(core::slice::from_ref(info))
+                    })
+                    .collect();
+                d.update_descriptor_sets(&writes, &[]);
+                s
+            }
+        };
+
+        let mut push_buf = [0u8; 128];
+        let push_byte_len = push.len() * 4;
+        assert!(push_byte_len <= push_buf.len());
+        for (i, &w) in push.iter().enumerate() {
+            push_buf[i * 4..i * 4 + 4].copy_from_slice(&w.to_ne_bytes());
+        }
+
+        // SAFETY: `p.pipeline`, `p.layout`, and `set` are valid for the lifetime of this recording.
+        unsafe {
+            if self.last_pipeline != p.pipeline {
+                d.cmd_bind_pipeline(self.cb, vk::PipelineBindPoint::COMPUTE, p.pipeline);
+                self.last_pipeline = p.pipeline;
+            }
             d.cmd_bind_descriptor_sets(
                 self.cb,
                 vk::PipelineBindPoint::COMPUTE,
@@ -1575,13 +1700,13 @@ impl Recorder<'_> {
                 &[set],
                 &[],
             );
-            if !push_bytes.is_empty() {
+            if push_byte_len > 0 {
                 d.cmd_push_constants(
                     self.cb,
                     p.layout,
                     vk::ShaderStageFlags::COMPUTE,
                     0,
-                    &push_bytes,
+                    &push_buf[..push_byte_len],
                 );
             }
             d.cmd_dispatch(self.cb, gx, gy, 1);
@@ -1606,6 +1731,10 @@ impl Drop for VulkanContext {
                     d.destroy_pipeline_layout(p.layout, None);
                     d.destroy_descriptor_set_layout(p.set_layout, None);
                 }
+            }
+            if let Ok(mut dc) = self.desc_cache.lock() {
+                dc.map.clear();
+                d.destroy_descriptor_pool(dc.pool, None);
             }
             if let Ok(mut e) = self.exec.lock() {
                 e.staging = None;

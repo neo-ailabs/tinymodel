@@ -19,9 +19,9 @@
 
 use tm_core::{DType, KvType, QK8_0, dequantize_row_bytes, probe_system_memory};
 use tm_cpu::{
-    KernelTable, MAX_CPU_BATCH, MatvecScratch, ThreadPool, matmul_f32,
-    matvec_batch_f32_unquant_act, matvec_f32, matvec_f32_unquant_act, rms_norm,
-    rms_norm_unit_inplace, softcap_inplace_parallel,
+    HugePageBytes, KernelTable, MAX_CPU_BATCH, MatvecScratch, ThreadPool, matmul_f32,
+    matvec_batch_f32_unquant_act, matvec_f32, matvec_f32_unquant_act, release_mmap_page_cache,
+    rms_norm, rms_norm_unit_inplace, softcap_inplace_parallel,
 };
 use tm_gguf::{DirectTensorReader, GgufError, GgufFile, PageAlignedSlot};
 
@@ -185,10 +185,11 @@ pub struct Inkling2PlacementStats {
     pub direct_io_active: bool,
 }
 
-/// Backing bytes for a matrix (either zero-copy borrowed from `GgufFile` or uncached anonymous RAM).
+/// Backing bytes for a matrix (zero-copy `GgufFile` slice, `Vec<u8>`, or `2 MiB` `MADV_HUGEPAGE` RAM).
 pub enum BytesBacking<'a> {
     Borrowed(&'a [u8]),
     Owned(Vec<u8>),
+    HugePage(HugePageBytes),
 }
 
 impl<'a> BytesBacking<'a> {
@@ -197,6 +198,7 @@ impl<'a> BytesBacking<'a> {
         match self {
             BytesBacking::Borrowed(b) => b,
             BytesBacking::Owned(v) => v.as_slice(),
+            BytesBacking::HugePage(hp) => hp.as_slice(),
         }
     }
 }
@@ -1118,15 +1120,35 @@ impl<'a> Inkling2Model<'a> {
                     &ltag,
                     &[n_ff, n_embd, n_exp],
                 )?;
-                stats.ram_mmap_expert_layers += 1;
+                let (gu_backing, dn_backing) = if skip_dense && gu_bytes.len() >= 2 * 1024 * 1024 {
+                    // Hybrid GPU+CPU mode on large MoE checkpoints: stage host experts into
+                    // `2 MiB` `MADV_HUGEPAGE` anonymous memory and immediately release the `4 KiB`
+                    // file-backed page cache (`MADV_DONTNEED`) to eliminate nested KVM EPT / TLB
+                    // misses without duplicating host RAM!
+                    let mut gu_hp = HugePageBytes::new_zeroed(gu_bytes.len());
+                    gu_hp.as_mut_slice().copy_from_slice(gu_bytes);
+                    release_mmap_page_cache(gu_bytes);
+                    let mut dn_hp = HugePageBytes::new_zeroed(dn_bytes.len());
+                    dn_hp.as_mut_slice().copy_from_slice(dn_bytes);
+                    release_mmap_page_cache(dn_bytes);
+                    stats.ram_owned_expert_layers += 1;
+                    stats.ram_owned_bytes += (gu_bytes.len() + dn_bytes.len()) as u64;
+                    (BytesBacking::HugePage(gu_hp), BytesBacking::HugePage(dn_hp))
+                } else {
+                    stats.ram_mmap_expert_layers += 1;
+                    (
+                        BytesBacking::Borrowed(gu_bytes),
+                        BytesBacking::Borrowed(dn_bytes),
+                    )
+                };
                 if is_core {
                     stats.core_layers_in_fast_tiers += 1;
                 }
                 ExpertLayerStore::InMemory {
-                    gate_up: BytesBacking::Borrowed(gu_bytes),
+                    gate_up: gu_backing,
                     gate_up_dtype: gu_info.dtype,
                     gate_up_expert_bytes: gu_bytes.len() / n_exp,
-                    down: BytesBacking::Borrowed(dn_bytes),
+                    down: dn_backing,
                     down_dtype: dn_info.dtype,
                     down_expert_bytes: dn_bytes.len() / n_exp,
                 }
@@ -1144,20 +1166,29 @@ impl<'a> Inkling2Model<'a> {
                     &[n_ff, n_embd, n_exp],
                 )?;
                 let dn_dt = dn_info.dtype;
-                let mut gu_owned = vec![0u8; gu_len];
-                rdr.read_exact_uncached(gu_off, &mut gu_owned, &mut io_slot)?;
-                let mut dn_owned = vec![0u8; dn_len];
-                rdr.read_exact_uncached(dn_off, &mut dn_owned, &mut io_slot)?;
+                let (gu_backing, dn_backing) = if gu_len >= 2 * 1024 * 1024 {
+                    let mut gu_hp = HugePageBytes::new_zeroed(gu_len);
+                    rdr.read_exact_uncached(gu_off, gu_hp.as_mut_slice(), &mut io_slot)?;
+                    let mut dn_hp = HugePageBytes::new_zeroed(dn_len);
+                    rdr.read_exact_uncached(dn_off, dn_hp.as_mut_slice(), &mut io_slot)?;
+                    (BytesBacking::HugePage(gu_hp), BytesBacking::HugePage(dn_hp))
+                } else {
+                    let mut gu_owned = vec![0u8; gu_len];
+                    rdr.read_exact_uncached(gu_off, &mut gu_owned, &mut io_slot)?;
+                    let mut dn_owned = vec![0u8; dn_len];
+                    rdr.read_exact_uncached(dn_off, &mut dn_owned, &mut io_slot)?;
+                    (BytesBacking::Owned(gu_owned), BytesBacking::Owned(dn_owned))
+                };
                 stats.ram_owned_expert_layers += 1;
                 stats.ram_owned_bytes += (gu_len + dn_len) as u64;
                 if is_core {
                     stats.core_layers_in_fast_tiers += 1;
                 }
                 ExpertLayerStore::InMemory {
-                    gate_up: BytesBacking::Owned(gu_owned),
+                    gate_up: gu_backing,
                     gate_up_dtype: gu_dt,
                     gate_up_expert_bytes: gu_len / n_exp,
-                    down: BytesBacking::Owned(dn_owned),
+                    down: dn_backing,
                     down_dtype: dn_dt,
                     down_expert_bytes: dn_len / n_exp,
                 }
