@@ -2011,6 +2011,7 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
             ds.state.reset();
         }
 
+        runner.reset_prof();
         let t_pp = Instant::now();
         let pp_logits = eval_inkling2_vk_batch(
             &mut runner,
@@ -2025,6 +2026,9 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
         let first_tok = if corpus_mode { argmax(pp_logits) } else { 0 };
         let pp_sec = t_pp.elapsed().as_secs_f64();
         let pp_tps = (n_pp as f64) / pp_sec.max(1e-9);
+        if let Some(rep) = runner.prof_report() {
+            eprintln!("{rep} (prefill)");
+        }
 
         let n_gen = opts.n_predict;
         let mut gen_tokens = Vec::with_capacity(n_gen + 1);
@@ -2059,6 +2063,7 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
 
         let mut dspark_accepted = 0usize;
         let mut dspark_drafted = 0usize;
+        runner.reset_prof();
         let t0 = Instant::now();
         if let Some(ref mut ds) = dspark_ctx {
             let mut drafts = [0u32; 8];
@@ -2165,6 +2170,9 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
         }
         let sec = t0.elapsed().as_secs_f64();
         let tps = (n_gen as f64) / sec.max(1e-9);
+        if let Some(rep) = runner.prof_report() {
+            eprintln!("{rep} (decode)");
+        }
         let tel_after = probe::collect_telemetry();
         let dev_name = runner.device_name().to_string();
         let wmode = if dspark_ctx.is_some() {

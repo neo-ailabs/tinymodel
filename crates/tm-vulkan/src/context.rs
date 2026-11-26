@@ -1361,6 +1361,16 @@ impl VulkanContext {
     where
         F: FnOnce(&mut Recorder<'_>) -> Result<(), VulkanError>,
     {
+        self.run_timed(f).map(|_| ())
+    }
+
+    /// Same as [`Self::run`], returning `(record_ns, total_ns)` wall-clock timings
+    /// (`record_ns` = time inside `f`; `total_ns` = whole call incl. submit + fence wait).
+    pub(crate) fn run_timed<F>(&self, f: F) -> Result<(u64, u64), VulkanError>
+    where
+        F: FnOnce(&mut Recorder<'_>) -> Result<(), VulkanError>,
+    {
+        let t_total = std::time::Instant::now();
         let (cb, fence, desc_pool) = {
             let e = self.exec.lock().map_err(|_| VulkanError::NoDevice)?;
             (e.cb, e.fence, e.desc_pool)
@@ -1399,7 +1409,9 @@ impl VulkanContext {
             cb,
             desc_pool,
         };
+        let t_rec = std::time::Instant::now();
         let r = f(&mut rec);
+        let rec_ns = t_rec.elapsed().as_nanos() as u64;
         // SAFETY: as above; the fence is unsignaled (reset after every wait).
         unsafe {
             // Vulkan 1.2 §7.9: `vkWaitForFences` alone does not flush discrete GPU L2/Mall caches
@@ -1426,7 +1438,7 @@ impl VulkanContext {
                 .ctx("vkWaitForFences")?;
             d.reset_fences(&[fence]).ctx("vkResetFences")?;
         }
-        Ok(())
+        Ok((rec_ns, t_total.elapsed().as_nanos() as u64))
     }
 }
 

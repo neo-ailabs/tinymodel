@@ -192,10 +192,27 @@ pub type HostMoeFn<'a> = dyn FnMut(usize, &[f32], &[usize], &[f32], &mut [f32]) 
 /// `(ip, window_len, cur_normed_win, top_ids_win, top_weights_win, moe_out_win)`.
 pub type HostMoeWindowFn<'a> = dyn FnMut(usize, usize, &[f32], &[usize], &[f32], &mut [f32]) + 'a;
 
+/// Wall-clock phase accumulators for `TM_VK_PROF=1` (host-side `Instant`, no GPU timestamp queries).
+#[derive(Debug, Default, Clone, Copy)]
+struct Inkling2Prof {
+    tokens: u64,
+    gpu_submits: u64,
+    /// CPU time spent recording command buffers (dispatch + descriptor-set allocation).
+    gpu_record_ns: u64,
+    /// `vkQueueSubmit` + GPU execution + `vkWaitForFences` (submit wall minus record).
+    gpu_wait_ns: u64,
+    host_moe_calls: u64,
+    host_moe_ns: u64,
+    /// Mapped-memory bridge reads/writes around host MoE.
+    bridge_ns: u64,
+}
+
 /// End-to-end / Hybrid Vulkan runner for `inkling2` & `inkling2_loop`.
 pub struct Inkling2VkRunner {
     ctx: VulkanContext,
     pub cfg: Inkling2VkConfig,
+    prof_on: bool,
+    prof: Inkling2Prof,
     vram_expert_mask: Vec<bool>,
     vram_total_bytes: u64,
     weights_mode_label: String,
@@ -1249,6 +1266,8 @@ impl Inkling2VkRunner {
 
         Ok(Self {
             ctx,
+            prof_on: std::env::var("TM_VK_PROF").is_ok_and(|v| v == "1"),
+            prof: Inkling2Prof::default(),
             vram_expert_mask,
             vram_total_bytes,
             weights_mode_label,
@@ -1346,6 +1365,42 @@ impl Inkling2VkRunner {
 
     pub fn weights_mode(&self) -> &str {
         &self.weights_mode_label
+    }
+
+    /// Clears `TM_VK_PROF=1` phase accumulators.
+    pub fn reset_prof(&mut self) {
+        self.prof = Inkling2Prof::default();
+    }
+
+    /// Returns a per-token phase breakdown since the last [`Self::reset_prof`] when `TM_VK_PROF=1`.
+    pub fn prof_report(&self) -> Option<String> {
+        if !self.prof_on || self.prof.tokens == 0 {
+            return None;
+        }
+        let p = self.prof;
+        let t = p.tokens as f64;
+        let ms = |ns: u64| ns as f64 / 1e6 / t;
+        let total = p.gpu_record_ns + p.gpu_wait_ns + p.host_moe_ns + p.bridge_ns;
+        Some(format!(
+            "[inkling2 prof] {} tok: submits/tok={:.1} | gpu_record={:.2} ms | gpu_submit+exec+wait={:.2} ms | host_moe={:.2} ms ({:.1} calls/tok) | bridge={:.2} ms | sum={:.2} ms/tok",
+            p.tokens,
+            p.gpu_submits as f64 / t,
+            ms(p.gpu_record_ns),
+            ms(p.gpu_wait_ns),
+            ms(p.host_moe_ns),
+            p.host_moe_calls as f64 / t,
+            ms(p.bridge_ns),
+            ms(total),
+        ))
+    }
+
+    /// Accumulates one `ctx.run_timed` submission into the `TM_VK_PROF=1` counters.
+    fn prof_add_submit(&mut self, (rec_ns, total_ns): (u64, u64)) {
+        if self.prof_on {
+            self.prof.gpu_submits += 1;
+            self.prof.gpu_record_ns += rec_ns;
+            self.prof.gpu_wait_ns += total_ns.saturating_sub(rec_ns);
+        }
     }
 
     pub fn vram_expert_mask(&self) -> &[bool] {
@@ -1721,6 +1776,9 @@ impl Inkling2VkRunner {
         let ratio = ((pos + 1) as f32) / (self.cfg.log_scale_floor as f32);
         let tau = 1.0 + self.cfg.log_scale_alpha * ratio.max(1.0).ln();
         let n_embd = self.cfg.n_embd;
+        if self.prof_on {
+            self.prof.tokens += 1;
+        }
 
         // Build flat execution schedule of `(il, ip, pass, reset_to_prelude_before_this_step)`
         // so pure-GPU runs submit ALL 48 passes in ONE single `ctx.run` command buffer, while
@@ -1790,7 +1848,7 @@ impl Inkling2VkRunner {
             let mut blocks_len = 0usize;
             let mut prelude_blocks_len = 0usize;
             let mut bank_len = 0usize;
-            self.ctx.run(|rec| {
+            let sub_t = self.ctx.run_timed(|rec| {
                 self.record_embed_and_norm(rec)?;
                 for st in &schedule {
                     self.record_pre_step_transitions(
@@ -1816,6 +1874,7 @@ impl Inkling2VkRunner {
                 }
                 self.record_output_stage(rec, blocks_len, compute_logits, compute_argmax)
             })?;
+            self.prof_add_submit(sub_t);
             return Ok(());
         }
 
@@ -1830,7 +1889,7 @@ impl Inkling2VkRunner {
 
         while cursor < schedule.len() {
             let mut stop_for_host_ip: Option<(usize, usize)> = None;
-            self.ctx.run(|rec| {
+            let sub_t = self.ctx.run_timed(|rec| {
                 if need_embed {
                     self.record_embed_and_norm(rec)?;
                     need_embed = false;
@@ -1872,8 +1931,10 @@ impl Inkling2VkRunner {
                 }
                 Ok(())
             })?;
+            self.prof_add_submit(sub_t);
 
             if let Some((h_il, h_ip)) = stop_for_host_ip {
+                let t_br0 = std::time::Instant::now();
                 let eval_fn = host_moe.as_deref_mut().ok_or_else(|| {
                     VulkanError::InvalidDimensions(format!(
                         "layer {h_ip} MoE experts are offloaded from VRAM, but no HostMoeFn was supplied"
@@ -1898,6 +1959,7 @@ impl Inkling2VkRunner {
                 {
                     *dst_id = raw_id as usize;
                 }
+                let t_moe0 = std::time::Instant::now();
                 eval_fn(
                     h_ip,
                     &self.host_cur_scratch[..n_embd],
@@ -1905,20 +1967,29 @@ impl Inkling2VkRunner {
                     &self.host_weights_scratch[..top_k],
                     &mut self.host_moe_out_scratch[..n_embd],
                 );
+                let t_moe1 = std::time::Instant::now();
                 write_mapped_f32(
                     &self.ctx,
                     &self.moe_out_bridge,
                     &self.host_moe_out_scratch[..n_embd],
                 )?;
+                if self.prof_on {
+                    let moe_ns = (t_moe1 - t_moe0).as_nanos() as u64;
+                    self.prof.host_moe_calls += 1;
+                    self.prof.host_moe_ns += moe_ns;
+                    self.prof.bridge_ns +=
+                        (t_br0.elapsed().as_nanos() as u64).saturating_sub(moe_ns);
+                }
                 pending_post_moe = Some((h_il, h_ip));
             }
         }
 
         if let Some((last_il, last_ip)) = pending_post_moe.take() {
-            self.ctx.run(|rec| {
+            let sub_t = self.ctx.run_timed(|rec| {
                 self.record_layer_post_moe(rec, last_il, last_ip, false)?;
                 self.record_output_stage(rec, blocks_len, compute_logits, compute_argmax)
             })?;
+            self.prof_add_submit(sub_t);
         }
 
         Ok(())
@@ -3236,6 +3307,9 @@ impl Inkling2VkRunner {
         let top_k = self.cfg.n_expert_used;
         let hist_len = self.cfg.shortconv_l_cache - 1;
         let n_taps = dspark_target_visits.len();
+        if self.prof_on {
+            self.prof.tokens += w as u64;
+        }
 
         write_mapped_u32(&self.ctx, &self.step_buf, window_tokens)?;
 
@@ -3323,7 +3397,7 @@ impl Inkling2VkRunner {
 
         while cursor < schedule.len() {
             let mut stop_for_host_ip: Option<(usize, usize)> = None;
-            self.ctx.run(|rec| {
+            let sub_t = self.ctx.run_timed(|rec| {
                 if need_embed {
                     for tok_i in 0..w {
                         self.record_buf_copy_bytes(
@@ -3626,8 +3700,10 @@ impl Inkling2VkRunner {
                 }
                 Ok(())
             })?;
+            self.prof_add_submit(sub_t);
 
             if let Some((h_il, h_ip)) = stop_for_host_ip {
+                let t_br0 = std::time::Instant::now();
                 let eval_win = host_moe_win.as_deref_mut().ok_or_else(|| {
                     VulkanError::InvalidDimensions(format!(
                         "layer {h_ip} MoE experts are offloaded from VRAM, but no HostMoeWindowFn was supplied"
@@ -3651,6 +3727,7 @@ impl Inkling2VkRunner {
                 {
                     *dst_id = raw_id as usize;
                 }
+                let t_moe0 = std::time::Instant::now();
                 eval_win(
                     h_ip,
                     w,
@@ -3659,11 +3736,19 @@ impl Inkling2VkRunner {
                     &self.host_weights_scratch[..w * top_k],
                     &mut self.host_moe_out_scratch[..w * n_embd],
                 );
+                let t_moe1 = std::time::Instant::now();
                 write_mapped_f32(
                     &self.ctx,
                     &self.moe_out_bridge,
                     &self.host_moe_out_scratch[..w * n_embd],
                 )?;
+                if self.prof_on {
+                    let moe_ns = (t_moe1 - t_moe0).as_nanos() as u64;
+                    self.prof.host_moe_calls += 1;
+                    self.prof.host_moe_ns += moe_ns;
+                    self.prof.bridge_ns +=
+                        (t_br0.elapsed().as_nanos() as u64).saturating_sub(moe_ns);
+                }
                 pending_post_moe = Some((h_il, h_ip));
             }
         }
@@ -3673,7 +3758,7 @@ impl Inkling2VkRunner {
             let ffn_conv_off_f32 =
                 self.slot_conv_bases[last_il] as usize + (2 * prev_kv_dim + n_embd) * hist_len;
             let ffn_conv_len_f32 = n_embd * hist_len;
-            self.ctx.run(|rec| {
+            let sub_t = self.ctx.run_timed(|rec| {
                 for tok_i in 0..w {
                     let base = (tok_i * self.per_tok_state_f32s) as u32;
                     self.record_vec_copy(
@@ -3715,6 +3800,7 @@ impl Inkling2VkRunner {
                     dspark_target_visits,
                 )
             })?;
+            self.prof_add_submit(sub_t);
         }
 
         Ok(())
