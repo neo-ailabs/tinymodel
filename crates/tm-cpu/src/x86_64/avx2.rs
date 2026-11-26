@@ -1496,3 +1496,80 @@ pub unsafe fn mamba2_scan_head(
         }
     }
 }
+
+/// `AVX2 + FMA + F16C` `dot_f32_f16` (`0-ULP` bit-exact on exact powers of two).
+///
+/// # Safety
+/// Caller must ensure `avx2`, `fma`, and `f16c` CPU features are supported.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub unsafe fn dot_f32_f16(q: &[f32], k_f16: &[u16]) -> f32 {
+    debug_assert_eq!(q.len(), k_f16.len());
+    let n = q.len();
+    let chunks8 = n / 8;
+    // SAFETY: `chunks8 * 8 <= n == q.len() == k_f16.len()`.
+    unsafe {
+        let mut acc = _mm256_setzero_ps();
+        for c in 0..chunks8 {
+            let off = c * 8;
+            let vq = _mm256_loadu_ps(q.as_ptr().add(off));
+            let vk16 = _mm_loadu_si128(k_f16.as_ptr().add(off) as *const __m128i);
+            acc = _mm256_fmadd_ps(vq, _mm256_cvtph_ps(vk16), acc);
+        }
+        let mut sum = hsum_8wide_pairwise_ps(acc);
+        for i in (chunks8 * 8)..n {
+            sum += *q.get_unchecked(i) * f16_to_f32(*k_f16.get_unchecked(i));
+        }
+        sum
+    }
+}
+
+/// `AVX2 + F16C` `axpy_f32_f16` (`0-ULP` bit-exact with `generic::axpy_f32_f16`).
+///
+/// # Safety
+/// Caller must ensure `avx2` and `f16c` CPU features are supported.
+#[target_feature(enable = "avx2,f16c")]
+pub unsafe fn axpy_f32_f16(out: &mut [f32], w: f32, v_f16: &[u16]) {
+    debug_assert_eq!(out.len(), v_f16.len());
+    let n = out.len();
+    let chunks8 = n / 8;
+    // SAFETY: `chunks8 * 8 <= n == out.len() == v_f16.len()`.
+    unsafe {
+        let vw = _mm256_set1_ps(w);
+        for c in 0..chunks8 {
+            let off = c * 8;
+            let vo = _mm256_loadu_ps(out.as_ptr().add(off));
+            let vv16 = _mm_loadu_si128(v_f16.as_ptr().add(off) as *const __m128i);
+            let vv = _mm256_cvtph_ps(vv16);
+            _mm256_storeu_ps(
+                out.as_mut_ptr().add(off),
+                _mm256_add_ps(vo, _mm256_mul_ps(vw, vv)),
+            );
+        }
+        for i in (chunks8 * 8)..n {
+            *out.get_unchecked_mut(i) += w * f16_to_f32(*v_f16.get_unchecked(i));
+        }
+    }
+}
+
+/// `AVX2 + F16C` `f32_to_f16_slice` (`0-ULP` IEEE-754 round-to-nearest-even).
+///
+/// # Safety
+/// Caller must ensure `avx2` and `f16c` CPU features are supported.
+#[target_feature(enable = "avx2,f16c")]
+pub unsafe fn f32_to_f16_slice(src: &[f32], dst: &mut [u16]) {
+    debug_assert_eq!(src.len(), dst.len());
+    let n = src.len();
+    let chunks8 = n / 8;
+    // SAFETY: `chunks8 * 8 <= n == src.len() == dst.len()`.
+    unsafe {
+        for c in 0..chunks8 {
+            let off = c * 8;
+            let vs = _mm256_loadu_ps(src.as_ptr().add(off));
+            let vh = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(vs);
+            _mm_storeu_si128(dst.as_mut_ptr().add(off) as *mut __m128i, vh);
+        }
+        for i in (chunks8 * 8)..n {
+            *dst.get_unchecked_mut(i) = tm_core::f32_to_f16(*src.get_unchecked(i));
+        }
+    }
+}

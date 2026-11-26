@@ -300,11 +300,12 @@ void main() {
         }
     } else if (pc.op == 8u) {
         // Multi-token causal ShortConv across `n_tok = pc.u6` tokens in registers (`1` dispatch/window!):
-        // `p0 = n_channels`, `p1 = n_conv (<= 9)`, `p2 = chan_offset`, `p3 = dyn_heads`,
-        // `u5 = weight_off`, `u6 = n_tok`, `p4 = slot_hist_base`
+        // `p0 = n_channels`, `p1 = (snap_stride << 8) | n_conv` (`n_conv <= 9`), `p2 = chan_offset`,
+        // `p3 = dyn_heads`, `u5 = weight_off`, `u6 = n_tok`, `p4 = slot_hist_base`
         if (gid >= pc.p0) return;
         const uint n_channels = pc.p0;
-        const uint n_conv = pc.p1;
+        const uint n_conv = pc.p1 & 0xFFu;
+        const uint snap_stride = pc.p1 >> 8u;
         const uint hist_len = n_conv - 1u;
         const uint chan_offset = pc.p2;
         const uint dyn_heads = pc.p3;
@@ -352,6 +353,12 @@ void main() {
             }
             if (hist_len > 0u) {
                 hist[hist_len - 1u] = cur_c;
+            }
+            if (snap_stride > 0u) {
+                const uint s_off = tok * snap_stride + h_off;
+                for (uint k = 0u; k < hist_len; ++k) {
+                    b4_u32[s_off + k] = floatBitsToUint(hist[k]);
+                }
             }
             b0[idx] = (cur_c + acc) * inv_scale;
         }

@@ -279,7 +279,8 @@ pub struct DFlashState {
     proj_blk: Vec<f32>,
     ffn_gate_blk: Vec<f32>,
     ffn_up_blk: Vec<f32>,
-    scores: Vec<f32>,
+    attn_head_scratch: Vec<(Vec<f32>, Vec<f32>)>,
+    kv_f16_tmp: Vec<u16>,
     hidden_blk: Vec<f32>,
     rnn_state: Vec<f32>,
     prev_embd: Vec<f32>,
@@ -944,11 +945,25 @@ impl<'a> DFlashModel<'a> {
             }
 
             // Round-trip block K/V through F16 so block K/V precision matches ggml's F16 KV cache!
-            for v in &mut state.k_blk[..bs * kv_dim] {
-                *v = f16_to_f32(tm_core::f32_to_f16(*v));
+            (kt.f32_to_f16_slice)(
+                &state.k_blk[..bs * kv_dim],
+                &mut state.kv_f16_tmp[..bs * kv_dim],
+            );
+            for (dst, &h16) in state.k_blk[..bs * kv_dim]
+                .iter_mut()
+                .zip(&state.kv_f16_tmp[..bs * kv_dim])
+            {
+                *dst = f16_to_f32(h16);
             }
-            for v in &mut state.v_blk[..bs * kv_dim] {
-                *v = f16_to_f32(tm_core::f32_to_f16(*v));
+            (kt.f32_to_f16_slice)(
+                &state.v_blk[..bs * kv_dim],
+                &mut state.kv_f16_tmp[..bs * kv_dim],
+            );
+            for (dst, &h16) in state.v_blk[..bs * kv_dim]
+                .iter_mut()
+                .zip(&state.kv_f16_tmp[..bs * kv_dim])
+            {
+                *dst = f16_to_f32(h16);
             }
 
             // Non-causal block attention over committed cache `[ctx_start .. pos0)` + all `bs` block keys!
@@ -963,13 +978,18 @@ impl<'a> DFlashModel<'a> {
             let total_kv = ctx_len + bs;
             let k_cache_il = &state.k_cache[il];
             let v_cache_il = &state.v_cache[il];
+            let q_blk_ref = &state.q_blk[..bs * q_dim];
+            let k_blk_ref = &state.k_blk[..bs * kv_dim];
+            let v_blk_ref = &state.v_blk[..bs * kv_dim];
 
-            state.attn_blk[..bs * q_dim].fill(0.0);
-            for r in 0..bs {
-                for h in 0..nh {
+            pool.parallel_for_each_mut(
+                &mut state.attn_head_scratch[..bs * nh],
+                |rh, (out_h, sc_buf)| {
+                    let r = rh / nh;
+                    let h = rh % nh;
                     let kvh = h / gqa_ratio;
-                    let q_h = &state.q_blk[r * q_dim + h * hd..r * q_dim + (h + 1) * hd];
-                    let sc = &mut state.scores[..total_kv];
+                    let q_h = &q_blk_ref[r * q_dim + h * hd..r * q_dim + (h + 1) * hd];
+                    let sc = &mut sc_buf[..total_kv];
                     let mut max_s = f32::NEG_INFINITY;
 
                     for (idx, kv_pos) in (ctx_start..pos0).enumerate() {
@@ -981,8 +1001,7 @@ impl<'a> DFlashModel<'a> {
                         }
                     }
                     for br in 0..bs {
-                        let k_bh =
-                            &state.k_blk[br * kv_dim + kvh * hd..br * kv_dim + (kvh + 1) * hd];
+                        let k_bh = &k_blk_ref[br * kv_dim + kvh * hd..br * kv_dim + (kvh + 1) * hd];
                         let mut dot = 0.0f32;
                         for d in 0..hd {
                             dot = q_h[d].mul_add(k_bh[d], dot);
@@ -1002,21 +1021,26 @@ impl<'a> DFlashModel<'a> {
                     }
                     let inv_sum = 1.0 / sum_e;
 
-                    let out_h = &mut state.attn_blk[r * q_dim + h * hd..r * q_dim + (h + 1) * hd];
+                    out_h[..hd].fill(0.0);
                     for (idx, kv_pos) in (ctx_start..pos0).enumerate() {
                         let p = sc[idx] * inv_sum;
                         let base = kv_pos * kv_dim + kvh * hd;
-                        (kt.axpy_f32_f16)(out_h, p, &v_cache_il[base..base + hd]);
+                        (kt.axpy_f32_f16)(&mut out_h[..hd], p, &v_cache_il[base..base + hd]);
                     }
                     for br in 0..bs {
                         let p = sc[ctx_len + br] * inv_sum;
-                        let v_bh =
-                            &state.v_blk[br * kv_dim + kvh * hd..br * kv_dim + (kvh + 1) * hd];
+                        let v_bh = &v_blk_ref[br * kv_dim + kvh * hd..br * kv_dim + (kvh + 1) * hd];
                         for d in 0..hd {
                             out_h[d] = v_bh[d].mul_add(p, out_h[d]);
                         }
                     }
-                }
+                },
+            );
+            for (rh, (out_h, _)) in state.attn_head_scratch[..bs * nh].iter().enumerate() {
+                let r = rh / nh;
+                let h = rh % nh;
+                let dst_off = r * q_dim + h * hd;
+                state.attn_blk[dst_off..dst_off + hd].copy_from_slice(&out_h[..hd]);
             }
 
             matmul_f32(
@@ -1217,7 +1241,10 @@ impl DFlashState {
             proj_blk: vec![0.0; bs * n_embd],
             ffn_gate_blk: vec![0.0; bs * n_ff],
             ffn_up_blk: vec![0.0; bs * n_ff],
-            scores: vec![0.0; max_ctx + bs],
+            attn_head_scratch: (0..bs * cfg.n_head)
+                .map(|_| (vec![0.0; cfg.head_dim], vec![0.0; max_ctx + bs]))
+                .collect(),
+            kv_f16_tmp: vec![0; bs * kv_dim],
             hidden_blk: vec![0.0; bs * n_embd],
             rnn_state: vec![0.0; rank],
             prev_embd: vec![0.0; rank],

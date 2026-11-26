@@ -2329,6 +2329,7 @@ impl Inkling2VkRunner {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_gemm_inner(
         &self,
         rec: &mut Recorder<'_>,
@@ -2336,9 +2337,11 @@ impl Inkling2VkRunner {
         x_win: &VkBuffer,
         y_win: &VkBuffer,
         n_tok: usize,
+        use_tc: bool,
         emit_barrier: bool,
     ) -> Result<(), VulkanError> {
-        if mat.cols.is_multiple_of(32)
+        if use_tc
+            && mat.cols.is_multiple_of(32)
             && let Some(ref p) = self.gemm_pipes[mat.dtype_code as usize]
         {
             let (bm, bn) = self.gemm_tile_mn;
@@ -2357,7 +2360,7 @@ impl Inkling2VkRunner {
                 rec.dispatch_xy_nb(p, &[&mat.buf, x_win, y_win], &push, gx, gy)
             }
         } else {
-            // 2D `gemv_res` fallback for non-32-multiple `cols` (e.g. small `gate_rank`) or KQuant fallback
+            // 2D `gemv_res` (`0-ULP` bit-exact with `w = 1` per token for speculative verify & small rows)
             let (p, gx) = self.select_gemv(mat.rows, mat.dtype_code);
             let push = [mat.cols as u32, mat.rows as u32, 0, mat.row_u16s];
             if emit_barrier {
@@ -2375,8 +2378,9 @@ impl Inkling2VkRunner {
         x_win: &VkBuffer,
         y_win: &VkBuffer,
         n_tok: usize,
+        use_tc: bool,
     ) -> Result<(), VulkanError> {
-        self.dispatch_gemm_inner(rec, mat, x_win, y_win, n_tok, true)
+        self.dispatch_gemm_inner(rec, mat, x_win, y_win, n_tok, use_tc, true)
     }
 
     fn dispatch_gemm_nb(
@@ -2386,8 +2390,9 @@ impl Inkling2VkRunner {
         x_win: &VkBuffer,
         y_win: &VkBuffer,
         n_tok: usize,
+        use_tc: bool,
     ) -> Result<(), VulkanError> {
-        self.dispatch_gemm_inner(rec, mat, x_win, y_win, n_tok, false)
+        self.dispatch_gemm_inner(rec, mat, x_win, y_win, n_tok, use_tc, false)
     }
 
     fn build_decode_segments(&self, out: &mut [GpuSegSpec; 64]) -> usize {
@@ -3722,11 +3727,13 @@ impl Inkling2VkRunner {
     /// (`CoopMat F16`) or LDS-tiled `Q8_0` GEMM when `w >= 4`, reading each active expert's
     /// weights once per 16 routed tokens instead of once per token!
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn record_vram_moe_window(
         &self,
         rec: &mut Recorder<'_>,
         ip: usize,
         w: usize,
+        use_grouped: bool,
         x_win_buf: &VkBuffer,
         top_ids_buf: &VkBuffer,
         top_w_buf: &VkBuffer,
@@ -3736,7 +3743,16 @@ impl Inkling2VkRunner {
             .vram_experts
             .as_ref()
             .expect("record_vram_moe_window requires vram_experts");
-        self.record_moe_window_with(rec, vexp, w, x_win_buf, top_ids_buf, top_w_buf, out_win_buf)
+        self.record_moe_window_with(
+            rec,
+            vexp,
+            w,
+            use_grouped,
+            x_win_buf,
+            top_ids_buf,
+            top_w_buf,
+            out_win_buf,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3745,6 +3761,7 @@ impl Inkling2VkRunner {
         rec: &mut Recorder<'_>,
         vexp: &VkVramExperts,
         w: usize,
+        use_grouped: bool,
         x_win_buf: &VkBuffer,
         top_ids_buf: &VkBuffer,
         top_w_buf: &VkBuffer,
@@ -3755,7 +3772,8 @@ impl Inkling2VkRunner {
         let top_k = self.cfg.n_expert_used;
         let total_k = w * top_k;
 
-        if w >= 4
+        if use_grouped
+            && w >= 4
             && n_embd.is_multiple_of(32)
             && n_ff.is_multiple_of(32)
             && let Some(ref p_grp) = self.pipe_moe_grouped
@@ -4341,6 +4359,7 @@ impl Inkling2VkRunner {
         ip: usize,
         w: usize,
         moe_in_dev: bool,
+        save_conv_snapshots: bool,
     ) -> Result<(), VulkanError> {
         let n_embd = self.cfg.n_embd;
         let kv_dim = self.cfg.kv_dim(ip);
@@ -4348,16 +4367,26 @@ impl Inkling2VkRunner {
         let slot_conv_base = self.slot_conv_bases[il];
         let layer = &self.layers[ip];
         let stride = self.per_tok_state_f32s as u32;
+        let conv_p1 = if save_conv_snapshots {
+            ((self.total_conv_f32s as u32) << 8) | (n_conv as u32)
+        } else {
+            n_conv as u32
+        };
+        let snap_buf = if save_conv_snapshots {
+            &self.conv_snapshots_buf
+        } else {
+            &self.dummy_buf
+        };
 
         if !moe_in_dev {
-            self.record_buf_copy_bytes(
+            self.record_vec_copy(
                 rec,
                 &self.win_moe_out_dev_buf,
                 0,
                 &self.moe_out_bridge,
                 0,
-                (w * n_embd * 4) as u64,
-            );
+                w * n_embd,
+            )?;
         }
         rec.dispatch(
             &self.pipe_ops,
@@ -4366,13 +4395,13 @@ impl Inkling2VkRunner {
                 &self.f32_params,
                 &self.dummy_buf,
                 &self.conv_hist,
-                &self.dummy_buf,
+                snap_buf,
                 &self.dummy_buf,
             ],
             &[
                 8,
                 n_embd as u32,
-                n_conv as u32,
+                conv_p1,
                 (2 * kv_dim + n_embd) as u32,
                 0,
                 layer.ffn_post_conv_off,
@@ -4578,8 +4607,8 @@ impl Inkling2VkRunner {
         }
 
         if let Some((prev_il, prev_ip)) = seg.prev_host {
-            if can_batch_gemm && !save_conv_snapshots {
-                self.record_win_post_moe(rec, prev_il, prev_ip, w, false)?;
+            if can_batch_gemm {
+                self.record_win_post_moe(rec, prev_il, prev_ip, w, false, save_conv_snapshots)?;
             } else {
                 let prev_kv_dim = self.cfg.kv_dim(prev_ip);
                 let ffn_conv_off_f32 =
@@ -4625,7 +4654,9 @@ impl Inkling2VkRunner {
         let mut prelude_blocks_len = seg.init_pb;
         let mut bank_len = seg.init_bk;
 
+        let use_tc = w >= 8 && !save_conv_snapshots;
         let allow_host_imported = can_batch_gemm
+            && use_tc
             && self.pipe_moe_grouped.is_some()
             && self.cfg.n_ff_exp.is_multiple_of(32);
 
@@ -4646,7 +4677,7 @@ impl Inkling2VkRunner {
             let mut next_pb = prelude_blocks_len;
             let mut next_bk = bank_len;
 
-            if can_batch_gemm && self.cfg.q_dim(st.ip).is_multiple_of(32) {
+            if can_batch_gemm && (!use_tc || self.cfg.q_dim(st.ip).is_multiple_of(32)) {
                 self.record_visit_batched_gemm(
                     rec,
                     st.il,
@@ -4659,6 +4690,8 @@ impl Inkling2VkRunner {
                     tap_slot,
                     n_taps,
                     batch_gpu_vexp.is_some(),
+                    use_tc,
+                    save_conv_snapshots,
                     &mut next_b,
                     &mut next_pb,
                     &mut next_bk,
@@ -4669,13 +4702,14 @@ impl Inkling2VkRunner {
                         rec,
                         vexp,
                         w,
+                        !save_conv_snapshots,
                         &self.win_ffn_norm_buf,
                         &self.win_top_ids_dev_buf,
                         &self.win_top_weights_dev_buf,
                         &self.win_moe_out_dev_buf,
                     )?;
                     TsRecorder::mark(ts, rec, STAGE_VRAM_MOE);
-                    self.record_win_post_moe(rec, st.il, st.ip, w, true)?;
+                    self.record_win_post_moe(rec, st.il, st.ip, w, true, save_conv_snapshots)?;
                     TsRecorder::mark(ts, rec, STAGE_POST_MOE);
                 }
             } else {
@@ -4818,6 +4852,7 @@ impl Inkling2VkRunner {
                         rec,
                         st.ip,
                         w,
+                        !save_conv_snapshots,
                         &self.ffn_normed_bridge,
                         &self.top_ids_bridge,
                         &self.top_weights_bridge,
@@ -4912,13 +4947,16 @@ impl Inkling2VkRunner {
         write_mapped_u32(&self.ctx, &self.step_buf, window_tokens)?;
         write_mapped_f32(&self.ctx, &self.win_taus_buf, &taus[..w])?;
 
-        let can_batch_gemm = w >= 8
-            && !save_conv_snapshots
+        let can_batch_gemm = w >= 2
+            && (!save_conv_snapshots
+                || (w <= MAX_INKLING2_SPEC_WINDOW && self.total_conv_f32s < (1 << 24)))
             && n_embd.is_multiple_of(32)
             && self.cfg.shortconv_l_cache <= 9
             && self.ctx.info().subgroup_size <= 128
             && self.ctx.info().max_workgroup_invocations >= 128;
         let allow_host_imported = can_batch_gemm
+            && w >= 8
+            && !save_conv_snapshots
             && self.pipe_moe_grouped.is_some()
             && self.cfg.n_ff_exp.is_multiple_of(32)
             && (0..self.cfg.n_layers_phys).all(|ip| self.cfg.q_dim(ip).is_multiple_of(32));
@@ -5162,6 +5200,7 @@ impl Inkling2VkRunner {
         rec: &mut Recorder<'_>,
         loop_w: &VkLoopLayer,
         w: usize,
+        use_tc: bool,
     ) -> Result<(), VulkanError> {
         let n_embd = self.cfg.n_embd as u32;
         let wy = w as u32;
@@ -5216,6 +5255,7 @@ impl Inkling2VkRunner {
                     &self.win_ctrl_in_bufs[j],
                     &self.win_ctrl_g_bufs[j],
                     w,
+                    use_tc,
                 )?;
             } else {
                 self.dispatch_gemm(
@@ -5224,6 +5264,7 @@ impl Inkling2VkRunner {
                     &self.win_ctrl_in_bufs[j],
                     &self.win_ctrl_g_bufs[j],
                     w,
+                    use_tc,
                 )?;
             }
         }
@@ -5236,6 +5277,7 @@ impl Inkling2VkRunner {
                 &self.win_ctrl_g_bufs[j],
                 &self.win_ctrl_gain_bufs[j],
                 w,
+                use_tc,
             )?;
             if j < 2 {
                 self.dispatch_gemm_nb(
@@ -5244,6 +5286,7 @@ impl Inkling2VkRunner {
                     &self.win_ctrl_g_bufs[j],
                     &self.win_ctrl_forget_bufs[j],
                     w,
+                    use_tc,
                 )?;
             } else {
                 self.dispatch_gemm(
@@ -5252,6 +5295,7 @@ impl Inkling2VkRunner {
                     &self.win_ctrl_g_bufs[j],
                     &self.win_ctrl_forget_bufs[j],
                     w,
+                    use_tc,
                 )?;
             }
         }
@@ -5282,6 +5326,7 @@ impl Inkling2VkRunner {
         loop_w: &VkLoopLayer,
         cur_win_buf: &VkBuffer,
         w: usize,
+        use_tc: bool,
     ) -> Result<(), VulkanError> {
         let n_embd = self.cfg.n_embd as u32;
         let wy = w as u32;
@@ -5329,9 +5374,16 @@ impl Inkling2VkRunner {
             1,
             wy,
         )?;
-        self.dispatch_gemm(rec, &loop_w.ctrl_down[LOOP_CTRL_FFN], cin, cg, w)?;
-        self.dispatch_gemm_nb(rec, &loop_w.ctrl_gain[LOOP_CTRL_FFN], cg, cgain, w)?;
-        self.dispatch_gemm(rec, &loop_w.ctrl_forget[LOOP_CTRL_FFN], cg, cforget, w)?;
+        self.dispatch_gemm(rec, &loop_w.ctrl_down[LOOP_CTRL_FFN], cin, cg, w, use_tc)?;
+        self.dispatch_gemm_nb(rec, &loop_w.ctrl_gain[LOOP_CTRL_FFN], cg, cgain, w, use_tc)?;
+        self.dispatch_gemm(
+            rec,
+            &loop_w.ctrl_forget[LOOP_CTRL_FFN],
+            cg,
+            cforget,
+            w,
+            use_tc,
+        )?;
         rec.dispatch_xy(
             &self.pipe_ops,
             &[
@@ -5348,8 +5400,9 @@ impl Inkling2VkRunner {
         )
     }
 
-    /// Evaluates pre-MoE dense, ShortConv, RelAttn, and Loop Controller operations across `w >= 8`
-    /// prefill tokens with ZERO per-token CPU/GPU loops (`CoopMat F16` / `gemm_tiled` + 2D ops).
+    /// Evaluates pre-MoE dense, ShortConv, RelAttn, and Loop Controller operations across `w >= 2`
+    /// tokens with ZERO per-token CPU/GPU loops (`CoopMat F16` / `gemm_tiled` for `w >= 8` prefill,
+    /// `0-ULP` bit-exact 2D `gemv_res` + `op=8` ShortConv snapshots for `DSpark` speculative verify).
     #[allow(clippy::too_many_arguments)]
     fn record_visit_batched_gemm(
         &self,
@@ -5364,6 +5417,8 @@ impl Inkling2VkRunner {
         tap_slot: Option<usize>,
         n_taps: usize,
         in_vram: bool,
+        use_tc: bool,
+        save_conv_snapshots: bool,
         blocks_len: &mut usize,
         prelude_blocks_len: &mut usize,
         bank_len: &mut usize,
@@ -5622,7 +5677,7 @@ impl Inkling2VkRunner {
 
         if has_messages {
             let loop_w = &self.loop_layers[ip - self.cfg.core_start];
-            self.record_win_controls_qkv(rec, loop_w, w)?;
+            self.record_win_controls_qkv(rec, loop_w, w, use_tc)?;
         }
 
         if swa && has_messages {
@@ -5728,17 +5783,57 @@ impl Inkling2VkRunner {
         }
         TsRecorder::mark(ts, rec, STAGE_LOOP_MIX_NORM);
 
+        let conv_p1 = if save_conv_snapshots {
+            ((self.total_conv_f32s as u32) << 8) | (n_conv as u32)
+        } else {
+            n_conv as u32
+        };
+        let snap_buf = if save_conv_snapshots {
+            &self.conv_snapshots_buf
+        } else {
+            &self.dummy_buf
+        };
+
         // Phase 2: Batched QKV / Rel / Sink / Gate (+ dynamic ShortConv tap) GEMMs across ALL `w` tokens!
-        self.dispatch_gemm_nb(rec, &layer.wq, &self.win_q_in_buf, &self.win_q_buf, w)?;
-        self.dispatch_gemm_nb(rec, &layer.wk, &self.win_k_in_buf, &self.win_k_buf, w)?;
-        self.dispatch_gemm_nb(rec, &layer.wv, &self.win_v_in_buf, &self.win_v_buf, w)?;
-        self.dispatch_gemm_nb(rec, &layer.attn_rel, &self.win_q_in_buf, &self.win_r_buf, w)?;
+        self.dispatch_gemm_nb(
+            rec,
+            &layer.wq,
+            &self.win_q_in_buf,
+            &self.win_q_buf,
+            w,
+            use_tc,
+        )?;
+        self.dispatch_gemm_nb(
+            rec,
+            &layer.wk,
+            &self.win_k_in_buf,
+            &self.win_k_buf,
+            w,
+            use_tc,
+        )?;
+        self.dispatch_gemm_nb(
+            rec,
+            &layer.wv,
+            &self.win_v_in_buf,
+            &self.win_v_buf,
+            w,
+            use_tc,
+        )?;
+        self.dispatch_gemm_nb(
+            rec,
+            &layer.attn_rel,
+            &self.win_q_in_buf,
+            &self.win_r_buf,
+            w,
+            use_tc,
+        )?;
         self.dispatch_gemm_nb(
             rec,
             &layer.attn_sink_proj,
             &self.win_q_in_buf,
             &self.win_sinks_buf,
             w,
+            use_tc,
         )?;
         if swa {
             self.dispatch_gemm(
@@ -5747,6 +5842,7 @@ impl Inkling2VkRunner {
                 &self.win_q_in_buf,
                 &self.win_gate_buf,
                 w,
+                use_tc,
             )?;
         } else {
             self.dispatch_gemm_nb(
@@ -5755,11 +5851,12 @@ impl Inkling2VkRunner {
                 &self.win_q_in_buf,
                 &self.win_gate_buf,
                 w,
+                use_tc,
             )?;
             let kp = layer.attn_k_conv_proj.as_ref().expect("k_conv_proj");
             let vp = layer.attn_v_conv_proj.as_ref().expect("v_conv_proj");
-            self.dispatch_gemm_nb(rec, kp, &self.win_k_in_buf, &self.win_k_dyn_buf, w)?;
-            self.dispatch_gemm(rec, vp, &self.win_v_in_buf, &self.win_v_dyn_buf, w)?;
+            self.dispatch_gemm_nb(rec, kp, &self.win_k_in_buf, &self.win_k_dyn_buf, w, use_tc)?;
+            self.dispatch_gemm(rec, vp, &self.win_v_in_buf, &self.win_v_dyn_buf, w, use_tc)?;
         }
 
         // Phase 3: Multi-token ShortConv (`op=8`) + 2D Clip/Norm + 2D KV Pack + 2D RelAttn (`8` dispatches total!)
@@ -5771,13 +5868,13 @@ impl Inkling2VkRunner {
                 &self.f32_params,
                 &self.win_k_dyn_buf,
                 &self.conv_hist,
-                &self.dummy_buf,
+                snap_buf,
                 &self.dummy_buf,
             ],
             &[
                 8,
                 kv_dim as u32,
-                n_conv as u32,
+                conv_p1,
                 0,
                 dyn_heads,
                 layer.k_conv_off,
@@ -5793,13 +5890,13 @@ impl Inkling2VkRunner {
                 &self.f32_params,
                 &self.win_v_dyn_buf,
                 &self.conv_hist,
-                &self.dummy_buf,
+                snap_buf,
                 &self.dummy_buf,
             ],
             &[
                 8,
                 kv_dim as u32,
-                n_conv as u32,
+                conv_p1,
                 kv_dim as u32,
                 dyn_heads,
                 layer.v_conv_off,
@@ -5949,6 +6046,7 @@ impl Inkling2VkRunner {
             &self.win_attn_vec_buf,
             &self.win_wo_out_buf,
             w,
+            use_tc,
         )?;
         TsRecorder::mark(ts, rec, STAGE_ATTN_DENSE);
 
@@ -5960,13 +6058,13 @@ impl Inkling2VkRunner {
                 &self.f32_params,
                 &self.dummy_buf,
                 &self.conv_hist,
-                &self.dummy_buf,
+                snap_buf,
                 &self.dummy_buf,
             ],
             &[
                 8,
                 n_embd as u32,
-                n_conv as u32,
+                conv_p1,
                 (2 * kv_dim) as u32,
                 0,
                 layer.attn_post_conv_off,
@@ -6068,7 +6166,7 @@ impl Inkling2VkRunner {
         )?;
         if has_messages {
             let loop_w = &self.loop_layers[ip - self.cfg.core_start];
-            self.record_win_control_ffn(rec, loop_w, &self.win_q_in_buf, w)?;
+            self.record_win_control_ffn(rec, loop_w, &self.win_q_in_buf, w, use_tc)?;
         }
         rec.dispatch_xy(
             &self.pipe_ops,
@@ -6101,6 +6199,7 @@ impl Inkling2VkRunner {
             &self.win_ffn_norm_buf,
             &self.win_router_logits_buf,
             w,
+            use_tc,
         )?;
         let (has_b, b_off) = match layer.exp_probs_b_off {
             Some(off) => (1u32, off),
@@ -6135,14 +6234,14 @@ impl Inkling2VkRunner {
             wy,
         )?;
         if !in_vram {
-            self.record_buf_copy_bytes(
+            self.record_vec_copy(
                 rec,
                 &self.ffn_normed_bridge,
                 0,
                 &self.win_ffn_norm_buf,
                 0,
-                (w * n_embd * 4) as u64,
-            );
+                w * n_embd,
+            )?;
         }
         TsRecorder::mark(ts, rec, STAGE_FFN_ROUTER);
         Ok(())

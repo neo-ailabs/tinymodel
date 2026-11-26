@@ -170,8 +170,53 @@ fn bench_f32_q8_0_gemv_gemm() {
     );
 }
 
+fn bench_f16_kv_ops() {
+    let hd = 128usize;
+    let n_kv = 512usize;
+    let iters = 2_000usize;
+    let q: Vec<f32> = (0..hd).map(|i| ((i as f32) * 0.05).sin()).collect();
+    let kv_f32: Vec<f32> = (0..n_kv * hd).map(|i| ((i as f32) * 0.02).cos()).collect();
+    let mut kv_f16 = vec![0u16; n_kv * hd];
+    let mut out = vec![0.0f32; hd];
+    let kt = active_kernels();
+    (kt.f32_to_f16_slice)(&kv_f32, &mut kv_f16);
+
+    let mut sink = 0.0f32;
+    for _ in 0..16 {
+        for p in 0..n_kv {
+            let s = (kt.dot_f32_f16)(black_box(&q), black_box(&kv_f16[p * hd..(p + 1) * hd]));
+            (kt.axpy_f32_f16)(
+                &mut out,
+                s * 0.001,
+                black_box(&kv_f16[p * hd..(p + 1) * hd]),
+            );
+            sink += s;
+        }
+    }
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        for p in 0..n_kv {
+            let s = (kt.dot_f32_f16)(black_box(&q), black_box(&kv_f16[p * hd..(p + 1) * hd]));
+            (kt.axpy_f32_f16)(
+                &mut out,
+                s * 0.001,
+                black_box(&kv_f16[p * hd..(p + 1) * hd]),
+            );
+            sink += s;
+        }
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    let gbps = ((iters * n_kv * hd * 2 * 2) as f64) / secs / 1e9;
+    println!(
+        "dot+axpy_f32_f16 (isa={}): {gbps:.1} GB/s (sink={:.2})",
+        kt.isa.name(),
+        sink + out[0]
+    );
+}
+
 fn main() {
     bench_mamba2_scan();
     bench_q4_0_gemv();
     bench_f32_q8_0_gemv_gemm();
+    bench_f16_kv_ops();
 }

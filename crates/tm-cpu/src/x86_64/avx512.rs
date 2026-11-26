@@ -75,8 +75,8 @@ pub unsafe fn vec_dot_q8_0_q8_0(x: &[BlockQ8_0], y: &[BlockQ8_0]) -> f32 {
 /// 8-row shared-activation `AVX-512` `gemv_q8_0_q8_0` (`0-ULP` bit-exact with `generic`).
 ///
 /// # Safety
-/// Caller must ensure `avx512f`, `avx512bw`, and `avx512vl` CPU features are supported.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+/// Caller must ensure `avx512f`, `avx512bw`, `avx512vl`, and `f16c` CPU features are supported.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,f16c")]
 pub unsafe fn gemv_q8_0_q8_0(
     w: &[BlockQ8_0],
     x: &[BlockQ8_0],
@@ -107,12 +107,26 @@ pub unsafe fn gemv_q8_0_q8_0(
                 let by = x.get_unchecked(ib);
                 let y32 =
                     _mm512_cvtepi8_epi16(_mm256_loadu_si256(by.qs.as_ptr() as *const __m256i));
-                let dy = _mm_set1_ps(f16_to_f32(by.d));
+                let dy = _mm_broadcastss_ps(_mm_cvtph_ps(_mm_cvtsi32_si128(by.d as i32)));
 
                 let b0 = w0.get_unchecked(ib);
                 let b1 = w1.get_unchecked(ib);
                 let b2 = w2.get_unchecked(ib);
                 let b3 = w3.get_unchecked(ib);
+                let b4 = w4.get_unchecked(ib);
+                let b5 = w5.get_unchecked(ib);
+                let b6 = w6.get_unchecked(ib);
+                let b7 = w7.get_unchecked(ib);
+                let dx8 = _mm256_cvtph_ps(_mm_set_epi16(
+                    b7.d as i16,
+                    b6.d as i16,
+                    b5.d as i16,
+                    b4.d as i16,
+                    b3.d as i16,
+                    b2.d as i16,
+                    b1.d as i16,
+                    b0.d as i16,
+                ));
                 let p0 = _mm512_madd_epi16(
                     _mm512_cvtepi8_epi16(_mm256_loadu_si256(b0.qs.as_ptr() as *const __m256i)),
                     y32,
@@ -130,18 +144,11 @@ pub unsafe fn gemv_q8_0_q8_0(
                     y32,
                 );
                 let sum0 = _mm_cvtepi32_ps(hsum4_epi32_avx512(p0, p1, p2, p3));
-                let dx0 = _mm_set_ps(
-                    f16_to_f32(b3.d),
-                    f16_to_f32(b2.d),
-                    f16_to_f32(b1.d),
-                    f16_to_f32(b0.d),
+                acc0 = _mm_add_ps(
+                    acc0,
+                    _mm_mul_ps(sum0, _mm_mul_ps(_mm256_castps256_ps128(dx8), dy)),
                 );
-                acc0 = _mm_add_ps(acc0, _mm_mul_ps(sum0, _mm_mul_ps(dx0, dy)));
 
-                let b4 = w4.get_unchecked(ib);
-                let b5 = w5.get_unchecked(ib);
-                let b6 = w6.get_unchecked(ib);
-                let b7 = w7.get_unchecked(ib);
                 let p4 = _mm512_madd_epi16(
                     _mm512_cvtepi8_epi16(_mm256_loadu_si256(b4.qs.as_ptr() as *const __m256i)),
                     y32,
@@ -159,13 +166,10 @@ pub unsafe fn gemv_q8_0_q8_0(
                     y32,
                 );
                 let sum1 = _mm_cvtepi32_ps(hsum4_epi32_avx512(p4, p5, p6, p7));
-                let dx1 = _mm_set_ps(
-                    f16_to_f32(b7.d),
-                    f16_to_f32(b6.d),
-                    f16_to_f32(b5.d),
-                    f16_to_f32(b4.d),
+                acc1 = _mm_add_ps(
+                    acc1,
+                    _mm_mul_ps(sum1, _mm_mul_ps(_mm256_extractf128_ps::<1>(dx8), dy)),
                 );
-                acc1 = _mm_add_ps(acc1, _mm_mul_ps(sum1, _mm_mul_ps(dx1, dy)));
             }
 
             _mm_storeu_ps(out.as_mut_ptr().add(r), acc0);
@@ -183,7 +187,7 @@ pub unsafe fn gemv_q8_0_q8_0(
                 let by = x.get_unchecked(ib);
                 let y32 =
                     _mm512_cvtepi8_epi16(_mm256_loadu_si256(by.qs.as_ptr() as *const __m256i));
-                let dy = _mm_set1_ps(f16_to_f32(by.d));
+                let dy = _mm_broadcastss_ps(_mm_cvtph_ps(_mm_cvtsi32_si128(by.d as i32)));
                 let b0 = w0.get_unchecked(ib);
                 let b1 = w1.get_unchecked(ib);
                 let b2 = w2.get_unchecked(ib);
@@ -205,12 +209,16 @@ pub unsafe fn gemv_q8_0_q8_0(
                     y32,
                 );
                 let sum4 = _mm_cvtepi32_ps(hsum4_epi32_avx512(p0, p1, p2, p3));
-                let dx4 = _mm_set_ps(
-                    f16_to_f32(b3.d),
-                    f16_to_f32(b2.d),
-                    f16_to_f32(b1.d),
-                    f16_to_f32(b0.d),
-                );
+                let dx4 = _mm_cvtph_ps(_mm_set_epi16(
+                    0,
+                    0,
+                    0,
+                    0,
+                    b3.d as i16,
+                    b2.d as i16,
+                    b1.d as i16,
+                    b0.d as i16,
+                ));
                 acc = _mm_add_ps(acc, _mm_mul_ps(sum4, _mm_mul_ps(dx4, dy)));
             }
             _mm_storeu_ps(out.as_mut_ptr().add(r), acc);
@@ -228,8 +236,8 @@ pub unsafe fn gemv_q8_0_q8_0(
 /// Multi-token shared-weight `AVX-512` `gemm_q8_0_q8_0` (`4 rows x 4 tokens`, `0-ULP` bit-exact).
 ///
 /// # Safety
-/// Caller must ensure `avx512f`, `avx512bw`, and `avx512vl` CPU features are supported.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+/// Caller must ensure `avx512f`, `avx512bw`, `avx512vl`, and `f16c` CPU features are supported.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,f16c")]
 pub unsafe fn gemm_q8_0_q8_0(
     w: &[BlockQ8_0],
     x: &[BlockQ8_0],
@@ -277,12 +285,16 @@ pub unsafe fn gemm_q8_0_q8_0(
                         _mm512_cvtepi8_epi16(_mm256_loadu_si256(b2.qs.as_ptr() as *const __m256i));
                     let x3 =
                         _mm512_cvtepi8_epi16(_mm256_loadu_si256(b3.qs.as_ptr() as *const __m256i));
-                    let dx4 = _mm_set_ps(
-                        f16_to_f32(b3.d),
-                        f16_to_f32(b2.d),
-                        f16_to_f32(b1.d),
-                        f16_to_f32(b0.d),
-                    );
+                    let dx4 = _mm_cvtph_ps(_mm_set_epi16(
+                        0,
+                        0,
+                        0,
+                        0,
+                        b3.d as i16,
+                        b2.d as i16,
+                        b1.d as i16,
+                        b0.d as i16,
+                    ));
 
                     for (ti, acc_ti) in acc.iter_mut().enumerate().take(bt) {
                         let by = x.get_unchecked((t0 + ti) * cols_blocks + ib);
@@ -294,8 +306,8 @@ pub unsafe fn gemm_q8_0_q8_0(
                         let p2 = _mm512_madd_epi16(x2, y32);
                         let p3 = _mm512_madd_epi16(x3, y32);
                         let sum4 = _mm_cvtepi32_ps(hsum4_epi32_avx512(p0, p1, p2, p3));
-                        let scale4 = _mm_mul_ps(dx4, _mm_set1_ps(f16_to_f32(by.d)));
-                        *acc_ti = _mm_add_ps(*acc_ti, _mm_mul_ps(sum4, scale4));
+                        let dy = _mm_broadcastss_ps(_mm_cvtph_ps(_mm_cvtsi32_si128(by.d as i32)));
+                        *acc_ti = _mm_add_ps(*acc_ti, _mm_mul_ps(sum4, _mm_mul_ps(dx4, dy)));
                     }
                 }
 
@@ -582,113 +594,21 @@ pub unsafe fn gemv_f32_q8_0(
     rows: usize,
     cols_blocks: usize,
 ) {
-    assert_eq!(w.len(), rows * cols_blocks);
-    assert_eq!(x.len(), cols_blocks * QK8_0);
-    assert_eq!(out.len(), rows);
-
-    let mut r = 0usize;
-    // SAFETY: Row and block bounds are asserted above.
-    unsafe {
-        while r + 8 <= rows {
-            let w0 = &w[r * cols_blocks..(r + 1) * cols_blocks];
-            let w1 = &w[(r + 1) * cols_blocks..(r + 2) * cols_blocks];
-            let w2 = &w[(r + 2) * cols_blocks..(r + 3) * cols_blocks];
-            let w3 = &w[(r + 3) * cols_blocks..(r + 4) * cols_blocks];
-            let w4 = &w[(r + 4) * cols_blocks..(r + 5) * cols_blocks];
-            let w5 = &w[(r + 5) * cols_blocks..(r + 6) * cols_blocks];
-            let w6 = &w[(r + 6) * cols_blocks..(r + 7) * cols_blocks];
-            let w7 = &w[(r + 7) * cols_blocks..(r + 8) * cols_blocks];
-            let mut tot0 = _mm_setzero_ps();
-            let mut tot1 = _mm_setzero_ps();
-
-            for ib in 0..cols_blocks {
-                let b0 = w0.get_unchecked(ib);
-                let b1 = w1.get_unchecked(ib);
-                let b2 = w2.get_unchecked(ib);
-                let b3 = w3.get_unchecked(ib);
-                let b4 = w4.get_unchecked(ib);
-                let b5 = w5.get_unchecked(ib);
-                let b6 = w6.get_unchecked(ib);
-                let b7 = w7.get_unchecked(ib);
-                let q_ptr = x.as_ptr().add(ib * QK8_0);
-
-                let mut acc01 = _mm512_setzero_ps();
-                let mut acc23 = _mm512_setzero_ps();
-                let mut acc45 = _mm512_setzero_ps();
-                let mut acc67 = _mm512_setzero_ps();
-
-                for c in 0..4 {
-                    let off = c * 8;
-                    let q256 = _mm256_loadu_ps(q_ptr.add(off));
-                    let q512 = _mm512_insertf32x8::<1>(_mm512_castps256_ps512(q256), q256);
-
-                    let k01 = _mm_unpacklo_epi64(
-                        _mm_loadl_epi64(b0.qs.as_ptr().add(off) as *const __m128i),
-                        _mm_loadl_epi64(b1.qs.as_ptr().add(off) as *const __m128i),
-                    );
-                    let k23 = _mm_unpacklo_epi64(
-                        _mm_loadl_epi64(b2.qs.as_ptr().add(off) as *const __m128i),
-                        _mm_loadl_epi64(b3.qs.as_ptr().add(off) as *const __m128i),
-                    );
-                    let k45 = _mm_unpacklo_epi64(
-                        _mm_loadl_epi64(b4.qs.as_ptr().add(off) as *const __m128i),
-                        _mm_loadl_epi64(b5.qs.as_ptr().add(off) as *const __m128i),
-                    );
-                    let k67 = _mm_unpacklo_epi64(
-                        _mm_loadl_epi64(b6.qs.as_ptr().add(off) as *const __m128i),
-                        _mm_loadl_epi64(b7.qs.as_ptr().add(off) as *const __m128i),
-                    );
-
-                    acc01 =
-                        _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(k01)), q512, acc01);
-                    acc23 =
-                        _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(k23)), q512, acc23);
-                    acc45 =
-                        _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(k45)), q512, acc45);
-                    acc67 =
-                        _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(k67)), q512, acc67);
-                }
-
-                let bsum0 = hsum2x2_8wide_pairwise_ps(acc01, acc23);
-                let bsum1 = hsum2x2_8wide_pairwise_ps(acc45, acc67);
-                let d0 = _mm_set_ps(
-                    f16_to_f32(b3.d),
-                    f16_to_f32(b2.d),
-                    f16_to_f32(b1.d),
-                    f16_to_f32(b0.d),
-                );
-                let d1 = _mm_set_ps(
-                    f16_to_f32(b7.d),
-                    f16_to_f32(b6.d),
-                    f16_to_f32(b5.d),
-                    f16_to_f32(b4.d),
-                );
-                tot0 = _mm_fmadd_ps(bsum0, d0, tot0);
-                tot1 = _mm_fmadd_ps(bsum1, d1, tot1);
-            }
-
-            _mm_storeu_ps(out.as_mut_ptr().add(r), tot0);
-            _mm_storeu_ps(out.as_mut_ptr().add(r + 4), tot1);
-            r += 8;
-        }
-
-        if r < rows {
-            super::avx2::gemv_f32_q8_0(
-                &w[r * cols_blocks..],
-                x,
-                &mut out[r..],
-                rows - r,
-                cols_blocks,
-            );
-        }
-    }
+    // Single-token `F32 x Q8_0` GEMV (`2 FLOP/B`) is strictly DRAM-bandwidth-bound across cores.
+    // Using 256-bit YMM (`AVX2 + FMA + F16C`, `0-ULP` bit-exact with `generic`) avoids Intel Xeon
+    // Skylake-X / Cascade Lake 512-bit ZMM frequency-license throttling (`-400 MHz` all-core drop)
+    // and scalar `f16_to_f32` overhead (`+34%` faster host MoE decode measured on Colab Xeon + L4).
+    // SAFETY: `avx512f + avx512bw + avx512vl + fma + f16c` implies `avx2 + fma + f16c`.
+    unsafe { super::avx2::gemv_f32_q8_0(w, x, out, rows, cols_blocks) };
 }
 
 /// Multi-token L1-pinned `4 rows x 4 tokens` `AVX-512` `gemm_f32_q8_0` (`0-ULP` bit-exact).
 ///
-/// Steps `r` by 4 in the outer loop (`< 10 KiB` of weights pinned in L1D cache across all tokens)
-/// and processes `4` tokens per inner pass using `8` 512-bit ZMM accumulators (`4 rows x 2 token-pairs`),
-/// converting each `BlockQ8_0` from `i8` to `f32` **once** across all 4 tokens!
+/// For small speculative/MoE token counts (`n_tokens <= 8`), delegates to `avx2::gemm_f32_q8_0`
+/// (`4x3` / `4x2` / `4x1` YMM + `F16C`) so `n_tokens = 2, 3` still share weights in registers and
+/// Xeon cores stay at full non-AVX512 turbo clock. For larger batches (`n_tokens > 8`), steps `r`
+/// by 4 (`< 10 KiB` of weights pinned in L1D) and processes `4` tokens per inner pass using `8`
+/// 512-bit ZMM accumulators.
 ///
 /// # Safety
 /// Caller must ensure `avx512f`, `avx512bw`, `avx512vl`, `fma`, and `f16c` CPU features are supported.
@@ -709,9 +629,9 @@ pub unsafe fn gemm_f32_q8_0(
     if n_tokens == 0 {
         return;
     }
-    if n_tokens == 1 {
-        // SAFETY: Same target features guaranteed by caller.
-        unsafe { gemv_f32_q8_0(w, x, out, rows, cols_blocks) };
+    if n_tokens <= 8 {
+        // SAFETY: `avx512f + avx512bw + avx512vl + fma + f16c` implies `avx2 + fma + f16c`.
+        unsafe { super::avx2::gemm_f32_q8_0(w, x, out, rows, cols_blocks, n_tokens) };
         return;
     }
 

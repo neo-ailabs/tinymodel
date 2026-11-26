@@ -1325,8 +1325,20 @@ mod x86_64_wrappers {
         head_dim: usize,
         d_state: usize,
     ) {
-        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma + f16c` detection.
         unsafe { avx2::mamba2_scan_head(x_h, b_g, c_g, da, dt, d_h, s_h, y_h, head_dim, d_state) }
+    }
+    fn avx2_dot_f32_f16(q: &[f32], k_f16: &[u16]) -> f32 {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma + f16c` detection.
+        unsafe { avx2::dot_f32_f16(q, k_f16) }
+    }
+    fn avx2_axpy_f32_f16(out: &mut [f32], w: f32, v_f16: &[u16]) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma + f16c` detection.
+        unsafe { avx2::axpy_f32_f16(out, w, v_f16) }
+    }
+    fn avx2_f32_to_f16_slice(src: &[f32], dst: &mut [u16]) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma + f16c` detection.
+        unsafe { avx2::f32_to_f16_slice(src, dst) }
     }
 
     pub const AVX2_TABLE: KernelTable = KernelTable {
@@ -1361,16 +1373,16 @@ mod x86_64_wrappers {
         vec_dot_iq4_nl_q8_0: generic::vec_dot_iq4_nl_q8_0,
         gemv_iq4_nl_q8_0: generic::gemv_iq4_nl_q8_0,
         gemm_iq4_nl_q8_0: generic::gemm_iq4_nl_q8_0,
-        dot_f32_f16: generic::dot_f32_f16,
+        dot_f32_f16: avx2_dot_f32_f16,
         dot_f32_bf16: avx2_dot_f32_bf16,
         dot_f32_q8_0: avx2_dot_f32_q8_0,
         gemv_f32_q8_0: avx2_gemv_f32_q8_0,
         gemm_f32_q8_0: avx2_gemm_f32_q8_0,
         axpy_f32: generic::axpy_f32,
-        axpy_f32_f16: generic::axpy_f32_f16,
+        axpy_f32_f16: avx2_axpy_f32_f16,
         axpy_f32_q8_0: avx2_axpy_f32_q8_0,
         gemm_q4_0_transposed_tile: generic::gemm_q4_0_transposed_tile,
-        f32_to_f16_slice: generic::f32_to_f16_slice,
+        f32_to_f16_slice: avx2_f32_to_f16_slice,
         quantize_q8_0: generic::quantize_q8_0,
         quantize_q8_1: generic::quantize_q8_1,
         quantize_q8_k: generic::quantize_q8_k,
