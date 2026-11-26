@@ -180,7 +180,7 @@ struct VkInklingLayer {
 
 /// Maximum number of tokens evaluated in lockstep per `forward_window_hybrid` pass
 /// (covers `32`-token prompt prefill chunks and `DSpark` `block_size == 8` verification windows!).
-pub const MAX_INKLING2_VK_WINDOW: usize = 32;
+pub const MAX_INKLING2_VK_WINDOW: usize = 128;
 /// Maximum speculative rollback window with `save_conv_snapshots == true` (`DSpark` `block_size == 8`).
 pub const MAX_INKLING2_SPEC_WINDOW: usize = 8;
 
@@ -1189,9 +1189,9 @@ impl Inkling2VkRunner {
         let max_wg = info.max_workgroup_invocations;
         let ops_wg = 128u32.max(sg).min(max_wg);
         let gemv_wg = 128u32.max(sg).min(max_wg);
-        let gemv_nr = 2u32;
+        let gemv_nr = 4u32;
         let moe_wg = gemv_wg;
-        let moe_nr = 2u32;
+        let moe_nr = 4u32;
         let attn_sg_cnt = if 8 * sg <= max_wg { 8u32 } else { 4u32 };
         let attn_wg = attn_sg_cnt * sg;
         let attn_n_vec = ((cfg.head_dim / 4).div_ceil(sg as usize)).max(1) as u32;

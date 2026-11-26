@@ -28,8 +28,8 @@ use tm_gguf::{DirectTensorReader, GgufError, GgufFile, PageAlignedSlot};
 use crate::llama::ModelError;
 use crate::state::{LayerState, MAX_SPEC_WINDOW, SpecVerifyBuf, decode_embedding_row};
 
-/// Maximum multi-token lockstep window for `eval_moe_experts_window_f32` (`DSpark` verify + 32-tok prefill).
-pub const MAX_INKLING2_WINDOW: usize = 32;
+/// Maximum multi-token lockstep window for `eval_moe_experts_window_f32` (`DSpark` verify + 128-tok prefill).
+pub const MAX_INKLING2_WINDOW: usize = 128;
 
 /// Controller indices for `inkling2_loop` cross-pass messages (`inkling2-loop.cpp:48-50`).
 pub const LOOP_CTRL_Q: usize = 0;
@@ -1403,35 +1403,31 @@ impl<'a> Inkling2Model<'a> {
             return;
         }
 
-        // Build deduplicated expert table on stack (`MAX_INKLING2_WINDOW * 32 <= 1024`, zero heap allocs!)
-        const MAX_REQS: usize = MAX_INKLING2_WINDOW * 32;
-        let total_reqs = window_len * top_k;
-        assert!(total_reqs <= MAX_REQS);
-        let mut uniq_exps = [0usize; MAX_REQS];
-        let mut uniq_mask = [0u32; MAX_REQS];
-        let mut uniq_kslot = [[0u8; MAX_INKLING2_WINDOW]; MAX_REQS];
+        // Build deduplicated expert table (`n_uniq <= n_expert`, 128-bit token mask per unique expert)
+        const MAX_UNIQ_EXPS: usize = 512;
+        let n_expert = self.cfg.n_expert;
+        assert!(n_expert <= MAX_UNIQ_EXPS);
+        let mut uniq_exps = [0usize; MAX_UNIQ_EXPS];
+        let mut uniq_mask = [[0u64; 2]; MAX_UNIQ_EXPS];
+        let mut exp_to_u = [u16::MAX; MAX_UNIQ_EXPS];
+        let mut uniq_kslot = vec![[0u8; MAX_INKLING2_WINDOW]; n_expert];
         let mut n_uniq = 0usize;
 
         for tok_i in 0..window_len {
+            let word = tok_i >> 6;
+            let bit = 1u64 << (tok_i & 63);
             for k_idx in 0..top_k {
                 let e_id = top_ids_win[tok_i * top_k + k_idx];
-                let mut found = None;
-                for (u, &ue) in uniq_exps.iter().enumerate().take(n_uniq) {
-                    if ue == e_id {
-                        found = Some(u);
-                        break;
-                    }
-                }
-                let u = match found {
-                    Some(u) => u,
-                    None => {
-                        let u = n_uniq;
-                        uniq_exps[u] = e_id;
-                        n_uniq += 1;
-                        u
-                    }
+                let u = if exp_to_u[e_id] != u16::MAX {
+                    exp_to_u[e_id] as usize
+                } else {
+                    let u = n_uniq;
+                    exp_to_u[e_id] = u as u16;
+                    uniq_exps[u] = e_id;
+                    n_uniq += 1;
+                    u
                 };
-                uniq_mask[u] |= 1u32 << tok_i;
+                uniq_mask[u][word] |= bit;
                 uniq_kslot[u][tok_i] = k_idx as u8;
             }
         }
@@ -1462,7 +1458,7 @@ impl<'a> Inkling2Model<'a> {
 
                         let mut m_cnt = 0usize;
                         for tok_i in 0..window_len {
-                            if (mask & (1u32 << tok_i)) != 0 {
+                            if (mask[tok_i >> 6] & (1u64 << (tok_i & 63))) != 0 {
                                 ws.win_in_buf[m_cnt * n_embd..(m_cnt + 1) * n_embd]
                                     .copy_from_slice(
                                         &cur_normed_win[tok_i * n_embd..(tok_i + 1) * n_embd],
@@ -1511,7 +1507,7 @@ impl<'a> Inkling2Model<'a> {
                         let kslots = &uniq_kslot[u];
                         let mut m_idx = 0usize;
                         for (tok_i, &ks) in kslots.iter().enumerate().take(window_len) {
-                            if (mask & (1u32 << tok_i)) == 0 {
+                            if (mask[tok_i >> 6] & (1u64 << (tok_i & 63))) == 0 {
                                 continue;
                             }
                             let k_idx = ks as usize;
@@ -1546,7 +1542,7 @@ impl<'a> Inkling2Model<'a> {
                         let mask = uniq_mask[u];
                         let mut m_cnt = 0usize;
                         for tok_i in 0..window_len {
-                            if (mask & (1u32 << tok_i)) != 0 {
+                            if (mask[tok_i >> 6] & (1u64 << (tok_i & 63))) != 0 {
                                 ws.win_in_buf[m_cnt * n_embd..(m_cnt + 1) * n_embd]
                                     .copy_from_slice(
                                         &cur_normed_win[tok_i * n_embd..(tok_i + 1) * n_embd],
@@ -1603,7 +1599,7 @@ impl<'a> Inkling2Model<'a> {
                         let kslots = &uniq_kslot[u];
                         let mut m_idx = 0usize;
                         for (tok_i, &ks) in kslots.iter().enumerate().take(window_len) {
-                            if (mask & (1u32 << tok_i)) == 0 {
+                            if (mask[tok_i >> 6] & (1u64 << (tok_i & 63))) == 0 {
                                 continue;
                             }
                             let k_idx = ks as usize;
