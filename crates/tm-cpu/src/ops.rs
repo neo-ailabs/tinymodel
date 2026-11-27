@@ -5,9 +5,9 @@
 //! pre-allocated scratch buffers.
 
 use tm_core::{
-    BlockIQ2XXS, BlockIQ3XXS, BlockIQ4NL, BlockQ2_0, BlockQ4_0, BlockQ4_0x4, BlockQ4_1, BlockQ5K,
-    BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, BlockTQ2_0, DType, QK_K, QK2_0, QK4_0, QK4_1, QK4_NL,
-    QK8_0, dequantize_q4_0x4_single_row, dequantize_row_bytes, f16_to_f32,
+    BlockIQ2XXS, BlockIQ3XXS, BlockIQ4NL, BlockNvFp4, BlockQ2_0, BlockQ4_0, BlockQ4_0x4, BlockQ4_1,
+    BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, BlockTQ2_0, DType, QK_K, QK_NVFP4, QK2_0,
+    QK4_0, QK4_1, QK4_NL, QK8_0, dequantize_q4_0x4_single_row, dequantize_row_bytes, f16_to_f32,
 };
 
 use crate::{KernelTable, ThreadPool, generic};
@@ -202,6 +202,12 @@ pub fn matvec_batch_f32_unquant_act(
                 }
             });
         }
+        return;
+    }
+    if matches!(dtype, DType::BF16 | DType::NvFp4) {
+        matmul_f32(
+            pool, kt, dtype, w_bytes, x_batch, scratch, out_batch, rows, cols, n_vec,
+        );
         return;
     }
     for m in 0..n_vec {
@@ -566,6 +572,37 @@ pub fn matvec_f32(
                 let o =
                     unsafe { core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(r0), len) };
                 (kt.gemv_iq4_nl_q8_0)(
+                    &w[r0 * cols_blocks..r1 * cols_blocks],
+                    xq_ref,
+                    o,
+                    len,
+                    cols_blocks,
+                );
+            });
+        }
+        DType::NvFp4 => {
+            let cols_blocks = cols / QK_NVFP4;
+            let q8_blocks = cols / QK8_0;
+            let xq = &mut scratch.q8_0[..q8_blocks];
+            (kt.quantize_q8_0)(x, xq);
+            let xq_ref: &[BlockQ8_0] = xq;
+            assert!(
+                (w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockNvFp4>()),
+                "NVFP4 tensor pointer misaligned"
+            );
+            // SAFETY: Length and alignment verified above; `BlockNvFp4` is `#[repr(C)]` POD (`align = 1`).
+            let w: &[BlockNvFp4] = unsafe {
+                core::slice::from_raw_parts(
+                    w_bytes.as_ptr() as *const BlockNvFp4,
+                    rows * cols_blocks,
+                )
+            };
+            pool.parallel_for(rows, chunk, |r0, r1| {
+                let len = r1 - r0;
+                // SAFETY: Disjoint `[r0..r1)` output ranges per parallel chunk.
+                let o =
+                    unsafe { core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(r0), len) };
+                (kt.gemv_nvfp4_q8_0)(
                     &w[r0 * cols_blocks..r1 * cols_blocks],
                     xq_ref,
                     o,
@@ -1904,6 +1941,55 @@ pub fn matmul_f32(
                     let b_rows = (r1 - r).min(16);
                     let wr = &w[r * cols_blocks..(r + b_rows) * cols_blocks];
                     (kt.gemm_iq4_nl_q8_0)(
+                        wr,
+                        xq_ref,
+                        &mut tile[..b_rows * n_tok],
+                        b_rows,
+                        cols_blocks,
+                        n_tok,
+                    );
+                    for t in 0..n_tok {
+                        // SAFETY: Disjoint `[t * rows + r .. + b_rows)` per worker.
+                        let dst = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                (out_ptr as *mut f32).add(t * rows + r),
+                                b_rows,
+                            )
+                        };
+                        dst.copy_from_slice(&tile[t * b_rows..(t + 1) * b_rows]);
+                    }
+                    r += b_rows;
+                }
+            });
+        }
+        DType::NvFp4 => {
+            let cols_blocks = cols / QK_NVFP4;
+            let q8_blocks = cols / QK8_0;
+            let xq = &mut scratch.q8_0[..n_tok * q8_blocks];
+            for t in 0..n_tok {
+                (kt.quantize_q8_0)(
+                    &x[t * cols..(t + 1) * cols],
+                    &mut xq[t * q8_blocks..(t + 1) * q8_blocks],
+                );
+            }
+            let xq_ref: &[BlockQ8_0] = xq;
+            assert!(
+                (w_bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<BlockNvFp4>())
+            );
+            // SAFETY: Alignment and length verified; `BlockNvFp4` is `#[repr(C)]` POD.
+            let w: &[BlockNvFp4] = unsafe {
+                core::slice::from_raw_parts(
+                    w_bytes.as_ptr() as *const BlockNvFp4,
+                    rows * cols_blocks,
+                )
+            };
+            pool.parallel_for(rows, chunk, |r0, r1| {
+                let mut r = r0;
+                let mut tile = [0.0f32; 16 * MAX_CPU_BATCH];
+                while r < r1 {
+                    let b_rows = (r1 - r).min(16);
+                    let wr = &w[r * cols_blocks..(r + b_rows) * cols_blocks];
+                    (kt.gemm_nvfp4_q8_0)(
                         wr,
                         xq_ref,
                         &mut tile[..b_rows * n_tok],

@@ -9,6 +9,10 @@ pub const KVALUES_IQ4NL: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 ];
 
+/// Doubled E2M1 FP4 codebook shared by `MXFP4` and `NVFP4` (`ggml_type = 40`).
+/// Each entry equals `2 * E2M1_float` (`{0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}` and negatives).
+pub const KVALUES_FP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
 /// 7-bit parity-expanded 8-bit sign masks (`IQ2_XXS` / `IQ2_XS` / `IQ3_XXS`).
 pub const KSIGNS_IQ2XS: [u8; 128] = [
     0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15, 144, 17, 18, 147, 20, 149,

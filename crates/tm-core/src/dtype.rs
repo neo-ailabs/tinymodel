@@ -6,10 +6,14 @@
 //! Upstream reference: llama.cpp `ggml/src/ggml-common.h` (commit `3cf03257` / `b001d7b`).
 
 use crate::fp16::{f16_to_f32, f32_to_f16};
-use crate::iq_tables::{IQ2XXS_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, KVALUES_IQ4NL};
+use crate::iq_tables::{IQ2XXS_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, KVALUES_FP4, KVALUES_IQ4NL};
 
 /// Number of weights per `BlockQ2_0` (2.25 bpw).
 pub const QK2_0: usize = 64;
+/// Number of weights per `BlockNvFp4` (4.50 bpw, 4 sub-blocks of 16 elements).
+pub const QK_NVFP4: usize = 64;
+/// Sub-block size per `UE4M3` scale in `BlockNvFp4`.
+pub const QK_NVFP4_SUB: usize = 16;
 /// Number of weights per `BlockQ4_0` / `BlockQ4_1`.
 pub const QK4_0: usize = 32;
 /// Number of weights per `BlockIQ4NL` (4.50 bpw non-linear codebook).
@@ -70,6 +74,7 @@ pub enum DType {
     Iq2Xxs,
     Iq3Xxs,
     Iq4Nl,
+    NvFp4,
     Q4_0,
     /// Offline 4-row x 32-col interleaved `Q4_0` layout (`72` bytes = `4 * 18` bytes, zero overhead).
     Q4_0x4,
@@ -99,6 +104,7 @@ impl DType {
             20 => Some(DType::Iq4Nl),
             30 => Some(DType::BF16),
             35 => Some(DType::TQ2_0),
+            40 => Some(DType::NvFp4),
             42 => Some(DType::Q2_0),
             GGML_TYPE_TM_Q4_0X4 => Some(DType::Q4_0x4),
             _ => None,
@@ -122,6 +128,7 @@ impl DType {
             DType::Iq4Nl => 20,
             DType::BF16 => 30,
             DType::TQ2_0 => 35,
+            DType::NvFp4 => 40,
             DType::Q2_0 => 42,
             DType::Q4_0x4 => GGML_TYPE_TM_Q4_0X4,
         }
@@ -138,6 +145,7 @@ impl DType {
             DType::Iq2Xxs => "iq2_xxs",
             DType::Iq3Xxs => "iq3_xxs",
             DType::Iq4Nl => "iq4_nl",
+            DType::NvFp4 => "nvfp4",
             DType::Q4_0 => "q4_0",
             DType::Q4_0x4 => "q4_0x4",
             DType::Q4_1 => "q4_1",
@@ -149,7 +157,7 @@ impl DType {
         }
     }
 
-    /// Parses a CLI quantization target name (`q4_0x4`, `q2_0`, `tq2_0`, `iq2_xxs`, `iq3_xxs`, `iq4_nl`, `q4_0`, `q8_0`).
+    /// Parses a CLI quantization target name (`q4_0x4`, `q2_0`, `tq2_0`, `iq2_xxs`, `iq3_xxs`, `iq4_nl`, `nvfp4`, `q4_0`, `q8_0`).
     pub fn from_cli_name(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "f32" => Some(DType::F32),
@@ -160,6 +168,7 @@ impl DType {
             "iq2_xxs" | "iq2" => Some(DType::Iq2Xxs),
             "iq3_xxs" | "iq3" => Some(DType::Iq3Xxs),
             "iq4_nl" | "iq4" => Some(DType::Iq4Nl),
+            "nvfp4" | "fp4" => Some(DType::NvFp4),
             "q4_0" => Some(DType::Q4_0),
             "q4_0x4" | "q4_0_4x8" => Some(DType::Q4_0x4),
             "q4_1" => Some(DType::Q4_1),
@@ -175,6 +184,7 @@ impl DType {
         match self {
             DType::F32 | DType::F16 | DType::BF16 => 1,
             DType::Q2_0 => QK2_0,
+            DType::NvFp4 => QK_NVFP4,
             DType::Q4_0 => QK4_0,
             DType::Iq4Nl => QK4_NL,
             DType::Q4_0x4 => QK4_0X4,
@@ -197,6 +207,7 @@ impl DType {
             DType::Iq2Xxs => core::mem::size_of::<BlockIQ2XXS>(),
             DType::Iq3Xxs => core::mem::size_of::<BlockIQ3XXS>(),
             DType::Iq4Nl => core::mem::size_of::<BlockIQ4NL>(),
+            DType::NvFp4 => core::mem::size_of::<BlockNvFp4>(),
             DType::Q4_0 => core::mem::size_of::<BlockQ4_0>(),
             DType::Q4_0x4 => core::mem::size_of::<BlockQ4_0x4>(),
             DType::Q4_1 => core::mem::size_of::<BlockQ4_1>(),
@@ -276,6 +287,74 @@ pub struct BlockIQ3XXS {
 pub struct BlockIQ4NL {
     pub d: u16,
     pub qs: [u8; QK4_NL / 2],
+}
+
+/// NVIDIA ModelOpt 4-bit FP4 (`E2M1`) super-block (`ggml_type = 40`, 64 weights in 36 bytes = 4.50 bpw).
+/// Contains 4 unsigned `UE4M3` sub-block scales (one per 16 elements) and 32 packed nibble bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockNvFp4 {
+    pub d: [u8; QK_NVFP4 / QK_NVFP4_SUB],
+    pub qs: [u8; QK_NVFP4 / 2],
+}
+
+/// Converts an unsigned `UE4M3` scale byte to `f32 * 0.5` matching `ggml_ue4m3_to_fp32` bit-for-bit
+/// (`0.5` compensates `KVALUES_FP4 = 2 * E2M1_float`).
+#[inline]
+pub const fn ue4m3_to_f32(x: u8) -> f32 {
+    if x == 0 || x == 0x7F {
+        return 0.0;
+    }
+    let exp = ((x >> 3) & 0x0F) as i32;
+    let man = (x & 0x07) as i32;
+    if exp == 0 {
+        (man as f32) * (1.0 / 1024.0)
+    } else {
+        let pow2 = f32::from_bits(((127 + exp - 8) as u32) << 23);
+        (1.0 + (man as f32) * 0.125) * pow2
+    }
+}
+
+/// Precomputed 256-entry `UE4M3 -> f32 * 0.5` lookup table (`1 KiB` L1-resident).
+pub const UE4M3_TO_F32_LUT: [f32; 256] = {
+    let mut tbl = [0.0f32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        tbl[i] = ue4m3_to_f32(i as u8);
+        i += 1;
+    }
+    tbl
+};
+
+/// Encodes a non-negative `f32` scale (`amax / 6.0`) into `UE4M3` matching `ggml_fp32_to_ue4m3`.
+#[inline]
+pub fn f32_to_ue4m3(mut x: f32) -> u8 {
+    if x.is_nan() || x <= 0.0 {
+        return 0;
+    }
+    if x > 448.0 {
+        x = 448.0;
+    }
+    let bits = x.to_bits();
+    let fp32_exp = (((bits >> 23) & 0xFF) as i32) - 127;
+    let fp32_man = ((bits >> 20) & 0x07) as i32;
+    let ue_exp = fp32_exp + 7;
+    if ue_exp <= 0 {
+        // Subnormal UE4M3 (`val = man * 2^-9`)
+        let sub = (x * 512.0).round() as i32;
+        return sub.clamp(0, 7) as u8;
+    }
+    if ue_exp >= 15 {
+        // Clamp away from `0x7F` NaN encoding (`max finite = 0x7E = 448.0`)
+        let man_clamped = fp32_man.min(6);
+        return ((15 << 3) | man_clamped) as u8;
+    }
+    let round_bit = (bits >> 19) & 1;
+    let mut code = ((ue_exp << 3) | fp32_man) + (round_bit as i32);
+    if code >= 0x7F {
+        code = 0x7E;
+    }
+    code as u8
 }
 
 /// 4-bit symmetric quantization block (32 weights in 18 bytes).
@@ -892,6 +971,21 @@ pub fn dequantize_row_bytes(dtype: DType, src: &[u8], dst: &mut [f32]) {
                 }
             }
         }
+        DType::NvFp4 => {
+            for (ib, blk) in src.as_chunks::<36>().0.iter().enumerate() {
+                let base = ib * QK_NVFP4;
+                for s in 0..4 {
+                    let d = UE4M3_TO_F32_LUT[blk[s] as usize];
+                    let sub_base = base + s * QK_NVFP4_SUB;
+                    for j in 0..(QK_NVFP4_SUB / 2) {
+                        let b = blk[4 + s * (QK_NVFP4_SUB / 2) + j];
+                        dst[sub_base + j] = d * (KVALUES_FP4[(b & 0x0F) as usize] as f32);
+                        dst[sub_base + j + QK_NVFP4_SUB / 2] =
+                            d * (KVALUES_FP4[(b >> 4) as usize] as f32);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1284,6 +1378,44 @@ pub fn quantize_row_iq4_nl(src: &[f32], dst: &mut [BlockIQ4NL]) {
     }
 }
 
+/// Quantizes `src` (`f32`, multiple of 64) into `BlockNvFp4` (`ggml_type = 40`).
+pub fn quantize_row_nvfp4(src: &[f32], dst: &mut [BlockNvFp4]) {
+    assert_eq!(src.len() % QK_NVFP4, 0);
+    assert_eq!(dst.len(), src.len() / QK_NVFP4);
+    for (ib, blk) in dst.iter_mut().enumerate() {
+        for s in 0..4 {
+            let xb = &src[ib * QK_NVFP4 + s * QK_NVFP4_SUB..ib * QK_NVFP4 + (s + 1) * QK_NVFP4_SUB];
+            let mut amax = 0.0f32;
+            for &v in xb {
+                let av = v.abs();
+                if av > amax {
+                    amax = av;
+                }
+            }
+            let ue = f32_to_ue4m3(amax / 6.0);
+            blk.d[s] = ue;
+            let d = UE4M3_TO_F32_LUT[ue as usize];
+            let nearest = |val: f32| -> u8 {
+                let mut best = 0u8;
+                let mut best_err = ((KVALUES_FP4[0] as f32) * d - val).abs();
+                for (idx, &kv) in KVALUES_FP4.iter().enumerate().skip(1) {
+                    let err = ((kv as f32) * d - val).abs();
+                    if err < best_err {
+                        best_err = err;
+                        best = idx as u8;
+                    }
+                }
+                best
+            };
+            for j in 0..(QK_NVFP4_SUB / 2) {
+                let x0 = nearest(xb[j]);
+                let x1 = nearest(xb[QK_NVFP4_SUB / 2 + j]);
+                blk.qs[s * (QK_NVFP4_SUB / 2) + j] = x0 | (x1 << 4);
+            }
+        }
+    }
+}
+
 /// Quantizes `src` (`f32` row of length `src.len()`) into raw little-endian bytes of `target_dtype`.
 pub fn quantize_row_to_bytes(target_dtype: DType, src: &[f32], dst: &mut [u8]) {
     let n = src.len();
@@ -1365,6 +1497,21 @@ pub fn quantize_row_to_bytes(target_dtype: DType, src: &[f32], dst: &mut [u8]) {
             for (i, b) in blks.iter().enumerate() {
                 dst[i * 18..i * 18 + 2].copy_from_slice(&b.d.to_le_bytes());
                 dst[i * 18 + 2..i * 18 + 18].copy_from_slice(&b.qs);
+            }
+        }
+        DType::NvFp4 => {
+            let nb = n / QK_NVFP4;
+            let mut blks = vec![
+                BlockNvFp4 {
+                    d: [0; 4],
+                    qs: [0; QK_NVFP4 / 2]
+                };
+                nb
+            ];
+            quantize_row_nvfp4(src, &mut blks);
+            for (i, b) in blks.iter().enumerate() {
+                dst[i * 36..i * 36 + 4].copy_from_slice(&b.d);
+                dst[i * 36 + 4..i * 36 + 36].copy_from_slice(&b.qs);
             }
         }
         DType::Q4_0 => {
@@ -1496,6 +1643,7 @@ mod tests {
             (DType::Iq2Xxs, 0.90f32),
             (DType::Iq3Xxs, 0.96f32),
             (DType::Iq4Nl, 0.99f32),
+            (DType::NvFp4, 0.985f32),
         ] {
             let mut raw = vec![0u8; dt.row_bytes(n)];
             quantize_row_to_bytes(dt, &src, &mut raw);

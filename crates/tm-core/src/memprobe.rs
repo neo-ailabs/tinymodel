@@ -196,7 +196,113 @@ pub fn probe_system_memory() -> Result<MemoryBudget, MemProbeError> {
     compute_budget(mem_total, mem_avail, min_cg_max, matched_cur)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+/// Parses macOS `vm_stat` output + `hw.memsize` into `(total_bytes, available_bytes)`.
+pub fn parse_macos_vm_stat(
+    total_bytes: u64,
+    vm_stat_text: &str,
+) -> Result<MemoryBudget, MemProbeError> {
+    if total_bytes == 0 {
+        return Err(MemProbeError::MissingOrZeroField("hw.memsize"));
+    }
+    let mut page_size: u64 = 16384;
+    let mut free_pages: u64 = 0;
+    let mut active_pages: u64 = 0;
+    let mut inactive_pages: u64 = 0;
+    let mut speculative_pages: u64 = 0;
+    let mut purgeable_pages: u64 = 0;
+    let mut file_backed_pages: u64 = 0;
+    let mut wired_pages: u64 = 0;
+    let mut compressor_pages: u64 = 0;
+
+    for line in vm_stat_text.lines() {
+        if let Some(idx) = line.find("page size of ") {
+            let after = &line[idx + "page size of ".len()..];
+            if let Some(num_str) = after.split_whitespace().next()
+                && let Ok(ps) = num_str.parse::<u64>()
+                && ps > 0
+            {
+                page_size = ps;
+            }
+            continue;
+        }
+        let Some((k, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let val_str = rest.trim().trim_end_matches('.');
+        let Ok(val) = val_str.parse::<u64>() else {
+            continue;
+        };
+        match k.trim() {
+            "Pages free" => free_pages = val,
+            "Pages active" => active_pages = val,
+            "Pages inactive" => inactive_pages = val,
+            "Pages speculative" => speculative_pages = val,
+            "Pages purgeable" => purgeable_pages = val,
+            "File-backed pages" => file_backed_pages = val,
+            "Pages wired down" => wired_pages = val,
+            "Pages occupied by compressor" => compressor_pages = val,
+            _ => {}
+        }
+    }
+
+    // Reclaimable without compressing/swapping anonymous pages: free + speculative + max(inactive + purgeable, file_backed).
+    let reclaimable = free_pages
+        .saturating_add(speculative_pages)
+        .saturating_add(
+            inactive_pages
+                .saturating_add(purgeable_pages)
+                .max(file_backed_pages),
+        )
+        .saturating_mul(page_size);
+    // Estimate live uncompressed anonymous pages currently in RAM.
+    let total_paged = active_pages
+        .saturating_add(inactive_pages)
+        .saturating_add(speculative_pages);
+    let live_anon_pages = total_paged.saturating_sub(file_backed_pages);
+    let os_headroom = (total_bytes / 16).clamp(384 * 1024 * 1024, 1024 * 1024 * 1024);
+    let uncompressed_cap = total_bytes
+        .saturating_sub(wired_pages.saturating_mul(page_size))
+        .saturating_sub(compressor_pages.saturating_mul(page_size))
+        .saturating_sub(live_anon_pages.saturating_mul(page_size))
+        .saturating_sub(os_headroom);
+    let available_bytes = if reclaimable > 0 && live_anon_pages > 0 {
+        reclaimable.min(uncompressed_cap.max(free_pages.saturating_mul(page_size)))
+    } else if reclaimable > 0 {
+        reclaimable.min(uncompressed_cap)
+    } else {
+        uncompressed_cap
+    }
+    .min(total_bytes)
+    .max(1);
+
+    Ok(MemoryBudget {
+        total_bytes,
+        available_bytes,
+        cgroup_max_bytes: None,
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub fn probe_system_memory() -> Result<MemoryBudget, MemProbeError> {
+    use std::process::Command;
+
+    let sysctl_out = Command::new("/usr/sbin/sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .map_err(|e| MemProbeError::Io(e.to_string()))?;
+    let total_bytes = String::from_utf8_lossy(&sysctl_out.stdout)
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| MemProbeError::MissingOrZeroField("hw.memsize"))?;
+
+    let vm_out = Command::new("/usr/bin/vm_stat")
+        .output()
+        .map_err(|e| MemProbeError::Io(e.to_string()))?;
+    let vm_text = String::from_utf8_lossy(&vm_out.stdout);
+    parse_macos_vm_stat(total_bytes, &vm_text)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 pub fn probe_system_memory() -> Result<MemoryBudget, MemProbeError> {
     Err(MemProbeError::UnsupportedPlatform)
 }
@@ -285,7 +391,28 @@ pub fn probe_process_memory_stats() -> ProcessMemoryStats {
             pss_anon_bytes,
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(target_os = "macos")]
+    {
+        let pid_str = std::process::id().to_string();
+        let rss_bytes = std::process::Command::new("/bin/ps")
+            .args(["-o", "rss=", "-p", &pid_str])
+            .output()
+            .ok()
+            .and_then(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            })
+            .map(|kb| kb * 1024);
+        ProcessMemoryStats {
+            rss_bytes,
+            peak_rss_bytes: rss_bytes,
+            private_dirty_bytes: None,
+            pss_anon_bytes: None,
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
         ProcessMemoryStats::default()
     }

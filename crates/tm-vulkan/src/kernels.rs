@@ -135,7 +135,8 @@ pub(crate) fn normalize_vk_mat_bytes<'a>(
         | DType::TQ2_0
         | DType::Iq2Xxs
         | DType::Iq3Xxs
-        | DType::Iq4Nl => {
+        | DType::Iq4Nl
+        | DType::NvFp4 => {
             let rb = dtype.row_bytes(cols);
             let mut f32_vals = vec![0.0f32; rows * cols];
             for r in 0..rows {

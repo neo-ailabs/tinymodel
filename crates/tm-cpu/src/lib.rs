@@ -13,7 +13,9 @@ pub mod aarch64;
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
 
-pub use affinity::{CpuTopology, detected_topology, recommended_threads};
+pub use affinity::{
+    CpuTopology, detected_topology, mlock_slice, recommended_threads, set_file_nocache,
+};
 pub use isa::{Caps, Isa, best_isa, detect_caps, effective_isa};
 pub use ops::{
     MAX_CPU_BATCH, MatvecScratch, RopeType, gdn_conv1d_silu_split_parallel,

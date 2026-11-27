@@ -304,9 +304,12 @@ impl GgufFile {
             path: path_str.clone(),
             source,
         })?;
-        // Hint sequential page-cache readahead on Unix (accelerates cold SD/SSD load on Pi 4B / Zero 2W).
+        // Hint sequential page-cache readahead on Unix for <= 4 GiB models (accelerates cold SD/SSD load
+        // on Pi 4B / Zero 2W without triggering aggressive unified-memory readahead on >20 GiB tiered GGUFs).
         #[cfg(unix)]
-        let _ = mmap.advise(memmap2::Advice::Sequential);
+        if mmap.len() <= 4 * 1024 * 1024 * 1024 {
+            let _ = mmap.advise(memmap2::Advice::Sequential);
+        }
         Self::parse(path_buf, Backing::Mmap(mmap))
     }
 
@@ -2145,6 +2148,11 @@ impl DirectTensorReader {
         {
             false
         }
+    }
+
+    /// Underlying read-only `File` handle (used on macOS to enable `F_NOCACHE` uncached streaming).
+    pub fn fallback_file(&self) -> &File {
+        &self.fallback_file
     }
 
     /// Reads `[file_offset .. file_offset + len)` directly into `slot` and returns the exact

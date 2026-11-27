@@ -6,9 +6,10 @@
 //! Upstream reference: llama.cpp `ggml/src/ggml-cpu/quants.c` (commit `3cf03257`).
 
 use tm_core::{
-    BlockIQ2XXS, BlockIQ3XXS, BlockIQ4NL, BlockQ2_0, BlockQ4_0, BlockQ4_0x4, BlockQ4_1, BlockQ5K,
-    BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, BlockTQ2_0, IQ2XXS_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS,
-    KVALUES_IQ4NL, QK_K, QK4_0, QK4_NL, QK8_0, QK8_1, f16_to_f32, unpack_q5k_scales_mins,
+    BlockIQ2XXS, BlockIQ3XXS, BlockIQ4NL, BlockNvFp4, BlockQ2_0, BlockQ4_0, BlockQ4_0x4, BlockQ4_1,
+    BlockQ5K, BlockQ6K, BlockQ8_0, BlockQ8_1, BlockQ8K, BlockTQ2_0, IQ2XXS_GRID, IQ3XXS_GRID,
+    KSIGNS_IQ2XS, KVALUES_FP4, KVALUES_IQ4NL, QK_K, QK_NVFP4_SUB, QK4_0, QK4_NL, QK8_0, QK8_1,
+    UE4M3_TO_F32_LUT, f16_to_f32, unpack_q5k_scales_mins,
 };
 
 /// Scalar dot product between one row of `BlockQ4_0` and one vector of `BlockQ8_0`.
@@ -1014,6 +1015,77 @@ pub fn gemm_iq4_nl_q8_0(
         gemv_iq4_nl_q8_0(
             w,
             &x[t * cols_blocks..(t + 1) * cols_blocks],
+            &mut out[t * rows..(t + 1) * rows],
+            rows,
+            cols_blocks,
+        );
+    }
+}
+
+/// Scalar dot product between `BlockNvFp4` (64 weights = 4 x 16 sub-blocks with `UE4M3` scales)
+/// and `2 * BlockQ8_0` (`y.len() == x.len() * 2`).
+/// Ported from llama.cpp `ggml_vec_dot_nvfp4_q8_0_generic` (`ggml/src/ggml-cpu/quants.c`, MIT License).
+#[inline]
+pub fn vec_dot_nvfp4_q8_0(x: &[BlockNvFp4], y: &[BlockQ8_0]) -> f32 {
+    debug_assert_eq!(y.len(), x.len() * 2);
+    let mut sumf = 0.0f32;
+    for (ib, bx) in x.iter().enumerate() {
+        let by0 = &y[2 * ib];
+        let by1 = &y[2 * ib + 1];
+        let dy0 = f16_to_f32(by0.d);
+        let dy1 = f16_to_f32(by1.d);
+        for s in 0..4 {
+            let q8_qs = if s < 2 {
+                &by0.qs[(s & 1) * QK_NVFP4_SUB..(s & 1) * QK_NVFP4_SUB + QK_NVFP4_SUB]
+            } else {
+                &by1.qs[(s & 1) * QK_NVFP4_SUB..(s & 1) * QK_NVFP4_SUB + QK_NVFP4_SUB]
+            };
+            let qs_sub = &bx.qs[s * (QK_NVFP4_SUB / 2)..(s + 1) * (QK_NVFP4_SUB / 2)];
+            let mut sumi: i32 = 0;
+            for j in 0..(QK_NVFP4_SUB / 2) {
+                let b = qs_sub[j];
+                sumi += (q8_qs[j] as i32) * (KVALUES_FP4[(b & 0x0F) as usize] as i32);
+                sumi +=
+                    (q8_qs[j + QK_NVFP4_SUB / 2] as i32) * (KVALUES_FP4[(b >> 4) as usize] as i32);
+            }
+            let d = UE4M3_TO_F32_LUT[bx.d[s] as usize] * if s < 2 { dy0 } else { dy1 };
+            sumf = (sumi as f32).mul_add(d, sumf);
+        }
+    }
+    sumf
+}
+
+pub fn gemv_nvfp4_q8_0(
+    w: &[BlockNvFp4],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), cols_blocks * 2);
+    assert_eq!(out.len(), rows);
+    for (r, o) in out.iter_mut().enumerate() {
+        *o = vec_dot_nvfp4_q8_0(&w[r * cols_blocks..(r + 1) * cols_blocks], x);
+    }
+}
+
+pub fn gemm_nvfp4_q8_0(
+    w: &[BlockNvFp4],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+    n_tokens: usize,
+) {
+    let q8_blocks = cols_blocks * 2;
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), n_tokens * q8_blocks);
+    assert_eq!(out.len(), n_tokens * rows);
+    for t in 0..n_tokens {
+        gemv_nvfp4_q8_0(
+            w,
+            &x[t * q8_blocks..(t + 1) * q8_blocks],
             &mut out[t * rows..(t + 1) * rows],
             rows,
             cols_blocks,

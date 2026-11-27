@@ -15,8 +15,8 @@
 use core::arch::aarch64::*;
 
 use tm_core::{
-    BlockIQ2XXS, BlockIQ3XXS, BlockIQ4NL, BlockQ2_0, BlockQ8_0, BlockQ8K, BlockTQ2_0, IQ2XXS_GRID,
-    IQ3XXS_GRID, KSIGNS64, KVALUES_IQ4NL,
+    BlockIQ2XXS, BlockIQ3XXS, BlockIQ4NL, BlockNvFp4, BlockQ2_0, BlockQ8_0, BlockQ8K, BlockTQ2_0,
+    IQ2XXS_GRID, IQ3XXS_GRID, KSIGNS64, KVALUES_FP4, KVALUES_IQ4NL, UE4M3_TO_F32_LUT,
 };
 
 use crate::aarch64::asm::f16_to_f32_hw;
@@ -1411,6 +1411,391 @@ pub unsafe fn dotprod_gemm_iq4_nl_q8_0(
             dotprod_gemv_iq4_nl_q8_0(
                 w,
                 &x[t * cols_blocks..(t + 1) * cols_blocks],
+                &mut out[t * rows..(t + 1) * rows],
+                rows,
+                cols_blocks,
+            );
+        }
+    }
+}
+
+/// Base ARMv8.0 NEON `NVFP4 x Q8_0` dot product (`vqtbl1q_s8` 16-entry FP4 E2M1 codebook lookup),
+/// `0-ULP` bit-exact with `crate::generic::vec_dot_nvfp4_q8_0`.
+///
+/// # Safety
+/// Caller must ensure NEON is available and `y.len() == x.len() * 2`.
+#[target_feature(enable = "neon")]
+pub unsafe fn vec_dot_nvfp4_q8_0(x: &[BlockNvFp4], y: &[BlockQ8_0]) -> f32 {
+    debug_assert_eq!(y.len(), x.len() * 2);
+    // SAFETY: `KVALUES_FP4` is 16 bytes; each `BlockNvFp4` has 32 `qs` bytes; `y` has `2 * x.len()` blocks.
+    unsafe {
+        let kv_lut = vld1q_s8(KVALUES_FP4.as_ptr());
+        let m4b = vdupq_n_u8(0x0F);
+        let mut sumf = 0.0f32;
+
+        for (ib, bx) in x.iter().enumerate() {
+            let by0 = y.get_unchecked(2 * ib);
+            let by1 = y.get_unchecked(2 * ib + 1);
+            let dy0 = f16_to_f32_hw(by0.d);
+            let dy1 = f16_to_f32_hw(by1.d);
+
+            let q4bits_0 = vld1q_u8(bx.qs.as_ptr());
+            let q4bits_1 = vld1q_u8(bx.qs.as_ptr().add(16));
+            let q4_lo_0 = vqtbl1q_s8(kv_lut, vandq_u8(q4bits_0, m4b));
+            let q4_hi_0 = vqtbl1q_s8(kv_lut, vshrq_n_u8::<4>(q4bits_0));
+            let q4_lo_1 = vqtbl1q_s8(kv_lut, vandq_u8(q4bits_1, m4b));
+            let q4_hi_1 = vqtbl1q_s8(kv_lut, vshrq_n_u8::<4>(q4bits_1));
+
+            let s0 = vaddlvq_s16(vmlal_s8(
+                vmull_s8(vget_low_s8(q4_lo_0), vld1_s8(by0.qs.as_ptr())),
+                vget_low_s8(q4_hi_0),
+                vld1_s8(by0.qs.as_ptr().add(8)),
+            ));
+            let s1 = vaddlvq_s16(vmlal_s8(
+                vmull_s8(vget_high_s8(q4_lo_0), vld1_s8(by0.qs.as_ptr().add(16))),
+                vget_high_s8(q4_hi_0),
+                vld1_s8(by0.qs.as_ptr().add(24)),
+            ));
+            let s2 = vaddlvq_s16(vmlal_s8(
+                vmull_s8(vget_low_s8(q4_lo_1), vld1_s8(by1.qs.as_ptr())),
+                vget_low_s8(q4_hi_1),
+                vld1_s8(by1.qs.as_ptr().add(8)),
+            ));
+            let s3 = vaddlvq_s16(vmlal_s8(
+                vmull_s8(vget_high_s8(q4_lo_1), vld1_s8(by1.qs.as_ptr().add(16))),
+                vget_high_s8(q4_hi_1),
+                vld1_s8(by1.qs.as_ptr().add(24)),
+            ));
+
+            let sumi = [s0, s1, s2, s3];
+            for s in 0..4 {
+                let d = UE4M3_TO_F32_LUT[bx.d[s] as usize] * if s < 2 { dy0 } else { dy1 };
+                sumf = (sumi[s] as f32).mul_add(d, sumf);
+            }
+        }
+        sumf
+    }
+}
+
+/// Base ARMv8.0 NEON 4-row unrolled `NVFP4 x Q8_0` GEMV (`0-ULP` bit-exact with `generic`).
+///
+/// # Safety
+/// Caller must ensure NEON is available and dimensions match.
+#[target_feature(enable = "neon")]
+pub unsafe fn gemv_nvfp4_q8_0(
+    w: &[BlockNvFp4],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), cols_blocks * 2);
+    assert_eq!(out.len(), rows);
+    // SAFETY: Verified bounds above.
+    unsafe {
+        let kv_lut = vld1q_s8(KVALUES_FP4.as_ptr());
+        let m4b = vdupq_n_u8(0x0F);
+
+        let mut r = 0usize;
+        while r + 4 <= rows {
+            let w0 = &w[r * cols_blocks..(r + 1) * cols_blocks];
+            let w1 = &w[(r + 1) * cols_blocks..(r + 2) * cols_blocks];
+            let w2 = &w[(r + 2) * cols_blocks..(r + 3) * cols_blocks];
+            let w3 = &w[(r + 3) * cols_blocks..(r + 4) * cols_blocks];
+            let mut sumv = vdupq_n_f32(0.0);
+
+            for ib in 0..cols_blocks {
+                let by0 = x.get_unchecked(2 * ib);
+                let by1 = x.get_unchecked(2 * ib + 1);
+                let dy0 = f16_to_f32_hw(by0.d);
+                let dy1 = f16_to_f32_hw(by1.d);
+                let y0_0 = vld1_s8(by0.qs.as_ptr());
+                let y0_1 = vld1_s8(by0.qs.as_ptr().add(8));
+                let y0_2 = vld1_s8(by0.qs.as_ptr().add(16));
+                let y0_3 = vld1_s8(by0.qs.as_ptr().add(24));
+                let y1_0 = vld1_s8(by1.qs.as_ptr());
+                let y1_1 = vld1_s8(by1.qs.as_ptr().add(8));
+                let y1_2 = vld1_s8(by1.qs.as_ptr().add(16));
+                let y1_3 = vld1_s8(by1.qs.as_ptr().add(24));
+
+                macro_rules! dot_row4 {
+                    ($wr:expr) => {{
+                        let bx = $wr.get_unchecked(ib);
+                        let q0 = vld1q_u8(bx.qs.as_ptr());
+                        let q1 = vld1q_u8(bx.qs.as_ptr().add(16));
+                        let l0 = vqtbl1q_s8(kv_lut, vandq_u8(q0, m4b));
+                        let h0 = vqtbl1q_s8(kv_lut, vshrq_n_u8::<4>(q0));
+                        let l1 = vqtbl1q_s8(kv_lut, vandq_u8(q1, m4b));
+                        let h1 = vqtbl1q_s8(kv_lut, vshrq_n_u8::<4>(q1));
+                        let s0 = vaddlvq_s16(vmlal_s8(
+                            vmull_s8(vget_low_s8(l0), y0_0),
+                            vget_low_s8(h0),
+                            y0_1,
+                        ));
+                        let s1 = vaddlvq_s16(vmlal_s8(
+                            vmull_s8(vget_high_s8(l0), y0_2),
+                            vget_high_s8(h0),
+                            y0_3,
+                        ));
+                        let s2 = vaddlvq_s16(vmlal_s8(
+                            vmull_s8(vget_low_s8(l1), y1_0),
+                            vget_low_s8(h1),
+                            y1_1,
+                        ));
+                        let s3 = vaddlvq_s16(vmlal_s8(
+                            vmull_s8(vget_high_s8(l1), y1_2),
+                            vget_high_s8(h1),
+                            y1_3,
+                        ));
+                        ([s0, s1, s2, s3], bx.d)
+                    }};
+                }
+
+                let (si0, d0) = dot_row4!(w0);
+                let (si1, d1) = dot_row4!(w1);
+                let (si2, d2) = dot_row4!(w2);
+                let (si3, d3) = dot_row4!(w3);
+
+                for s in 0..4 {
+                    let dy = if s < 2 { dy0 } else { dy1 };
+                    let sv = vcvtq_f32_s32(vld1q_s32([si0[s], si1[s], si2[s], si3[s]].as_ptr()));
+                    let dv = vld1q_f32(
+                        [
+                            UE4M3_TO_F32_LUT[d0[s] as usize] * dy,
+                            UE4M3_TO_F32_LUT[d1[s] as usize] * dy,
+                            UE4M3_TO_F32_LUT[d2[s] as usize] * dy,
+                            UE4M3_TO_F32_LUT[d3[s] as usize] * dy,
+                        ]
+                        .as_ptr(),
+                    );
+                    sumv = vfmaq_f32(sumv, sv, dv);
+                }
+            }
+            vst1q_f32(out.as_mut_ptr().add(r), sumv);
+            r += 4;
+        }
+
+        while r < rows {
+            *out.get_unchecked_mut(r) =
+                vec_dot_nvfp4_q8_0(&w[r * cols_blocks..(r + 1) * cols_blocks], x);
+            r += 1;
+        }
+    }
+}
+
+/// Base ARMv8.0 NEON `NVFP4 x Q8_0` GEMM.
+///
+/// # Safety
+/// Caller must ensure NEON is available and dimensions match.
+#[target_feature(enable = "neon")]
+pub unsafe fn gemm_nvfp4_q8_0(
+    w: &[BlockNvFp4],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+    n_tokens: usize,
+) {
+    let q8_blocks = cols_blocks * 2;
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), n_tokens * q8_blocks);
+    assert_eq!(out.len(), n_tokens * rows);
+    // SAFETY: Verified bounds above.
+    unsafe {
+        for t in 0..n_tokens {
+            gemv_nvfp4_q8_0(
+                w,
+                &x[t * q8_blocks..(t + 1) * q8_blocks],
+                &mut out[t * rows..(t + 1) * rows],
+                rows,
+                cols_blocks,
+            );
+        }
+    }
+}
+
+/// ARMv8.2 `dotprod` (`sdot`) `NVFP4 x Q8_0` dot product (`0-ULP` bit-exact with `generic`).
+///
+/// # Safety
+/// Caller must ensure `neon` and `dotprod` CPU features are available.
+#[cfg(feature = "dotprod")]
+#[target_feature(enable = "neon,dotprod")]
+pub unsafe fn dotprod_vec_dot_nvfp4_q8_0(x: &[BlockNvFp4], y: &[BlockQ8_0]) -> f32 {
+    debug_assert_eq!(y.len(), x.len() * 2);
+    // SAFETY: `dotprod` enabled by caller; `KVALUES_FP4` is 16 bytes.
+    unsafe {
+        let kv_lut = vld1q_s8(KVALUES_FP4.as_ptr());
+        let m4b = vdupq_n_u8(0x0F);
+        let zero = vdupq_n_s32(0);
+        let mut sumf = 0.0f32;
+
+        for (ib, bx) in x.iter().enumerate() {
+            let by0 = y.get_unchecked(2 * ib);
+            let by1 = y.get_unchecked(2 * ib + 1);
+            let dy0 = f16_to_f32_hw(by0.d);
+            let dy1 = f16_to_f32_hw(by1.d);
+
+            let q4bits_0 = vld1q_u8(bx.qs.as_ptr());
+            let q4bits_1 = vld1q_u8(bx.qs.as_ptr().add(16));
+            let q4_lo_0 = vqtbl1q_s8(kv_lut, vandq_u8(q4bits_0, m4b));
+            let q4_hi_0 = vqtbl1q_s8(kv_lut, vshrq_n_u8::<4>(q4bits_0));
+            let q4_lo_1 = vqtbl1q_s8(kv_lut, vandq_u8(q4bits_1, m4b));
+            let q4_hi_1 = vqtbl1q_s8(kv_lut, vshrq_n_u8::<4>(q4bits_1));
+
+            let q8_0a = vld1q_s8(by0.qs.as_ptr());
+            let q8_0b = vld1q_s8(by0.qs.as_ptr().add(16));
+            let q8_lo_0 = vcombine_s8(vget_low_s8(q8_0a), vget_low_s8(q8_0b));
+            let q8_hi_0 = vcombine_s8(vget_high_s8(q8_0a), vget_high_s8(q8_0b));
+
+            let q8_1a = vld1q_s8(by1.qs.as_ptr());
+            let q8_1b = vld1q_s8(by1.qs.as_ptr().add(16));
+            let q8_lo_1 = vcombine_s8(vget_low_s8(q8_1a), vget_low_s8(q8_1b));
+            let q8_hi_1 = vcombine_s8(vget_high_s8(q8_1a), vget_high_s8(q8_1b));
+
+            let p0 = vdotq_s32(vdotq_s32(zero, q4_lo_0, q8_lo_0), q4_hi_0, q8_hi_0);
+            let p1 = vdotq_s32(vdotq_s32(zero, q4_lo_1, q8_lo_1), q4_hi_1, q8_hi_1);
+            let sumi4 = vpaddq_s32(p0, p1);
+            let mut sumi = [0i32; 4];
+            vst1q_s32(sumi.as_mut_ptr(), sumi4);
+
+            for s in 0..4 {
+                let d = UE4M3_TO_F32_LUT[bx.d[s] as usize] * if s < 2 { dy0 } else { dy1 };
+                sumf = (sumi[s] as f32).mul_add(d, sumf);
+            }
+        }
+        sumf
+    }
+}
+
+/// ARMv8.2 `dotprod` 4-row unrolled `NVFP4 x Q8_0` GEMV (`0-ULP` bit-exact with `generic`).
+/// Shares unzipped `q8_lo`/`q8_hi` across 4 output rows per K-block and transposes `4x4` `i32`
+/// sub-block dot products in registers.
+///
+/// # Safety
+/// Caller must ensure `neon` and `dotprod` CPU features are available.
+#[cfg(feature = "dotprod")]
+#[target_feature(enable = "neon,dotprod")]
+pub unsafe fn dotprod_gemv_nvfp4_q8_0(
+    w: &[BlockNvFp4],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), cols_blocks * 2);
+    assert_eq!(out.len(), rows);
+    // SAFETY: Verified bounds above.
+    unsafe {
+        let kv_lut = vld1q_s8(KVALUES_FP4.as_ptr());
+        let m4b = vdupq_n_u8(0x0F);
+        let zero = vdupq_n_s32(0);
+
+        let mut r = 0usize;
+        while r + 4 <= rows {
+            let w0 = &w[r * cols_blocks..(r + 1) * cols_blocks];
+            let w1 = &w[(r + 1) * cols_blocks..(r + 2) * cols_blocks];
+            let w2 = &w[(r + 2) * cols_blocks..(r + 3) * cols_blocks];
+            let w3 = &w[(r + 3) * cols_blocks..(r + 4) * cols_blocks];
+            let mut sumv = vdupq_n_f32(0.0);
+
+            for ib in 0..cols_blocks {
+                let by0 = x.get_unchecked(2 * ib);
+                let by1 = x.get_unchecked(2 * ib + 1);
+                let dy0 = f16_to_f32_hw(by0.d);
+                let dy1 = f16_to_f32_hw(by1.d);
+
+                let q8_0a = vld1q_s8(by0.qs.as_ptr());
+                let q8_0b = vld1q_s8(by0.qs.as_ptr().add(16));
+                let q8_lo_0 = vcombine_s8(vget_low_s8(q8_0a), vget_low_s8(q8_0b));
+                let q8_hi_0 = vcombine_s8(vget_high_s8(q8_0a), vget_high_s8(q8_0b));
+
+                let q8_1a = vld1q_s8(by1.qs.as_ptr());
+                let q8_1b = vld1q_s8(by1.qs.as_ptr().add(16));
+                let q8_lo_1 = vcombine_s8(vget_low_s8(q8_1a), vget_low_s8(q8_1b));
+                let q8_hi_1 = vcombine_s8(vget_high_s8(q8_1a), vget_high_s8(q8_1b));
+
+                macro_rules! row_sdot4 {
+                    ($wr:expr) => {{
+                        let bx = $wr.get_unchecked(ib);
+                        let q0 = vld1q_u8(bx.qs.as_ptr());
+                        let q1 = vld1q_u8(bx.qs.as_ptr().add(16));
+                        let l0 = vqtbl1q_s8(kv_lut, vandq_u8(q0, m4b));
+                        let h0 = vqtbl1q_s8(kv_lut, vshrq_n_u8::<4>(q0));
+                        let l1 = vqtbl1q_s8(kv_lut, vandq_u8(q1, m4b));
+                        let h1 = vqtbl1q_s8(kv_lut, vshrq_n_u8::<4>(q1));
+                        let p0 = vdotq_s32(vdotq_s32(zero, l0, q8_lo_0), h0, q8_hi_0);
+                        let p1 = vdotq_s32(vdotq_s32(zero, l1, q8_lo_1), h1, q8_hi_1);
+                        (vpaddq_s32(p0, p1), bx.d)
+                    }};
+                }
+
+                let (sumi0, d0) = row_sdot4!(w0);
+                let (sumi1, d1) = row_sdot4!(w1);
+                let (sumi2, d2) = row_sdot4!(w2);
+                let (sumi3, d3) = row_sdot4!(w3);
+
+                let t01_lo = vzip1q_s32(sumi0, sumi1);
+                let t01_hi = vzip2q_s32(sumi0, sumi1);
+                let t23_lo = vzip1q_s32(sumi2, sumi3);
+                let t23_hi = vzip2q_s32(sumi2, sumi3);
+                let cols_s = [
+                    vcombine_s32(vget_low_s32(t01_lo), vget_low_s32(t23_lo)),
+                    vcombine_s32(vget_high_s32(t01_lo), vget_high_s32(t23_lo)),
+                    vcombine_s32(vget_low_s32(t01_hi), vget_low_s32(t23_hi)),
+                    vcombine_s32(vget_high_s32(t01_hi), vget_high_s32(t23_hi)),
+                ];
+
+                for (s, &cs_vec) in cols_s.iter().enumerate() {
+                    let dy = if s < 2 { dy0 } else { dy1 };
+                    let dv = vld1q_f32(
+                        [
+                            UE4M3_TO_F32_LUT[d0[s] as usize] * dy,
+                            UE4M3_TO_F32_LUT[d1[s] as usize] * dy,
+                            UE4M3_TO_F32_LUT[d2[s] as usize] * dy,
+                            UE4M3_TO_F32_LUT[d3[s] as usize] * dy,
+                        ]
+                        .as_ptr(),
+                    );
+                    sumv = vfmaq_f32(sumv, vcvtq_f32_s32(cs_vec), dv);
+                }
+            }
+            vst1q_f32(out.as_mut_ptr().add(r), sumv);
+            r += 4;
+        }
+        while r < rows {
+            *out.get_unchecked_mut(r) =
+                dotprod_vec_dot_nvfp4_q8_0(&w[r * cols_blocks..(r + 1) * cols_blocks], x);
+            r += 1;
+        }
+    }
+}
+
+/// ARMv8.2 `dotprod` `NVFP4 x Q8_0` GEMM.
+///
+/// # Safety
+/// Caller must ensure `neon` and `dotprod` CPU features are available.
+#[cfg(feature = "dotprod")]
+#[target_feature(enable = "neon,dotprod")]
+pub unsafe fn dotprod_gemm_nvfp4_q8_0(
+    w: &[BlockNvFp4],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+    n_tokens: usize,
+) {
+    let q8_blocks = cols_blocks * 2;
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), n_tokens * q8_blocks);
+    assert_eq!(out.len(), n_tokens * rows);
+    // SAFETY: Verified bounds above.
+    unsafe {
+        for t in 0..n_tokens {
+            dotprod_gemv_nvfp4_q8_0(
+                w,
+                &x[t * q8_blocks..(t + 1) * q8_blocks],
                 &mut out[t * rows..(t + 1) * rows],
                 rows,
                 cols_blocks,

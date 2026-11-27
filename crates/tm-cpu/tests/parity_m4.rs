@@ -68,6 +68,7 @@ fn l1_lowbit_lut_and_iq_kernels_bit_exact_across_all_isas() {
         DType::Iq2Xxs,
         DType::Iq3Xxs,
         DType::Iq4Nl,
+        DType::NvFp4,
     ];
 
     let pool1 = ThreadPool::new(1);
@@ -201,6 +202,7 @@ fn l1b_batch_width_invariance_m4_formats() {
         DType::Iq2Xxs,
         DType::Iq3Xxs,
         DType::Iq4Nl,
+        DType::NvFp4,
     ] {
         let w_f32 = make_f32_matrix(
             rows,

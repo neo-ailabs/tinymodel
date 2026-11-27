@@ -202,6 +202,51 @@ pub fn apply_pool_thread_affinity(n_threads: usize) {
     }
 }
 
+/// Disables unified buffer caching (`F_NOCACHE`) on `file` under macOS so multi-GiB GGUF
+/// weight / SSD MoE streaming (`DirectTensorReader`) does not evict anonymous/wired pages
+/// into `vm_compressor` or swap. No-op (`false`) on non-macOS platforms.
+pub fn set_file_nocache(file: &std::fs::File) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        const F_NOCACHE: i32 = 48;
+        unsafe extern "C" {
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        }
+        // SAFETY: `file.as_raw_fd()` is a valid open file descriptor for the duration of this call,
+        // and macOS `fcntl(fd, F_NOCACHE, 1)` takes a single `c_int` vararg flag.
+        unsafe { fcntl(file.as_raw_fd(), F_NOCACHE, 1i32) != -1 }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = file;
+        false
+    }
+}
+
+/// Locks `bytes` in physical RAM on macOS (`mlock`) so XNU `vm_compressor` does not compress
+/// hot Arena / looped-core weight pages under unified-memory pressure (`AGENTS.md` §9).
+/// Best-effort: returns `false` if OS `RLIMIT_MEMLOCK` denies locking or on non-macOS platforms.
+pub fn mlock_slice(bytes: &[u8]) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if bytes.is_empty() {
+            return true;
+        }
+        unsafe extern "C" {
+            fn mlock(addr: *const core::ffi::c_void, len: usize) -> i32;
+        }
+        // SAFETY: `bytes` is a valid live slice `[bytes.as_ptr() .. +bytes.len())`. `mlock` is a
+        // read-only page-residency hint to the kernel and does not mutate or alias memory.
+        unsafe { mlock(bytes.as_ptr().cast(), bytes.len()) == 0 }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = bytes;
+        false
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn macos_perf_physical_cpus() -> Option<usize> {
     unsafe extern "C" {

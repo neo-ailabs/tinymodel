@@ -3,7 +3,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use tm_core::{BlockQ4_0, BlockQ8_0, f32_to_f16};
+use tm_core::{BlockNvFp4, BlockQ4_0, BlockQ8_0, f32_to_f16};
 use tm_cpu::{Isa, active_kernels, select_kernels};
 
 fn bench_mamba2_scan() {
@@ -100,7 +100,48 @@ fn bench_q4_0_gemv() {
     );
 }
 
+fn bench_nvfp4_gemv() {
+    let rows = 2304usize;
+    let cols_blocks = 2304usize / 64;
+    let iters = 500usize;
+    let w = vec![
+        BlockNvFp4 {
+            d: [0x38, 0x3A, 0x36, 0x3C],
+            qs: [0x5A; 32],
+        };
+        rows * cols_blocks
+    ];
+    let x = vec![
+        BlockQ8_0 {
+            d: f32_to_f16(0.25),
+            qs: [3; 32],
+        };
+        cols_blocks * 2
+    ];
+    let mut out = vec![0.0f32; rows];
+    for (label, kt) in [
+        ("generic", select_kernels(Isa::Generic)),
+        ("active", active_kernels()),
+    ] {
+        for _ in 0..32 {
+            (kt.gemv_nvfp4_q8_0)(black_box(&w), black_box(&x), &mut out, rows, cols_blocks);
+        }
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            (kt.gemv_nvfp4_q8_0)(black_box(&w), black_box(&x), &mut out, rows, cols_blocks);
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        let gbps = ((iters * rows * cols_blocks * 36) as f64) / secs / 1e9;
+        println!(
+            "gemv_nvfp4_q8_0 ({label}, isa={}): {gbps:.1} GB/s (sink={:.2})",
+            kt.isa.name(),
+            out[0]
+        );
+    }
+}
+
 fn main() {
     bench_mamba2_scan();
     bench_q4_0_gemv();
+    bench_nvfp4_gemv();
 }
