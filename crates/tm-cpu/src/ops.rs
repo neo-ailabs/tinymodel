@@ -1440,9 +1440,29 @@ pub fn matmul_f32(
     cols: usize,
     n_tok: usize,
 ) {
-    assert!((1..=MAX_CPU_BATCH).contains(&n_tok));
+    assert!(n_tok >= 1);
     assert_eq!(x.len(), n_tok * cols);
     assert_eq!(out.len(), n_tok * rows);
+    if n_tok > MAX_CPU_BATCH {
+        let mut off = 0;
+        while off < n_tok {
+            let chunk_t = (n_tok - off).min(MAX_CPU_BATCH);
+            matmul_f32(
+                pool,
+                kt,
+                dtype,
+                w_bytes,
+                &x[off * cols..(off + chunk_t) * cols],
+                scratch,
+                &mut out[off * rows..(off + chunk_t) * rows],
+                rows,
+                cols,
+                chunk_t,
+            );
+            off += chunk_t;
+        }
+        return;
+    }
     if n_tok == 1 {
         matvec_f32(pool, kt, dtype, w_bytes, x, scratch, out, rows, cols);
         return;
