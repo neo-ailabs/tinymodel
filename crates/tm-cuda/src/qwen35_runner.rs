@@ -107,6 +107,7 @@ pub struct Qwen35CudaRunner {
     token_ids_buf: CudaBuffer,
     pos_buf: CudaBuffer,
     decode_graphs: [Option<CudaGraphExec>; 3],
+    verify_graphs: [Option<CudaGraphExec>; MAX_SPEC_WINDOW],
     x: CudaBuffer,
     xb: CudaBuffer,
     xb2: CudaBuffer,
@@ -385,8 +386,8 @@ impl Qwen35CudaRunner {
         let gate_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * q_dim.max(v_gdn_dim) * 4)?;
         let alpha_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * hv * 4)?;
         let beta_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * hv * 4)?;
-        let beta_act_buf = ctx.alloc_zeroed(hv * 4)?;
-        let g_buf = ctx.alloc_zeroed(hv * 4)?;
+        let beta_act_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * hv * 4)?;
+        let g_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * hv * 4)?;
         let hb = ctx.alloc_zeroed(MAX_CUDA_BATCH * ff_max.max(1) * 4)?;
         let hb2 = ctx.alloc_zeroed(MAX_CUDA_BATCH * ff_max.max(1) * 4)?;
         let xq_scratch = ctx.alloc_zeroed(MAX_CUDA_BATCH * (max_cols / 32) * BLOCK_Q8_1_BYTES)?;
@@ -428,6 +429,7 @@ impl Qwen35CudaRunner {
             token_ids_buf,
             pos_buf,
             decode_graphs: [None, None, None],
+            verify_graphs: std::array::from_fn(|_| None),
             x,
             xb,
             xb2,
@@ -506,7 +508,6 @@ impl Qwen35CudaRunner {
         let s_dim = self.cfg.ssm_state_size;
         let dv_dim = self.cfg.ssm_head_v_dim();
         let k_gdn_dim = hk * s_dim;
-        let v_gdn_dim = self.cfg.ssm_d_inner;
         let d_conv = self.cfg.ssm_conv_kernel;
         let is_q8_kv = self.kv_type == KvType::Q8_0;
         let attn_scale = 1.0f32 / (self.cfg.head_dim as f32).sqrt();
@@ -714,10 +715,11 @@ impl Qwen35CudaRunner {
                 w_out,
                 conv_hist,
                 ssm_state,
+                conv_snap,
+                ssm_snap,
                 spec_qkv,
                 spec_alpha,
                 spec_beta,
-                ..
             } => {
                 let uses_q8 = matches!(
                     wqkv.dtype,
@@ -760,7 +762,7 @@ impl Qwen35CudaRunner {
                     can_share_xq && uses_q8,
                     self.alpha_buf.device_ptr(),
                     n_tok,
-                    true,
+                    false,
                 )?;
                 self.kernels.launch_linear(
                     &self.ctx,
@@ -770,27 +772,50 @@ impl Qwen35CudaRunner {
                     can_share_xq && uses_q8,
                     self.beta_buf.device_ptr(),
                     n_tok,
-                    true,
+                    false,
                 )?;
 
-                if save_spec_gdn {
-                    spec_qkv.copy_from_device(&self.qg_or_qkv, n_tok * conv_dim * 4)?;
-                    spec_alpha.copy_from_device(&self.alpha_buf, n_tok * hv * 4)?;
-                    spec_beta.copy_from_device(&self.beta_buf, n_tok * hv * 4)?;
-                }
+                let (opt_conv_snap, opt_state_snap) = if save_spec_gdn {
+                    let bytes_qkv = n_tok * conv_dim * 4;
+                    let bytes_ab = n_tok * hv * 4;
+                    self.kernels.launch_copy_2d_rows(
+                        &self.ctx,
+                        spec_qkv.device_ptr(),
+                        self.qg_or_qkv.device_ptr(),
+                        bytes_qkv / 4,
+                        bytes_qkv / 4,
+                        bytes_qkv / 4,
+                        1,
+                    )?;
+                    self.kernels.launch_copy_2d_rows(
+                        &self.ctx,
+                        spec_alpha.device_ptr(),
+                        self.alpha_buf.device_ptr(),
+                        bytes_ab / 4,
+                        bytes_ab / 4,
+                        bytes_ab / 4,
+                        1,
+                    )?;
+                    self.kernels.launch_copy_2d_rows(
+                        &self.ctx,
+                        spec_beta.device_ptr(),
+                        self.beta_buf.device_ptr(),
+                        bytes_ab / 4,
+                        bytes_ab / 4,
+                        bytes_ab / 4,
+                        1,
+                    )?;
+                    (conv_snap.device_ptr(), ssm_snap.device_ptr())
+                } else {
+                    (0, 0)
+                };
 
-                for t in 0..n_tok {
-                    let qkv_t = self.qg_or_qkv.device_ptr() + (t * conv_dim * 4) as u64;
-                    let z_t = self.gate_buf.device_ptr() + (t * v_gdn_dim * 4) as u64;
-                    let alpha_t = self.alpha_buf.device_ptr() + (t * hv * 4) as u64;
-                    let beta_t = self.beta_buf.device_ptr() + (t * hv * 4) as u64;
-                    let y_t = self.xb.device_ptr() + (t * v_gdn_dim * 4) as u64;
-
+                if n_tok == 1 && !save_spec_gdn {
                     self.launch_gdn_recurrence_one_step(
-                        qkv_t,
-                        alpha_t,
-                        beta_t,
-                        y_t,
+                        self.qg_or_qkv.device_ptr(),
+                        self.alpha_buf.device_ptr(),
+                        self.beta_buf.device_ptr(),
+                        self.xb.device_ptr(),
                         conv_hist.device_ptr(),
                         conv1d.device_ptr(),
                         ssm_a.device_ptr(),
@@ -804,32 +829,62 @@ impl Qwen35CudaRunner {
                         s_dim,
                         dv_dim,
                     )?;
-
-                    {
-                        let mut py = y_t;
-                        let mut pz = z_t;
-                        let mut pnw = ssm_norm.device_ptr();
-                        let mut cdv = dv_dim as i32;
-                        let mut eps = self.cfg.rms_eps;
-                        let mut args: [*mut c_void; 5] = [
-                            (&mut py as *mut CUdeviceptr).cast(),
-                            (&mut pz as *mut CUdeviceptr).cast(),
-                            (&mut pnw as *mut CUdeviceptr).cast(),
-                            (&mut cdv as *mut i32).cast(),
-                            (&mut eps as *mut f32).cast(),
-                        ];
-                        // SAFETY: Matches `gdn_rms_norm_gated_f32`.
-                        unsafe {
-                            self.ctx.launch(
-                                "gdn_rms_norm_gated_f32",
-                                self.kernels.gdn_rms_norm_gated_f32,
-                                (hv as u32, 1, 1),
-                                (32, 1, 1),
-                                0,
-                                &mut args,
-                            )?;
-                        }
+                    let mut py = self.xb.device_ptr();
+                    let mut pz = self.gate_buf.device_ptr();
+                    let mut pnw = ssm_norm.device_ptr();
+                    let mut cdv = dv_dim as i32;
+                    let mut eps = self.cfg.rms_eps;
+                    let mut args: [*mut c_void; 5] = [
+                        (&mut py as *mut CUdeviceptr).cast(),
+                        (&mut pz as *mut CUdeviceptr).cast(),
+                        (&mut pnw as *mut CUdeviceptr).cast(),
+                        (&mut cdv as *mut i32).cast(),
+                        (&mut eps as *mut f32).cast(),
+                    ];
+                    // SAFETY: Matches `gdn_rms_norm_gated_f32`.
+                    unsafe {
+                        self.ctx.launch(
+                            "gdn_rms_norm_gated_f32",
+                            self.kernels.gdn_rms_norm_gated_f32,
+                            (hv as u32, 1, 1),
+                            (32, 1, 1),
+                            0,
+                            &mut args,
+                        )?;
                     }
+                } else {
+                    self.kernels.launch_gdn_multi_step(
+                        &self.ctx,
+                        self.qg_or_qkv.device_ptr(),
+                        self.gate_buf.device_ptr(),
+                        self.alpha_buf.device_ptr(),
+                        self.beta_buf.device_ptr(),
+                        conv_hist.device_ptr(),
+                        conv_hist.device_ptr(),
+                        opt_conv_snap,
+                        conv1d.device_ptr(),
+                        ssm_a.device_ptr(),
+                        ssm_dt_bias.device_ptr(),
+                        ssm_norm.device_ptr(),
+                        ssm_state.device_ptr(),
+                        ssm_state.device_ptr(),
+                        opt_state_snap,
+                        self.q_buf.device_ptr(),
+                        self.k_buf.device_ptr(),
+                        self.v_buf.device_ptr(),
+                        self.g_buf.device_ptr(),
+                        self.beta_act_buf.device_ptr(),
+                        self.xb.device_ptr(),
+                        conv_dim,
+                        d_conv,
+                        hk,
+                        hv,
+                        s_dim,
+                        dv_dim,
+                        self.cfg.rms_eps,
+                        0, // SiLU output gate for Qwen3.5 / Qwen3.6
+                        n_tok,
+                    )?;
                 }
 
                 self.kernels.launch_linear(
@@ -1267,30 +1322,12 @@ impl Qwen35CudaRunner {
         Ok(())
     }
 
-    fn snapshot_gdn_states(&self) -> Result<(), CudaError> {
-        for layer in &self.layers {
-            if let CudaQwen35Attn::Gdn {
-                conv_hist,
-                ssm_state,
-                conv_snap,
-                ssm_snap,
-                ..
-            } = &layer.attn
-            {
-                conv_snap.copy_from_device(conv_hist, conv_hist.len())?;
-                ssm_snap.copy_from_device(ssm_state, ssm_state.len())?;
-            }
-        }
-        Ok(())
-    }
-
     fn restore_and_replay_gdn_states(&self, committed: usize) -> Result<(), CudaError> {
         let conv_dim = self.cfg.conv_dim();
         let hk = self.cfg.ssm_n_group;
         let hv = self.cfg.ssm_dt_rank;
         let s_dim = self.cfg.ssm_state_size;
         let dv_dim = self.cfg.ssm_head_v_dim();
-        let k_gdn_dim = hk * s_dim;
         let d_conv = self.cfg.ssm_conv_kernel;
 
         for layer in &self.layers {
@@ -1298,6 +1335,7 @@ impl Qwen35CudaRunner {
                 conv1d,
                 ssm_a,
                 ssm_dt_bias,
+                ssm_norm,
                 conv_hist,
                 ssm_state,
                 conv_snap,
@@ -1308,29 +1346,41 @@ impl Qwen35CudaRunner {
                 ..
             } = &layer.attn
             {
-                conv_hist.copy_from_device(conv_snap, conv_snap.len())?;
-                ssm_state.copy_from_device(ssm_snap, ssm_snap.len())?;
-                for t in 0..committed {
-                    let qkv_t = spec_qkv.device_ptr() + (t * conv_dim * 4) as u64;
-                    let alpha_t = spec_alpha.device_ptr() + (t * hv * 4) as u64;
-                    let beta_t = spec_beta.device_ptr() + (t * hv * 4) as u64;
-                    self.launch_gdn_recurrence_one_step(
-                        qkv_t,
-                        alpha_t,
-                        beta_t,
-                        self.xb.device_ptr(),
+                if committed == 0 {
+                    conv_hist.copy_from_device(conv_snap, conv_snap.len())?;
+                    ssm_state.copy_from_device(ssm_snap, ssm_snap.len())?;
+                } else {
+                    self.kernels.launch_gdn_multi_step(
+                        &self.ctx,
+                        spec_qkv.device_ptr(),
+                        0,
+                        spec_alpha.device_ptr(),
+                        spec_beta.device_ptr(),
+                        conv_snap.device_ptr(),
                         conv_hist.device_ptr(),
+                        0,
                         conv1d.device_ptr(),
                         ssm_a.device_ptr(),
                         ssm_dt_bias.device_ptr(),
+                        ssm_norm.device_ptr(),
+                        ssm_snap.device_ptr(),
                         ssm_state.device_ptr(),
+                        0,
+                        self.q_buf.device_ptr(),
+                        self.k_buf.device_ptr(),
+                        self.v_buf.device_ptr(),
+                        self.g_buf.device_ptr(),
+                        self.beta_act_buf.device_ptr(),
+                        0, // skip output RMSNorm on rollback replay
                         conv_dim,
                         d_conv,
-                        k_gdn_dim,
                         hk,
                         hv,
                         s_dim,
                         dv_dim,
+                        self.cfg.rms_eps,
+                        0,
+                        committed,
                     )?;
                 }
             }
@@ -1414,53 +1464,66 @@ impl Qwen35CudaRunner {
             return Ok((1, 0));
         }
 
-        self.snapshot_gdn_states()?;
-
         let mut win = [0u32; MAX_SPEC_WINDOW + 1];
         win[0] = x_tok;
         win[1..w].copy_from_slice(&drafts[..d_len]);
         self.pinned_ids.write_u32_at(0, &win[..w]);
+        self.pinned_pos.write_u32_at(0, &[pos as u32]);
         self.token_ids_buf
             .copy_from_pinned_async(0, &self.pinned_ids, 0, w * 4)?;
+        self.pos_buf
+            .copy_from_pinned_async(0, &self.pinned_pos, 0, 4)?;
 
         let d = self.cfg.n_embd;
-        self.kernels.launch_embed(
-            &self.ctx,
-            &self.token_embd,
-            self.token_ids_buf.device_ptr(),
-            self.x.device_ptr(),
-            w,
-            1.0,
-        )?;
-        for layer in &self.layers {
-            self.encode_one_layer(layer, w, pos, 0, true)?;
+        let g_slot = d_len - 1;
+        if self.verify_graphs[g_slot].is_none() {
+            let pos_ptr = self.pos_buf.device_ptr();
+            let ctx = self.ctx.clone();
+            let g = CudaGraphExec::capture(&ctx, || {
+                self.kernels.launch_embed(
+                    &self.ctx,
+                    &self.token_embd,
+                    self.token_ids_buf.device_ptr(),
+                    self.x.device_ptr(),
+                    w,
+                    1.0,
+                )?;
+                for layer in &self.layers {
+                    self.encode_one_layer(layer, w, 0, pos_ptr, true)?;
+                }
+                self.kernels.launch_rms_norm(
+                    &self.ctx,
+                    self.x.device_ptr(),
+                    self.output_norm.device_ptr(),
+                    self.hmain_buf.device_ptr(),
+                    d,
+                    w,
+                    self.cfg.rms_eps,
+                )?;
+                self.kernels.launch_linear(
+                    &self.ctx,
+                    &self.output,
+                    self.hmain_buf.device_ptr(),
+                    self.xq_scratch.device_ptr(),
+                    false,
+                    self.logits_dev.device_ptr(),
+                    w,
+                    false,
+                )?;
+                self.kernels.launch_argmax_rows(
+                    &self.ctx,
+                    self.logits_dev.device_ptr(),
+                    self.argmax_dev.device_ptr(),
+                    self.cfg.vocab_size,
+                    w,
+                )
+            })?;
+            self.verify_graphs[g_slot] = Some(g);
         }
-        self.kernels.launch_rms_norm(
-            &self.ctx,
-            self.x.device_ptr(),
-            self.output_norm.device_ptr(),
-            self.hmain_buf.device_ptr(),
-            d,
-            w,
-            self.cfg.rms_eps,
-        )?;
-        self.kernels.launch_linear(
-            &self.ctx,
-            &self.output,
-            self.hmain_buf.device_ptr(),
-            self.xq_scratch.device_ptr(),
-            false,
-            self.logits_dev.device_ptr(),
-            w,
-            false,
-        )?;
-        self.kernels.launch_argmax_rows(
-            &self.ctx,
-            self.logits_dev.device_ptr(),
-            self.argmax_dev.device_ptr(),
-            self.cfg.vocab_size,
-            w,
-        )?;
+        self.verify_graphs[g_slot]
+            .as_ref()
+            .expect("captured qwen35 verify graph")
+            .launch()?;
 
         let mut picks = [0u32; MAX_SPEC_WINDOW + 1];
         // SAFETY: `[u32]` is POD; `w <= MAX_SPEC_WINDOW + 1`.

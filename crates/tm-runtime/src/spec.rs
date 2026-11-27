@@ -362,8 +362,9 @@ impl SuffixDrafter {
             } else if let Some((tok, cnt)) =
                 Self::lookup_best(&self.bigrams, self.mask, Self::bigram_key(prev1), self.tick)
             {
-                // Require count >= 2 for unanchored multi-step bigram chains to avoid noisy speculation
-                if drafted == 0 || cnt >= 2 {
+                // Require count >= 3 on step 0 (`drafted == 0`) and count >= 2 on chained steps
+                // so unanchored single-occurrence bigrams never trigger noisy 4-token speculation.
+                if (drafted == 0 && cnt >= 3) || (drafted > 0 && cnt >= 2) {
                     Some(tok)
                 } else {
                     None

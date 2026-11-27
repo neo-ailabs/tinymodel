@@ -27,17 +27,23 @@ use crate::driver::{
     CUdeviceptr, CUfunction, CudaBuffer, CudaContext, CudaEvent, CudaGraphExec, CudaPinnedBuffer,
 };
 use crate::kernels::{BLOCK_Q8_1_BYTES, CudaKernels, CudaMat};
-use crate::llama_runner::{CudaProfileReport, CudaStageStat, MAX_CUDA_BATCH};
+use crate::llama_runner::{CudaProfileReport, CudaStageStat};
 
 const BLOCK_Q8_1_G64_BYTES: usize = 72;
 const STREAM_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum prefill batch chunk on `Hy4CudaRunner` (`256` tokens = `8` full `64x32` WMMA N-tiles, `< 220 MiB` scratch).
+const HY4_MAX_BATCH: usize = 256;
 /// Default `DFly2` draft block length (`K = 4`, evaluating `B = K + 1 = 5` slots `[x_a, mask..mask]`).
 pub const DFLY2_DEFAULT_DRAFT_K: usize = 4;
 
 struct Hy4CudaKernels {
     quantize_g64: CUfunction,
+    swiglu_quantize_g64: CUfunction,
     mmvq_sk_g64: CUfunction,
     mmvq_q8row: CUfunction,
+    wmma_sk_gemm: CUfunction,
+    wmma_latmoe_grouped: CUfunction,
+    latmoe_swiglu_sq: CUfunction,
     embed_sk: CUfunction,
     hc_apply_pre: CUfunction,
     hc_post: CUfunction,
@@ -54,8 +60,12 @@ impl Hy4CudaKernels {
     fn load(ctx: &CudaContext) -> Result<Self, CudaError> {
         Ok(Self {
             quantize_g64: ctx.get_function("quantize_q8_1_g64_f32")?,
+            swiglu_quantize_g64: ctx.get_function("swiglu_quantize_g64_f32")?,
             mmvq_sk_g64: ctx.get_function("mmvq_sk_q8_1_g64")?,
             mmvq_q8row: ctx.get_function("mmvq_q8row_q8_1")?,
+            wmma_sk_gemm: ctx.get_function("wmma_hy4_sk_gemm_f32")?,
+            wmma_latmoe_grouped: ctx.get_function("wmma_hy4_latmoe_grouped_f32")?,
+            latmoe_swiglu_sq: ctx.get_function("hy4_latmoe_swiglu_sq_quantize_g64")?,
             embed_sk: ctx.get_function("hy4_embed_sk_f32")?,
             hc_apply_pre: ctx.get_function("hy4_hc_apply_pre_f32")?,
             hc_post: ctx.get_function("hy4_hc_post_f32")?,
@@ -255,6 +265,10 @@ pub struct Hy4CudaRunner {
     router_logits_buf: CudaBuffer,
     top_ids_buf: CudaBuffer,
     top_weights_buf: CudaBuffer,
+    exp_offs_buf: CudaBuffer,
+    tile_offs_buf: CudaBuffer,
+    sorted_ts_buf: CudaBuffer,
+    lat_gu_buf: CudaBuffer,
     lat_z_buf: CudaBuffer,
     lat_act_f32_buf: CudaBuffer,
     lat_slots_buf: CudaBuffer,
@@ -340,7 +354,7 @@ impl Hy4CudaRunner {
         let mut kv_total_bytes = 0usize;
         for il in 0..cfg.n_layers {
             let cap = if cfg.is_swa[il] && cfg.window > 0 {
-                (cfg.window + MAX_CUDA_BATCH).min(max_ctx)
+                (cfg.window + HY4_MAX_BATCH).min(max_ctx)
             } else {
                 max_ctx
             };
@@ -348,7 +362,7 @@ impl Hy4CudaRunner {
         }
 
         let (free_vram, _) = ctx.mem_info()?;
-        let needed_bytes = model_weight_bytes + kv_total_bytes + 192 * 1024 * 1024;
+        let needed_bytes = model_weight_bytes + kv_total_bytes + 224 * 1024 * 1024;
         if needed_bytes > free_vram {
             return Err(CudaError::OutOfDeviceMemory {
                 needed_mib: needed_bytes as f64 / (1024.0 * 1024.0),
@@ -517,7 +531,7 @@ impl Hy4CudaRunner {
             let swa = cfg.is_swa[il];
             let nh = if swa { cfg.heads_swa } else { cfg.heads_sparse };
             let cap = if swa && cfg.window > 0 {
-                (cfg.window + MAX_CUDA_BATCH).min(max_ctx)
+                (cfg.window + HY4_MAX_BATCH).min(max_ctx)
             } else {
                 max_ctx
             };
@@ -692,51 +706,56 @@ impl Hy4CudaRunner {
 
         let n_mod = ecfg.n_mod.max(1);
         let ed = ecfg.engram_dim.max(1);
-        let rows_slots = MAX_CUDA_BATCH * cfg.top_k.max(1);
+        let rows_slots = HY4_MAX_BATCH * cfg.top_k.max(1);
 
-        let pinned_ids = ctx.alloc_pinned(MAX_CUDA_BATCH * 4)?;
+        let pinned_ids = ctx.alloc_pinned(HY4_MAX_BATCH * 4)?;
         let pinned_pos = ctx.alloc_pinned(4)?;
-        let pinned_engram_r = ctx.alloc_pinned(n_mod * MAX_CUDA_BATCH * ed * 4)?;
-        let pinned_engram_valid = ctx.alloc_pinned(n_mod * MAX_CUDA_BATCH * 4)?;
-        let token_ids_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * 4)?;
+        let pinned_engram_r = ctx.alloc_pinned(n_mod * HY4_MAX_BATCH * ed * 4)?;
+        let pinned_engram_valid = ctx.alloc_pinned(n_mod * HY4_MAX_BATCH * 4)?;
+        let token_ids_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * 4)?;
         let pos_buf = ctx.alloc_zeroed(4)?;
-        let engram_r_dev = ctx.alloc_zeroed(n_mod * MAX_CUDA_BATCH * ed * 4)?;
-        let engram_valid_dev = ctx.alloc_zeroed(n_mod * MAX_CUDA_BATCH * 4)?;
-        let engram_kv_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * (hc + 1) * h * 4)?;
-        let engram_tmp_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * h * 4)?;
+        let engram_r_dev = ctx.alloc_zeroed(n_mod * HY4_MAX_BATCH * ed * 4)?;
+        let engram_valid_dev = ctx.alloc_zeroed(n_mod * HY4_MAX_BATCH * 4)?;
+        let engram_kv_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * (hc + 1) * h * 4)?;
+        let engram_tmp_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * h * 4)?;
 
-        let x_hc_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * hc_dim * 4)?;
-        let fl_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * hc_dim * 4)?;
-        let mix_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * 2 * hc * 4)?;
-        let post_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * hc * 4)?;
-        let cur_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * h * 4)?;
-        let curn_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * h * 4)?;
-        let hf_verify_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * h * 4)?;
-        let sub_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * h * 4)?;
-        let qa_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * cfg.q_lora * 4)?;
-        let qr_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * cfg.q_lora * 4)?;
-        let q_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_qd * 4)?;
-        let q_abs_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_nh * kv_lat * 4)?;
-        let kva_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * kv_lat * 4)?;
-        let ctx_lat_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_nh * cfg.kv_lora * 4)?;
-        let attn_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_vd * 4)?;
-        let gate_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_vd * 4)?;
-        let ff1_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_ff * 4)?;
-        let ff2_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_ff * 4)?;
-        let router_logits_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * cfg.n_experts.max(1) * 4)?;
+        let x_hc_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * hc_dim * 4)?;
+        let fl_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * hc_dim * 4)?;
+        let mix_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * 2 * hc * 4)?;
+        let post_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * hc * 4)?;
+        let cur_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * h * 4)?;
+        let curn_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * h * 4)?;
+        let hf_verify_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * h * 4)?;
+        let sub_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * h * 4)?;
+        let qa_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * cfg.q_lora * 4)?;
+        let qr_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * cfg.q_lora * 4)?;
+        let q_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * max_qd * 4)?;
+        let q_abs_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * max_nh * kv_lat * 4)?;
+        let kva_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * kv_lat * 4)?;
+        let ctx_lat_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * max_nh * cfg.kv_lora * 4)?;
+        let attn_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * max_vd * 4)?;
+        let gate_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * max_vd * 4)?;
+        let ff1_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * max_ff * 4)?;
+        let ff2_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * max_ff * 4)?;
+        let router_logits_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * cfg.n_experts.max(1) * 4)?;
         let top_ids_buf = ctx.alloc_zeroed(rows_slots * 4)?;
         let top_weights_buf = ctx.alloc_zeroed(rows_slots * 4)?;
+        let ne_bkt = cfg.n_experts.max(1);
+        let exp_offs_buf = ctx.alloc_zeroed((ne_bkt + 2) * 4)?;
+        let tile_offs_buf = ctx.alloc_zeroed((ne_bkt + 2) * 4)?;
+        let sorted_ts_buf = ctx.alloc_zeroed(rows_slots * 4)?;
         let lat = cfg.lat_dim.max(64);
-        let lat_z_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * lat * 4)?;
+        let lat_gu_buf = ctx.alloc_zeroed(rows_slots * 2 * lat * 4)?;
+        let lat_z_buf = ctx.alloc_zeroed(HY4_MAX_BATCH * lat * 4)?;
         let lat_act_f32_buf = ctx.alloc_zeroed(rows_slots * lat * 4)?;
         let lat_slots_buf = ctx.alloc_zeroed(rows_slots * lat * 4)?;
-        let max_ctx_rows = MAX_CUDA_BATCH * max_nh;
+        let max_ctx_rows = HY4_MAX_BATCH * max_nh;
         let xq_q8_1_buf = ctx.alloc_zeroed(
-            (MAX_CUDA_BATCH * (max_cols / 32)).max(max_ctx_rows * cfg.kv_lora.div_ceil(32))
+            (HY4_MAX_BATCH * (max_cols / 32)).max(max_ctx_rows * cfg.kv_lora.div_ceil(32))
                 * BLOCK_Q8_1_BYTES,
         )?;
         let xq_g64_buf = ctx.alloc_zeroed(
-            (MAX_CUDA_BATCH * (max_cols / 64)).max(max_ctx_rows * cfg.kv_lora.div_ceil(64))
+            (HY4_MAX_BATCH * (max_cols / 64)).max(max_ctx_rows * cfg.kv_lora.div_ceil(64))
                 * BLOCK_Q8_1_G64_BYTES,
         )?;
         let slot_xq_g64_buf =
@@ -811,6 +830,10 @@ impl Hy4CudaRunner {
                 router_logits_buf,
                 top_ids_buf,
                 top_weights_buf,
+                exp_offs_buf,
+                tile_offs_buf,
+                sorted_ts_buf,
+                lat_gu_buf,
                 lat_z_buf,
                 lat_act_f32_buf,
                 lat_slots_buf,
@@ -910,8 +933,41 @@ impl Hy4CudaRunner {
         }
     }
 
+    fn launch_swiglu_quantize_g64(
+        &self,
+        gate_ptr: CUdeviceptr,
+        up_ptr: CUdeviceptr,
+        out_xq_ptr: CUdeviceptr,
+        cols: usize,
+        n_rows: usize,
+    ) -> Result<(), CudaError> {
+        let mut pg = gate_ptr;
+        let mut pu = up_ptr;
+        let mut po = out_xq_ptr;
+        let mut cc = cols as i32;
+        let mut nr = n_rows as i32;
+        let mut args: [*mut c_void; 5] = [
+            (&mut pg as *mut CUdeviceptr).cast(),
+            (&mut pu as *mut CUdeviceptr).cast(),
+            (&mut po as *mut CUdeviceptr).cast(),
+            (&mut cc as *mut i32).cast(),
+            (&mut nr as *mut i32).cast(),
+        ];
+        // SAFETY: Matches `swiglu_quantize_g64_f32`.
+        unsafe {
+            self.ctx.launch(
+                "swiglu_quantize_g64_f32",
+                self.hk.swiglu_quantize_g64,
+                (((cols / 64) as u32).div_ceil(2), n_rows as u32, 1),
+                (32, 2, 1),
+                0,
+                &mut args,
+            )
+        }
+    }
+
     /// Launches a `.strata` trunk linear projection (`F32`, `Q8_ROW`, or `S_K`) across arbitrary `n_tok`
-    /// by looping in `MMVQ_MAX_TOK` (`8`-token) micro-batches when `n_tok > 8`!
+    /// using `wmma_hy4_sk_gemm_f32` Tensor Cores when `n_tok > 8` (`P0-A`) and `NR = 4` `__dp4a` MMVQ for decode!
     fn launch_hy4_linear(
         &self,
         w: &TrunkWeight,
@@ -937,8 +993,43 @@ impl Hy4CudaRunner {
                 false,
                 y_ptr,
                 n_tok,
-                true,
+                false,
             );
+        }
+
+        // `P0-A`: Tensor Core `64x32` WMMA GEMM for `.strata` `S_K` & `Q8_ROW` when `n_tok > 8`!
+        let can_wmma = n_tok > crate::kernels::MMVQ_MAX_TOK
+            && self.ctx.info().has_fp16_wmma()
+            && ((w.fmt == FMT_Q8ROW && w.cols.is_multiple_of(32))
+                || (w.fmt < 100 && w.cols.is_multiple_of(256)));
+        if can_wmma {
+            let mut pw = w.ptr;
+            let mut px = x_ptr;
+            let mut py = y_ptr;
+            let mut sc = w.fmt;
+            let mut cr = w.rows as i32;
+            let mut cc = w.cols as i32;
+            let mut nt = n_tok as i32;
+            let mut args: [*mut c_void; 7] = [
+                (&mut pw as *mut CUdeviceptr).cast(),
+                (&mut px as *mut CUdeviceptr).cast(),
+                (&mut py as *mut CUdeviceptr).cast(),
+                (&mut sc as *mut i32).cast(),
+                (&mut cr as *mut i32).cast(),
+                (&mut cc as *mut i32).cast(),
+                (&mut nt as *mut i32).cast(),
+            ];
+            // SAFETY: Matches `wmma_hy4_sk_gemm_f32`.
+            return unsafe {
+                self.ctx.launch(
+                    "wmma_hy4_sk_gemm_f32",
+                    self.hk.wmma_sk_gemm,
+                    ((w.rows as u32).div_ceil(64), (n_tok as u32).div_ceil(32), 1),
+                    (32, 4, 1),
+                    0,
+                    &mut args,
+                )
+            };
         }
 
         if w.fmt == FMT_Q8ROW {
@@ -1010,7 +1101,9 @@ impl Hy4CudaRunner {
                 (&mut cc as *mut i32).cast(),
                 (&mut nt as *mut i32).cast(),
             ];
-            let grid_x = if b == 1 && w.cols >= 1024 {
+            let grid_x = if b == 1 && w.rows >= 64 {
+                (w.rows as u32).div_ceil(16)
+            } else if b == 1 && w.cols >= 1024 {
                 w.rows as u32
             } else {
                 (w.rows as u32).div_ceil(4)
@@ -1173,7 +1266,7 @@ impl Hy4CudaRunner {
             if let Some(ref eng) = l.engram {
                 let r_ptr = self.engram_r_dev.device_ptr() + (eng.mod_idx * n_tok * ed * 4) as u64;
                 let v_ptr = self.engram_valid_dev.device_ptr() + (eng.mod_idx * n_tok * 4) as u64;
-                let is_sk = eng.val_proj.fmt < 100;
+                let is_sk = eng.val_proj.fmt < 100 && n_tok <= crate::kernels::MMVQ_MAX_TOK;
                 if is_sk {
                     self.launch_quantize_g64(r_ptr, self.xq_g64_buf.device_ptr(), ed, n_tok)?;
                 }
@@ -1317,7 +1410,8 @@ impl Hy4CudaRunner {
                     post_fc2_norm,
                 } => {
                     let ff = self.cfg.dense_ff;
-                    let sk = gate_proj.fmt < 100 || up_proj.fmt < 100;
+                    let sk = (gate_proj.fmt < 100 || up_proj.fmt < 100)
+                        && n_tok <= crate::kernels::MMVQ_MAX_TOK;
                     if sk {
                         self.launch_quantize_g64(
                             self.curn_buf.device_ptr(),
@@ -1340,19 +1434,39 @@ impl Hy4CudaRunner {
                         n_tok,
                         sk && up_proj.fmt < 100,
                     )?;
-                    self.kernels.launch_swiglu(
-                        &self.ctx,
-                        self.ff1_buf.device_ptr(),
-                        self.ff2_buf.device_ptr(),
-                        n_tok * ff,
-                    )?;
-                    self.launch_hy4_linear(
-                        down_proj,
-                        self.ff1_buf.device_ptr(),
-                        self.cur_buf.device_ptr(),
-                        n_tok,
-                        false,
-                    )?;
+                    if down_proj.fmt < 100
+                        && n_tok <= crate::kernels::MMVQ_MAX_TOK
+                        && ff.is_multiple_of(64)
+                    {
+                        self.launch_swiglu_quantize_g64(
+                            self.ff1_buf.device_ptr(),
+                            self.ff2_buf.device_ptr(),
+                            self.xq_g64_buf.device_ptr(),
+                            ff,
+                            n_tok,
+                        )?;
+                        self.launch_hy4_linear(
+                            down_proj,
+                            self.ff1_buf.device_ptr(),
+                            self.cur_buf.device_ptr(),
+                            n_tok,
+                            true,
+                        )?;
+                    } else {
+                        self.kernels.launch_swiglu(
+                            &self.ctx,
+                            self.ff1_buf.device_ptr(),
+                            self.ff2_buf.device_ptr(),
+                            n_tok * ff,
+                        )?;
+                        self.launch_hy4_linear(
+                            down_proj,
+                            self.ff1_buf.device_ptr(),
+                            self.cur_buf.device_ptr(),
+                            n_tok,
+                            false,
+                        )?;
+                    }
                     self.kernels.launch_rms_norm(
                         &self.ctx,
                         self.cur_buf.device_ptr(),
@@ -1378,6 +1492,7 @@ impl Hy4CudaRunner {
                     let ne = self.cfg.n_experts;
                     let ku = self.cfg.top_k;
                     let lat = self.cfg.lat_dim;
+                    let n_rows = n_tok * ku;
                     self.launch_hy4_linear(
                         gate,
                         self.curn_buf.device_ptr(),
@@ -1400,7 +1515,8 @@ impl Hy4CudaRunner {
                         n_tok,
                     )?;
 
-                    let curn_sk = routed_down.fmt < 100 || sh_gate.fmt < 100 || sh_up.fmt < 100;
+                    let curn_sk = (routed_down.fmt < 100 || sh_gate.fmt < 100 || sh_up.fmt < 100)
+                        && n_tok <= crate::kernels::MMVQ_MAX_TOK;
                     if curn_sk {
                         self.launch_quantize_g64(
                             self.curn_buf.device_ptr(),
@@ -1431,99 +1547,236 @@ impl Hy4CudaRunner {
                         curn_sk && sh_up.fmt < 100,
                     )?;
 
-                    // `P0-3`: Fused dual `Gate + Up + clamped SwiGLU + SmoothQuant sq16` + `BlockQ8_1_G64` quantize!
-                    self.launch_quantize_g64(
-                        self.lat_z_buf.device_ptr(),
-                        self.xq_g64_buf.device_ptr(),
-                        lat,
-                        n_tok,
-                    )?;
                     let layer_dir_ptr =
                         self.expert_dir_dev.device_ptr() + (*moe_idx * ne * 32) as u64;
                     let rank_layer_ptr = self.rank_of_dev.device_ptr() + (*moe_idx * ne * 4) as u64;
-                    {
-                        let mut ps4 = self.sec4_arena.device_ptr();
-                        let mut pld = layer_dir_ptr;
-                        let mut prk = rank_layer_ptr;
-                        let mut pxq = self.xq_g64_buf.device_ptr();
-                        let mut pxf = self.lat_z_buf.device_ptr();
-                        let mut pid = self.top_ids_buf.device_ptr();
-                        let mut po = self.lat_act_f32_buf.device_ptr();
-                        let mut cl = lat as i32;
-                        let mut cc = lat as i32;
-                        let mut csc = ku as i32;
-                        let mut clim = self.cfg.swiglu_limit;
-                        let mut args: [*mut c_void; 11] = [
-                            (&mut ps4 as *mut CUdeviceptr).cast(),
-                            (&mut pld as *mut CUdeviceptr).cast(),
-                            (&mut prk as *mut CUdeviceptr).cast(),
-                            (&mut pxq as *mut CUdeviceptr).cast(),
-                            (&mut pxf as *mut CUdeviceptr).cast(),
-                            (&mut pid as *mut CUdeviceptr).cast(),
-                            (&mut po as *mut CUdeviceptr).cast(),
-                            (&mut cl as *mut i32).cast(),
-                            (&mut cc as *mut i32).cast(),
-                            (&mut csc as *mut i32).cast(),
-                            (&mut clim as *mut f32).cast(),
-                        ];
-                        // SAFETY: Matches `hy4_latmoe_dual_gu_swiglu_sq_f32`.
-                        unsafe {
-                            self.ctx.launch(
-                                "hy4_latmoe_dual_gu_swiglu_sq_f32",
-                                self.hk.latmoe_dual_gu_sq,
-                                ((lat as u32).div_ceil(4), ku as u32, n_tok as u32),
-                                (32, 4, 1),
-                                0,
-                                &mut args,
-                            )?;
-                        }
-                    }
-                    let n_rows = n_tok * ku;
-                    self.launch_quantize_g64(
-                        self.lat_act_f32_buf.device_ptr(),
-                        self.slot_xq_g64_buf.device_ptr(),
-                        lat,
-                        n_rows,
-                    )?;
 
-                    // Parallel `ku`-slot `S_K` down + ordered slot reduction!
-                    {
-                        let mut ps4 = self.sec4_arena.device_ptr();
-                        let mut pld = layer_dir_ptr;
-                        let mut prk = rank_layer_ptr;
-                        let mut pxq = self.slot_xq_g64_buf.device_ptr();
-                        let mut pxf = self.lat_act_f32_buf.device_ptr();
-                        let mut pid = self.top_ids_buf.device_ptr();
-                        let mut ptw = self.top_weights_buf.device_ptr();
-                        let mut po = self.lat_slots_buf.device_ptr();
-                        let mut isd = 1i32;
-                        let mut cr = lat as i32;
-                        let mut cc = lat as i32;
-                        let mut csc = ku as i32;
-                        let mut args: [*mut c_void; 12] = [
-                            (&mut ps4 as *mut CUdeviceptr).cast(),
-                            (&mut pld as *mut CUdeviceptr).cast(),
-                            (&mut prk as *mut CUdeviceptr).cast(),
-                            (&mut pxq as *mut CUdeviceptr).cast(),
-                            (&mut pxf as *mut CUdeviceptr).cast(),
-                            (&mut pid as *mut CUdeviceptr).cast(),
-                            (&mut ptw as *mut CUdeviceptr).cast(),
-                            (&mut po as *mut CUdeviceptr).cast(),
-                            (&mut isd as *mut i32).cast(),
-                            (&mut cr as *mut i32).cast(),
-                            (&mut cc as *mut i32).cast(),
-                            (&mut csc as *mut i32).cast(),
-                        ];
-                        // SAFETY: Matches `hy4_latmoe_indexed_sk_q8_1_g64`.
-                        unsafe {
-                            self.ctx.launch(
-                                "hy4_latmoe_indexed_sk_q8_1_g64",
-                                self.hk.latmoe_indexed_sk,
-                                ((lat as u32).div_ceil(4), ku as u32, n_tok as u32),
-                                (32, 4, 1),
-                                0,
-                                &mut args,
-                            )?;
+                    let use_grouped_wmma = n_tok >= 16
+                        && ne <= 512
+                        && self.ctx.info().has_fp16_wmma()
+                        && lat.is_multiple_of(256);
+                    if use_grouped_wmma {
+                        // `P0-A`: Grouped `64x32` WMMA Tensor Core prefill for `.strata` `LatentMoE`!
+                        self.kernels.launch_moe_build_expert_buckets(
+                            &self.ctx,
+                            self.top_ids_buf.device_ptr(),
+                            self.exp_offs_buf.device_ptr(),
+                            self.tile_offs_buf.device_ptr(),
+                            self.sorted_ts_buf.device_ptr(),
+                            n_rows,
+                            ne,
+                        )?;
+                        let max_tiles = (n_rows.div_ceil(16) + n_rows.min(ne)).max(1) as u32;
+                        {
+                            let mut ps4 = self.sec4_arena.device_ptr();
+                            let mut pld = layer_dir_ptr;
+                            let mut prk = rank_layer_ptr;
+                            let mut px = self.lat_z_buf.device_ptr();
+                            let mut peo = self.exp_offs_buf.device_ptr();
+                            let mut pto = self.tile_offs_buf.device_ptr();
+                            let mut pst = self.sorted_ts_buf.device_ptr();
+                            let mut ptw = self.top_weights_buf.device_ptr();
+                            let mut po = self.lat_gu_buf.device_ptr();
+                            let mut isd = 0i32;
+                            let mut cr = (2 * lat) as i32;
+                            let mut cc = lat as i32;
+                            let mut nx = ne as i32;
+                            let mut csc = ku as i32;
+                            let mut args: [*mut c_void; 14] = [
+                                (&mut ps4 as *mut CUdeviceptr).cast(),
+                                (&mut pld as *mut CUdeviceptr).cast(),
+                                (&mut prk as *mut CUdeviceptr).cast(),
+                                (&mut px as *mut CUdeviceptr).cast(),
+                                (&mut peo as *mut CUdeviceptr).cast(),
+                                (&mut pto as *mut CUdeviceptr).cast(),
+                                (&mut pst as *mut CUdeviceptr).cast(),
+                                (&mut ptw as *mut CUdeviceptr).cast(),
+                                (&mut po as *mut CUdeviceptr).cast(),
+                                (&mut isd as *mut i32).cast(),
+                                (&mut cr as *mut i32).cast(),
+                                (&mut cc as *mut i32).cast(),
+                                (&mut nx as *mut i32).cast(),
+                                (&mut csc as *mut i32).cast(),
+                            ];
+                            // SAFETY: Matches `wmma_hy4_latmoe_grouped_f32` (`is_down = 0`).
+                            unsafe {
+                                self.ctx.launch(
+                                    "wmma_hy4_latmoe_grouped_f32",
+                                    self.hk.wmma_latmoe_grouped,
+                                    (((2 * lat) as u32).div_ceil(64), max_tiles, 1),
+                                    (32, 4, 1),
+                                    0,
+                                    &mut args,
+                                )?;
+                            }
+                        }
+                        {
+                            let mut pgu = self.lat_gu_buf.device_ptr();
+                            let mut ps4 = self.sec4_arena.device_ptr();
+                            let mut pld = layer_dir_ptr;
+                            let mut prk = rank_layer_ptr;
+                            let mut pid = self.top_ids_buf.device_ptr();
+                            let mut pxq = self.slot_xq_g64_buf.device_ptr();
+                            let mut pof = self.lat_act_f32_buf.device_ptr();
+                            let mut cl = lat as i32;
+                            let mut nr = n_rows as i32;
+                            let mut clim = self.cfg.swiglu_limit;
+                            let mut args: [*mut c_void; 10] = [
+                                (&mut pgu as *mut CUdeviceptr).cast(),
+                                (&mut ps4 as *mut CUdeviceptr).cast(),
+                                (&mut pld as *mut CUdeviceptr).cast(),
+                                (&mut prk as *mut CUdeviceptr).cast(),
+                                (&mut pid as *mut CUdeviceptr).cast(),
+                                (&mut pxq as *mut CUdeviceptr).cast(),
+                                (&mut pof as *mut CUdeviceptr).cast(),
+                                (&mut cl as *mut i32).cast(),
+                                (&mut nr as *mut i32).cast(),
+                                (&mut clim as *mut f32).cast(),
+                            ];
+                            // SAFETY: Matches `hy4_latmoe_swiglu_sq_quantize_g64`.
+                            unsafe {
+                                self.ctx.launch(
+                                    "hy4_latmoe_swiglu_sq_quantize_g64",
+                                    self.hk.latmoe_swiglu_sq,
+                                    (((lat / 64) as u32).div_ceil(2), n_rows as u32, 1),
+                                    (32, 2, 1),
+                                    0,
+                                    &mut args,
+                                )?;
+                            }
+                        }
+                        {
+                            let mut ps4 = self.sec4_arena.device_ptr();
+                            let mut pld = layer_dir_ptr;
+                            let mut prk = rank_layer_ptr;
+                            let mut px = self.lat_act_f32_buf.device_ptr();
+                            let mut peo = self.exp_offs_buf.device_ptr();
+                            let mut pto = self.tile_offs_buf.device_ptr();
+                            let mut pst = self.sorted_ts_buf.device_ptr();
+                            let mut ptw = self.top_weights_buf.device_ptr();
+                            let mut po = self.lat_slots_buf.device_ptr();
+                            let mut isd = 1i32;
+                            let mut cr = lat as i32;
+                            let mut cc = lat as i32;
+                            let mut nx = ne as i32;
+                            let mut csc = ku as i32;
+                            let mut args: [*mut c_void; 14] = [
+                                (&mut ps4 as *mut CUdeviceptr).cast(),
+                                (&mut pld as *mut CUdeviceptr).cast(),
+                                (&mut prk as *mut CUdeviceptr).cast(),
+                                (&mut px as *mut CUdeviceptr).cast(),
+                                (&mut peo as *mut CUdeviceptr).cast(),
+                                (&mut pto as *mut CUdeviceptr).cast(),
+                                (&mut pst as *mut CUdeviceptr).cast(),
+                                (&mut ptw as *mut CUdeviceptr).cast(),
+                                (&mut po as *mut CUdeviceptr).cast(),
+                                (&mut isd as *mut i32).cast(),
+                                (&mut cr as *mut i32).cast(),
+                                (&mut cc as *mut i32).cast(),
+                                (&mut nx as *mut i32).cast(),
+                                (&mut csc as *mut i32).cast(),
+                            ];
+                            // SAFETY: Matches `wmma_hy4_latmoe_grouped_f32` (`is_down = 1`).
+                            unsafe {
+                                self.ctx.launch(
+                                    "wmma_hy4_latmoe_grouped_f32",
+                                    self.hk.wmma_latmoe_grouped,
+                                    ((lat as u32).div_ceil(64), max_tiles, 1),
+                                    (32, 4, 1),
+                                    0,
+                                    &mut args,
+                                )?;
+                            }
+                        }
+                    } else {
+                        // `P0-3` + `P0-C`: Fused `NR = 2` dual `Gate + Up + clamped SwiGLU + sq16` + `NR = 4` `S_K` down!
+                        self.launch_quantize_g64(
+                            self.lat_z_buf.device_ptr(),
+                            self.xq_g64_buf.device_ptr(),
+                            lat,
+                            n_tok,
+                        )?;
+                        {
+                            let mut ps4 = self.sec4_arena.device_ptr();
+                            let mut pld = layer_dir_ptr;
+                            let mut prk = rank_layer_ptr;
+                            let mut pxq = self.xq_g64_buf.device_ptr();
+                            let mut pxf = self.lat_z_buf.device_ptr();
+                            let mut pid = self.top_ids_buf.device_ptr();
+                            let mut po = self.lat_act_f32_buf.device_ptr();
+                            let mut cl = lat as i32;
+                            let mut cc = lat as i32;
+                            let mut csc = ku as i32;
+                            let mut clim = self.cfg.swiglu_limit;
+                            let mut args: [*mut c_void; 11] = [
+                                (&mut ps4 as *mut CUdeviceptr).cast(),
+                                (&mut pld as *mut CUdeviceptr).cast(),
+                                (&mut prk as *mut CUdeviceptr).cast(),
+                                (&mut pxq as *mut CUdeviceptr).cast(),
+                                (&mut pxf as *mut CUdeviceptr).cast(),
+                                (&mut pid as *mut CUdeviceptr).cast(),
+                                (&mut po as *mut CUdeviceptr).cast(),
+                                (&mut cl as *mut i32).cast(),
+                                (&mut cc as *mut i32).cast(),
+                                (&mut csc as *mut i32).cast(),
+                                (&mut clim as *mut f32).cast(),
+                            ];
+                            // SAFETY: Matches `hy4_latmoe_dual_gu_swiglu_sq_f32` (`NR = 2` -> `8` rows/CTA).
+                            unsafe {
+                                self.ctx.launch(
+                                    "hy4_latmoe_dual_gu_swiglu_sq_f32",
+                                    self.hk.latmoe_dual_gu_sq,
+                                    ((lat as u32).div_ceil(8), ku as u32, n_tok as u32),
+                                    (32, 4, 1),
+                                    0,
+                                    &mut args,
+                                )?;
+                            }
+                        }
+                        self.launch_quantize_g64(
+                            self.lat_act_f32_buf.device_ptr(),
+                            self.slot_xq_g64_buf.device_ptr(),
+                            lat,
+                            n_rows,
+                        )?;
+                        {
+                            let mut ps4 = self.sec4_arena.device_ptr();
+                            let mut pld = layer_dir_ptr;
+                            let mut prk = rank_layer_ptr;
+                            let mut pxq = self.slot_xq_g64_buf.device_ptr();
+                            let mut pxf = self.lat_act_f32_buf.device_ptr();
+                            let mut pid = self.top_ids_buf.device_ptr();
+                            let mut ptw = self.top_weights_buf.device_ptr();
+                            let mut po = self.lat_slots_buf.device_ptr();
+                            let mut isd = 1i32;
+                            let mut cr = lat as i32;
+                            let mut cc = lat as i32;
+                            let mut csc = ku as i32;
+                            let mut args: [*mut c_void; 12] = [
+                                (&mut ps4 as *mut CUdeviceptr).cast(),
+                                (&mut pld as *mut CUdeviceptr).cast(),
+                                (&mut prk as *mut CUdeviceptr).cast(),
+                                (&mut pxq as *mut CUdeviceptr).cast(),
+                                (&mut pxf as *mut CUdeviceptr).cast(),
+                                (&mut pid as *mut CUdeviceptr).cast(),
+                                (&mut ptw as *mut CUdeviceptr).cast(),
+                                (&mut po as *mut CUdeviceptr).cast(),
+                                (&mut isd as *mut i32).cast(),
+                                (&mut cr as *mut i32).cast(),
+                                (&mut cc as *mut i32).cast(),
+                                (&mut csc as *mut i32).cast(),
+                            ];
+                            // SAFETY: Matches `hy4_latmoe_indexed_sk_q8_1_g64` (`NR = 4` -> `16` rows/CTA).
+                            unsafe {
+                                self.ctx.launch(
+                                    "hy4_latmoe_indexed_sk_q8_1_g64",
+                                    self.hk.latmoe_indexed_sk,
+                                    ((lat as u32).div_ceil(16), ku as u32, n_tok as u32),
+                                    (32, 4, 1),
+                                    0,
+                                    &mut args,
+                                )?;
+                            }
                         }
                     }
 
@@ -1544,19 +1797,39 @@ impl Hy4CudaRunner {
                     )?;
 
                     // Shared expert + residual add + `combine_output_norm`
-                    self.kernels.launch_swiglu(
-                        &self.ctx,
-                        self.ff1_buf.device_ptr(),
-                        self.ff2_buf.device_ptr(),
-                        n_tok * *sh_ff,
-                    )?;
-                    self.launch_hy4_linear(
-                        sh_down,
-                        self.ff1_buf.device_ptr(),
-                        self.engram_tmp_buf.device_ptr(),
-                        n_tok,
-                        false,
-                    )?;
+                    if sh_down.fmt < 100
+                        && n_tok <= crate::kernels::MMVQ_MAX_TOK
+                        && sh_ff.is_multiple_of(64)
+                    {
+                        self.launch_swiglu_quantize_g64(
+                            self.ff1_buf.device_ptr(),
+                            self.ff2_buf.device_ptr(),
+                            self.xq_g64_buf.device_ptr(),
+                            *sh_ff,
+                            n_tok,
+                        )?;
+                        self.launch_hy4_linear(
+                            sh_down,
+                            self.ff1_buf.device_ptr(),
+                            self.engram_tmp_buf.device_ptr(),
+                            n_tok,
+                            true,
+                        )?;
+                    } else {
+                        self.kernels.launch_swiglu(
+                            &self.ctx,
+                            self.ff1_buf.device_ptr(),
+                            self.ff2_buf.device_ptr(),
+                            n_tok * *sh_ff,
+                        )?;
+                        self.launch_hy4_linear(
+                            sh_down,
+                            self.ff1_buf.device_ptr(),
+                            self.engram_tmp_buf.device_ptr(),
+                            n_tok,
+                            false,
+                        )?;
+                    }
                     self.kernels.launch_add_scaled(
                         &self.ctx,
                         self.cur_buf.device_ptr(),
@@ -1656,7 +1929,8 @@ impl Hy4CudaRunner {
         pos_dev_ptr: CUdeviceptr,
     ) -> Result<(), CudaError> {
         let h = self.cfg.n_embd;
-        let curn_sk = q_a_proj.fmt < 100 || kv_a_proj.fmt < 100 || linear_gate.fmt < 100;
+        let curn_sk = (q_a_proj.fmt < 100 || kv_a_proj.fmt < 100 || linear_gate.fmt < 100)
+            && n_tok <= crate::kernels::MMVQ_MAX_TOK;
         if curn_sk {
             self.launch_quantize_g64(in_ptr, self.xq_g64_buf.device_ptr(), h, n_tok)?;
         }
@@ -1802,15 +2076,15 @@ impl Hy4CudaRunner {
                     (&mut kvl as *mut i32).cast(),
                     (&mut nt as *mut i32).cast(),
                 ];
-                // SAFETY: Matches `hy4_mla_absorb_q`.
+                // SAFETY: Matches `hy4_mla_absorb_q` (`64`-col x `16`-row x `8`-tok high-occupancy grid).
                 unsafe {
                     self.ctx.launch(
                         "hy4_mla_absorb_q",
                         self.hk.mla_absorb_q,
                         (
-                            (self.cfg.kv_lora as u32).div_ceil(256),
+                            (self.cfg.kv_lora as u32).div_ceil(64),
                             n_head as u32,
-                            (sub_nt as u32).div_ceil(4),
+                            (sub_nt as u32).div_ceil(8),
                         ),
                         (32, 4, 1),
                         0,
@@ -1892,7 +2166,8 @@ impl Hy4CudaRunner {
             let mut qkn = self.cfg.qk_nope as i32;
             let mut vh = self.cfg.v_head as i32;
             let mut kvl = self.cfg.kv_lora as i32;
-            let mut args: [*mut c_void; 11] = [
+            let mut nt = n_tok as i32;
+            let mut args: [*mut c_void; 12] = [
                 (&mut pw as *mut CUdeviceptr).cast(),
                 (&mut pg64 as *mut CUdeviceptr).cast(),
                 (&mut pq8 as *mut CUdeviceptr).cast(),
@@ -1904,16 +2179,17 @@ impl Hy4CudaRunner {
                 (&mut qkn as *mut i32).cast(),
                 (&mut vh as *mut i32).cast(),
                 (&mut kvl as *mut i32).cast(),
+                (&mut nt as *mut i32).cast(),
             ];
-            // SAFETY: Matches `hy4_mla_vup_gate`.
+            // SAFETY: Matches `hy4_mla_vup_gate` (`NR = 2` x `8`-tok weight reuse).
             unsafe {
                 self.ctx.launch(
                     "hy4_mla_vup_gate",
                     self.hk.mla_vup_gate,
                     (
-                        (self.cfg.v_head as u32).div_ceil(4),
+                        (self.cfg.v_head as u32).div_ceil(8),
                         n_head as u32,
-                        n_tok as u32,
+                        (n_tok as u32).div_ceil(8),
                     ),
                     (32, 4, 1),
                     0,
@@ -2479,7 +2755,7 @@ impl Hy4CudaRunner {
         }
         let mut off = 0usize;
         while off < token_ids.len() {
-            let chunk = &token_ids[off..(off + MAX_CUDA_BATCH).min(token_ids.len())];
+            let chunk = &token_ids[off..(off + HY4_MAX_BATCH).min(token_ids.len())];
             let is_last = off + chunk.len() == token_ids.len();
             self.pinned_ids.write_u32_at(0, chunk);
             self.token_ids_buf

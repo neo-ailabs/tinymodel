@@ -18,8 +18,8 @@ use crate::driver::{
 };
 use crate::kernels::{BLOCK_Q8_1_BYTES, CudaKernels, CudaMat, dtype_cuda_tag};
 
-/// Maximum batch chunk processed in a single prefill pass on GPU (`128` tokens).
-pub const MAX_CUDA_BATCH: usize = 128;
+/// Maximum batch chunk processed in a single prefill pass on GPU (`512` tokens).
+pub const MAX_CUDA_BATCH: usize = 512;
 
 #[derive(Debug, Clone)]
 pub struct CudaStageStat {
@@ -121,12 +121,23 @@ pub(crate) enum CudaPackedExperts {
     },
 }
 
+pub(crate) struct CudaMoeVramCache {
+    pub cache_slots: usize,
+    pub vram_gate_cache: Option<CudaBuffer>,
+    pub vram_up_cache: CudaBuffer,
+    pub vram_down_cache: CudaBuffer,
+    pub slot_of_exp: CudaBuffer,
+    pub exp_of_slot: CudaBuffer,
+    pub hit_counts: CudaBuffer,
+}
+
 pub(crate) struct CudaMoeLayer {
     pub cfg: SparseMoeConfig,
     pub gate_inp: CudaMat,
     pub gate_inp_bias: Option<CudaBuffer>,
     pub exp_probs_b: Option<CudaBuffer>,
     pub experts: CudaPackedExperts,
+    pub vram_cache: Option<CudaMoeVramCache>,
     pub shared_expert: Option<CudaSharedExpert>,
 }
 
@@ -275,6 +286,130 @@ fn alloc_expert_buf(
     }
 }
 
+fn plan_moe_vram_cache_slots(
+    ctx: &CudaContext,
+    moe: &SparseMoeFfn<'_>,
+    host_mapped: bool,
+) -> usize {
+    if !host_mapped || moe.cfg.n_expert == 0 {
+        return 0;
+    }
+    if let Ok(raw) = std::env::var("TM_CUDA_MOE_CACHE_EXPERTS") {
+        let s = raw.trim().to_ascii_lowercase();
+        if matches!(s.as_str(), "0" | "off" | "false" | "no") {
+            return 0;
+        }
+        if let Ok(n) = s.parse::<usize>() {
+            return n.min(moe.cfg.n_expert);
+        }
+    }
+    let exp_total = moe_expert_only_bytes(moe);
+    let per_exp = (exp_total / moe.cfg.n_expert.max(1)).max(1);
+    let default_slots = (moe.cfg.n_expert / 4).clamp(4, 64).min(moe.cfg.n_expert);
+    if let Ok((free_vram, _)) = ctx.mem_info() {
+        let reserve = 256 * 1024 * 1024usize;
+        if free_vram > reserve {
+            let max_fit = (free_vram - reserve) / (per_exp * 4).max(1);
+            return default_slots.min(max_fit);
+        }
+    }
+    0
+}
+
+fn build_moe_vram_cache(
+    ctx: &CudaContext,
+    moe: &SparseMoeFfn<'_>,
+    host_mapped: bool,
+) -> Result<Option<CudaMoeVramCache>, CudaError> {
+    let slots = plan_moe_vram_cache_slots(ctx, moe, host_mapped);
+    let ne = moe.cfg.n_expert;
+    if slots == 0 || slots >= ne {
+        return Ok(None);
+    }
+
+    // Seed initial cache slots with the highest-bias experts (`exp_probs_b`) or `0..slots`.
+    let mut order: Vec<usize> = (0..ne).collect();
+    if let Some(ref b) = moe.exp_probs_b
+        && b.len() >= ne
+    {
+        order.sort_by(|&a, &c| b[c].total_cmp(&b[a]).then_with(|| a.cmp(&c)));
+    }
+    let chosen = &order[..slots];
+    let mut slot_of_exp_host = vec![-1i32; ne];
+    let mut exp_of_slot_host = vec![0u32; slots];
+    for (s, &e) in chosen.iter().enumerate() {
+        slot_of_exp_host[e] = s as i32;
+        exp_of_slot_host[s] = e as u32;
+    }
+
+    let copy_slots = |src: &[u8], exp_bytes: usize| -> Result<CudaBuffer, CudaError> {
+        let mut init = Vec::with_capacity(slots * exp_bytes);
+        for &e in chosen {
+            init.extend_from_slice(&src[e * exp_bytes..(e + 1) * exp_bytes]);
+        }
+        ctx.alloc_from_bytes(&init)
+    };
+
+    let (vram_gate_cache, vram_up_cache, vram_down_cache) = match &moe.experts {
+        PackedExperts::Separate {
+            gate_exps,
+            gate_exp_bytes,
+            up_exps,
+            up_exp_bytes,
+            down_exps,
+            down_exp_bytes,
+            ..
+        } => {
+            let vg = match gate_exps {
+                Some(ge) => Some(copy_slots(ge, *gate_exp_bytes)?),
+                None => None,
+            };
+            let vu = copy_slots(up_exps, *up_exp_bytes)?;
+            let vd = copy_slots(down_exps, *down_exp_bytes)?;
+            (vg, vu, vd)
+        }
+        PackedExperts::FusedGateUp {
+            gate_up_exps,
+            gate_up_exp_bytes,
+            down_exps,
+            down_exp_bytes,
+            ..
+        } => {
+            let vgu = copy_slots(gate_up_exps, *gate_up_exp_bytes)?;
+            let vd = copy_slots(down_exps, *down_exp_bytes)?;
+            (None, vgu, vd)
+        }
+    };
+
+    // SAFETY: `[i32]` is POD.
+    let slot_bytes = unsafe {
+        core::slice::from_raw_parts(
+            slot_of_exp_host.as_ptr().cast::<u8>(),
+            slot_of_exp_host.len() * 4,
+        )
+    };
+    let slot_of_exp = ctx.alloc_from_bytes(slot_bytes)?;
+    // SAFETY: `[u32]` is POD.
+    let exp_bytes = unsafe {
+        core::slice::from_raw_parts(
+            exp_of_slot_host.as_ptr().cast::<u8>(),
+            exp_of_slot_host.len() * 4,
+        )
+    };
+    let exp_of_slot = ctx.alloc_from_bytes(exp_bytes)?;
+    let hit_counts = ctx.alloc_zeroed((ne + 1) * 4)?;
+
+    Ok(Some(CudaMoeVramCache {
+        cache_slots: slots,
+        vram_gate_cache,
+        vram_up_cache,
+        vram_down_cache,
+        slot_of_exp,
+        exp_of_slot,
+        hit_counts,
+    }))
+}
+
 impl CudaMoeLayer {
     #[allow(dead_code)]
     pub(crate) fn upload(
@@ -349,6 +484,7 @@ impl CudaMoeLayer {
                 down_exp_bytes: *down_exp_bytes,
             },
         };
+        let vram_cache = build_moe_vram_cache(ctx, moe, host_mapped)?;
         let shared_expert = match &moe.shared_expert {
             Some(SharedExpertWeights {
                 n_ff_shexp,
@@ -374,6 +510,7 @@ impl CudaMoeLayer {
             gate_inp_bias,
             exp_probs_b,
             experts,
+            vram_cache,
             shared_expert,
         })
     }
@@ -434,7 +571,74 @@ impl CudaMoeLayer {
             n_tok,
         )?;
 
-        // 3a. `P0-2`: Grouped `wmma` Tensor Core prefill GEMM when `n_tok >= 16`!
+        // `P2`: Capture-safe on-GPU frequency-aged hot-expert VRAM cache promotion!
+        let (vram_g_ptr, vram_u_ptr, vram_d_ptr, slot_of_exp_ptr) =
+            if let Some(ref vc) = self.vram_cache {
+                let vg = vc.vram_gate_cache.as_ref().map_or(0, |b| b.device_ptr());
+                let vu = vc.vram_up_cache.device_ptr();
+                let vd = vc.vram_down_cache.device_ptr();
+                let soe = vc.slot_of_exp.device_ptr();
+                let (hg, gb, hu, ub, hd, db) = match &self.experts {
+                    CudaPackedExperts::Separate {
+                        gate_exps,
+                        gate_exp_bytes,
+                        up_exps,
+                        up_exp_bytes,
+                        down_exps,
+                        down_exp_bytes,
+                        ..
+                    } => (
+                        gate_exps.as_ref().map_or(0, |b| b.device_ptr()),
+                        if gate_exps.is_some() {
+                            *gate_exp_bytes
+                        } else {
+                            0
+                        },
+                        up_exps.device_ptr(),
+                        *up_exp_bytes,
+                        down_exps.device_ptr(),
+                        *down_exp_bytes,
+                    ),
+                    CudaPackedExperts::FusedGateUp {
+                        gate_up_exps,
+                        gate_up_exp_bytes,
+                        down_exps,
+                        down_exp_bytes,
+                        ..
+                    } => (
+                        0,
+                        0,
+                        gate_up_exps.device_ptr(),
+                        *gate_up_exp_bytes,
+                        down_exps.device_ptr(),
+                        *down_exp_bytes,
+                    ),
+                };
+                kernels.launch_moe_cache_tick_promote(
+                    ctx,
+                    scratch.top_ids.device_ptr(),
+                    vc.hit_counts.device_ptr(),
+                    soe,
+                    vc.exp_of_slot.device_ptr(),
+                    hg,
+                    vg,
+                    gb,
+                    hu,
+                    vu,
+                    ub,
+                    hd,
+                    vd,
+                    db,
+                    rows_slots,
+                    ne,
+                    vc.cache_slots,
+                )?;
+                (vg, vu, vd, soe)
+            } else {
+                (0, 0, 0, 0)
+            };
+
+        // 3a. `P0-A`: Grouped `wmma` Tensor Core prefill GEMM when `n_tok >= 16`!
         let use_grouped_wmma = n_tok >= 16
             && ne <= 512
             && ctx.info().has_fp16_wmma()
@@ -468,6 +672,8 @@ impl CudaMoeLayer {
                     kernels.launch_wmma_moe_grouped(
                         ctx,
                         up_exps.device_ptr(),
+                        vram_u_ptr,
+                        slot_of_exp_ptr,
                         ffn_in_ptr,
                         scratch.exp_offs.device_ptr(),
                         scratch.tile_offs.device_ptr(),
@@ -491,6 +697,8 @@ impl CudaMoeLayer {
                         kernels.launch_wmma_moe_grouped(
                             ctx,
                             ge.device_ptr(),
+                            vram_g_ptr,
+                            slot_of_exp_ptr,
                             ffn_in_ptr,
                             scratch.exp_offs.device_ptr(),
                             scratch.tile_offs.device_ptr(),
@@ -523,6 +731,8 @@ impl CudaMoeLayer {
                     kernels.launch_wmma_moe_grouped(
                         ctx,
                         down_exps.device_ptr(),
+                        vram_d_ptr,
+                        slot_of_exp_ptr,
                         down_f32_ptr,
                         scratch.exp_offs.device_ptr(),
                         scratch.tile_offs.device_ptr(),
@@ -557,6 +767,8 @@ impl CudaMoeLayer {
                     kernels.launch_wmma_moe_grouped(
                         ctx,
                         gate_up_exps.device_ptr(),
+                        vram_u_ptr,
+                        slot_of_exp_ptr,
                         ffn_in_ptr,
                         scratch.exp_offs.device_ptr(),
                         scratch.tile_offs.device_ptr(),
@@ -586,6 +798,8 @@ impl CudaMoeLayer {
                     kernels.launch_wmma_moe_grouped(
                         ctx,
                         down_exps.device_ptr(),
+                        vram_d_ptr,
+                        slot_of_exp_ptr,
                         scratch.exp_up.device_ptr(),
                         scratch.exp_offs.device_ptr(),
                         scratch.tile_offs.device_ptr(),
@@ -608,8 +822,23 @@ impl CudaMoeLayer {
                 }
             }
         } else {
-            // 3b. `P0-3`: Fused dual `Gate + Up + SwiGLU` `__dp4a` decode/verify path!
-            let in_xq_ptr = if d.is_multiple_of(32) {
+            // 3b. `P0-3` + `P1`: Fused dual `Gate + Up + SwiGLU` `__dp4a` decode/verify path
+            // supporting heterogeneous `(gate_dtype, up_dtype)` (e.g. `Qwen3.8` `GSQ-RCO`)!
+            let need_in_xq = match &self.experts {
+                CudaPackedExperts::Separate {
+                    gate_exps,
+                    gate_dtype,
+                    up_dtype,
+                    ..
+                } => {
+                    is_q8_1_moe_dtype(*up_dtype, d)
+                        || (gate_exps.is_some() && is_q8_1_moe_dtype(*gate_dtype, d))
+                }
+                CudaPackedExperts::FusedGateUp { gate_up_dtype, .. } => {
+                    is_q8_1_moe_dtype(*gate_up_dtype, d)
+                }
+            };
+            let in_xq_ptr = if need_in_xq {
                 kernels.launch_quantize_q8_1(
                     ctx,
                     ffn_in_ptr,
@@ -638,14 +867,14 @@ impl CudaMoeLayer {
                     down_exp_bytes,
                 } => {
                     let down_uses_q8 = is_q8_1_moe_dtype(*down_dtype, n_ff_exp);
-                    let (down_xq_ptr, down_f32_ptr) = if let Some(ge) = gate_exps
-                        && *gate_dtype == *up_dtype
-                        && *gate_row_bytes == *up_row_bytes
-                    {
+                    let (down_xq_ptr, down_f32_ptr) = if let Some(ge) = gate_exps {
                         kernels.launch_moe_indexed_dual_gu_act(
                             ctx,
                             ge.device_ptr(),
                             up_exps.device_ptr(),
+                            vram_g_ptr,
+                            vram_u_ptr,
+                            slot_of_exp_ptr,
                             in_xq_ptr,
                             ffn_in_ptr,
                             scratch.top_ids.device_ptr(),
@@ -653,9 +882,11 @@ impl CudaMoeLayer {
                             0,
                             scratch.exp_up.device_ptr(),
                             *gate_dtype,
+                            *up_dtype,
                             n_ff_exp,
                             d,
                             *gate_row_bytes,
+                            *up_row_bytes,
                             *gate_exp_bytes,
                             *up_exp_bytes,
                             0,
@@ -681,6 +912,8 @@ impl CudaMoeLayer {
                         kernels.launch_moe_indexed_gemv_q8_1(
                             ctx,
                             up_exps.device_ptr(),
+                            vram_u_ptr,
+                            slot_of_exp_ptr,
                             in_xq_ptr,
                             ffn_in_ptr,
                             scratch.top_ids.device_ptr(),
@@ -697,46 +930,7 @@ impl CudaMoeLayer {
                             0,
                             0,
                         )?;
-                        if let Some(ge) = gate_exps {
-                            kernels.launch_moe_indexed_gemv_q8_1(
-                                ctx,
-                                ge.device_ptr(),
-                                in_xq_ptr,
-                                ffn_in_ptr,
-                                scratch.top_ids.device_ptr(),
-                                scratch.top_weights.device_ptr(),
-                                0,
-                                scratch.exp_gate.device_ptr(),
-                                *gate_dtype,
-                                n_ff_exp,
-                                d,
-                                *gate_row_bytes,
-                                *gate_exp_bytes,
-                                ku,
-                                n_tok,
-                                0,
-                                0,
-                            )?;
-                            if down_uses_q8 {
-                                kernels.launch_swiglu_quantize_q8_1(
-                                    ctx,
-                                    scratch.exp_gate.device_ptr(),
-                                    scratch.exp_up.device_ptr(),
-                                    scratch.exp_xq.device_ptr(),
-                                    n_ff_exp,
-                                    rows_slots,
-                                )?;
-                                (scratch.exp_xq.device_ptr(), scratch.exp_gate.device_ptr())
-                            } else {
-                                kernels.launch_swiglu(
-                                    ctx,
-                                    scratch.exp_gate.device_ptr(),
-                                    scratch.exp_up.device_ptr(),
-                                    rows_slots * n_ff_exp,
-                                )?;
-                                (0, scratch.exp_gate.device_ptr())
-                            }
-                        } else if down_uses_q8 {
+                        if down_uses_q8 {
                             kernels.launch_quantize_q8_1(
                                 ctx,
                                 scratch.exp_up.device_ptr(),
@@ -752,6 +946,8 @@ impl CudaMoeLayer {
                     kernels.launch_moe_indexed_gemv_q8_1(
                         ctx,
                         down_exps.device_ptr(),
+                        vram_d_ptr,
+                        slot_of_exp_ptr,
                         down_xq_ptr,
                         down_f32_ptr,
                         scratch.top_ids.device_ptr(),
@@ -784,6 +980,9 @@ impl CudaMoeLayer {
                         ctx,
                         gate_up_exps.device_ptr(),
                         gate_up_exps.device_ptr(),
+                        vram_u_ptr,
+                        vram_u_ptr,
+                        slot_of_exp_ptr,
                         in_xq_ptr,
                         ffn_in_ptr,
                         scratch.top_ids.device_ptr(),
@@ -791,8 +990,10 @@ impl CudaMoeLayer {
                         0,
                         scratch.exp_up.device_ptr(),
                         *gate_up_dtype,
+                        *gate_up_dtype,
                         n_ff_exp,
                         d,
+                        *gate_up_row_bytes,
                         *gate_up_row_bytes,
                         *gate_up_exp_bytes,
                         *gate_up_exp_bytes,
@@ -819,6 +1020,8 @@ impl CudaMoeLayer {
                     kernels.launch_moe_indexed_gemv_q8_1(
                         ctx,
                         down_exps.device_ptr(),
+                        vram_d_ptr,
+                        slot_of_exp_ptr,
                         down_xq_ptr,
                         scratch.exp_up.device_ptr(),
                         scratch.top_ids.device_ptr(),

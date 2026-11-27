@@ -1,0 +1,567 @@
+#version 450
+// Subgroup-portable fused Dual-(Gate + Up) + SwiGLU indexed 3D Sparse MoE GEMV (`P1` / `ADR-026`)
+// for both single-token decode and batched prefill (`gl_WorkGroupID.y = t * k + slot`).
+// Supports homogeneous and heterogeneous `(GATE_DTYPE, UP_DTYPE)` pairs:
+//   0 = Q4_0, 1 = Q4_1, 2 = Q8_0, 3 = Q5_K, 4 = Q6_K, 5 = F32, 6 = Q2_0.
+// Zero subgroupShuffle; portable across subgroup sizes {8, 16, 32, 64}.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(constant_id = 0) const uint WG = 128;
+layout(constant_id = 1) const uint GATE_DTYPE = 0;
+layout(constant_id = 2) const uint UP_DTYPE = 0;
+layout(constant_id = 3) const uint NR = 2;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer WG16 { uint16_t wg16[]; };
+layout(std430, binding = 0) readonly buffer WG32 { uint wg32[]; };
+layout(std430, binding = 1) readonly buffer WU16 { uint16_t wu16[]; };
+layout(std430, binding = 1) readonly buffer WU32 { uint wu32[]; };
+layout(std430, binding = 2) readonly buffer X    { float x[]; };
+layout(std430, binding = 3) readonly buffer IDs  { uint top_ids[]; };
+layout(std430, binding = 4) writeonly buffer Y   { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint n_in;
+    uint n_out;
+    uint gate_row_u16s;
+    uint up_row_u16s;
+    uint gate_exp_stride_u16;
+    uint up_exp_stride_u16;
+    uint up_intra_off_u16;
+    uint k;
+    uint x_tok_stride;
+} pc;
+
+uint g_ubyte_at(uint base_u16, uint byte_idx) {
+    uint w = uint(wg16[base_u16 + (byte_idx >> 1u)]);
+    return ((byte_idx & 1u) == 0u) ? (w & 0xFFu) : (w >> 8u);
+}
+
+int g_sbyte_at(uint base_u16, uint byte_idx) {
+    return bitfieldExtract(int(g_ubyte_at(base_u16, byte_idx)), 0, 8);
+}
+
+uint u_ubyte_at(uint base_u16, uint byte_idx) {
+    uint w = uint(wu16[base_u16 + (byte_idx >> 1u)]);
+    return ((byte_idx & 1u) == 0u) ? (w & 0xFFu) : (w >> 8u);
+}
+
+int u_sbyte_at(uint base_u16, uint byte_idx) {
+    return bitfieldExtract(int(u_ubyte_at(base_u16, byte_idx)), 0, 8);
+}
+
+void main() {
+    const uint row0 = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * NR;
+    if (row0 >= pc.n_out) return;
+
+    const uint tk = gl_WorkGroupID.y;
+    const uint t = tk / pc.k;
+    const uint exp_id = top_ids[tk];
+
+    const uint g_exp_base = exp_id * pc.gate_exp_stride_u16;
+    const uint u_exp_base = exp_id * pc.up_exp_stride_u16 + pc.up_intra_off_u16;
+    const uint x_base = t * pc.x_tok_stride;
+    const uint y_base = tk * pc.n_out;
+
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg_size = gl_SubgroupSize;
+
+    float acc_g[NR];
+    float acc_u[NR];
+    uint row_g[NR];
+    uint row_u[NR];
+    for (uint r = 0u; r < NR; ++r) {
+        acc_g[r] = 0.0;
+        acc_u[r] = 0.0;
+        const uint row = min(row0 + r, pc.n_out - 1u);
+        row_g[r] = g_exp_base + row * pc.gate_row_u16s;
+        row_u[r] = u_exp_base + row * pc.up_row_u16s;
+    }
+
+    if (GATE_DTYPE == UP_DTYPE) {
+        if (GATE_DTYPE == 0u) {
+            const uint nb = pc.n_in / 32u;
+            const uint sub = lane & 3u;
+            const uint blk_step = max(sg_size >> 2u, 1u);
+            for (uint ib = (lane >> 2u); ib < nb; ib += blk_step) {
+                const uint x0 = x_base + ib * 32u + sub * 4u;
+                const vec4 xlo = vec4(x[x0], x[x0 + 1u], x[x0 + 2u], x[x0 + 3u]);
+                const vec4 xhi = vec4(x[x0 + 16u], x[x0 + 17u], x[x0 + 18u], x[x0 + 19u]);
+                const uint blk_u16 = ib * 9u;
+                for (uint r = 0u; r < NR; ++r) {
+                    const uint bg = row_g[r] + blk_u16;
+                    const float dg = unpackHalf2x16(uint(wg16[bg])).x;
+                    const uint ug = uint(wg16[bg + 1u + 2u * sub]) | (uint(wg16[bg + 2u + 2u * sub]) << 16u);
+                    const float sg_v = dot(vec4(ug & 15u, (ug >> 8u) & 15u, (ug >> 16u) & 15u, (ug >> 24u) & 15u) - 8.0, xlo)
+                                     + dot(vec4((ug >> 4u) & 15u, (ug >> 12u) & 15u, (ug >> 20u) & 15u, ug >> 28u) - 8.0, xhi);
+                    acc_g[r] = fma(dg, sg_v, acc_g[r]);
+
+                    const uint bu = row_u[r] + blk_u16;
+                    const float du = unpackHalf2x16(uint(wu16[bu])).x;
+                    const uint uu = uint(wu16[bu + 1u + 2u * sub]) | (uint(wu16[bu + 2u + 2u * sub]) << 16u);
+                    const float su_v = dot(vec4(uu & 15u, (uu >> 8u) & 15u, (uu >> 16u) & 15u, (uu >> 24u) & 15u) - 8.0, xlo)
+                                     + dot(vec4((uu >> 4u) & 15u, (uu >> 12u) & 15u, (uu >> 20u) & 15u, uu >> 28u) - 8.0, xhi);
+                    acc_u[r] = fma(du, su_v, acc_u[r]);
+                }
+            }
+        } else if (GATE_DTYPE == 1u) {
+            const uint nb = pc.n_in / 32u;
+            const uint sub = lane & 3u;
+            const uint blk_step = max(sg_size >> 2u, 1u);
+            for (uint ib = (lane >> 2u); ib < nb; ib += blk_step) {
+                const uint x0 = x_base + ib * 32u + sub * 4u;
+                const vec4 xlo = vec4(x[x0], x[x0 + 1u], x[x0 + 2u], x[x0 + 3u]);
+                const vec4 xhi = vec4(x[x0 + 16u], x[x0 + 17u], x[x0 + 18u], x[x0 + 19u]);
+                const float sumx8 = (xlo.x + xlo.y + xlo.z + xlo.w) + (xhi.x + xhi.y + xhi.z + xhi.w);
+                const uint blk_u16 = ib * 10u;
+                for (uint r = 0u; r < NR; ++r) {
+                    const uint bg = row_g[r] + blk_u16;
+                    const float dg = unpackHalf2x16(uint(wg16[bg])).x;
+                    const float mg = unpackHalf2x16(uint(wg16[bg + 1u])).x;
+                    const uint ug = uint(wg16[bg + 2u + 2u * sub]) | (uint(wg16[bg + 3u + 2u * sub]) << 16u);
+                    const float sg_v = dot(vec4(ug & 15u, (ug >> 8u) & 15u, (ug >> 16u) & 15u, (ug >> 24u) & 15u), xlo)
+                                     + dot(vec4((ug >> 4u) & 15u, (ug >> 12u) & 15u, (ug >> 20u) & 15u, ug >> 28u), xhi);
+                    acc_g[r] = fma(dg, sg_v, fma(mg, sumx8, acc_g[r]));
+
+                    const uint bu = row_u[r] + blk_u16;
+                    const float du = unpackHalf2x16(uint(wu16[bu])).x;
+                    const float mu = unpackHalf2x16(uint(wu16[bu + 1u])).x;
+                    const uint uu = uint(wu16[bu + 2u + 2u * sub]) | (uint(wu16[bu + 3u + 2u * sub]) << 16u);
+                    const float su_v = dot(vec4(uu & 15u, (uu >> 8u) & 15u, (uu >> 16u) & 15u, (uu >> 24u) & 15u), xlo)
+                                     + dot(vec4((uu >> 4u) & 15u, (uu >> 12u) & 15u, (uu >> 20u) & 15u, uu >> 28u), xhi);
+                    acc_u[r] = fma(du, su_v, fma(mu, sumx8, acc_u[r]));
+                }
+            }
+        } else if (GATE_DTYPE == 2u) {
+            const uint nb = pc.n_in / 32u;
+            const uint sub_blk = lane >> 3u;
+            const uint sub_lane = lane & 7u;
+            const uint step_blk = max(sg_size >> 3u, 1u);
+            const uint q_u16_off = 1u + (sub_lane << 1u);
+            for (uint ib = sub_blk; ib < nb; ib += step_blk) {
+                const uint x0 = x_base + ib * 32u + sub_lane * 4u;
+                const vec4 xv = vec4(x[x0], x[x0 + 1u], x[x0 + 2u], x[x0 + 3u]);
+                const uint blk_u16 = ib * 17u;
+                for (uint r = 0u; r < NR; ++r) {
+                    const uint bg = row_g[r] + blk_u16;
+                    const uint dwg = wg32[bg >> 1u];
+                    const float dg = ((bg & 1u) == 0u) ? unpackHalf2x16(dwg).x : unpackHalf2x16(dwg).y;
+                    const uint qg = bg + q_u16_off;
+                    const uint q32g = ((qg & 1u) == 0u)
+                        ? wg32[qg >> 1u]
+                        : ((wg32[qg >> 1u] >> 16u) | (wg32[(qg >> 1u) + 1u] << 16u));
+                    const vec4 q4g = vec4(
+                        float(bitfieldExtract(int(q32g), 0, 8)),
+                        float(bitfieldExtract(int(q32g), 8, 8)),
+                        float(bitfieldExtract(int(q32g), 16, 8)),
+                        float(bitfieldExtract(int(q32g), 24, 8))
+                    );
+                    acc_g[r] = fma(dg, dot(q4g, xv), acc_g[r]);
+
+                    const uint bu = row_u[r] + blk_u16;
+                    const uint dwu = wu32[bu >> 1u];
+                    const float du = ((bu & 1u) == 0u) ? unpackHalf2x16(dwu).x : unpackHalf2x16(dwu).y;
+                    const uint qu = bu + q_u16_off;
+                    const uint q32u = ((qu & 1u) == 0u)
+                        ? wu32[qu >> 1u]
+                        : ((wu32[qu >> 1u] >> 16u) | (wu32[(qu >> 1u) + 1u] << 16u));
+                    const vec4 q4u = vec4(
+                        float(bitfieldExtract(int(q32u), 0, 8)),
+                        float(bitfieldExtract(int(q32u), 8, 8)),
+                        float(bitfieldExtract(int(q32u), 16, 8)),
+                        float(bitfieldExtract(int(q32u), 24, 8))
+                    );
+                    acc_u[r] = fma(du, dot(q4u, xv), acc_u[r]);
+                }
+            }
+        } else {
+            // Fall through to independent gate/up loops below for K-quants / Q2_0 / F32.
+        }
+    }
+
+    if (GATE_DTYPE != UP_DTYPE || GATE_DTYPE >= 3u) {
+        // Gate accumulation
+        if (GATE_DTYPE == 0u) {
+            const uint nb = pc.n_in / 32u;
+            const uint sub = lane & 3u;
+            const uint blk_step = max(sg_size >> 2u, 1u);
+            for (uint ib = (lane >> 2u); ib < nb; ib += blk_step) {
+                const uint x0 = x_base + ib * 32u + sub * 4u;
+                const vec4 xlo = vec4(x[x0], x[x0 + 1u], x[x0 + 2u], x[x0 + 3u]);
+                const vec4 xhi = vec4(x[x0 + 16u], x[x0 + 17u], x[x0 + 18u], x[x0 + 19u]);
+                for (uint r = 0u; r < NR; ++r) {
+                    const uint b = row_g[r] + ib * 9u;
+                    const float d = unpackHalf2x16(uint(wg16[b])).x;
+                    const uint u = uint(wg16[b + 1u + 2u * sub]) | (uint(wg16[b + 2u + 2u * sub]) << 16u);
+                    const float s = dot(vec4(u & 15u, (u >> 8u) & 15u, (u >> 16u) & 15u, (u >> 24u) & 15u) - 8.0, xlo)
+                                  + dot(vec4((u >> 4u) & 15u, (u >> 12u) & 15u, (u >> 20u) & 15u, u >> 28u) - 8.0, xhi);
+                    acc_g[r] = fma(d, s, acc_g[r]);
+                }
+            }
+        } else if (GATE_DTYPE == 1u) {
+            const uint nb = pc.n_in / 32u;
+            const uint sub = lane & 3u;
+            const uint blk_step = max(sg_size >> 2u, 1u);
+            for (uint ib = (lane >> 2u); ib < nb; ib += blk_step) {
+                const uint x0 = x_base + ib * 32u + sub * 4u;
+                const vec4 xlo = vec4(x[x0], x[x0 + 1u], x[x0 + 2u], x[x0 + 3u]);
+                const vec4 xhi = vec4(x[x0 + 16u], x[x0 + 17u], x[x0 + 18u], x[x0 + 19u]);
+                const float sumx8 = (xlo.x + xlo.y + xlo.z + xlo.w) + (xhi.x + xhi.y + xhi.z + xhi.w);
+                for (uint r = 0u; r < NR; ++r) {
+                    const uint b = row_g[r] + ib * 10u;
+                    const float d = unpackHalf2x16(uint(wg16[b])).x;
+                    const float m = unpackHalf2x16(uint(wg16[b + 1u])).x;
+                    const uint u = uint(wg16[b + 2u + 2u * sub]) | (uint(wg16[b + 3u + 2u * sub]) << 16u);
+                    const float s = dot(vec4(u & 15u, (u >> 8u) & 15u, (u >> 16u) & 15u, (u >> 24u) & 15u), xlo)
+                                  + dot(vec4((u >> 4u) & 15u, (u >> 12u) & 15u, (u >> 20u) & 15u, u >> 28u), xhi);
+                    acc_g[r] = fma(d, s, fma(m, sumx8, acc_g[r]));
+                }
+            }
+        } else if (GATE_DTYPE == 2u) {
+            const uint nb = pc.n_in / 32u;
+            const uint sub_blk = lane >> 3u;
+            const uint sub_lane = lane & 7u;
+            const uint step_blk = max(sg_size >> 3u, 1u);
+            const uint q_u16_off = 1u + (sub_lane << 1u);
+            for (uint ib = sub_blk; ib < nb; ib += step_blk) {
+                const uint x0 = x_base + ib * 32u + sub_lane * 4u;
+                const vec4 xv = vec4(x[x0], x[x0 + 1u], x[x0 + 2u], x[x0 + 3u]);
+                const uint blk_u16 = ib * 17u;
+                for (uint r = 0u; r < NR; ++r) {
+                    const uint b = row_g[r] + blk_u16;
+                    const uint dw = wg32[b >> 1u];
+                    const float d = ((b & 1u) == 0u) ? unpackHalf2x16(dw).x : unpackHalf2x16(dw).y;
+                    const uint q = b + q_u16_off;
+                    const uint q32 = ((q & 1u) == 0u)
+                        ? wg32[q >> 1u]
+                        : ((wg32[q >> 1u] >> 16u) | (wg32[(q >> 1u) + 1u] << 16u));
+                    const vec4 q4 = vec4(
+                        float(bitfieldExtract(int(q32), 0, 8)),
+                        float(bitfieldExtract(int(q32), 8, 8)),
+                        float(bitfieldExtract(int(q32), 16, 8)),
+                        float(bitfieldExtract(int(q32), 24, 8))
+                    );
+                    acc_g[r] = fma(d, dot(q4, xv), acc_g[r]);
+                }
+            }
+        } else if (GATE_DTYPE == 3u) {
+            const uint nb = pc.n_in / 256u;
+            const uint total_groups = nb * 8u;
+            for (uint idx = lane; idx < total_groups; idx += sg_size) {
+                const uint ib = idx >> 3u;
+                const uint l4 = idx & 7u;
+                vec4 x_lo[4];
+                vec4 x_hi[4];
+                for (uint chunk = 0u; chunk < 4u; ++chunk) {
+                    const uint x0 = x_base + ib * 256u + chunk * 64u + l4 * 4u;
+                    x_lo[chunk] = vec4(x[x0], x[x0 + 1u], x[x0 + 2u], x[x0 + 3u]);
+                    x_hi[chunk] = vec4(x[x0 + 32u], x[x0 + 33u], x[x0 + 34u], x[x0 + 35u]);
+                }
+                for (uint r = 0u; r < NR; ++r) {
+                    const uint b32 = (row_g[r] >> 1u) + ib * 44u;
+                    const vec2 dm = unpackHalf2x16(wg32[b32]);
+                    const uint s0 = wg32[b32 + 1u];
+                    const uint s1 = wg32[b32 + 2u];
+                    const uint s2 = wg32[b32 + 3u];
+                    const uint qh4 = wg32[b32 + 4u + l4];
+                    const uvec4 qh_bytes = uvec4(qh4 & 0xFFu, (qh4 >> 8u) & 0xFFu, (qh4 >> 16u) & 0xFFu, qh4 >> 24u);
+                    for (uint chunk = 0u; chunk < 4u; ++chunk) {
+                        uint sc0, m0, sc1, m1;
+                        if (chunk < 2u) {
+                            const uint sh0 = (2u * chunk) * 8u;
+                            const uint sh1 = (2u * chunk + 1u) * 8u;
+                            sc0 = (s0 >> sh0) & 63u;
+                            m0  = (s1 >> sh0) & 63u;
+                            sc1 = (s0 >> sh1) & 63u;
+                            m1  = (s1 >> sh1) & 63u;
+                        } else {
+                            const uint k0 = (2u * chunk - 4u) * 8u;
+                            const uint k1 = (2u * chunk - 3u) * 8u;
+                            const uint b4_0  = (s2 >> k0) & 0xFFu;
+                            const uint bm4_0 = (s0 >> k0) & 0xFFu;
+                            const uint b0_0  = (s1 >> k0) & 0xFFu;
+                            sc0 = (b4_0 & 0x0Fu) | ((bm4_0 >> 6u) << 4u);
+                            m0  = (b4_0 >> 4u)   | ((b0_0  >> 6u) << 4u);
+                            const uint b4_1  = (s2 >> k1) & 0xFFu;
+                            const uint bm4_1 = (s0 >> k1) & 0xFFu;
+                            const uint b0_1  = (s1 >> k1) & 0xFFu;
+                            sc1 = (b4_1 & 0x0Fu) | ((bm4_1 >> 6u) << 4u);
+                            m1  = (b4_1 >> 4u)   | ((b0_1  >> 6u) << 4u);
+                        }
+                        const uint ql4 = wg32[b32 + 12u + chunk * 8u + l4];
+                        const uvec4 ql_bytes = uvec4(ql4 & 0xFFu, (ql4 >> 8u) & 0xFFu, (ql4 >> 16u) & 0xFFu, ql4 >> 24u);
+                        const vec4 q_lo = vec4((ql_bytes & 15u) | (((qh_bytes >> (2u * chunk)) & 1u) << 4u));
+                        const vec4 q_hi = vec4((ql_bytes >> 4u) | (((qh_bytes >> (2u * chunk + 1u)) & 1u) << 4u));
+                        const vec4 w_lo = fma(vec4(dm.x * float(sc0)), q_lo, vec4(-dm.y * float(m0)));
+                        const vec4 w_hi = fma(vec4(dm.x * float(sc1)), q_hi, vec4(-dm.y * float(m1)));
+                        acc_g[r] += dot(w_lo, x_lo[chunk]) + dot(w_hi, x_hi[chunk]);
+                    }
+                }
+            }
+        } else if (GATE_DTYPE == 4u) {
+            const uint nb = pc.n_in / 256u;
+            const uint total_pairs = nb * 16u;
+            for (uint idx = lane; idx < total_pairs; idx += sg_size) {
+                const uint ib = idx >> 4u;
+                const uint l2 = idx & 15u;
+                const uint is = l2 >> 3u;
+                for (uint half_idx = 0u; half_idx < 2u; ++half_idx) {
+                    const uint xh = x_base + ib * 256u + half_idx * 128u + l2 * 2u;
+                    const vec2 xa = vec2(x[xh],        x[xh + 1u]);
+                    const vec2 xb = vec2(x[xh + 32u],  x[xh + 33u]);
+                    const vec2 xc = vec2(x[xh + 64u],  x[xh + 65u]);
+                    const vec2 xd = vec2(x[xh + 96u],  x[xh + 97u]);
+                    for (uint r = 0u; r < NR; ++r) {
+                        const uint b = row_g[r] + ib * 105u;
+                        const float d = unpackHalf2x16(uint(wg16[b + 104u])).x;
+                        const uint ql0_u = uint(wg16[b + half_idx * 32u + l2]);
+                        const uint ql1_u = uint(wg16[b + half_idx * 32u + 16u + l2]);
+                        const uint qh_u  = uint(wg16[b + 64u + half_idx * 16u + l2]);
+                        const uint sc_b  = b + 96u + half_idx * 4u;
+                        const uvec2 ql0 = uvec2(ql0_u & 0xFFu, ql0_u >> 8u);
+                        const uvec2 ql1 = uvec2(ql1_u & 0xFFu, ql1_u >> 8u);
+                        const uvec2 qhv = uvec2(qh_u  & 0xFFu, qh_u  >> 8u);
+                        const vec2 qa = vec2(ivec2((ql0 & 15u) | ((qhv & 3u) << 4u)) - 32);
+                        const vec2 qb = vec2(ivec2((ql1 & 15u) | (((qhv >> 2u) & 3u) << 4u)) - 32);
+                        const vec2 qc = vec2(ivec2((ql0 >> 4u) | (((qhv >> 4u) & 3u) << 4u)) - 32);
+                        const vec2 qd = vec2(ivec2((ql1 >> 4u) | (((qhv >> 6u) & 3u) << 4u)) - 32);
+                        float s = 0.0;
+                        s = fma(float(g_sbyte_at(sc_b, is))      * dot(qa, xa), 1.0, s);
+                        s = fma(float(g_sbyte_at(sc_b, is + 2u)) * dot(qb, xb), 1.0, s);
+                        s = fma(float(g_sbyte_at(sc_b, is + 4u)) * dot(qc, xc), 1.0, s);
+                        s = fma(float(g_sbyte_at(sc_b, is + 6u)) * dot(qd, xd), 1.0, s);
+                        acc_g[r] = fma(d, s, acc_g[r]);
+                    }
+                }
+            }
+        } else if (GATE_DTYPE == 6u) {
+            const uint nb2 = pc.n_in / 64u;
+            const uint total_bytes = nb2 * 16u;
+            for (uint idx = lane; idx < total_bytes; idx += sg_size) {
+                const uint ib2 = idx >> 4u;
+                const uint byte_in_blk = idx & 15u;
+                const uint x0 = x_base + ib2 * 64u + byte_in_blk * 4u;
+                const vec4 xv = vec4(x[x0], x[x0 + 1u], x[x0 + 2u], x[x0 + 3u]);
+                for (uint r = 0u; r < NR; ++r) {
+                    const uint b = row_g[r] + ib2 * 9u;
+                    const float d = unpackHalf2x16(uint(wg16[b])).x;
+                    const uint bt = g_ubyte_at(b + 1u, byte_in_blk);
+                    const vec4 q4 = vec4(
+                        float(int(bt & 3u) - 1),
+                        float(int((bt >> 2u) & 3u) - 1),
+                        float(int((bt >> 4u) & 3u) - 1),
+                        float(int((bt >> 6u) & 3u) - 1)
+                    );
+                    acc_g[r] = fma(d, dot(q4, xv), acc_g[r]);
+                }
+            }
+        } else {
+            for (uint k_i = lane; k_i < pc.n_in; k_i += sg_size) {
+                const float xv = x[x_base + k_i];
+                for (uint r = 0u; r < NR; ++r) {
+                    const uint idx = row_g[r] + 2u * k_i;
+                    const uint bits = uint(wg16[idx]) | (uint(wg16[idx + 1u]) << 16u);
+                    acc_g[r] = fma(uintBitsToFloat(bits), xv, acc_g[r]);
+                }
+            }
+        }
+
+        // Up accumulation
+        if (UP_DTYPE == 0u) {
+            const uint nb = pc.n_in / 32u;
+            const uint sub = lane & 3u;
+            const uint blk_step = max(sg_size >> 2u, 1u);
+            for (uint ib = (lane >> 2u); ib < nb; ib += blk_step) {
+                const uint x0 = x_base + ib * 32u + sub * 4u;
+                const vec4 xlo = vec4(x[x0], x[x0 + 1u], x[x0 + 2u], x[x0 + 3u]);
+                const vec4 xhi = vec4(x[x0 + 16u], x[x0 + 17u], x[x0 + 18u], x[x0 + 19u]);
+                for (uint r = 0u; r < NR; ++r) {
+                    const uint b = row_u[r] + ib * 9u;
+                    const float d = unpackHalf2x16(uint(wu16[b])).x;
+                    const uint u = uint(wu16[b + 1u + 2u * sub]) | (uint(wu16[b + 2u + 2u * sub]) << 16u);
+                    const float s = dot(vec4(u & 15u, (u >> 8u) & 15u, (u >> 16u) & 15u, (u >> 24u) & 15u) - 8.0, xlo)
+                                  + dot(vec4((u >> 4u) & 15u, (u >> 12u) & 15u, (u >> 20u) & 15u, u >> 28u) - 8.0, xhi);
+                    acc_u[r] = fma(d, s, acc_u[r]);
+                }
+            }
+        } else if (UP_DTYPE == 1u) {
+            const uint nb = pc.n_in / 32u;
+            const uint sub = lane & 3u;
+            const uint blk_step = max(sg_size >> 2u, 1u);
+            for (uint ib = (lane >> 2u); ib < nb; ib += blk_step) {
+                const uint x0 = x_base + ib * 32u + sub * 4u;
+                const vec4 xlo = vec4(x[x0], x[x0 + 1u], x[x0 + 2u], x[x0 + 3u]);
+                const vec4 xhi = vec4(x[x0 + 16u], x[x0 + 17u], x[x0 + 18u], x[x0 + 19u]);
+                const float sumx8 = (xlo.x + xlo.y + xlo.z + xlo.w) + (xhi.x + xhi.y + xhi.z + xhi.w);
+                for (uint r = 0u; r < NR; ++r) {
+                    const uint b = row_u[r] + ib * 10u;
+                    const float d = unpackHalf2x16(uint(wu16[b])).x;
+                    const float m = unpackHalf2x16(uint(wu16[b + 1u])).x;
+                    const uint u = uint(wu16[b + 2u + 2u * sub]) | (uint(wu16[b + 3u + 2u * sub]) << 16u);
+                    const float s = dot(vec4(u & 15u, (u >> 8u) & 15u, (u >> 16u) & 15u, (u >> 24u) & 15u), xlo)
+                                  + dot(vec4((u >> 4u) & 15u, (u >> 12u) & 15u, (u >> 20u) & 15u, u >> 28u), xhi);
+                    acc_u[r] = fma(d, s, fma(m, sumx8, acc_u[r]));
+                }
+            }
+        } else if (UP_DTYPE == 2u) {
+            const uint nb = pc.n_in / 32u;
+            const uint sub_blk = lane >> 3u;
+            const uint sub_lane = lane & 7u;
+            const uint step_blk = max(sg_size >> 3u, 1u);
+            const uint q_u16_off = 1u + (sub_lane << 1u);
+            for (uint ib = sub_blk; ib < nb; ib += step_blk) {
+                const uint x0 = x_base + ib * 32u + sub_lane * 4u;
+                const vec4 xv = vec4(x[x0], x[x0 + 1u], x[x0 + 2u], x[x0 + 3u]);
+                const uint blk_u16 = ib * 17u;
+                for (uint r = 0u; r < NR; ++r) {
+                    const uint b = row_u[r] + blk_u16;
+                    const uint dw = wu32[b >> 1u];
+                    const float d = ((b & 1u) == 0u) ? unpackHalf2x16(dw).x : unpackHalf2x16(dw).y;
+                    const uint q = b + q_u16_off;
+                    const uint q32 = ((q & 1u) == 0u)
+                        ? wu32[q >> 1u]
+                        : ((wu32[q >> 1u] >> 16u) | (wu32[(q >> 1u) + 1u] << 16u));
+                    const vec4 q4 = vec4(
+                        float(bitfieldExtract(int(q32), 0, 8)),
+                        float(bitfieldExtract(int(q32), 8, 8)),
+                        float(bitfieldExtract(int(q32), 16, 8)),
+                        float(bitfieldExtract(int(q32), 24, 8))
+                    );
+                    acc_u[r] = fma(d, dot(q4, xv), acc_u[r]);
+                }
+            }
+        } else if (UP_DTYPE == 3u) {
+            const uint nb = pc.n_in / 256u;
+            const uint total_groups = nb * 8u;
+            for (uint idx = lane; idx < total_groups; idx += sg_size) {
+                const uint ib = idx >> 3u;
+                const uint l4 = idx & 7u;
+                vec4 x_lo[4];
+                vec4 x_hi[4];
+                for (uint chunk = 0u; chunk < 4u; ++chunk) {
+                    const uint x0 = x_base + ib * 256u + chunk * 64u + l4 * 4u;
+                    x_lo[chunk] = vec4(x[x0], x[x0 + 1u], x[x0 + 2u], x[x0 + 3u]);
+                    x_hi[chunk] = vec4(x[x0 + 32u], x[x0 + 33u], x[x0 + 34u], x[x0 + 35u]);
+                }
+                for (uint r = 0u; r < NR; ++r) {
+                    const uint b32 = (row_u[r] >> 1u) + ib * 44u;
+                    const vec2 dm = unpackHalf2x16(wu32[b32]);
+                    const uint s0 = wu32[b32 + 1u];
+                    const uint s1 = wu32[b32 + 2u];
+                    const uint s2 = wu32[b32 + 3u];
+                    const uint qh4 = wu32[b32 + 4u + l4];
+                    const uvec4 qh_bytes = uvec4(qh4 & 0xFFu, (qh4 >> 8u) & 0xFFu, (qh4 >> 16u) & 0xFFu, qh4 >> 24u);
+                    for (uint chunk = 0u; chunk < 4u; ++chunk) {
+                        uint sc0, m0, sc1, m1;
+                        if (chunk < 2u) {
+                            const uint sh0 = (2u * chunk) * 8u;
+                            const uint sh1 = (2u * chunk + 1u) * 8u;
+                            sc0 = (s0 >> sh0) & 63u;
+                            m0  = (s1 >> sh0) & 63u;
+                            sc1 = (s0 >> sh1) & 63u;
+                            m1  = (s1 >> sh1) & 63u;
+                        } else {
+                            const uint k0 = (2u * chunk - 4u) * 8u;
+                            const uint k1 = (2u * chunk - 3u) * 8u;
+                            const uint b4_0  = (s2 >> k0) & 0xFFu;
+                            const uint bm4_0 = (s0 >> k0) & 0xFFu;
+                            const uint b0_0  = (s1 >> k0) & 0xFFu;
+                            sc0 = (b4_0 & 0x0Fu) | ((bm4_0 >> 6u) << 4u);
+                            m0  = (b4_0 >> 4u)   | ((b0_0  >> 6u) << 4u);
+                            const uint b4_1  = (s2 >> k1) & 0xFFu;
+                            const uint bm4_1 = (s0 >> k1) & 0xFFu;
+                            const uint b0_1  = (s1 >> k1) & 0xFFu;
+                            sc1 = (b4_1 & 0x0Fu) | ((bm4_1 >> 6u) << 4u);
+                            m1  = (b4_1 >> 4u)   | ((b0_1  >> 6u) << 4u);
+                        }
+                        const uint ql4 = wu32[b32 + 12u + chunk * 8u + l4];
+                        const uvec4 ql_bytes = uvec4(ql4 & 0xFFu, (ql4 >> 8u) & 0xFFu, (ql4 >> 16u) & 0xFFu, ql4 >> 24u);
+                        const vec4 q_lo = vec4((ql_bytes & 15u) | (((qh_bytes >> (2u * chunk)) & 1u) << 4u));
+                        const vec4 q_hi = vec4((ql_bytes >> 4u) | (((qh_bytes >> (2u * chunk + 1u)) & 1u) << 4u));
+                        const vec4 w_lo = fma(vec4(dm.x * float(sc0)), q_lo, vec4(-dm.y * float(m0)));
+                        const vec4 w_hi = fma(vec4(dm.x * float(sc1)), q_hi, vec4(-dm.y * float(m1)));
+                        acc_u[r] += dot(w_lo, x_lo[chunk]) + dot(w_hi, x_hi[chunk]);
+                    }
+                }
+            }
+        } else if (UP_DTYPE == 4u) {
+            const uint nb = pc.n_in / 256u;
+            const uint total_pairs = nb * 16u;
+            for (uint idx = lane; idx < total_pairs; idx += sg_size) {
+                const uint ib = idx >> 4u;
+                const uint l2 = idx & 15u;
+                const uint is = l2 >> 3u;
+                for (uint half_idx = 0u; half_idx < 2u; ++half_idx) {
+                    const uint xh = x_base + ib * 256u + half_idx * 128u + l2 * 2u;
+                    const vec2 xa = vec2(x[xh],        x[xh + 1u]);
+                    const vec2 xb = vec2(x[xh + 32u],  x[xh + 33u]);
+                    const vec2 xc = vec2(x[xh + 64u],  x[xh + 65u]);
+                    const vec2 xd = vec2(x[xh + 96u],  x[xh + 97u]);
+                    for (uint r = 0u; r < NR; ++r) {
+                        const uint b = row_u[r] + ib * 105u;
+                        const float d = unpackHalf2x16(uint(wu16[b + 104u])).x;
+                        const uint ql0_u = uint(wu16[b + half_idx * 32u + l2]);
+                        const uint ql1_u = uint(wu16[b + half_idx * 32u + 16u + l2]);
+                        const uint qh_u  = uint(wu16[b + 64u + half_idx * 16u + l2]);
+                        const uint sc_b  = b + 96u + half_idx * 4u;
+                        const uvec2 ql0 = uvec2(ql0_u & 0xFFu, ql0_u >> 8u);
+                        const uvec2 ql1 = uvec2(ql1_u & 0xFFu, ql1_u >> 8u);
+                        const uvec2 qhv = uvec2(qh_u  & 0xFFu, qh_u  >> 8u);
+                        const vec2 qa = vec2(ivec2((ql0 & 15u) | ((qhv & 3u) << 4u)) - 32);
+                        const vec2 qb = vec2(ivec2((ql1 & 15u) | (((qhv >> 2u) & 3u) << 4u)) - 32);
+                        const vec2 qc = vec2(ivec2((ql0 >> 4u) | (((qhv >> 4u) & 3u) << 4u)) - 32);
+                        const vec2 qd = vec2(ivec2((ql1 >> 4u) | (((qhv >> 6u) & 3u) << 4u)) - 32);
+                        float s = 0.0;
+                        s = fma(float(u_sbyte_at(sc_b, is))      * dot(qa, xa), 1.0, s);
+                        s = fma(float(u_sbyte_at(sc_b, is + 2u)) * dot(qb, xb), 1.0, s);
+                        s = fma(float(u_sbyte_at(sc_b, is + 4u)) * dot(qc, xc), 1.0, s);
+                        s = fma(float(u_sbyte_at(sc_b, is + 6u)) * dot(qd, xd), 1.0, s);
+                        acc_u[r] = fma(d, s, acc_u[r]);
+                    }
+                }
+            }
+        } else if (UP_DTYPE == 6u) {
+            const uint nb2 = pc.n_in / 64u;
+            const uint total_bytes = nb2 * 16u;
+            for (uint idx = lane; idx < total_bytes; idx += sg_size) {
+                const uint ib2 = idx >> 4u;
+                const uint byte_in_blk = idx & 15u;
+                const uint x0 = x_base + ib2 * 64u + byte_in_blk * 4u;
+                const vec4 xv = vec4(x[x0], x[x0 + 1u], x[x0 + 2u], x[x0 + 3u]);
+                for (uint r = 0u; r < NR; ++r) {
+                    const uint b = row_u[r] + ib2 * 9u;
+                    const float d = unpackHalf2x16(uint(wu16[b])).x;
+                    const uint bt = u_ubyte_at(b + 1u, byte_in_blk);
+                    const vec4 q4 = vec4(
+                        float(int(bt & 3u) - 1),
+                        float(int((bt >> 2u) & 3u) - 1),
+                        float(int((bt >> 4u) & 3u) - 1),
+                        float(int((bt >> 6u) & 3u) - 1)
+                    );
+                    acc_u[r] = fma(d, dot(q4, xv), acc_u[r]);
+                }
+            }
+        } else {
+            for (uint k_i = lane; k_i < pc.n_in; k_i += sg_size) {
+                const float xv = x[x_base + k_i];
+                for (uint r = 0u; r < NR; ++r) {
+                    const uint idx = row_u[r] + 2u * k_i;
+                    const uint bits = uint(wu16[idx]) | (uint(wu16[idx + 1u]) << 16u);
+                    acc_u[r] = fma(uintBitsToFloat(bits), xv, acc_u[r]);
+                }
+            }
+        }
+    }
+
+    for (uint r = 0u; r < NR; ++r) {
+        const float g = subgroupAdd(acc_g[r]);
+        const float u = subgroupAdd(acc_u[r]);
+        if (subgroupElect() && row0 + r < pc.n_out) {
+            const float sg_val = g / (1.0 + exp(-g));
+            y[y_base + row0 + r] = sg_val * u;
+        }
+    }
+}

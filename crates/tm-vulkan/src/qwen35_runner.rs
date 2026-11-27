@@ -100,6 +100,7 @@ const SPV_ADD_BIAS_AXPY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/lora_
 const SPV_MOE_ROUTER_TOPK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_router_topk.spv"));
 const SPV_MOE_INDEXED_GEMV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/moe_indexed_gemv.spv"));
+const SPV_MOE_DUAL_GU_ACT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_dual_gu_act.spv"));
 const SPV_MOE_REDUCE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_reduce.spv"));
 
 const PREFERRED_MAX_BATCH: usize = 512;
@@ -453,7 +454,6 @@ struct MoeSharedExpertPlan {
 struct MoeLayerPlan {
     n_expert: u32,
     n_expert_used: u32,
-    n_ff_exp: u32,
     gating_func: u32,
     norm_weights: u32,
     has_exp_probs_b: u32,
@@ -463,15 +463,10 @@ struct MoeLayerPlan {
     router_batch: BatchGemmEntry,
     router_bias_set: Option<vk::DescriptorSet>,
     router_topk_set: vk::DescriptorSet,
-    gate_pipe: Arc<Pipeline>,
-    gate_set: vk::DescriptorSet,
-    gate_gx: u32,
-    gate_push: [u32; 9],
-    up_pipe: Arc<Pipeline>,
-    up_set: vk::DescriptorSet,
-    up_gx: u32,
-    up_push: [u32; 9],
-    silu_set: vk::DescriptorSet,
+    gu_pipe: Arc<Pipeline>,
+    gu_set: vk::DescriptorSet,
+    gu_gx: u32,
+    gu_push: [u32; 9],
     down_pipe: Arc<Pipeline>,
     down_set: vk::DescriptorSet,
     down_gx: u32,
@@ -1466,7 +1461,7 @@ impl Qwen35VkRunner {
             let n_exp = mp.n_expert;
             let k_used = mp.n_expert_used;
             let ff_exp = max_n_ff_exp_seen.max(1);
-            3 * n_exp + 2 * k_used + 2 * k_used * ff_exp + k_used * n_embd + n_embd + 2
+            3 * n_exp + 2 * k_used + k_used * ff_exp + k_used * n_embd + n_embd + 2
         });
         let per_tok_scratch = ((2 * n_embd
             + qkv_cap
@@ -1512,7 +1507,6 @@ impl Qwen35VkRunner {
             top_ids: VkSlice,
             top_w: VkSlice,
             gate: VkSlice,
-            up: VkSlice,
             down: VkSlice,
             shexp_out: Option<VkSlice>,
             shexp_gate: Option<VkSlice>,
@@ -1528,7 +1522,6 @@ impl Qwen35VkRunner {
                 top_ids: planner.reserve((max_batch * k_used * 4) as u64)?,
                 top_w: planner.reserve((max_batch * k_used * 4) as u64)?,
                 gate: planner.reserve((max_batch * k_used * ff_exp * 4) as u64)?,
-                up: planner.reserve((max_batch * k_used * ff_exp * 4) as u64)?,
                 down: planner.reserve((max_batch * k_used * n_embd * 4) as u64)?,
                 shexp_out: if any_moe_shexp_1d_gate {
                     Some(planner.reserve((max_batch * n_embd * 4) as u64)?)
@@ -3442,16 +3435,64 @@ impl Qwen35VkRunner {
                         Ok((pipe, set, gx, push))
                     };
 
+                    let mk_dual_gu = |gate_pm3: &PendingMat3D<'_>,
+                                      up_pm3: &PendingMat3D<'_>,
+                                      n_out: usize,
+                                      up_intra_off_bytes: usize,
+                                      x_slice: VkSlice,
+                                      y_slice: VkSlice,
+                                      x_tok_stride: usize|
+                     -> Result<
+                        (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 9]),
+                        VulkanError,
+                    > {
+                        let g_dt = dtype_code(gate_pm3.dtype)?;
+                        let u_dt = dtype_code(up_pm3.dtype)?;
+                        let wg = 128u32;
+                        let nr = 2u32;
+                        let key = g_dt | (u_dt << 4) | (nr << 8) | (wg << 16);
+                        let pipe = ctx.pipeline(
+                            "moe_dual_gu_act",
+                            key,
+                            SPV_MOE_DUAL_GU_ACT,
+                            5,
+                            36,
+                            &[wg, g_dt, u_dt, nr],
+                        )?;
+                        let set = alloc_set(
+                            &pipe,
+                            &[
+                                Binding::Arena(gate_pm3.slice),
+                                Binding::Arena(up_pm3.slice),
+                                Binding::Arena(x_slice),
+                                Binding::Arena(ms.top_ids),
+                                Binding::Arena(y_slice),
+                            ],
+                        )?;
+                        let rows_per_wg = (wg / sg).max(1) * nr;
+                        let gx = (n_out as u32).div_ceil(rows_per_wg);
+                        let push = [
+                            gate_pm3.cols as u32,
+                            n_out as u32,
+                            (gate_pm3.row_bytes / 2) as u32,
+                            (up_pm3.row_bytes / 2) as u32,
+                            (gate_pm3.exp_stride_bytes / 2) as u32,
+                            (up_pm3.exp_stride_bytes / 2) as u32,
+                            (up_intra_off_bytes / 2) as u32,
+                            m.n_expert_used as u32,
+                            x_tok_stride as u32,
+                        ];
+                        Ok((pipe, set, gx, push))
+                    };
+
                     let (
-                        (gate_pipe, gate_set, gate_gx, gate_push),
-                        (up_pipe, up_set, up_gx, up_push),
+                        (gu_pipe, gu_set, gu_gx, gu_push),
                         (down_pipe, down_set, down_gx, down_push),
                         mut gu_bytes,
                         mut dn_bytes,
                     ) = match &m.experts {
                         PendingMoeExperts::Separate { gate, up, down } => {
-                            let g = mk_indexed(gate, m.n_ff_exp, 0, s_xb, ms.gate, n_embd, 0, 0)?;
-                            let u = mk_indexed(up, m.n_ff_exp, 0, s_xb, ms.up, n_embd, 0, 0)?;
+                            let gu = mk_dual_gu(gate, up, m.n_ff_exp, 0, s_xb, ms.gate, n_embd)?;
                             let dn = mk_indexed(
                                 down,
                                 n_embd,
@@ -3466,14 +3507,12 @@ impl Qwen35VkRunner {
                                 + ((gate.exp_stride_bytes + up.exp_stride_bytes) * m.n_expert_used)
                                     as u64;
                             let dnb = (down.exp_stride_bytes * m.n_expert_used) as u64;
-                            (g, u, dn, gub, dnb)
+                            (gu, dn, gub, dnb)
                         }
                         PendingMoeExperts::FusedGateUp { gate_up, down } => {
                             let half_off = m.n_ff_exp * gate_up.row_bytes;
-                            let g =
-                                mk_indexed(gate_up, m.n_ff_exp, 0, s_xb, ms.gate, n_embd, 0, 0)?;
-                            let u = mk_indexed(
-                                gate_up, m.n_ff_exp, half_off, s_xb, ms.up, n_embd, 0, 0,
+                            let gu = mk_dual_gu(
+                                gate_up, gate_up, m.n_ff_exp, half_off, s_xb, ms.gate, n_embd,
                             )?;
                             let dn = mk_indexed(
                                 down,
@@ -3488,14 +3527,10 @@ impl Qwen35VkRunner {
                             let gub = m.gate_inp.mat.byte_len()
                                 + (gate_up.exp_stride_bytes * m.n_expert_used) as u64;
                             let dnb = (down.exp_stride_bytes * m.n_expert_used) as u64;
-                            (g, u, dn, gub, dnb)
+                            (gu, dn, gub, dnb)
                         }
                     };
 
-                    let silu_set = alloc_set(
-                        &pipes.silu_mul,
-                        &[Binding::Arena(ms.gate), Binding::Arena(ms.up)],
-                    )?;
                     let reduce_set = alloc_set(
                         &pipes.moe_reduce,
                         &[
@@ -3564,7 +3599,6 @@ impl Qwen35VkRunner {
                         Qwen35LayerFfnPlan::Moe(Box::new(MoeLayerPlan {
                             n_expert: m.n_expert as u32,
                             n_expert_used: m.n_expert_used as u32,
-                            n_ff_exp: m.n_ff_exp as u32,
                             gating_func: m.gating_func,
                             norm_weights: u32::from(m.norm_weights),
                             has_exp_probs_b: u32::from(m.exp_probs_b.is_some()),
@@ -3574,15 +3608,10 @@ impl Qwen35VkRunner {
                             router_batch,
                             router_bias_set,
                             router_topk_set,
-                            gate_pipe,
-                            gate_set,
-                            gate_gx,
-                            gate_push,
-                            up_pipe,
-                            up_set,
-                            up_gx,
-                            up_push,
-                            silu_set,
+                            gu_pipe,
+                            gu_set,
+                            gu_gx,
+                            gu_push,
                             down_pipe,
                             down_set,
                             down_gx,
@@ -4004,34 +4033,15 @@ impl Qwen35VkRunner {
             true,
         )?;
 
-        // 3. Indexed expert gate & up + SwiGLU
+        // 3. Fused indexed expert dual-(gate + up) + SwiGLU (`P1`)
         let gy = n_tok * moe.n_expert_used;
         self.cmd_dispatch_set(
             cb,
-            &moe.gate_pipe,
-            moe.gate_set,
-            &moe.gate_push,
-            moe.gate_gx,
+            &moe.gu_pipe,
+            moe.gu_set,
+            &moe.gu_push,
+            moe.gu_gx,
             gy,
-            false,
-        )?;
-        self.cmd_dispatch_set(
-            cb,
-            &moe.up_pipe,
-            moe.up_set,
-            &moe.up_push,
-            moe.up_gx,
-            gy,
-            true,
-        )?;
-        let total_ff = gy * moe.n_ff_exp;
-        self.cmd_dispatch_set(
-            cb,
-            &self.pipes.silu_mul,
-            moe.silu_set,
-            &[total_ff],
-            total_ff.div_ceil(256).min(65535),
-            1,
             true,
         )?;
 

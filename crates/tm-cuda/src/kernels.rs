@@ -92,6 +92,7 @@ pub struct CudaKernels {
     pub mmvq_iq4_xs_q8_1: CUfunction,
     pub mmvq_float_f32: CUfunction,
     pub wmma_gemm_mixed_f32: CUfunction,
+    pub wmma_gemm_mixed_64x64_f32: CUfunction,
     pub embed_tokens_f32: CUfunction,
     pub rms_norm_rows_f32: CUfunction,
     pub qk_rms_norm_inplace_f32: CUfunction,
@@ -114,9 +115,14 @@ pub struct CudaKernels {
     pub gdn_gates_f32: CUfunction,
     pub gdn_recurrence_step_f32: CUfunction,
     pub gdn_rms_norm_gated_f32: CUfunction,
+    pub gdn_conv1d_silu_split_batch_f32: CUfunction,
+    pub gdn_l2_gates_batch_f32: CUfunction,
+    pub gdn_recurrence_batch_f32: CUfunction,
+    pub gdn_rms_norm_gated_rows_f32: CUfunction,
     pub moe_router_topk_f32: CUfunction,
     pub moe_indexed_gemv_q8_1: CUfunction,
     pub moe_indexed_dual_gu_act_f32: CUfunction,
+    pub moe_cache_tick_promote: CUfunction,
     pub moe_build_expert_buckets_u32: CUfunction,
     pub wmma_moe_grouped_f32: CUfunction,
     pub moe_reduce_slots_f32: CUfunction,
@@ -147,6 +153,7 @@ impl CudaKernels {
             mmvq_iq4_xs_q8_1: ctx.get_function("mmvq_iq4_xs_q8_1")?,
             mmvq_float_f32: ctx.get_function("mmvq_float_f32")?,
             wmma_gemm_mixed_f32: ctx.get_function("wmma_gemm_mixed_f32")?,
+            wmma_gemm_mixed_64x64_f32: ctx.get_function("wmma_gemm_mixed_64x64_f32")?,
             embed_tokens_f32: ctx.get_function("embed_tokens_f32")?,
             rms_norm_rows_f32: ctx.get_function("rms_norm_rows_f32")?,
             qk_rms_norm_inplace_f32: ctx.get_function("qk_rms_norm_inplace_f32")?,
@@ -170,9 +177,14 @@ impl CudaKernels {
             gdn_gates_f32: ctx.get_function("gdn_gates_f32")?,
             gdn_recurrence_step_f32: ctx.get_function("gdn_recurrence_step_f32")?,
             gdn_rms_norm_gated_f32: ctx.get_function("gdn_rms_norm_gated_f32")?,
+            gdn_conv1d_silu_split_batch_f32: ctx.get_function("gdn_conv1d_silu_split_batch_f32")?,
+            gdn_l2_gates_batch_f32: ctx.get_function("gdn_l2_gates_batch_f32")?,
+            gdn_recurrence_batch_f32: ctx.get_function("gdn_recurrence_batch_f32")?,
+            gdn_rms_norm_gated_rows_f32: ctx.get_function("gdn_rms_norm_gated_rows_f32")?,
             moe_router_topk_f32: ctx.get_function("moe_router_topk_f32")?,
             moe_indexed_gemv_q8_1: ctx.get_function("moe_indexed_gemv_q8_1")?,
             moe_indexed_dual_gu_act_f32: ctx.get_function("moe_indexed_dual_gu_act_f32")?,
+            moe_cache_tick_promote: ctx.get_function("moe_cache_tick_promote")?,
             moe_build_expert_buckets_u32: ctx.get_function("moe_build_expert_buckets_u32")?,
             wmma_moe_grouped_f32: ctx.get_function("wmma_moe_grouped_f32")?,
             moe_reduce_slots_f32: ctx.get_function("moe_reduce_slots_f32")?,
@@ -328,6 +340,19 @@ impl CudaKernels {
                 (&mut rb as *mut usize).cast(),
                 (&mut nt as *mut i32).cast(),
             ];
+            if n_tok >= 64 {
+                // SAFETY: Matches `wmma_gemm_mixed_64x64_f32`.
+                return unsafe {
+                    ctx.launch(
+                        "wmma_gemm_mixed_64x64_f32",
+                        self.wmma_gemm_mixed_64x64_f32,
+                        ((w.rows as u32).div_ceil(64), (n_tok as u32).div_ceil(64), 1),
+                        (32, 4, 1),
+                        0,
+                        &mut args,
+                    )
+                };
+            }
             // SAFETY: Matches `wmma_gemm_mixed_f32`.
             return unsafe {
                 ctx.launch(
@@ -1289,6 +1314,8 @@ impl CudaKernels {
         &self,
         ctx: &CudaContext,
         w_exps_ptr: CUdeviceptr,
+        vram_cache_ptr: CUdeviceptr,
+        slot_of_exp_ptr: CUdeviceptr,
         xq_ptr: CUdeviceptr,
         x_f32_ptr: CUdeviceptr,
         top_ids_ptr: CUdeviceptr,
@@ -1306,6 +1333,8 @@ impl CudaKernels {
         out_mode: i32,
     ) -> Result<(), CudaError> {
         let mut pw = w_exps_ptr;
+        let mut pvc = vram_cache_ptr;
+        let mut pso = slot_of_exp_ptr;
         let mut pxq = xq_ptr;
         let mut pxf = x_f32_ptr;
         let mut pids = top_ids_ptr;
@@ -1320,8 +1349,10 @@ impl CudaKernels {
         let mut sc = slot_count as i32;
         let mut xm = x_mode;
         let mut om = out_mode;
-        let mut args: [*mut c_void; 15] = [
+        let mut args: [*mut c_void; 17] = [
             (&mut pw as *mut CUdeviceptr).cast(),
+            (&mut pvc as *mut CUdeviceptr).cast(),
+            (&mut pso as *mut CUdeviceptr).cast(),
             (&mut pxq as *mut CUdeviceptr).cast(),
             (&mut pxf as *mut CUdeviceptr).cast(),
             (&mut pids as *mut CUdeviceptr).cast(),
@@ -1390,16 +1421,21 @@ impl CudaKernels {
         ctx: &CudaContext,
         w_gate_ptr: CUdeviceptr,
         w_up_ptr: CUdeviceptr,
+        vram_gate_cache_ptr: CUdeviceptr,
+        vram_up_cache_ptr: CUdeviceptr,
+        slot_of_exp_ptr: CUdeviceptr,
         xq_ptr: CUdeviceptr,
         x_f32_ptr: CUdeviceptr,
         top_ids_ptr: CUdeviceptr,
         gate_scales_ptr: CUdeviceptr,
         up_scales_ptr: CUdeviceptr,
         out_act_ptr: CUdeviceptr,
-        dtype: i32,
+        gate_dtype: i32,
+        up_dtype: i32,
         n_ff_exp: usize,
         cols: usize,
-        row_bytes: usize,
+        gate_row_bytes: usize,
+        up_row_bytes: usize,
         gate_exp_stride: usize,
         up_exp_stride: usize,
         up_sub_offset_bytes: usize,
@@ -1411,16 +1447,21 @@ impl CudaKernels {
     ) -> Result<(), CudaError> {
         let mut pwg = w_gate_ptr;
         let mut pwu = w_up_ptr;
+        let mut pvgc = vram_gate_cache_ptr;
+        let mut pvuc = vram_up_cache_ptr;
+        let mut pso = slot_of_exp_ptr;
         let mut pxq = xq_ptr;
         let mut pxf = x_f32_ptr;
         let mut pids = top_ids_ptr;
         let mut pgs = gate_scales_ptr;
         let mut pus = up_scales_ptr;
         let mut pout = out_act_ptr;
-        let mut dt = dtype;
+        let mut gdt = gate_dtype;
+        let mut udt = up_dtype;
         let mut r = n_ff_exp as i32;
         let mut c = cols as i32;
-        let mut rb = row_bytes;
+        let mut grb = gate_row_bytes;
+        let mut urb = up_row_bytes;
         let mut ges = gate_exp_stride;
         let mut ues = up_exp_stride;
         let mut uso = up_sub_offset_bytes;
@@ -1428,19 +1469,24 @@ impl CudaKernels {
         let mut am = act_mode;
         let mut sb = situ_beta;
         let mut sl = situ_lb;
-        let mut args: [*mut c_void; 19] = [
+        let mut args: [*mut c_void; 24] = [
             (&mut pwg as *mut CUdeviceptr).cast(),
             (&mut pwu as *mut CUdeviceptr).cast(),
+            (&mut pvgc as *mut CUdeviceptr).cast(),
+            (&mut pvuc as *mut CUdeviceptr).cast(),
+            (&mut pso as *mut CUdeviceptr).cast(),
             (&mut pxq as *mut CUdeviceptr).cast(),
             (&mut pxf as *mut CUdeviceptr).cast(),
             (&mut pids as *mut CUdeviceptr).cast(),
             (&mut pgs as *mut CUdeviceptr).cast(),
             (&mut pus as *mut CUdeviceptr).cast(),
             (&mut pout as *mut CUdeviceptr).cast(),
-            (&mut dt as *mut i32).cast(),
+            (&mut gdt as *mut i32).cast(),
+            (&mut udt as *mut i32).cast(),
             (&mut r as *mut i32).cast(),
             (&mut c as *mut i32).cast(),
-            (&mut rb as *mut usize).cast(),
+            (&mut grb as *mut usize).cast(),
+            (&mut urb as *mut usize).cast(),
             (&mut ges as *mut usize).cast(),
             (&mut ues as *mut usize).cast(),
             (&mut uso as *mut usize).cast(),
@@ -1460,6 +1506,74 @@ impl CudaKernels {
                     n_tok as u32,
                 ),
                 (32, 4, 1),
+                0,
+                &mut args,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_moe_cache_tick_promote(
+        &self,
+        ctx: &CudaContext,
+        top_ids_ptr: CUdeviceptr,
+        hit_counts_ptr: CUdeviceptr,
+        slot_of_exp_ptr: CUdeviceptr,
+        exp_of_slot_ptr: CUdeviceptr,
+        host_g_ptr: CUdeviceptr,
+        vram_g_ptr: CUdeviceptr,
+        g_exp_bytes: usize,
+        host_u_ptr: CUdeviceptr,
+        vram_u_ptr: CUdeviceptr,
+        u_exp_bytes: usize,
+        host_d_ptr: CUdeviceptr,
+        vram_d_ptr: CUdeviceptr,
+        d_exp_bytes: usize,
+        n_ent: usize,
+        n_expert: usize,
+        cache_slots: usize,
+    ) -> Result<(), CudaError> {
+        let mut pids = top_ids_ptr;
+        let mut phc = hit_counts_ptr;
+        let mut pso = slot_of_exp_ptr;
+        let mut peo = exp_of_slot_ptr;
+        let mut phg = host_g_ptr;
+        let mut pvg = vram_g_ptr;
+        let mut gb = g_exp_bytes;
+        let mut phu = host_u_ptr;
+        let mut pvu = vram_u_ptr;
+        let mut ub = u_exp_bytes;
+        let mut phd = host_d_ptr;
+        let mut pvd = vram_d_ptr;
+        let mut db = d_exp_bytes;
+        let mut ne = n_ent as i32;
+        let mut nx = n_expert as i32;
+        let mut cs = cache_slots as i32;
+        let mut args: [*mut c_void; 16] = [
+            (&mut pids as *mut CUdeviceptr).cast(),
+            (&mut phc as *mut CUdeviceptr).cast(),
+            (&mut pso as *mut CUdeviceptr).cast(),
+            (&mut peo as *mut CUdeviceptr).cast(),
+            (&mut phg as *mut CUdeviceptr).cast(),
+            (&mut pvg as *mut CUdeviceptr).cast(),
+            (&mut gb as *mut usize).cast(),
+            (&mut phu as *mut CUdeviceptr).cast(),
+            (&mut pvu as *mut CUdeviceptr).cast(),
+            (&mut ub as *mut usize).cast(),
+            (&mut phd as *mut CUdeviceptr).cast(),
+            (&mut pvd as *mut CUdeviceptr).cast(),
+            (&mut db as *mut usize).cast(),
+            (&mut ne as *mut i32).cast(),
+            (&mut nx as *mut i32).cast(),
+            (&mut cs as *mut i32).cast(),
+        ];
+        // SAFETY: Matches `moe_cache_tick_promote`.
+        unsafe {
+            ctx.launch(
+                "moe_cache_tick_promote",
+                self.moe_cache_tick_promote,
+                (1, 1, 1),
+                (256, 1, 1),
                 0,
                 &mut args,
             )
@@ -1508,6 +1622,8 @@ impl CudaKernels {
         &self,
         ctx: &CudaContext,
         w_exps_ptr: CUdeviceptr,
+        vram_cache_ptr: CUdeviceptr,
+        slot_of_exp_ptr: CUdeviceptr,
         x_f32_ptr: CUdeviceptr,
         exp_offs_ptr: CUdeviceptr,
         tile_offs_ptr: CUdeviceptr,
@@ -1530,6 +1646,8 @@ impl CudaKernels {
         let n_ent = n_tok * slot_count;
         let max_tiles = (n_ent.div_ceil(16) + n_ent.min(n_expert)).max(1) as u32;
         let mut pw = w_exps_ptr;
+        let mut pvc = vram_cache_ptr;
+        let mut pso = slot_of_exp_ptr;
         let mut px = x_f32_ptr;
         let mut peo = exp_offs_ptr;
         let mut pto = tile_offs_ptr;
@@ -1547,8 +1665,10 @@ impl CudaKernels {
         let mut sc = slot_count as i32;
         let mut xm = x_mode;
         let mut om = out_mode;
-        let mut args: [*mut c_void; 18] = [
+        let mut args: [*mut c_void; 20] = [
             (&mut pw as *mut CUdeviceptr).cast(),
+            (&mut pvc as *mut CUdeviceptr).cast(),
+            (&mut pso as *mut CUdeviceptr).cast(),
             (&mut px as *mut CUdeviceptr).cast(),
             (&mut peo as *mut CUdeviceptr).cast(),
             (&mut pto as *mut CUdeviceptr).cast(),
@@ -1578,5 +1698,195 @@ impl CudaKernels {
                 &mut args,
             )
         }
+    }
+
+    /// Launches the 4-stage register-resident multi-token GDN pass (`0-ULP` bit-exact to `n_tok` single steps!).
+    /// `gate_mode`: `0` = SiLU (`Qwen3.5/3.6`), `1` = Sigmoid (`Qwen3.8`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_gdn_multi_step(
+        &self,
+        ctx: &CudaContext,
+        qkv_ptr: CUdeviceptr,
+        z_ptr: CUdeviceptr,
+        alpha_ptr: CUdeviceptr,
+        beta_ptr: CUdeviceptr,
+        conv_hist_in_ptr: CUdeviceptr,
+        conv_hist_out_ptr: CUdeviceptr,
+        opt_conv_snap_ptr: CUdeviceptr,
+        conv_w_ptr: CUdeviceptr,
+        ssm_a_ptr: CUdeviceptr,
+        ssm_dt_bias_ptr: CUdeviceptr,
+        ssm_norm_ptr: CUdeviceptr,
+        state_in_ptr: CUdeviceptr,
+        state_out_ptr: CUdeviceptr,
+        opt_state_snap_ptr: CUdeviceptr,
+        q_scratch_ptr: CUdeviceptr,
+        k_scratch_ptr: CUdeviceptr,
+        v_scratch_ptr: CUdeviceptr,
+        g_scratch_ptr: CUdeviceptr,
+        beta_act_scratch_ptr: CUdeviceptr,
+        opt_y_out_ptr: CUdeviceptr,
+        conv_dim: usize,
+        d_conv: usize,
+        hk: usize,
+        hv: usize,
+        s_dim: usize,
+        dv_dim: usize,
+        rms_eps: f32,
+        gate_mode: i32,
+        n_tok: usize,
+    ) -> Result<(), CudaError> {
+        let k_dim = hk * s_dim;
+        {
+            let mut pqkv = qkv_ptr;
+            let mut phin = conv_hist_in_ptr;
+            let mut phout = conv_hist_out_ptr;
+            let mut psnap = opt_conv_snap_ptr;
+            let mut pcw = conv_w_ptr;
+            let mut pq = q_scratch_ptr;
+            let mut pk = k_scratch_ptr;
+            let mut pv = v_scratch_ptr;
+            let mut cd = conv_dim as i32;
+            let mut dc = d_conv as i32;
+            let mut kd = k_dim as i32;
+            let mut nt = n_tok as i32;
+            let mut args: [*mut c_void; 12] = [
+                (&mut pqkv as *mut CUdeviceptr).cast(),
+                (&mut phin as *mut CUdeviceptr).cast(),
+                (&mut phout as *mut CUdeviceptr).cast(),
+                (&mut psnap as *mut CUdeviceptr).cast(),
+                (&mut pcw as *mut CUdeviceptr).cast(),
+                (&mut pq as *mut CUdeviceptr).cast(),
+                (&mut pk as *mut CUdeviceptr).cast(),
+                (&mut pv as *mut CUdeviceptr).cast(),
+                (&mut cd as *mut i32).cast(),
+                (&mut dc as *mut i32).cast(),
+                (&mut kd as *mut i32).cast(),
+                (&mut nt as *mut i32).cast(),
+            ];
+            // SAFETY: Matches `gdn_conv1d_silu_split_batch_f32`.
+            unsafe {
+                ctx.launch(
+                    "gdn_conv1d_silu_split_batch_f32",
+                    self.gdn_conv1d_silu_split_batch_f32,
+                    ((conv_dim as u32).div_ceil(256), 1, 1),
+                    (256, 1, 1),
+                    0,
+                    &mut args,
+                )?;
+            }
+        }
+        {
+            let mut pq = q_scratch_ptr;
+            let mut pk = k_scratch_ptr;
+            let mut pa = alpha_ptr;
+            let mut pb = beta_ptr;
+            let mut psa = ssm_a_ptr;
+            let mut pdb = ssm_dt_bias_ptr;
+            let mut pg = g_scratch_ptr;
+            let mut pbo = beta_act_scratch_ptr;
+            let mut chk = hk as i32;
+            let mut chv = hv as i32;
+            let mut csd = s_dim as i32;
+            let mut eps = rms_eps;
+            let mut args: [*mut c_void; 12] = [
+                (&mut pq as *mut CUdeviceptr).cast(),
+                (&mut pk as *mut CUdeviceptr).cast(),
+                (&mut pa as *mut CUdeviceptr).cast(),
+                (&mut pb as *mut CUdeviceptr).cast(),
+                (&mut psa as *mut CUdeviceptr).cast(),
+                (&mut pdb as *mut CUdeviceptr).cast(),
+                (&mut pg as *mut CUdeviceptr).cast(),
+                (&mut pbo as *mut CUdeviceptr).cast(),
+                (&mut chk as *mut i32).cast(),
+                (&mut chv as *mut i32).cast(),
+                (&mut csd as *mut i32).cast(),
+                (&mut eps as *mut f32).cast(),
+            ];
+            // SAFETY: Matches `gdn_l2_gates_batch_f32`.
+            unsafe {
+                ctx.launch(
+                    "gdn_l2_gates_batch_f32",
+                    self.gdn_l2_gates_batch_f32,
+                    ((hk + 1) as u32, n_tok as u32, 1),
+                    (32, 1, 1),
+                    0,
+                    &mut args,
+                )?;
+            }
+        }
+        {
+            let mut pst_in = state_in_ptr;
+            let mut pst_out = state_out_ptr;
+            let mut pst_snap = opt_state_snap_ptr;
+            let mut pq = q_scratch_ptr;
+            let mut pk = k_scratch_ptr;
+            let mut pv = v_scratch_ptr;
+            let mut pg = g_scratch_ptr;
+            let mut pb = beta_act_scratch_ptr;
+            let mut py = opt_y_out_ptr;
+            let mut chk = hk as i32;
+            let mut chv = hv as i32;
+            let mut csd = s_dim as i32;
+            let mut cdv = dv_dim as i32;
+            let mut nt = n_tok as i32;
+            let mut args: [*mut c_void; 14] = [
+                (&mut pst_in as *mut CUdeviceptr).cast(),
+                (&mut pst_out as *mut CUdeviceptr).cast(),
+                (&mut pst_snap as *mut CUdeviceptr).cast(),
+                (&mut pq as *mut CUdeviceptr).cast(),
+                (&mut pk as *mut CUdeviceptr).cast(),
+                (&mut pv as *mut CUdeviceptr).cast(),
+                (&mut pg as *mut CUdeviceptr).cast(),
+                (&mut pb as *mut CUdeviceptr).cast(),
+                (&mut py as *mut CUdeviceptr).cast(),
+                (&mut chk as *mut i32).cast(),
+                (&mut chv as *mut i32).cast(),
+                (&mut csd as *mut i32).cast(),
+                (&mut cdv as *mut i32).cast(),
+                (&mut nt as *mut i32).cast(),
+            ];
+            // SAFETY: Matches `gdn_recurrence_batch_f32`.
+            unsafe {
+                ctx.launch(
+                    "gdn_recurrence_batch_f32",
+                    self.gdn_recurrence_batch_f32,
+                    (hv as u32, (dv_dim as u32).div_ceil(4), 1),
+                    (32, 4, 1),
+                    0,
+                    &mut args,
+                )?;
+            }
+        }
+        if opt_y_out_ptr != 0 {
+            let mut py = opt_y_out_ptr;
+            let mut pz = z_ptr;
+            let mut pnw = ssm_norm_ptr;
+            let mut chv = hv as i32;
+            let mut cdv = dv_dim as i32;
+            let mut eps = rms_eps;
+            let mut gm = gate_mode;
+            let mut args: [*mut c_void; 7] = [
+                (&mut py as *mut CUdeviceptr).cast(),
+                (&mut pz as *mut CUdeviceptr).cast(),
+                (&mut pnw as *mut CUdeviceptr).cast(),
+                (&mut chv as *mut i32).cast(),
+                (&mut cdv as *mut i32).cast(),
+                (&mut eps as *mut f32).cast(),
+                (&mut gm as *mut i32).cast(),
+            ];
+            // SAFETY: Matches `gdn_rms_norm_gated_rows_f32`.
+            unsafe {
+                ctx.launch(
+                    "gdn_rms_norm_gated_rows_f32",
+                    self.gdn_rms_norm_gated_rows_f32,
+                    (hv as u32, n_tok as u32, 1),
+                    (32, 1, 1),
+                    0,
+                    &mut args,
+                )?;
+            }
+        }
+        Ok(())
     }
 }

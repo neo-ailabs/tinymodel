@@ -1544,6 +1544,7 @@ struct DSparkAdaptiveCtrl {
     single_step_s: f64,
     spec_steps: usize,
     cooldown: usize,
+    failed_probes: usize,
 }
 
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
@@ -1558,12 +1559,18 @@ impl DSparkAdaptiveCtrl {
             single_step_s,
             spec_steps: 0,
             cooldown: 0,
+            failed_probes: 0,
         }
     }
 
     #[inline]
+    fn is_permanently_disabled(&self) -> bool {
+        self.cooldown == usize::MAX
+    }
+
+    #[inline]
     fn choose_k(&mut self, cap_k: usize) -> usize {
-        if cap_k == 0 || self.max_k == 0 {
+        if cap_k == 0 || self.max_k == 0 || self.cooldown == usize::MAX {
             return 0;
         }
         if self.cooldown > 0 {
@@ -1613,20 +1620,23 @@ impl DSparkAdaptiveCtrl {
         }
         self.spec_steps += 1;
         let step_acc = (accepted as f32) / (drafted as f32);
-        self.ema_acc = 0.84 * self.ema_acc + 0.16 * step_acc;
-        self.ema_tok_per_step = 0.84 * self.ema_tok_per_step + 0.16 * (committed as f64);
+        self.ema_acc = 0.72 * self.ema_acc + 0.28 * step_acc;
+        self.ema_tok_per_step = 0.72 * self.ema_tok_per_step + 0.28 * (committed as f64);
         self.ema_step_s = if self.ema_step_s <= 0.0 {
             step_s
         } else {
-            0.84 * self.ema_step_s + 0.16 * step_s
+            0.72 * self.ema_step_s + 0.28 * step_s
         };
 
         // If a probe at k=1 succeeded (`accepted == 1`), ramp right back up!
-        if self.active_k == 1 && drafted == 1 && accepted == 1 && self.ema_acc < 0.52 {
-            self.ema_acc = 0.52;
+        if self.active_k == 1 && drafted == 1 && accepted == 1 {
+            self.failed_probes = 0;
+            if self.ema_acc < 0.52 {
+                self.ema_acc = 0.52;
+            }
         }
 
-        if self.spec_steps < 6 {
+        if self.spec_steps < 3 {
             return;
         }
 
@@ -1644,23 +1654,32 @@ impl DSparkAdaptiveCtrl {
         if self.single_step_s > 0.0 && self.ema_step_s > 0.0 {
             let spec_tps = self.ema_tok_per_step / self.ema_step_s;
             let base_tps = 1.0 / self.single_step_s;
-            if spec_tps < 0.94 * base_tps {
-                if self.active_k > 1 {
-                    self.active_k = (self.active_k - 1).min(target_k.max(1));
-                    self.ema_step_s = 0.0;
-                    return;
-                } else {
-                    self.active_k = 0;
-                    self.cooldown = 10;
+            if spec_tps < 1.02 * base_tps {
+                if self.active_k > 1 && self.ema_acc >= 0.20 {
+                    self.active_k = 1;
                     self.ema_step_s = 0.0;
                     return;
                 }
+                self.active_k = 0;
+                self.failed_probes += 1;
+                self.cooldown = if self.failed_probes >= 2 {
+                    usize::MAX
+                } else {
+                    12
+                };
+                self.ema_step_s = 0.0;
+                return;
             }
         }
 
         self.active_k = target_k;
         if self.active_k == 0 {
-            self.cooldown = 10;
+            self.failed_probes += 1;
+            self.cooldown = if self.failed_probes >= 2 {
+                usize::MAX
+            } else {
+                12
+            };
         }
     }
 }
@@ -2908,8 +2927,12 @@ fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
         let gguf = GgufFile::open(&opts.model)?;
         let tok = Tokenizer::from_gguf(&gguf)?;
         let prompt_ids = resolve_prompt_ids(&opts, &tok)?;
-        let runner =
+        let mut runner =
             tm_cuda::CudaRunner::from_gguf_with_kv_type(&gguf, opts.max_ctx, opts.kv_type)?;
+        if let Some(ref mp) = opts.mtp_path {
+            let mg = GgufFile::open(mp)?;
+            runner.attach_mtp_gguf(&mg)?;
+        }
         let draft_gguf = match &opts.draft_model {
             Some(p) => Some(GgufFile::open(p)?),
             None => None,
@@ -2998,7 +3021,16 @@ fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
     if let (tm_cuda::CudaRunner::Inkling2(ik), Some(ds)) = (&mut runner, &mut dspark_cuda) {
         let visits = ds.cfg.target_layers.clone();
         let max_k = opts.draft_max.min(ds.cfg.block_size.saturating_sub(1));
-        let mut ctrl = DSparkAdaptiveCtrl::new(max_k, 0.0);
+        // Measure single-step `CudaGraphExec` baseline latency before starting DSpark!
+        let single_step_s = if pos + 1 < opts.max_ctx {
+            let _ = ik.forward_token_greedy(next_id, pos)?;
+            let t_s1 = Instant::now();
+            let _ = ik.forward_token_greedy(next_id, pos)?;
+            t_s1.elapsed().as_secs_f64()
+        } else {
+            0.0
+        };
+        let mut ctrl = DSparkAdaptiveCtrl::new(max_k, single_step_s);
         let mut drafts = [0u32; tm_cuda::MAX_INKLING2_CUDA_SPEC_WINDOW];
         let mut probs = [0.0f32; tm_cuda::MAX_INKLING2_CUDA_SPEC_WINDOW];
         let mut win_toks = [0u32; tm_cuda::MAX_INKLING2_CUDA_SPEC_WINDOW];
@@ -3017,23 +3049,49 @@ fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
             let rem_ctx = opts.max_ctx.saturating_sub(pos + 1);
             let cap_k = max_k.min(rem_gen.saturating_sub(1)).min(rem_ctx);
             let ask_k = ctrl.choose_k(cap_k);
-            let (inj_pos, inj_cnt) = pending_inj.take().unwrap_or((0, 0));
-            let raw_d = ds.inject_and_draft_greedy_with_probs(
-                ik,
-                inj_pos,
-                inj_cnt,
-                pos,
-                next_id,
-                ask_k,
-                &mut drafts,
-                &mut probs,
-            )?;
-            let drafted = DSparkAdaptiveCtrl::gate_drafts(raw_d, &probs);
+            if ask_k == 0 && ctrl.is_permanently_disabled() {
+                // Circuit breaker permanently open: run pure `CudaGraphExec` single-step fast path!
+                next_id = ik.forward_token_greedy(next_id, pos)?;
+                pos += 1;
+                if !tok.is_stop_token(next_id) && generated < opts.n_predict {
+                    stdout.write_all(&tok.decode_token_bytes(next_id))?;
+                    stdout.flush()?;
+                    history.push(next_id);
+                    generated += 1;
+                }
+                continue;
+            }
+
+            let mut tap_slot = 0usize;
+            let drafted = if ask_k > 0 {
+                let (inj_pos, inj_cnt) = pending_inj.take().unwrap_or((0, 0));
+                let raw_d = ds.inject_and_draft_greedy_with_probs(
+                    ik,
+                    inj_pos,
+                    inj_cnt,
+                    pos,
+                    next_id,
+                    ask_k,
+                    &mut drafts,
+                    &mut probs,
+                )?;
+                DSparkAdaptiveCtrl::gate_drafts(raw_d, &probs)
+            } else {
+                if let Some((inj_pos, inj_cnt)) = pending_inj {
+                    if inj_cnt >= tm_cuda::MAX_INKLING2_CUDA_SPEC_WINDOW {
+                        ds.inject_batch(ik, inj_pos, inj_cnt)?;
+                        pending_inj = None;
+                    } else {
+                        tap_slot = inj_cnt;
+                    }
+                }
+                0
+            };
             let w = 1 + drafted;
             win_toks[0] = next_id;
             win_toks[1..w].copy_from_slice(&drafts[..drafted]);
 
-            ik.set_dspark_tap_slot(0);
+            ik.set_dspark_tap_slot(tap_slot);
             let _ = ik.forward_window_with_taps(
                 &win_toks[..w],
                 pos,
@@ -3042,6 +3100,7 @@ fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
                 &visits,
                 Some(&mut win_argmax[..w]),
             )?;
+            ik.set_dspark_tap_slot(0);
 
             let mut accepted = 0usize;
             let mut committed = 1usize;
@@ -3086,14 +3145,21 @@ fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
             } else if ask_k == 0 {
                 ctrl.observe(0, 0, 1, step_s);
             }
-            pending_inj = Some((pos, committed));
+            pending_inj = match pending_inj {
+                Some((inj_pos, inj_cnt)) => Some((inj_pos, inj_cnt + committed)),
+                None => Some((pos, committed)),
+            };
             pos += committed;
         }
     } else if is_pure_greedy && opts.spec_mode != SpecMode::Off {
         let builtin_name = runner.builtin_spec_name();
         let use_builtin =
             builtin_name.is_some() && matches!(opts.spec_mode, SpecMode::Auto | SpecMode::Mtp);
-        let max_k = opts.draft_max.clamp(1, tm_models::MAX_SPEC_WINDOW);
+        let max_k = if runner.arch() == "qwen4exp" && opts.spec_mode == SpecMode::Auto {
+            1
+        } else {
+            opts.draft_max.clamp(1, tm_models::MAX_SPEC_WINDOW)
+        };
         let mut suffix = SuffixDrafter::default();
         suffix.observe_sequence(&history);
         let mut ctrl = SpecController::new(max_k);
@@ -3101,6 +3167,8 @@ fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
         let mut committed_buf = Vec::with_capacity(max_k + 1);
         let mut spec_drafted = 0usize;
         let mut spec_accepted = 0usize;
+        let mut base_calib_steps = 0usize;
+        let mut verify_graph_warm = [false; tm_models::MAX_SPEC_WINDOW];
         let spec_label = builtin_name.filter(|_| use_builtin).unwrap_or("suffix");
 
         if !tok.is_stop_token(next_id) && opts.n_predict > 0 {
@@ -3114,10 +3182,17 @@ fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
             let rem_gen = opts.n_predict - generated;
             let rem_ctx = opts.max_ctx.saturating_sub(pos + 1);
             let cap_k = max_k.min(rem_gen.saturating_sub(1)).min(rem_ctx);
-            if cap_k == 0 {
+            // In `SpecMode::Auto`, run 2 initial single-token steps (step 0 captures `decode_graphs`,
+            // step 1 measures true steady-state `CudaGraphExec` latency) so `SpecController` has
+            // an accurate hardware `ema_base_ns` reference!
+            if cap_k == 0 || (opts.spec_mode == SpecMode::Auto && base_calib_steps < 2) {
                 let t_step = Instant::now();
                 next_id = runner.forward_token_greedy(next_id, pos)?;
-                ctrl.record_base_step(t_step.elapsed().as_nanos() as u64);
+                let step_ns = t_step.elapsed().as_nanos() as u64;
+                if base_calib_steps >= 1 {
+                    ctrl.record_base_step(step_ns);
+                }
+                base_calib_steps += 1;
                 pos += 1;
                 if !tok.is_stop_token(next_id) {
                     stdout.write_all(&tok.decode_token_bytes(next_id))?;
@@ -3146,7 +3221,14 @@ fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
                     let (d_cnt, a_cnt) =
                         runner.spec_step_builtin_greedy(next_id, pos, ask_k, &mut committed_buf)?;
                     let step_ns = t_step.elapsed().as_nanos() as u64;
-                    ctrl.record_mtp_verify(d_cnt, a_cnt, 0, step_ns);
+                    let k_idx = ask_k.saturating_sub(1).min(tm_models::MAX_SPEC_WINDOW - 1);
+                    let eff_ns = if verify_graph_warm[k_idx] {
+                        step_ns
+                    } else {
+                        verify_graph_warm[k_idx] = true;
+                        0
+                    };
+                    ctrl.record_mtp_verify(d_cnt, a_cnt, 0, eff_ns);
                     spec_drafted += d_cnt;
                     spec_accepted += a_cnt;
                     let mut actual_used = 0usize;
@@ -3193,7 +3275,14 @@ fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
                         &mut committed_buf,
                     )?;
                     let step_ns = t_step.elapsed().as_nanos() as u64;
-                    ctrl.record_suffix_verify(d_cnt, a_cnt, step_ns);
+                    let k_idx = ask_k.saturating_sub(1).min(tm_models::MAX_SPEC_WINDOW - 1);
+                    let eff_ns = if verify_graph_warm[k_idx] {
+                        step_ns
+                    } else {
+                        verify_graph_warm[k_idx] = true;
+                        0
+                    };
+                    ctrl.record_suffix_verify(d_cnt, a_cnt, eff_ns);
                     spec_drafted += d_cnt;
                     spec_accepted += a_cnt;
                     let mut actual_used = 0usize;
@@ -3341,8 +3430,12 @@ fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
             let arch = gguf.req_str("general.architecture")?.to_string();
             let active_decode_bytes = compute_active_decode_bytes(&gguf);
             let (pp_ids, corpus_mode) = resolve_bench_pp_ids(&opts, &gguf)?;
-            let runner =
+            let mut runner =
                 tm_cuda::CudaRunner::from_gguf_with_kv_type(&gguf, opts.max_ctx, opts.kv_type)?;
+            if let Some(ref mp) = opts.mtp_path {
+                let mg = GgufFile::open(mp)?;
+                runner.attach_mtp_gguf(&mg)?;
+            }
             let draft_gguf = match &opts.draft_model {
                 Some(p) => Some(GgufFile::open(p)?),
                 None => None,
@@ -3448,23 +3541,44 @@ fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
             let rem_ctx = opts.max_ctx.saturating_sub(cur_pos + 1);
             let cap_k = max_k.min(rem_gen.saturating_sub(1)).min(rem_ctx);
             let ask_k = ctrl.choose_k(cap_k);
-            let (inj_pos, inj_cnt) = pending_inj.take().unwrap_or((0, 0));
-            let raw_d = ds.inject_and_draft_greedy_with_probs(
-                ik,
-                inj_pos,
-                inj_cnt,
-                cur_pos,
-                tok,
-                ask_k,
-                &mut drafts,
-                &mut probs,
-            )?;
-            let drafted = DSparkAdaptiveCtrl::gate_drafts(raw_d, &probs);
+            if ask_k == 0 && ctrl.is_permanently_disabled() {
+                // Circuit breaker permanently open: run pure `CudaGraphExec` single-step fast path!
+                tok = ik.forward_token_greedy(tok, cur_pos)?;
+                cur_pos += 1;
+                gen_tokens.push(tok);
+                continue;
+            }
+
+            let mut tap_slot = 0usize;
+            let drafted = if ask_k > 0 {
+                let (inj_pos, inj_cnt) = pending_inj.take().unwrap_or((0, 0));
+                let raw_d = ds.inject_and_draft_greedy_with_probs(
+                    ik,
+                    inj_pos,
+                    inj_cnt,
+                    cur_pos,
+                    tok,
+                    ask_k,
+                    &mut drafts,
+                    &mut probs,
+                )?;
+                DSparkAdaptiveCtrl::gate_drafts(raw_d, &probs)
+            } else {
+                if let Some((inj_pos, inj_cnt)) = pending_inj {
+                    if inj_cnt >= tm_cuda::MAX_INKLING2_CUDA_SPEC_WINDOW {
+                        ds.inject_batch(ik, inj_pos, inj_cnt)?;
+                        pending_inj = None;
+                    } else {
+                        tap_slot = inj_cnt;
+                    }
+                }
+                0
+            };
             let w = 1 + drafted;
             win_toks[0] = tok;
             win_toks[1..w].copy_from_slice(&drafts[..drafted]);
 
-            ik.set_dspark_tap_slot(0);
+            ik.set_dspark_tap_slot(tap_slot);
             let _ = ik.forward_window_with_taps(
                 &win_toks[..w],
                 cur_pos,
@@ -3473,6 +3587,7 @@ fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
                 &visits,
                 Some(&mut win_argmax[..w]),
             )?;
+            ik.set_dspark_tap_slot(0);
 
             let mut accepted = 0usize;
             let mut committed = 1usize;
@@ -3506,14 +3621,21 @@ fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
             } else if ask_k == 0 {
                 ctrl.observe(0, 0, 1, step_s);
             }
-            pending_inj = Some((cur_pos, committed));
+            pending_inj = match pending_inj {
+                Some((inj_pos, inj_cnt)) => Some((inj_pos, inj_cnt + committed)),
+                None => Some((cur_pos, committed)),
+            };
             cur_pos += committed;
         }
     } else if opts.spec_mode != SpecMode::Off {
         let builtin_name = runner.builtin_spec_name();
         let use_builtin =
             builtin_name.is_some() && matches!(opts.spec_mode, SpecMode::Auto | SpecMode::Mtp);
-        let max_k = opts.draft_max.clamp(1, tm_models::MAX_SPEC_WINDOW);
+        let max_k = if arch == "qwen4exp" && opts.spec_mode == SpecMode::Auto {
+            1
+        } else {
+            opts.draft_max.clamp(1, tm_models::MAX_SPEC_WINDOW)
+        };
         let mut suffix = SuffixDrafter::default();
         if corpus_mode {
             suffix.observe_sequence(&pp_ids);

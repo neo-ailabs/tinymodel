@@ -200,8 +200,19 @@ impl CudaRunner {
     pub fn builtin_spec_name(&self) -> Option<&'static str> {
         match self {
             CudaRunner::Qwen35(r) if r.has_builtin_mtp() => Some("mtp"),
+            CudaRunner::Qwen4Exp(r) if r.has_builtin_mtp() => Some("mtp"),
             CudaRunner::Hy4(r) if r.has_builtin_dfly2() => Some("dfly2"),
             _ => None,
+        }
+    }
+
+    pub fn attach_mtp_gguf(&mut self, mtp_gguf: &tm_gguf::GgufFile) -> Result<(), CudaError> {
+        match self {
+            CudaRunner::Qwen4Exp(r) => r.attach_mtp_gguf(mtp_gguf),
+            _ => Err(CudaError::UnsupportedArch(format!(
+                "external --mtp GGUF attachment is not supported for architecture '{}'",
+                self.arch()
+            ))),
         }
     }
 
@@ -216,6 +227,9 @@ impl CudaRunner {
     ) -> Result<(usize, usize), CudaError> {
         match self {
             CudaRunner::Qwen35(r) if r.has_builtin_mtp() => {
+                r.spec_step_mtp_greedy(x_tok, pos, draft_k, out_committed)
+            }
+            CudaRunner::Qwen4Exp(r) if r.has_builtin_mtp() => {
                 r.spec_step_mtp_greedy(x_tok, pos, draft_k, out_committed)
             }
             CudaRunner::Hy4(r) if r.has_builtin_dfly2() => {

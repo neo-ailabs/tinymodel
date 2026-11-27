@@ -1728,12 +1728,12 @@ pack_strata_file(m_path, 1, m_secs, eng_sha)
             assert!(tok.is_stop_token(2));
         }
 
-        let mut cpu_st = cpu_m.new_state(cpu_eng, 32);
+        let mut cpu_st = cpu_m.new_state(cpu_eng, 64);
         let pool = ThreadPool::new(2);
         let kt = active_kernels();
 
         // Sibling `Hy4-Synth-Engram-Q8.strata` is auto-discovered when `engram_path` is `None`!
-        let (mut cuda_r, _) = CudaRunner::from_strata(&model_strata, None, 32).unwrap();
+        let (mut cuda_r, _) = CudaRunner::from_strata(&model_strata, None, 64).unwrap();
 
         // Include token `29` (`engram_token_map[29] == -1`, dead token) + 5 tokens so Layer 0 SWA (`window=4`) wraps!
         let pp = [3u32, 9, 29, 12, 5];
@@ -1799,6 +1799,34 @@ pack_strata_file(m_path, 1, m_secs, eng_sha)
                     "hy4 S_K+Q8_ROW decode pos={pos} cos_sim={cs} max_diff={max_diff_tg}"
                 );
             }
+        }
+
+        // Also verify `n_tok = 24 >= 16` Tensor Core `.strata` prefill (`wmma_hy4_sk_gemm_f32` +
+        // `wmma_hy4_latmoe_grouped_f32` + multi-token absorbed MLA) against CPU reference!
+        cpu_st.reset();
+        cuda_r.reset_state().unwrap();
+        let pp24: Vec<u32> = (0..24).map(|i| ((i * 5 + 3) % 31) as u32).collect();
+        cpu_m
+            .forward_tokens(&mut cpu_st, &pool, kt, &pp24, 0, true)
+            .unwrap();
+        let cuda_pp24 = cuda_r.forward_batch(&pp24, 0, true).unwrap().to_vec();
+        if mode == "f32" {
+            let max_diff24 = cpu_st
+                .logits()
+                .iter()
+                .zip(cuda_pp24.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff24 < 5e-3,
+                "hy4 F32 WMMA pp24 max_diff={max_diff24} (cpu={:?}, cuda={:?})",
+                &cpu_st.logits()[..6],
+                &cuda_pp24[..6]
+            );
+            assert_eq!(argmax(cpu_st.logits()), argmax(&cuda_pp24));
+        } else {
+            let cs24 = cos_sim(cpu_st.logits(), &cuda_pp24);
+            assert!(cs24 > 0.997, "hy4 S_K WMMA pp24 cos_sim={cs24}");
         }
     }
 
@@ -2263,6 +2291,369 @@ pack_strata_file(m_path, 1, secs)
     assert_eq!(
         hy_ref_seq, hy_spec_seq,
         "Hy4 built-in DFly2 speculative sequence diverged from greedy baseline!"
+    );
+
+    // Part C: `n_tok = 68 >= 64` `wmma_gemm_mixed_64x64_f32` + `launch_gdn_multi_step` +
+    //         captured `verify_graphs` (`P0-A/B`) + `TM_CUDA_MOE_CACHE_EXPERTS=2` (`P2`) 0-ULP!
+    {
+        // SAFETY: `--test-threads=1` serializes env var changes across tests.
+        unsafe {
+            std::env::set_var("TM_CUDA_MOE_HOST_OFFLOAD", "1");
+            std::env::set_var("TM_CUDA_MOE_CACHE_EXPERTS", "0");
+        }
+        let mut q35_nocache =
+            tm_cuda::Qwen35CudaRunner::from_gguf_with_kv_type(&gguf_q35, 128, KvType::F16).unwrap();
+        unsafe {
+            std::env::set_var("TM_CUDA_MOE_CACHE_EXPERTS", "2");
+        }
+        let mut q35_cached =
+            tm_cuda::Qwen35CudaRunner::from_gguf_with_kv_type(&gguf_q35, 128, KvType::F16).unwrap();
+        unsafe {
+            std::env::remove_var("TM_CUDA_MOE_HOST_OFFLOAD");
+            std::env::remove_var("TM_CUDA_MOE_CACHE_EXPERTS");
+        }
+
+        let pp68: Vec<u32> = (0..68).map(|i| ((i * 7 + 2) % 31) as u32).collect();
+        let mut cpu_st68 = Qwen35State::new(&cpu_q35, 128);
+        cpu_q35
+            .forward_batch(&mut cpu_st68, &pool, kt, &pp68, 0, true)
+            .unwrap();
+        let lg_nocache = q35_nocache.forward_batch(&pp68, 0, true).unwrap().to_vec();
+        let lg_cached = q35_cached.forward_batch(&pp68, 0, true).unwrap().to_vec();
+        assert_eq!(argmax(cpu_st68.logits()), argmax(&lg_nocache));
+        for (i, (&a, &b)) in lg_nocache.iter().zip(lg_cached.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "P2 VRAM expert cache prefill diverged at logit[{i}]: {a} vs {b}"
+            );
+        }
+
+        // Run 8 decode steps so `moe_cache_tick_promote` promotes hot experts into VRAM slots
+        // and verify 0-ULP bit-exactness at every step!
+        let mut t_cur = argmax(&lg_nocache);
+        for s in 0..8 {
+            let l0 = q35_nocache
+                .forward_token(t_cur, pp68.len() + s, true)
+                .unwrap()
+                .to_vec();
+            let l1 = q35_cached
+                .forward_token(t_cur, pp68.len() + s, true)
+                .unwrap()
+                .to_vec();
+            for (i, (&a, &b)) in l0.iter().zip(l1.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "P2 VRAM expert cache decode step {s} diverged at logit[{i}]: {a} vs {b}"
+                );
+            }
+            t_cur = argmax(&l0);
+        }
+
+        // Verify `verify_graphs` capture (call 1) + replay (call 2) on `Qwen35CudaRunner`!
+        let mut ref_vw = Vec::new();
+        let mut c_vw = t_cur;
+        for s in 0..6 {
+            c_vw = q35_cached
+                .forward_token_greedy(c_vw, pp68.len() + 8 + s)
+                .unwrap();
+            ref_vw.push(c_vw);
+        }
+        q35_cached.reset_state().unwrap();
+        let _ = q35_cached.forward_batch(&pp68, 0, true).unwrap();
+        let mut c2 = argmax(&lg_cached);
+        for s in 0..8 {
+            c2 = q35_cached.forward_token_greedy(c2, pp68.len() + s).unwrap();
+        }
+        assert_eq!(c2, t_cur);
+        let mut vw_comm = Vec::new();
+        let mut vw_seq = Vec::new();
+        let mut vw_pos = pp68.len() + 8;
+        let mut vw_tok = t_cur;
+        // Call 1 captures `verify_graphs[1]` (`d_len = 2`), Call 2 replays `verify_graphs[1]`!
+        let (_, acc1) = q35_cached
+            .verify_window_greedy(
+                vw_tok,
+                &[ref_vw[0], (ref_vw[1] + 5) % 30],
+                vw_pos,
+                &mut vw_comm,
+            )
+            .unwrap();
+        assert_eq!(acc1, 1);
+        for &ct in &vw_comm {
+            vw_tok = ct;
+            vw_seq.push(ct);
+            vw_pos += 1;
+        }
+        let (_, acc2) = q35_cached
+            .verify_window_greedy(vw_tok, &[ref_vw[2], ref_vw[3]], vw_pos, &mut vw_comm)
+            .unwrap();
+        assert_eq!(acc2, 2);
+        for &ct in &vw_comm {
+            vw_tok = ct;
+            vw_seq.push(ct);
+            vw_pos += 1;
+        }
+        while vw_seq.len() < 6 {
+            vw_tok = q35_cached.forward_token_greedy(vw_tok, vw_pos).unwrap();
+            vw_seq.push(vw_tok);
+            vw_pos += 1;
+        }
+        assert_eq!(
+            ref_vw, vw_seq,
+            "Qwen35 verify_graphs capture/replay diverged!"
+        );
+    }
+
+    // Part D: `Qwen4Exp` + companion `qwen4exp-mtp` GGUF (`mtp-q2_0.gguf`, `P0-B` + `P1`)!
+    let q4_trunk_path = out_dir.join("qwen4exp_trunk.gguf");
+    let q4_mtp_path = out_dir.join("mtp-q2_0.gguf");
+    let gen_q4_mtp = r#"
+import struct, sys
+from pathlib import Path
+import numpy as np
+
+trunk_out, mtp_out = Path(sys.argv[1]), Path(sys.argv[2])
+rng = np.random.default_rng(20261128)
+
+def gstr(s):
+    b = s.encode()
+    return struct.pack("<Q", len(b)) + b
+
+def write_gguf(path, kvs, tensors):
+    hdr = bytearray(b"GGUF")
+    hdr.extend(struct.pack("<IQQ", 3, len(tensors), len(kvs)))
+    for k, vt, v in kvs:
+        hdr.extend(gstr(k))
+        if vt == 94:
+            hdr.extend(struct.pack("<IIQ", 9, 4, len(v)))
+            for x in v: hdr.extend(struct.pack("<I", x))
+        else:
+            hdr.extend(struct.pack("<I", vt))
+            if vt == 4: hdr.extend(struct.pack("<I", v))
+            elif vt == 6: hdr.extend(struct.pack("<f", v))
+            elif vt == 8: hdr.extend(gstr(v))
+    offs, cur = [], 0
+    for _, _, _, raw in tensors:
+        cur = (cur + 31) // 32 * 32
+        offs.append(cur)
+        cur += len(raw)
+    for (n, dims, dt, _), off in zip(tensors, offs):
+        hdr.extend(gstr(n))
+        hdr.extend(struct.pack("<I", len(dims)))
+        for dm in dims: hdr.extend(struct.pack("<Q", dm))
+        hdr.extend(struct.pack("<IQ", dt, off))
+    while len(hdr) % 32 != 0: hdr.append(0)
+    base = len(hdr)
+    for (_, _, _, raw), off in zip(tensors, offs):
+        if len(hdr) < base + off: hdr.extend(b"\x00" * (base + off - len(hdr)))
+        hdr.extend(raw)
+    path.write_bytes(bytes(hdr))
+
+def pack_q2_0(rows, cols):
+    out = bytearray()
+    for _ in range(rows * (cols // 64)):
+        d = np.float16(rng.uniform(0.02, 0.08)).tobytes()
+        qs = rng.integers(0, 256, size=16, dtype=np.uint8).tobytes()
+        out.extend(d + qs)
+    return bytes(out)
+
+def pack_q3_k(rows, cols):
+    out = bytearray()
+    for _ in range(rows * (cols // 256)):
+        hm = rng.integers(0, 256, size=32, dtype=np.uint8).tobytes()
+        qs = rng.integers(0, 256, size=64, dtype=np.uint8).tobytes()
+        sc = rng.integers(0, 256, size=12, dtype=np.uint8).tobytes()
+        d = np.float16(rng.uniform(0.003, 0.01)).tobytes()
+        out.extend(hm + qs + sc + d)
+    return bytes(out)
+
+n_embd, hc, hc_lr, vocab = 256, 4, 32, 32
+hc_dim = hc * n_embd
+n_exp, top_k, n_ff_exp, n_ff_sh = 8, 2, 64, 128
+n_head, n_head_kv, head_dim, rope_dim = 4, 2, 64, 16
+hk, hv, s_dim, d_inner, d_conv = 2, 4, 32, 128, 4
+conv_dim = 2 * hk * s_dim + d_inner
+idx_nh, idx_d, idx_topk = 2, 32, 8
+
+kvs_t = [
+    ("general.architecture", 8, "qwen4exp"),
+    ("qwen4exp.block_count", 4, 2),
+    ("qwen4exp.embedding_length", 4, n_embd),
+    ("qwen4exp.hyper_connection.count", 4, hc),
+    ("qwen4exp.hyper_connection.low_rank", 4, hc_lr),
+    ("qwen4exp.expert_count", 4, n_exp),
+    ("qwen4exp.expert_used_count", 4, top_k),
+    ("qwen4exp.expert_feed_forward_length", 4, n_ff_exp),
+    ("qwen4exp.expert_shared_feed_forward_length", 4, n_ff_sh),
+    ("qwen4exp.attention.head_count", 4, n_head),
+    ("qwen4exp.attention.head_count_kv", 4, n_head_kv),
+    ("qwen4exp.attention.key_length", 4, head_dim),
+    ("qwen4exp.rope.dimension_count", 4, rope_dim),
+    ("qwen4exp.rope.freq_base", 6, 10000000.0),
+    ("qwen4exp.attention.layer_norm_rms_epsilon", 6, 1e-6),
+    ("qwen4exp.full_attention_interval", 4, 2),
+    ("qwen4exp.ssm.conv_kernel", 4, d_conv),
+    ("qwen4exp.ssm.state_size", 4, s_dim),
+    ("qwen4exp.ssm.group_count", 4, hk),
+    ("qwen4exp.ssm.time_step_rank", 4, hv),
+    ("qwen4exp.ssm.inner_size", 4, d_inner),
+    ("qwen4exp.attention.indexer.head_count", 4, idx_nh),
+    ("qwen4exp.attention.indexer.key_length", 4, idx_d),
+    ("qwen4exp.attention.indexer.top_k", 4, idx_topk),
+    ("qwen4exp.attention.compress_ratios", 94, [0, 4]),
+    ("qwen4exp.ple.layers", 94, []),
+]
+
+tt = []
+def add_1d(tl, name, n, lo=0.85, hi=1.15):
+    a = rng.uniform(lo, hi, n).astype(np.float32)
+    tl.append((name, (n,), 0, a.tobytes()))
+def add_mat(tl, name, rows, cols, s=0.12):
+    a = rng.uniform(-s, s, (rows, cols)).astype(np.float32)
+    tl.append((name, (cols, rows), 0, a.tobytes()))
+
+add_mat(tt, "token_embd.weight", vocab, n_embd, 0.2)
+add_mat(tt, "output.weight", vocab, n_embd, 0.2)
+add_1d(tt, "output_hc_norm.weight", hc_dim)
+add_mat(tt, "output_hc_down.weight", hc_lr, hc_dim, 0.08)
+add_mat(tt, "output_hc_up.weight", hc_dim, hc_lr, 0.08)
+
+for il in range(2):
+    p = f"blk.{il}"
+    for kind in ["attn", "ffn"]:
+        add_1d(tt, f"{p}.hc_{kind}_norm.weight", hc_dim)
+        add_mat(tt, f"{p}.hc_{kind}_down.weight", hc_lr, hc_dim, 0.08)
+        add_mat(tt, f"{p}.hc_{kind}_up.weight", hc_dim, hc_lr, 0.08)
+        add_mat(tt, f"{p}.hc_{kind}_inject.weight", hc, hc_dim, 0.08)
+    if il == 0:
+        add_mat(tt, f"{p}.attn_qkv.weight", conv_dim, n_embd)
+        add_mat(tt, f"{p}.attn_gate.weight", d_inner, n_embd)
+        add_mat(tt, f"{p}.ssm_alpha.weight", hv, n_embd)
+        add_mat(tt, f"{p}.ssm_beta.weight", hv, n_embd)
+        cw = rng.uniform(-0.2, 0.2, (conv_dim, d_conv)).astype(np.float32)
+        tt.append((f"{p}.ssm_conv1d.weight", (d_conv, conv_dim), 0, cw.tobytes()))
+        add_1d(tt, f"{p}.ssm_a", hv, -1.4, -0.6)
+        add_1d(tt, f"{p}.ssm_dt.bias", hv, -0.1, 0.1)
+        add_1d(tt, f"{p}.ssm_norm.weight", s_dim)
+        add_mat(tt, f"{p}.ssm_out.weight", n_embd, d_inner)
+    else:
+        add_1d(tt, f"{p}.attn_q_norm.weight", head_dim)
+        add_1d(tt, f"{p}.attn_k_norm.weight", head_dim)
+        add_mat(tt, f"{p}.attn_q.weight", 2 * n_head * head_dim, n_embd)
+        add_mat(tt, f"{p}.attn_k.weight", n_head_kv * head_dim, n_embd)
+        add_mat(tt, f"{p}.attn_v.weight", n_head_kv * head_dim, n_embd)
+        add_mat(tt, f"{p}.attn_output.weight", n_embd, n_head * head_dim)
+        add_mat(tt, f"{p}.indexer.q_proj.weight", idx_nh * idx_d, n_embd)
+        add_mat(tt, f"{p}.indexer.k_proj.weight", idx_d, n_embd)
+        add_1d(tt, f"{p}.indexer.q_norm.weight", idx_d)
+        add_1d(tt, f"{p}.indexer.k_norm.weight", idx_d)
+    add_mat(tt, f"{p}.ffn_gate_inp.weight", n_exp, n_embd, 0.4)
+    eb = np.linspace(-1.2, 1.2, n_exp).astype(np.float32)
+    tt.append((f"{p}.exp_probs_b.bias", (n_exp,), 0, eb.tobytes()))
+    tt.append((f"{p}.ffn_gate_exps.weight", (n_embd, n_ff_exp, n_exp), 42, pack_q2_0(n_exp * n_ff_exp, n_embd)))
+    tt.append((f"{p}.ffn_up_exps.weight", (n_embd, n_ff_exp, n_exp), 11, pack_q3_k(n_exp * n_ff_exp, n_embd)))
+    tt.append((f"{p}.ffn_down_exps.weight", (n_ff_exp, n_embd, n_exp), 42, pack_q2_0(n_exp * n_embd, n_ff_exp)))
+    add_mat(tt, f"{p}.ffn_gate_shexp.weight", n_ff_sh, n_embd)
+    add_mat(tt, f"{p}.ffn_up_shexp.weight", n_ff_sh, n_embd)
+    add_mat(tt, f"{p}.ffn_down_shexp.weight", n_embd, n_ff_sh)
+    add_mat(tt, f"{p}.ffn_gate_inp_shexp.weight", 1, n_embd)
+write_gguf(trunk_out, kvs_t, tt)
+
+# Build companion `qwen4exp-mtp` GGUF (`31` tensors, `GemmaRMSNorm` stored centered at 0.0!)
+tm = []
+def add_gnorm(name, n):
+    a = rng.uniform(-0.1, 0.1, n).astype(np.float32)
+    tm.append((name, (n,), 0, a.tobytes()))
+def add_hc_mtp(pfx, with_inj):
+    add_gnorm(f"{pfx}.hc_norm.weight", hc_dim)
+    add_mat(tm, f"{pfx}.input_mix_weight_down.weight", hc_lr, hc_dim, 0.08)
+    add_mat(tm, f"{pfx}.input_mix_weight_up.weight", hc_dim, hc_lr, 0.08)
+    if with_inj:
+        add_mat(tm, f"{pfx}.block_inject_weight.weight", hc, hc_dim, 0.08)
+
+add_gnorm("mtp.pre_fc_norm_embedding.weight", n_embd)
+add_gnorm("mtp.pre_fc_norm_hidden.weight", hc_dim)
+add_mat(tm, "mtp.fc_embedding.weight", n_embd, n_embd, 0.1)
+add_mat(tm, "mtp.fc_hidden.weight", n_embd, n_embd, 0.1)
+add_hc_mtp("mtp.hyper_connection_mixer", False)
+add_hc_mtp("mtp.layers.0.attn_hyper_connection", True)
+add_hc_mtp("mtp.layers.0.mlp_hyper_connection", True)
+add_gnorm("mtp.layers.0.self_attn.q_norm.weight", head_dim)
+add_gnorm("mtp.layers.0.self_attn.k_norm.weight", head_dim)
+add_mat(tm, "mtp.layers.0.self_attn.q_proj.weight", 2 * n_head * head_dim, n_embd)
+add_mat(tm, "mtp.layers.0.self_attn.k_proj.weight", n_head_kv * head_dim, n_embd)
+add_mat(tm, "mtp.layers.0.self_attn.v_proj.weight", n_head_kv * head_dim, n_embd)
+add_mat(tm, "mtp.layers.0.self_attn.o_proj.weight", n_embd, n_head * head_dim)
+add_mat(tm, "mtp.layers.0.self_attn.indexer.index_qk_proj.weight", (idx_nh + 1) * idx_d, n_embd)
+add_gnorm("mtp.layers.0.self_attn.indexer.q_layernorm.weight", idx_d)
+add_gnorm("mtp.layers.0.self_attn.indexer.k_layernorm.weight", idx_d)
+add_mat(tm, "mtp.layers.0.mlp.gate.weight", n_exp, n_embd, 0.4)
+tm.append(("mtp.layers.0.mlp.experts.gate_up_proj", (n_embd, 2 * n_ff_exp, n_exp), 42, pack_q2_0(n_exp * 2 * n_ff_exp, n_embd)))
+tm.append(("mtp.layers.0.mlp.experts.down_proj", (n_ff_exp, n_embd, n_exp), 42, pack_q2_0(n_exp * n_embd, n_ff_exp)))
+add_mat(tm, "mtp.layers.0.mlp.shared_expert.gate_proj.weight", n_ff_sh, n_embd)
+add_mat(tm, "mtp.layers.0.mlp.shared_expert.up_proj.weight", n_ff_sh, n_embd)
+add_mat(tm, "mtp.layers.0.mlp.shared_expert.down_proj.weight", n_embd, n_ff_sh)
+add_mat(tm, "mtp.layers.0.mlp.shared_expert_gate.weight", 1, n_embd)
+assert len(tm) == 31, f"expected 31 MTP tensors, got {len(tm)}"
+write_gguf(mtp_out, [("general.architecture", 8, "qwen4exp-mtp")], tm)
+"#;
+    assert!(
+        Command::new(&py)
+            .args([
+                "-c",
+                gen_q4_mtp,
+                q4_trunk_path.to_str().unwrap(),
+                q4_mtp_path.to_str().unwrap()
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let q4_gguf = GgufFile::open(&q4_trunk_path).unwrap();
+    let mut q4_cuda = CudaRunner::from_gguf_with_kv_type(&q4_gguf, 64, KvType::F16).unwrap();
+    // Sibling `mtp-q2_0.gguf` in the same directory is auto-discovered!
+    assert_eq!(q4_cuda.builtin_spec_name(), Some("mtp"));
+
+    let pp_q4 = [1u32, 3, 5, 7, 9, 11, 13, 15];
+    let lg_q4 = q4_cuda.forward_batch(&pp_q4, 0, true).unwrap().to_vec();
+    let q4_first = argmax(&lg_q4);
+
+    let mut q4_ref_seq = Vec::with_capacity(14);
+    let mut q4_cur = q4_first;
+    for s in 0..14 {
+        q4_cur = q4_cuda
+            .forward_token_greedy(q4_cur, pp_q4.len() + s)
+            .unwrap();
+        q4_ref_seq.push(q4_cur);
+    }
+
+    q4_cuda.reset_state().unwrap();
+    let _ = q4_cuda.forward_batch(&pp_q4, 0, true).unwrap();
+    let mut q4_mtp_seq = Vec::with_capacity(14);
+    let mut q4_comm = Vec::new();
+    let mut q4_pos = pp_q4.len();
+    let mut q4_tok = q4_first;
+    while q4_mtp_seq.len() < 14 {
+        let rem = 14 - q4_mtp_seq.len();
+        let dk = 3usize.min(rem.saturating_sub(1));
+        let (_d, _a) = q4_cuda
+            .spec_step_builtin_greedy(q4_tok, q4_pos, dk, &mut q4_comm)
+            .unwrap();
+        for &ct in &q4_comm {
+            q4_tok = ct;
+            q4_mtp_seq.push(ct);
+            q4_pos += 1;
+            if q4_mtp_seq.len() >= 14 {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        q4_ref_seq, q4_mtp_seq,
+        "Qwen4Exp neural MTP (`mtp-q2_0.gguf`) speculative sequence diverged from greedy baseline!"
     );
 
     let _ = std::fs::remove_dir_all(&out_dir);

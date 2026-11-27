@@ -4658,6 +4658,7 @@ impl Inkling2VkRunner {
         let top_k = self.cfg.n_expert_used;
         let sg = self.ctx.info().subgroup_size;
         let rows_per_wg = ((self.moe_wg / sg) * self.moe_nr) as usize;
+        let pairs_per_wg = ((self.moe_wg / sg) * 2) as usize;
 
         let fq8 = self.fused_q8_active();
         let use_moe_dp4a = self.dp4a_q8_enabled
@@ -4666,7 +4667,7 @@ impl Inkling2VkRunner {
             && n_embd.is_multiple_of(32)
             && n_ff.is_multiple_of(32);
 
-        // 1. Indexed `gate_up` `Q8_0` GEMV (`[2 * n_ff]` rows x `top_k` experts)
+        // 1. Fused indexed Dual-(Gate + Up) `Q8_0` GEMV + `SiTU-GLU` (`op = 6`, `P1`) & 2. `down` `Q8_0` GEMV
         if use_moe_dp4a && let Some(ref p_dp4a) = self.pipe_moe_dp4a {
             let (in_xq, in_xd) = if fq8 {
                 (&self.ffn_norm_q8.0, &self.ffn_norm_q8.1)
@@ -4681,102 +4682,28 @@ impl Inkling2VkRunner {
                     in_xq,
                     in_xd,
                     top_ids_buf,
-                    &self.exp_gate_up_buf,
-                ],
-                &[
-                    1,
-                    n_embd as u32,
-                    (2 * n_ff) as u32,
-                    vexp.gate_up_row_u16s,
-                    vexp.gate_up_expert_u16s,
-                    top_k as u32,
-                    0,
-                    0,
-                ],
-                (2 * n_ff).div_ceil(rows_per_wg) as u32,
-                top_k as u32,
-            )?;
-        } else {
-            rec.dispatch_xy(
-                &self.pipe_moe_ops,
-                &[
-                    &vexp.gate_up,
-                    x_buf,
-                    &self.dummy_buf,
-                    top_ids_buf,
-                    top_w_buf,
-                    &self.exp_gate_up_buf,
-                ],
-                &[
-                    1,
-                    n_embd as u32,
-                    (2 * n_ff) as u32,
-                    vexp.gate_up_row_u16s,
-                    vexp.gate_up_expert_u16s,
-                    top_k as u32,
-                    0,
-                    0,
-                ],
-                (2 * n_ff).div_ceil(rows_per_wg) as u32,
-                top_k as u32,
-            )?;
-        }
-        // 2. SiTU-GLU (+ fused `Q8_1`!) & 3. Indexed `down` `Q8_0` GEMV
-        if use_moe_dp4a && let Some(ref p_dp4a) = self.pipe_moe_dp4a {
-            if let Some(ref p_q8) = self.pipe_q8_ops {
-                rec.dispatch(
-                    p_q8,
-                    &[
-                        &self.dummy_buf,
-                        &self.exp_gate_up_buf,
-                        &self.exp_hidden_buf,
-                        &self.dummy_buf,
-                        &self.xq_buf,
-                        &self.xd_buf,
-                    ],
-                    &[
-                        2,
-                        (top_k * n_ff) as u32,
-                        n_ff as u32,
-                        0,
-                        0,
-                        self.cfg.situ_beta.to_bits(),
-                        self.cfg.situ_linear_beta.to_bits(),
-                        0,
-                    ],
-                    ((top_k * n_ff) / 32).div_ceil(4) as u32,
-                )?;
-            } else {
-                rec.dispatch(
-                    &self.pipe_moe_ops,
-                    &[
-                        &self.dummy_buf,
-                        &self.exp_gate_up_buf,
-                        &self.dummy_buf,
-                        top_ids_buf,
-                        top_w_buf,
-                        &self.exp_hidden_buf,
-                    ],
-                    &[
-                        2,
-                        (top_k * n_ff) as u32,
-                        n_ff as u32,
-                        0,
-                        0,
-                        0,
-                        self.cfg.situ_beta.to_bits(),
-                        self.cfg.situ_linear_beta.to_bits(),
-                    ],
-                    (top_k * n_ff).div_ceil(self.moe_wg as usize) as u32,
-                )?;
-                self.record_quant_q8_1(
-                    rec,
                     &self.exp_hidden_buf,
-                    &self.xq_buf,
-                    &self.xd_buf,
-                    top_k * n_ff,
-                )?;
-            }
+                ],
+                &[
+                    6,
+                    n_embd as u32,
+                    n_ff as u32,
+                    vexp.gate_up_row_u16s,
+                    vexp.gate_up_expert_u16s,
+                    top_k as u32,
+                    self.cfg.situ_beta.to_bits(),
+                    self.cfg.situ_linear_beta.to_bits(),
+                ],
+                n_ff.div_ceil(pairs_per_wg) as u32,
+                top_k as u32,
+            )?;
+            self.record_quant_q8_1(
+                rec,
+                &self.exp_hidden_buf,
+                &self.xq_buf,
+                &self.xd_buf,
+                top_k * n_ff,
+            )?;
             rec.dispatch_xy(
                 p_dp4a,
                 &[
@@ -4800,27 +4727,28 @@ impl Inkling2VkRunner {
                 top_k as u32,
             )?;
         } else {
-            rec.dispatch(
+            rec.dispatch_xy(
                 &self.pipe_moe_ops,
                 &[
-                    &self.dummy_buf,
-                    &self.exp_gate_up_buf,
+                    &vexp.gate_up,
+                    x_buf,
                     &self.dummy_buf,
                     top_ids_buf,
                     top_w_buf,
                     &self.exp_hidden_buf,
                 ],
                 &[
-                    2,
-                    (top_k * n_ff) as u32,
+                    6,
+                    n_embd as u32,
                     n_ff as u32,
-                    0,
-                    0,
-                    0,
+                    vexp.gate_up_row_u16s,
+                    vexp.gate_up_expert_u16s,
+                    top_k as u32,
                     self.cfg.situ_beta.to_bits(),
                     self.cfg.situ_linear_beta.to_bits(),
                 ],
-                (top_k * n_ff).div_ceil(self.moe_wg as usize) as u32,
+                n_ff.div_ceil(pairs_per_wg) as u32,
+                top_k as u32,
             )?;
             rec.dispatch_xy(
                 &self.pipe_moe_ops,
@@ -4883,8 +4811,10 @@ impl Inkling2VkRunner {
         let top_k = self.cfg.n_expert_used;
         let total_gpu_k = w * k_gpu;
         let pack_u7 = ((top_k as u32) << 16) | (k_gpu as u32);
+        let pack_p4_gu = (top_k as u32) | ((k_cpu as u32) << 8) | ((k_gpu as u32) << 16);
         let sg = self.ctx.info().subgroup_size;
         let rows_per_wg = ((self.moe_wg / sg) * self.moe_nr) as usize;
+        let pairs_per_wg = ((self.moe_wg / sg) * 2) as usize;
         let fq8 = self.fused_q8_active() && w <= MAX_INKLING2_SPEC_WINDOW;
         let use_moe_dp4a = self.dp4a_q8_enabled
             && n_embd >= self.dp4a_min_dim
@@ -4906,101 +4836,28 @@ impl Inkling2VkRunner {
                     in_xq,
                     in_xd,
                     top_ids_buf,
-                    &self.exp_gate_up_buf,
-                ],
-                &[
-                    1,
-                    n_embd as u32,
-                    (2 * n_ff) as u32,
-                    vexp.gate_up_row_u16s,
-                    vexp.gate_up_expert_u16s,
-                    top_k as u32,
-                    k_cpu as u32,
-                    pack_u7,
-                ],
-                (2 * n_ff).div_ceil(rows_per_wg) as u32,
-                total_gpu_k as u32,
-            )?;
-        } else {
-            rec.dispatch_xy(
-                &self.pipe_moe_ops,
-                &[
-                    &vexp.gate_up,
-                    x_buf,
-                    &self.dummy_buf,
-                    top_ids_buf,
-                    &self.dummy_buf,
-                    &self.exp_gate_up_buf,
-                ],
-                &[
-                    1,
-                    n_embd as u32,
-                    (2 * n_ff) as u32,
-                    vexp.gate_up_row_u16s,
-                    vexp.gate_up_expert_u16s,
-                    top_k as u32,
-                    k_cpu as u32,
-                    pack_u7,
-                ],
-                (2 * n_ff).div_ceil(rows_per_wg) as u32,
-                total_gpu_k as u32,
-            )?;
-        }
-        if use_moe_dp4a && let Some(ref p_dp4a) = self.pipe_moe_dp4a {
-            if let Some(ref p_q8) = self.pipe_q8_ops {
-                rec.dispatch(
-                    p_q8,
-                    &[
-                        &self.dummy_buf,
-                        &self.exp_gate_up_buf,
-                        &self.exp_hidden_buf,
-                        &self.dummy_buf,
-                        &self.ext_xq_buf,
-                        &self.ext_xd_buf,
-                    ],
-                    &[
-                        2,
-                        (total_gpu_k * n_ff) as u32,
-                        n_ff as u32,
-                        0,
-                        0,
-                        self.cfg.situ_beta.to_bits(),
-                        self.cfg.situ_linear_beta.to_bits(),
-                        0,
-                    ],
-                    ((total_gpu_k * n_ff) / 32).div_ceil(4) as u32,
-                )?;
-            } else {
-                rec.dispatch(
-                    &self.pipe_moe_ops,
-                    &[
-                        &self.dummy_buf,
-                        &self.exp_gate_up_buf,
-                        &self.dummy_buf,
-                        top_ids_buf,
-                        &self.dummy_buf,
-                        &self.exp_hidden_buf,
-                    ],
-                    &[
-                        2,
-                        (total_gpu_k * n_ff) as u32,
-                        n_ff as u32,
-                        0,
-                        0,
-                        0,
-                        self.cfg.situ_beta.to_bits(),
-                        self.cfg.situ_linear_beta.to_bits(),
-                    ],
-                    (total_gpu_k * n_ff).div_ceil(self.moe_wg as usize) as u32,
-                )?;
-                self.record_quant_q8_1(
-                    rec,
                     &self.exp_hidden_buf,
-                    &self.ext_xq_buf,
-                    &self.ext_xd_buf,
-                    total_gpu_k * n_ff,
-                )?;
-            }
+                ],
+                &[
+                    6,
+                    n_embd as u32,
+                    n_ff as u32,
+                    vexp.gate_up_row_u16s,
+                    vexp.gate_up_expert_u16s,
+                    pack_p4_gu,
+                    self.cfg.situ_beta.to_bits(),
+                    self.cfg.situ_linear_beta.to_bits(),
+                ],
+                n_ff.div_ceil(pairs_per_wg) as u32,
+                total_gpu_k as u32,
+            )?;
+            self.record_quant_q8_1(
+                rec,
+                &self.exp_hidden_buf,
+                &self.ext_xq_buf,
+                &self.ext_xd_buf,
+                total_gpu_k * n_ff,
+            )?;
             rec.dispatch_xy(
                 p_dp4a,
                 &[
@@ -5024,27 +4881,28 @@ impl Inkling2VkRunner {
                 total_gpu_k as u32,
             )
         } else {
-            rec.dispatch(
+            rec.dispatch_xy(
                 &self.pipe_moe_ops,
                 &[
-                    &self.dummy_buf,
-                    &self.exp_gate_up_buf,
+                    &vexp.gate_up,
+                    x_buf,
                     &self.dummy_buf,
                     top_ids_buf,
                     &self.dummy_buf,
                     &self.exp_hidden_buf,
                 ],
                 &[
-                    2,
-                    (total_gpu_k * n_ff) as u32,
+                    6,
+                    n_embd as u32,
                     n_ff as u32,
-                    0,
-                    0,
-                    0,
+                    vexp.gate_up_row_u16s,
+                    vexp.gate_up_expert_u16s,
+                    pack_p4_gu,
                     self.cfg.situ_beta.to_bits(),
                     self.cfg.situ_linear_beta.to_bits(),
                 ],
-                (total_gpu_k * n_ff).div_ceil(self.moe_wg as usize) as u32,
+                n_ff.div_ceil(pairs_per_wg) as u32,
+                total_gpu_k as u32,
             )?;
             rec.dispatch_xy(
                 &self.pipe_moe_ops,

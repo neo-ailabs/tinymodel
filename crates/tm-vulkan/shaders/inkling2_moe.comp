@@ -350,5 +350,95 @@ void main() {
                 }
             }
         }
+    } else if (pc.op == 6u) {
+        // Fused Dual-(Gate + Up) `Q8_0` GEMV + `SiTU-GLU` (`NR_PAIR = 2` pairs = `4` dot products/subgroup):
+        //   `p0 = n_in`, `p1 = n_ff`, `p2 = row_u16s`, `p3 = expert_u16s`,
+        //   `p4 = full_top_k | (k_off << 8) | (k_gpu << 16)`, `u6 = situ_beta_bits`, `u7 = situ_lb_bits`
+        const uint NR_PAIR = 2u;
+        const uint y_slot = gl_WorkGroupID.y;
+        const uint row0 = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * NR_PAIR;
+        if (row0 >= pc.p1) return;
+
+        const uint full_top_k = pc.p4 & 0xFFu;
+        const uint k_off = (pc.p4 >> 8u) & 0xFFu;
+        const uint k_gpu = pc.p4 >> 16u;
+        const uint id_slot = (k_gpu != 0u)
+            ? ((y_slot / k_gpu) * full_top_k + k_off + (y_slot % k_gpu))
+            : (k_off + y_slot);
+        const uint e_id = top_ids[id_slot];
+        const uint exp_base = e_id * pc.p3;
+        const uint x_base = (full_top_k != 0u)
+            ? (((k_gpu != 0u) ? (y_slot / k_gpu) : (id_slot / full_top_k)) * pc.p0)
+            : (y_slot * pc.p0);
+
+        const uint lane = gl_SubgroupInvocationID;
+        const uint sg_size = gl_SubgroupSize;
+        const uint nb = pc.p0 / 32u;
+        const uint sub_blk = lane >> 3u;
+        const uint sub_lane = lane & 7u;
+        const uint step_blk = max(sg_size >> 3u, 1u);
+        const uint q_u16_off = 1u + (sub_lane << 1u);
+        const uint x4_base = x_base >> 2u;
+
+        float acc_g[2];
+        float acc_u[2];
+        uint row_g[2];
+        uint row_u[2];
+        [[unroll]] for (uint r = 0u; r < NR_PAIR; ++r) {
+            acc_g[r] = 0.0;
+            acc_u[r] = 0.0;
+            const uint row = min(row0 + r, pc.p1 - 1u);
+            row_g[r] = exp_base + row * pc.p2;
+            row_u[r] = exp_base + (pc.p1 + row) * pc.p2;
+        }
+
+        for (uint ib = sub_blk; ib < nb; ib += step_blk) {
+            const vec4 xv = x4[x4_base + ib * 8u + sub_lane];
+            const uint blk_u16 = ib * 17u;
+            [[unroll]] for (uint r = 0u; r < NR_PAIR; ++r) {
+                const uint bg = row_g[r] + blk_u16;
+                const uint dwg = w32[bg >> 1u];
+                const float dg = ((bg & 1u) == 0u) ? unpackHalf2x16(dwg).x : unpackHalf2x16(dwg).y;
+                const uint qg = bg + q_u16_off;
+                const uint q32g = ((qg & 1u) == 0u)
+                    ? w32[qg >> 1u]
+                    : ((w32[qg >> 1u] >> 16u) | (w32[(qg >> 1u) + 1u] << 16u));
+                const vec4 q4g = vec4(
+                    float(bitfieldExtract(int(q32g), 0, 8)),
+                    float(bitfieldExtract(int(q32g), 8, 8)),
+                    float(bitfieldExtract(int(q32g), 16, 8)),
+                    float(bitfieldExtract(int(q32g), 24, 8))
+                );
+                acc_g[r] = fma(dg, dot(q4g, xv), acc_g[r]);
+
+                const uint bu = row_u[r] + blk_u16;
+                const uint dwu = w32[bu >> 1u];
+                const float du = ((bu & 1u) == 0u) ? unpackHalf2x16(dwu).x : unpackHalf2x16(dwu).y;
+                const uint qu = bu + q_u16_off;
+                const uint q32u = ((qu & 1u) == 0u)
+                    ? w32[qu >> 1u]
+                    : ((w32[qu >> 1u] >> 16u) | (w32[(qu >> 1u) + 1u] << 16u));
+                const vec4 q4u = vec4(
+                    float(bitfieldExtract(int(q32u), 0, 8)),
+                    float(bitfieldExtract(int(q32u), 8, 8)),
+                    float(bitfieldExtract(int(q32u), 16, 8)),
+                    float(bitfieldExtract(int(q32u), 24, 8))
+                );
+                acc_u[r] = fma(du, dot(q4u, xv), acc_u[r]);
+            }
+        }
+
+        const float beta = uintBitsToFloat(pc.u6);
+        const float lb = uintBitsToFloat(pc.u7);
+        [[unroll]] for (uint r = 0u; r < NR_PAIR; ++r) {
+            const float g = subgroupAdd(acc_g[r]);
+            const float u = subgroupAdd(acc_u[r]);
+            const uint row = row0 + r;
+            if (subgroupElect() && row < pc.p1) {
+                const float act_g = beta * accurate_tanh(g / beta) * (1.0 / (1.0 + exp(-g)));
+                const float act_u = (lb > 0.0) ? (lb * accurate_tanh(u / lb)) : u;
+                y[y_slot * pc.p1 + row] = act_g * act_u;
+            }
+        }
     }
 }
