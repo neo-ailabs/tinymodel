@@ -3,10 +3,10 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>tinymodel — Pure Rust Edge-First LLM Inference Engine</title>
-  <meta name="description" content="tinymodel: Rust stable 通用端侧 LLM 推理与微调引擎，覆盖 512MB Raspberry Pi Zero 2W、Pixel 8、RK3588、Apple Silicon 与桌面 GPU。" />
-  <meta property="og:title" content="tinymodel — Pure Rust Edge-First LLM Engine" />
-  <meta property="og:description" content="One Rust stable codebase from 512MB Raspberry Pi Zero 2W to desktop GPUs. Zero-copy GGUF, Qwen3.5 GDN, Gemma 4 PLE, LFM2, Vulkan CoopMat, Metal & QLoRA." />
+  <title>tinymodel — Pure Rust Edge-to-Blackwell LLM Inference &amp; Fine-Tuning Engine</title>
+  <meta name="description" content="tinymodel: Rust stable 通用端侧与全场景 LLM 推理及微调引擎，覆盖 512MB Raspberry Pi Zero 2W、Pixel 8、RK3588、Apple Silicon、RDNA4 Vulkan 与 NVIDIA Blackwell CUDA。" />
+  <meta property="og:title" content="tinymodel — Pure Rust Edge-to-Blackwell LLM Engine" />
+  <meta property="og:description" content="One Rust stable codebase from 512MB Raspberry Pi Zero 2W to NVIDIA Blackwell GPUs. Zero-copy GGUF & .strata, Qwen3.5/3.6 GDN+MTP, Gemma 4 PLE, Mamba-2, Multimodal ViT, Vulkan CoopMat, Metal, CUDA & QLoRA." />
   <meta property="og:type" content="website" />
   <link rel="icon" type="image/svg+xml" href="./assets/favicon.svg" />
   <link rel="stylesheet" href="./css/style.css" />
@@ -20,7 +20,7 @@
       <a class="brand" href="#top">
         <img src="./assets/favicon.svg" alt="tinymodel logo" />
         <span>tinymodel</span>
-        <span class="brand-tag">v0.1 · Rust</span>
+        <span class="brand-tag">v0.2 · Rust</span>
       </a>
 
       <nav id="nav-links" class="nav-links" aria-label="Main navigation">
@@ -47,16 +47,16 @@
       <div class="container">
         <div class="hero-eyebrow">
           <span class="pulse-dot" aria-hidden="true"></span>
-          <span data-i18n="hero.eyebrow">Rust Stable · Zero-Alloc Decode · MIT / Apache-2.0</span>
+          <span data-i18n="hero.eyebrow">Rust Stable · Metal / Vulkan / CUDA · MIT / Apache-2.0</span>
         </div>
 
         <h1>
-          <span data-i18n="hero.title_1">从 512MB 树莓派到桌面 GPU 的</span><br />
-          <span class="highlight" data-i18n="hero.title_highlight">纯 Rust 端侧 LLM 引擎</span>
+          <span data-i18n="hero.title_1">从 512MB 树莓派到 Blackwell 独显的</span><br />
+          <span class="highlight" data-i18n="hero.title_highlight">纯 Rust 端侧与全场景 LLM 引擎</span>
         </h1>
 
         <p class="hero-sub" data-i18n="hero.sub">
-          tinymodel 用同一份 Rust stable 代码库覆盖 Raspberry Pi Zero 2W（≤0.5B）、手机与 ARM 开发板（≤5B）及主机 GPU（≤8B 及 26B 循环 MoE）。直接 mmap 加载 GGUF，一等支持 Qwen3.5 GDN、Gemma 4 PLE、LFM2 与端侧 QLoRA 微调。
+          tinymodel 用同一份 Rust stable 代码库覆盖 Raspberry Pi Zero 2W（≤0.5B）、手机与 ARM 开发板（≤5B）及 Apple / AMD / NVIDIA 主机 GPU（稠密 ≤9B 与 26B–120B 稀疏 MoE）。零拷贝加载单/多分片 GGUF 与 .strata 容器，一等支持 Qwen3.5/3.6 GDN+MTP、Gemma 4 PLE、Mamba-2、多模态视觉及端侧 QLoRA 微调。
         </p>
 
         <div class="hero-actions">
@@ -67,31 +67,31 @@
 
         <div class="quick-cmd">
           <span class="prompt">$</span>
-          <code>git clone https://github.com/neo-ailabs/tinymodel &amp;&amp; cd tinymodel &amp;&amp; cargo build --release</code>
+          <code>git clone https://github.com/neo-ailabs/tinymodel &amp;&amp; cd tinymodel &amp;&amp; cargo build --release --features &quot;vulkan,cuda&quot;</code>
           <button id="copy-hero-cmd" class="copy-mini" type="button" data-i18n="copy">复制</button>
         </div>
 
         <!-- KPI Strip -->
         <div class="kpi-grid">
           <div class="kpi-card">
-            <div class="kpi-value accent">1.18 MiB</div>
-            <div class="kpi-label" data-i18n="kpi.1.label">micro 纯静态二进制</div>
-            <div class="kpi-desc" data-i18n="kpi.1.desc">aarch64-musl stripped ELF，0 条 sdot/smmla，512MB Zero 2W 稳跑</div>
-          </div>
-          <div class="kpi-card">
-            <div class="kpi-value green">0 ULP</div>
-            <div class="kpi-label" data-i18n="kpi.2.label">数值对齐门禁</div>
-            <div class="kpi-desc" data-i18n="kpi.2.desc">SIMD 与标量参考实现逐位一致，投机解码与前缀缓存 100% 确定性</div>
+            <div class="kpi-value accent">239.4 tok/s</div>
+            <div class="kpi-label" data-i18n="kpi.1.label">Qwen3.6-35B Q8 + MTP</div>
+            <div class="kpi-desc" data-i18n="kpi.1.desc">Blackwell CUDA 图捕获投机解码；30.6G DDR 卸载+64 槽缓存亦达 109.6 tok/s</div>
           </div>
           <div class="kpi-card">
             <div class="kpi-value blue">226%</div>
-            <div class="kpi-label" data-i18n="kpi.3.label">RX 9060 XT Vulkan 加速</div>
-            <div class="kpi-desc" data-i18n="kpi.3.desc">Decode 反超 ROCm 7.1.1 HIP 最高 2.26×，零 SDK 依赖预编译 SPIR-V</div>
+            <div class="kpi-label" data-i18n="kpi.2.label">RX 9060 XT Vulkan 加速</div>
+            <div class="kpi-desc" data-i18n="kpi.2.desc">Decode 反超 ROCm 7.1.1 HIP 最高 2.26×，零 SDK 依赖预编译 SPIR-V</div>
           </div>
           <div class="kpi-card">
-            <div class="kpi-value">1.47 GiB</div>
-            <div class="kpi-label" data-i18n="kpi.4.label">Pixel 8 跑 Gemma 4 E2B</div>
-            <div class="kpi-desc" data-i18n="kpi.4.desc">PLE 按需单行 mmap，总 RSS 仅 1.47 GiB，私有脏内存低至 55.6 MiB</div>
+            <div class="kpi-value green">0 ULP</div>
+            <div class="kpi-label" data-i18n="kpi.3.label">数值与投机确定性门禁</div>
+            <div class="kpi-desc" data-i18n="kpi.3.desc">SIMD/批 GDN/热专家缓存逐位一致，开启投机贪心输出 100% 不变</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-value">1.18 MiB</div>
+            <div class="kpi-label" data-i18n="kpi.4.label">micro 极简静态二进制</div>
+            <div class="kpi-desc" data-i18n="kpi.4.desc">512MB Zero 2W 纯 NEON 查表；Pixel 8 跑 Gemma 4 E2B 总 RSS 仅 1.47 GiB</div>
           </div>
         </div>
       </div>
@@ -105,7 +105,7 @@
             <div class="section-tag" data-i18n="profiles.tag">Hardware Profiles</div>
             <h2 class="section-title" data-i18n="profiles.title">一份代码，按三档硬件精准裁剪</h2>
             <p class="section-desc" data-i18n="profiles.desc">
-              通过 Cargo feature 与运行时 ISA 自动选择（NEON / dotprod / i8mm / AVX2 + Metal / Vulkan），兼顾极低功耗设备、移动终端与桌面独显。
+              通过 Cargo feature 与运行时 ISA / GPU 自动分派（NEON / dotprod / i8mm / AVX2 + Metal / Vulkan / CUDA），兼顾百兆级微设备、移动终端与旗舰独显。
             </p>
           </div>
         </div>
@@ -121,7 +121,7 @@
             <div class="section-tag" data-i18n="bench.tag">Verified Benchmarks</div>
             <h2 class="section-title" data-i18n="bench.title">真机实测性能与内存基线</h2>
             <p class="section-desc" data-i18n="bench.desc">
-              所有数据均来自仓库内可复现基准协议（与同一台机器上的 llama.cpp / ROCm HIP 对照实测）。
+              所有数据均来自仓库内可复现基准协议（与同一台机器上的 Strata CUDA / ROCm HIP / llama.cpp 对照实测）。
             </p>
           </div>
           <div id="bench-tabs" class="tab-group" role="tablist"></div>
@@ -146,9 +146,9 @@
         <div class="section-head">
           <div>
             <div class="section-tag" data-i18n="models.tag">First-Class Architectures</div>
-            <h2 class="section-title" data-i18n="models.title">一等支持新一代混合小模型与端侧微调</h2>
+            <h2 class="section-title" data-i18n="models.title">全谱系小模型、四大前沿 MoE、多模态与端侧微调</h2>
             <p class="section-desc" data-i18n="models.desc">
-              不走动态计算图，每个模型结构手写零分配 forward 与独立激活重算 QLoRA 反向。
+              不走动态计算图，每个模型结构手写零堆分配 forward、多步投机验证图捕获与独立激活重算 QLoRA 反向。
             </p>
           </div>
         </div>
@@ -162,9 +162,9 @@
         <div class="section-head">
           <div>
             <div class="section-tag" data-i18n="arch.tag">System Architecture</div>
-            <h2 class="section-title" data-i18n="arch.title">为端侧带宽与内存红线而生的分层设计</h2>
+            <h2 class="section-title" data-i18n="arch.title">为端侧带宽红线与 GPU 极致吞吐而生的分层设计</h2>
             <p class="section-desc" data-i18n="arch.desc">
-              严格隔离 unsafe 边界（仅限内核、GPU 后端、FFI 与 GGUF mmap），在生成 token 热路径上实现零堆分配。
+              严格隔离 unsafe 边界（仅限内核、GPU 后端、FFI 与 mmap），在生成 token 热路径上实现零堆分配。
             </p>
           </div>
         </div>
@@ -172,48 +172,50 @@
         <div class="arch-layout">
           <div class="arch-stack">
             <div class="arch-layer">
-              <div class="arch-layer-title">Interfaces &amp; Tools</div>
+              <div class="arch-layer-title">Interfaces &amp; Training</div>
               <div class="arch-crates">
                 <span class="crate-pill">tm-cli</span>
-                <span class="crate-pill">tm-train (QLoRA / MTP)</span>
+                <span class="crate-pill">tm-train (Safe QLoRA / MTP)</span>
                 <span class="crate-pill">tm-lora</span>
-                <span class="crate-pill">tm-tokenizer</span>
+                <span class="crate-pill">tm-tokenizer (BPE / SPM / HF JSON)</span>
               </div>
             </div>
             <div class="arch-layer accent">
-              <div class="arch-layer-title">Runtime &amp; State Management</div>
+              <div class="arch-layer-title">Runtime &amp; Speculative Engine</div>
               <div class="arch-crates">
                 <span class="crate-pill">tm-runtime</span>
                 <span class="crate-pill">Session</span>
-                <span class="crate-pill">LayerState</span>
+                <span class="crate-pill">LayerState (KV / MLA / GDN / SSM)</span>
                 <span class="crate-pill">PrefixCache (LRU)</span>
-                <span class="crate-pill">Suffix / MTP / DSpark Spec</span>
+                <span class="crate-pill">MTP / DFly2 / DSpark / Suffix</span>
               </div>
             </div>
             <div class="arch-layer">
               <div class="arch-layer-title">Hand-Written Model Modules</div>
               <div class="arch-crates">
                 <span class="crate-pill">tm-models</span>
-                <span class="crate-pill">llama / qwen2 / qwen3</span>
-                <span class="crate-pill">qwen35 (GDN)</span>
-                <span class="crate-pill">gemma4 (PLE)</span>
-                <span class="crate-pill">lfm2</span>
-                <span class="crate-pill">inkling2_loop</span>
+                <span class="crate-pill">10+ Dense (llama / qwen3 / phi3 ...)</span>
+                <span class="crate-pill">qwen35 &amp; qwen36 (GDN)</span>
+                <span class="crate-pill">gemma2–4 (PLE)</span>
+                <span class="crate-pill">lfm2–3 / mamba2</span>
+                <span class="crate-pill">inkling2 / qwen4exp / hy4flash</span>
+                <span class="crate-pill">vision (mmproj ViT)</span>
               </div>
             </div>
             <div class="arch-layer">
               <div class="arch-layer-title">Compute Backends (Isolated unsafe)</div>
               <div class="arch-crates">
-                <span class="crate-pill">tm-cpu (generic / neon / dotprod / i8mm / avx2)</span>
+                <span class="crate-pill">tm-cpu (generic / neon LUT / dotprod / i8mm / avx2)</span>
                 <span class="crate-pill">tm-metal (objc2-metal)</span>
-                <span class="crate-pill">tm-vulkan (ash + SPIR-V 1.2)</span>
+                <span class="crate-pill">tm-vulkan (SPIR-V 1.2 CoopMat)</span>
+                <span class="crate-pill">tm-cuda (Driver API + WMMA64 + CudaGraph)</span>
               </div>
             </div>
             <div class="arch-layer">
               <div class="arch-layer-title">Zero-Copy Foundation</div>
               <div class="arch-crates">
-                <span class="crate-pill">tm-gguf (mmap + ModelSpec)</span>
-                <span class="crate-pill">tm-core (DType + Arena + Zero-Dep)</span>
+                <span class="crate-pill">tm-gguf (Multi-Shard mmap + Q4_0x4)</span>
+                <span class="crate-pill">tm-core (DType + Q2_0/IQ + Arena)</span>
               </div>
             </div>
           </div>
@@ -231,7 +233,7 @@
             <div class="section-tag" data-i18n="cli.tag">Interactive Quickstart</div>
             <h2 class="section-title" data-i18n="cli.title">交互式 CLI 命令生成器</h2>
             <p class="section-desc" data-i18n="cli.desc">
-              按你的任务场景、硬件后端与量化策略，即时生成可直接复制执行的 tinymodel 命令。
+              按你的任务场景、硬件后端（含 CUDA / Vulkan / Metal / CPU）与卸载缓存策略，即时生成可直接复制执行的命令。
             </p>
           </div>
         </div>
@@ -251,26 +253,31 @@
             <div class="control-group">
               <label for="cli-backend" data-i18n="cli.backend">计算后端</label>
               <select id="cli-backend">
+                <option value="cuda">CUDA (NVIDIA Turing–Blackwell)</option>
+                <option value="vulkan">Vulkan (AMD / Intel / Mali / V3DV)</option>
                 <option value="metal">Metal (Apple Silicon)</option>
-                <option value="vulkan">Vulkan (AMD / Intel / Mali)</option>
                 <option value="cpu">CPU (NEON / i8mm / AVX2)</option>
               </select>
             </div>
             <div class="control-group">
               <label for="cli-model" data-i18n="cli.model">示例模型</label>
               <select id="cli-model">
+                <option value="Qwen3.6-35B-A3B-Q8_0.gguf">Qwen3.6-35B-A3B Q8_0 (GDN+MoE+MTP)</option>
+                <option value="Inkling-2-Mini-Q8_0.gguf">Inkling-2-Mini 26B Q8_0 (+DSpark)</option>
+                <option value="Qwen3.8-Flash-Next-Q2_0-00001-of-00002.gguf">Qwen3.8-Flash-Next Q2_0 (2-Shard)</option>
+                <option value="Hy4-Flash-SQ-64.strata">Tencent Hy4-Flash (.strata + DFly2)</option>
                 <option value="qwen35-0.8b.gguf">Qwen3.5-0.8B (GDN)</option>
                 <option value="gemma4-e2b.gguf">Gemma 4 E2B (PLE)</option>
                 <option value="smollm2-360m.gguf">SmolLM2-360M (micro)</option>
-                <option value="llama-3.2-1b.gguf">Llama-3.2-1B</option>
-                <option value="lfm2-350m.gguf">LFM2-350M (ShortConv)</option>
               </select>
             </div>
             <div class="control-group">
               <label for="cli-opt" data-i18n="cli.opt">优化特性</label>
               <select id="cli-opt">
-                <option value="spec">Auto Speculative + Q8 KV</option>
+                <option value="spec">Auto Speculative (MTP / DFly2 / DSpark)</option>
+                <option value="moe_cache">DDR MoE Offload + 64-Slot VRAM Cache (&lt;32GB)</option>
                 <option value="q8kv">Q8_0 KV Cache (-45% RAM)</option>
+                <option value="mmproj">Multimodal Vision (--mmproj + --image)</option>
                 <option value="lora">Dynamic GGUF LoRA</option>
                 <option value="micro">micro Q2_0 + Vocab Prune</option>
                 <option value="default">Default (F16 KV)</option>
@@ -297,7 +304,7 @@
             <div class="section-tag" data-i18n="roadmap.tag">Project Roadmap</div>
             <h2 class="section-title" data-i18n="roadmap.title">开发进度与里程碑</h2>
             <p class="section-desc" data-i18n="roadmap.desc">
-              以可量化的吞吐、KL 散度与二进制体积作为每阶段验收门禁。
+              以可量化的同机吞吐、多步 KL 散度、0-ULP 对齐与二进制体积作为每阶段验收门禁。
             </p>
           </div>
         </div>
@@ -315,6 +322,7 @@
       <div class="footer-links">
         <a href="https://github.com/neo-ailabs/tinymodel/blob/main/docs/ARCHITECTURE.md" target="_blank" rel="noopener noreferrer" data-i18n="footer.docs">架构文档</a>
         <a href="https://github.com/neo-ailabs/tinymodel/blob/main/docs/DECISIONS.md" target="_blank" rel="noopener noreferrer" data-i18n="footer.decisions">ADR 决策记录</a>
+        <a href="https://github.com/neo-ailabs/tinymodel/blob/main/docs/research/16-strata-4families-blackwell-comparison.md" target="_blank" rel="noopener noreferrer" data-i18n="footer.blackwell">Blackwell 实测报告</a>
         <a href="https://github.com/neo-ailabs/tinymodel/blob/main/docs/ROADMAP.md" target="_blank" rel="noopener noreferrer" data-i18n="footer.roadmap">路线图</a>
         <a href="https://github.com/neo-ailabs/tinymodel/blob/main/website/README.md" target="_blank" rel="noopener noreferrer" data-i18n="footer.deploy">低成本云部署指南</a>
       </div>

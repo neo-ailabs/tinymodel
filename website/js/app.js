@@ -3,7 +3,7 @@ import { I18N, PROFILES, BENCHMARKS, MODELS, ARCH_HIGHLIGHTS, ROADMAP } from "./
 const state = {
   lang: localStorage.getItem("tm_lang") || "zh",
   theme: localStorage.getItem("tm_theme") || "dark",
-  benchTab: "vulkan"
+  benchTab: "cuda"
 };
 
 function t(key) {
@@ -189,32 +189,48 @@ function renderRoadmap() {
 
 function updateCliCommand() {
   const mode = document.getElementById("cli-mode")?.value || "run";
-  const backend = document.getElementById("cli-backend")?.value || "metal";
-  const model = document.getElementById("cli-model")?.value || "qwen35-0.8b.gguf";
-  const opt = document.getElementById("cli-opt")?.value || "default";
+  const backend = document.getElementById("cli-backend")?.value || "cuda";
+  const model = document.getElementById("cli-model")?.value || "Qwen3.6-35B-A3B-Q8_0.gguf";
+  const opt = document.getElementById("cli-opt")?.value || "spec";
   const out = document.getElementById("cli-output");
   if (!out) return;
 
   const gpuFlag = backend === "cpu" ? "" : ` --${backend}`;
   let buildLine = "cargo build --release";
+  if (backend === "cuda") buildLine = "cargo build --release --features cuda";
   if (backend === "metal") buildLine = "cargo build --release --features metal";
   if (backend === "vulkan") buildLine = "cargo build --release --features vulkan";
   if (mode === "finetune") buildLine += backend === "cpu" ? " --features train" : ",train";
+
+  const envPrefix =
+    opt === "moe_cache" && backend === "cuda"
+      ? "TM_CUDA_MOE_HOST_OFFLOAD=10 TM_CUDA_MOE_CACHE_EXPERTS=64 "
+      : "";
+  const extraModelFlags =
+    model.endsWith(".strata")
+      ? " --engram models/Hy4-Flash-Engram-Q8.strata"
+      : model.startsWith("Inkling-2") && opt === "spec"
+      ? " --dspark models/dspark-Inkling-2-Mini-Q8_0.gguf"
+      : "";
 
   let runLine = "";
   if (mode === "run") {
     const optFlags =
       opt === "spec"
-        ? " --spec auto --kv-type q8_0"
+        ? model.startsWith("Inkling-2")
+          ? ""
+          : " --spec auto"
         : opt === "lora"
         ? " --lora adapter.gguf:1.0"
         : opt === "q8kv"
         ? " --kv-type q8_0"
+        : opt === "mmproj"
+        ? " --mmproj models/mmproj-f16.gguf --image demo.ppm"
         : "";
-    runLine = `./target/release/tinymodel run -m models/${model} -p "Explain Rust zero-cost abstractions:" -n 128${gpuFlag}${optFlags}`;
+    runLine = `${envPrefix}./target/release/tinymodel run -m models/${model}${extraModelFlags} -p "Explain Rust zero-cost abstractions:" -n 128${gpuFlag}${optFlags}`;
   } else if (mode === "bench") {
-    const optFlags = opt === "spec" ? " --spec auto" : opt === "q8kv" ? " --kv-type q8_0" : "";
-    runLine = `./target/release/tinymodel bench -m models/${model} -n 128${gpuFlag}${optFlags} --json`;
+    const optFlags = opt === "spec" && !model.startsWith("Inkling-2") ? " --spec auto" : opt === "q8kv" ? " --kv-type q8_0" : "";
+    runLine = `${envPrefix}./target/release/tinymodel bench -m models/${model}${extraModelFlags} -c 4096 -n 128${gpuFlag}${optFlags}`;
   } else if (mode === "convert") {
     const quantFlag = opt === "micro" ? "--quant q2_0 --prune-vocab 16384" : "--quant q4_0x4 --lm-head-quant q6_k";
     runLine = `./target/release/tinymodel convert -i models/${model} -o models/packed-${model} ${quantFlag}`;
@@ -283,7 +299,7 @@ function init() {
   });
 
   document.getElementById("copy-hero-cmd")?.addEventListener("click", () => {
-    copyText("git clone https://github.com/neo-ailabs/tinymodel && cd tinymodel && cargo build --release");
+    copyText("git clone https://github.com/neo-ailabs/tinymodel && cd tinymodel && cargo build --release --features \"vulkan,cuda\"");
   });
 
   document.getElementById("copy-cli-cmd")?.addEventListener("click", () => {

@@ -36,8 +36,8 @@
 | Raspberry Pi 5 | edge 档 SBC 基准（4×A76、dotprod） | `--target ssh://pi@<host>` | 手动或自托管 runner |
 | Raspberry Pi 4B | micro ISA 大内存基准（4×A72、纯 ARMv8.0 NEON） | `--target ssh://pi@<host> --profile micro` | 手动 |
 | Raspberry Pi Zero 2W | micro 档极限内存基准（4×A53、512MB） | `--target ssh://pi@<host> --profile micro` | 手动 |
-| **x86 + AMD RX 9060 XT**（RDNA4，8 GiB） | Vulkan 后端主力开发机（RADV）；同机还有 Intel UHD 770（ANV）和 lavapipe | `--target local` | 本地 |
-| x86 + NVIDIA | AVX2 / AVX-512、CUDA | `--target ssh://...` | 远期 |
+| **x86 + AMD RX 9060 XT**（RDNA4，8 GiB） | Vulkan 后端主力开发机（RADV）；同机还有 Intel UHD 770（ANV）和 lavapipe | `--target local` | 本地（已实测） |
+| **x86 + NVIDIA T1000 / RTX PRO 6000 Blackwell** | `AVX2`、`tm-cuda`（`sm_75` 本地对齐门禁 + `sm_120` `98 GiB` 四大家族全量基准） | `--target local` / `--target ssh://...` | 本地 + 远端已实测 |
 | CI（GitHub Actions） | x86_64 和 aarch64 Linux 的 L0/L1/L5 测试、交叉编译检查、GPU 后端只做编译检查 | — | 每次提交 |
 
 ### 外部设备一键测试命令（`bench/device_harness.py` + `tinymodel probe`）
@@ -65,3 +65,15 @@
 - **微基准与可移植性消融**：`cargo run --release -p tm-vulkan --example bench_vk_gemv_q4_0 [wg nr]`（Decode GEMV）、`cargo run --release -p tm-vulkan --example bench_vk_gemm`（V3 Prefill）及 `cargo run --release -p tm-vulkan --example bench_vk_portability [model.gguf]`（V5 Subgroup `8/16/32/64` 与 `shuffle`/`lds` 消融）。可通过 `TM_VK_PREFILL=auto|f16|i8|fallback` 切换端到端 Prefill 路径。RX 9060 XT 有 32 MB Infinity Cache，**小于 32 MB 的形状测的是缓存带宽**；带宽利用率要看 ≥64 MB 的形状（例如 `65536x4096`、`151936x1024`）。
 - **基线**：`bench/run_amd_gpu_baseline.sh <out.json>`（llama.cpp Vulkan + HIP，`-p 512 -n 128 -r 5 -ngl 99 -fa 1`）。
 - **Shader 编译**：改了 `shaders/*.comp` 之后运行 `crates/tm-vulkan/gen_spv.sh`，把重新生成的 `spv/` 一起提交。
+
+## 6. CUDA 后端（`tm-cuda`）
+
+- **构建与动态探测**：`tm-cuda/build.rs` 自动调用 `nvcc` 并行编译 `compute_75` 与 `compute_80` 两套 PTX；运行时动态加载 `libcuda.so.1`，无 NVIDIA 驱动的机器自动优雅跳过 GPU 测试而不破坏构建。
+- **对齐容差与逐位门禁**：
+  - 单步 `__dp4a` / `F32` 解码路径与 CPU 参考实现容差 `≤ 1e-4`（`F32` 稠密/MoE 为 `≤ 1e-5`）；
+  - `n_tok >= 16` 触发 FP16 输入 `wmma` Tensor Core 预填充（含 `wmma_gemm_mixed_64x64_f32` 与 `.strata` `wmma_hy4_sk_gemm_f32`）容差 `≤ 5e-3` 且贪心 `argmax` 一致；
+  - 多 token 寄存器驻留批 GDN（`gdn_step_batch_f32`）、`CudaGraphExec` 单图重放、`verify_graphs` 多步投机验证（内置 `nextn` MTP、`qwen4exp-mtp`、`DFly2`、`DSpark`）以及 `TM_CUDA_MOE_CACHE_EXPERTS` 热专家 VRAM 缓存均要求贪心 token 序列 **0-ULP / 100% 逐 token 一致**。
+- **必跑测试命令**（单 GPU 测试须加 `--test-threads=1` 避免多进程抢占显存上下文）：
+  ```sh
+  cargo test -p tm-cuda --test parity_cuda -- --test-threads=1
+  ```
