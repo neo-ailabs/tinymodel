@@ -1369,7 +1369,7 @@ impl<'a> VkDSparkCtx<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn inject_and_draft_greedy(
+    fn inject_and_draft_greedy_with_probs(
         &mut self,
         target: &mut tm_vulkan::Inkling2VkRunner,
         pool: &ThreadPool,
@@ -1380,9 +1380,10 @@ impl<'a> VkDSparkCtx<'a> {
         anchor_token_id: u32,
         max_k: usize,
         out_drafts: &mut [u32],
+        out_probs: &mut [f32],
     ) -> Result<usize> {
         match self {
-            Self::Gpu(g) => Ok(g.inject_and_draft_greedy(
+            Self::Gpu(g) => Ok(g.inject_and_draft_greedy_with_probs(
                 target,
                 inject_start_pos,
                 inject_count,
@@ -1390,6 +1391,7 @@ impl<'a> VkDSparkCtx<'a> {
                 anchor_token_id,
                 max_k,
                 out_drafts,
+                out_probs,
             )?),
             Self::Cpu {
                 model,
@@ -1414,7 +1416,7 @@ impl<'a> VkDSparkCtx<'a> {
                     return Ok(0);
                 }
                 target.embed_token_normed(anchor_token_id, emb_tmp)?;
-                Ok(model.draft_block_greedy(
+                let n = model.draft_block_greedy(
                     state,
                     pool,
                     kt,
@@ -1428,8 +1430,141 @@ impl<'a> VkDSparkCtx<'a> {
                             .expect("GPU DSpark project_dspark_greedy failed")
                     },
                     &mut out_drafts[..max_k],
-                )?)
+                )?;
+                out_probs[..n].fill(1.0);
+                Ok(n)
             }
+        }
+    }
+}
+
+#[cfg(feature = "vulkan")]
+struct DSparkAdaptiveCtrl {
+    max_k: usize,
+    active_k: usize,
+    ema_acc: f32,
+    ema_tok_per_step: f64,
+    ema_step_s: f64,
+    single_step_s: f64,
+    spec_steps: usize,
+    cooldown: usize,
+}
+
+#[cfg(feature = "vulkan")]
+impl DSparkAdaptiveCtrl {
+    fn new(max_k: usize, single_step_s: f64) -> Self {
+        Self {
+            max_k,
+            active_k: max_k,
+            ema_acc: 0.75,
+            ema_tok_per_step: 1.0 + 0.75 * (max_k as f64),
+            ema_step_s: 0.0,
+            single_step_s,
+            spec_steps: 0,
+            cooldown: 0,
+        }
+    }
+
+    #[inline]
+    fn choose_k(&mut self, cap_k: usize) -> usize {
+        if cap_k == 0 || self.max_k == 0 {
+            return 0;
+        }
+        if self.cooldown > 0 {
+            self.cooldown -= 1;
+            if self.cooldown == 0 {
+                // Probe 1 draft token to detect transition back to predictable text/code.
+                self.active_k = 1.min(cap_k);
+                return self.active_k;
+            }
+            return 0;
+        }
+        self.active_k.min(cap_k)
+    }
+
+    #[inline]
+    fn gate_drafts(drafted: usize, probs: &[f32]) -> usize {
+        let mut keep = 0usize;
+        let mut cum_p = 1.0f32;
+        for (j, &p) in probs.iter().enumerate().take(drafted) {
+            cum_p *= p;
+            // Calibrated for 201k-vocab `logit_softcap = 30.0` softmax:
+            // confident code/boilerplate tokens satisfy `p >= 0.10`, while uncertain open-class
+            // prose tails (`p < 0.06..0.10` or cumulative `< 0.03`) are truncated early.
+            let ok = if j == 0 {
+                p >= 0.06
+            } else {
+                p >= 0.10 && cum_p >= 0.03
+            };
+            if !ok {
+                break;
+            }
+            keep = j + 1;
+        }
+        keep
+    }
+
+    fn observe(&mut self, drafted: usize, accepted: usize, committed: usize, step_s: f64) {
+        if drafted == 0 {
+            if step_s > 0.0 {
+                self.single_step_s = if self.single_step_s <= 0.0 {
+                    step_s
+                } else {
+                    0.80 * self.single_step_s + 0.20 * step_s
+                };
+            }
+            return;
+        }
+        self.spec_steps += 1;
+        let step_acc = (accepted as f32) / (drafted as f32);
+        self.ema_acc = 0.84 * self.ema_acc + 0.16 * step_acc;
+        self.ema_tok_per_step = 0.84 * self.ema_tok_per_step + 0.16 * (committed as f64);
+        self.ema_step_s = if self.ema_step_s <= 0.0 {
+            step_s
+        } else {
+            0.84 * self.ema_step_s + 0.16 * step_s
+        };
+
+        // If a probe at k=1 succeeded (`accepted == 1`), ramp right back up!
+        if self.active_k == 1 && drafted == 1 && accepted == 1 && self.ema_acc < 0.52 {
+            self.ema_acc = 0.52;
+        }
+
+        if self.spec_steps < 6 {
+            return;
+        }
+
+        let target_k = if self.ema_acc >= 0.52 {
+            self.max_k
+        } else if self.ema_acc >= 0.38 {
+            self.max_k.min(2)
+        } else if self.ema_acc >= 0.24 {
+            self.max_k.min(1)
+        } else {
+            0
+        };
+
+        // Profitability guard against measured pure single-token `W=1` latency:
+        if self.single_step_s > 0.0 && self.ema_step_s > 0.0 {
+            let spec_tps = self.ema_tok_per_step / self.ema_step_s;
+            let base_tps = 1.0 / self.single_step_s;
+            if spec_tps < 0.94 * base_tps {
+                if self.active_k > 1 {
+                    self.active_k = (self.active_k - 1).min(target_k.max(1));
+                    self.ema_step_s = 0.0;
+                    return;
+                } else {
+                    self.active_k = 0;
+                    self.cooldown = 10;
+                    self.ema_step_s = 0.0;
+                    return;
+                }
+            }
+        }
+
+        self.active_k = target_k;
+        if self.active_k == 0 {
+            self.cooldown = 10;
         }
     }
 }
@@ -1511,14 +1646,14 @@ fn eval_inkling2_vk_batch<'a>(
     }
     let max_w = tm_vulkan::MAX_INKLING2_VK_WINDOW;
     let total = token_ids.len();
+    let visits: Vec<usize> = match dspark.as_deref() {
+        Some(ds) => ds.target_layers().to_vec(),
+        None => Vec::new(),
+    };
     let mut off = 0usize;
     while off < total {
         let w = (total - off).min(max_w);
         let is_last = off + w == total;
-        let visits: Vec<usize> = match dspark.as_deref() {
-            Some(ds) => ds.target_layers().to_vec(),
-            None => Vec::new(),
-        };
         let _ = eval_inkling2_vk_window(
             runner,
             host_helper,
@@ -1726,11 +1861,13 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
 
         if is_pure_greedy && let Some(ref mut ds) = dspark_ctx {
             let mut drafts = [0u32; 8];
+            let mut draft_probs = [0.0f32; 8];
             let mut win_toks = [0u32; tm_vulkan::MAX_INKLING2_VK_WINDOW];
             let mut win_argmax = [0u32; tm_vulkan::MAX_INKLING2_VK_WINDOW];
             let target_visits = ds.target_layers().to_vec();
             let bs = ds.block_size();
             let max_d_cfg = ds.max_draft_tokens();
+            let mut ctrl = DSparkAdaptiveCtrl::new(opts.draft_max.min(max_d_cfg), 0.0);
 
             // Emit `next_id` (first token predicted from prompt) immediately
             if !tok.is_stop_token(next_id) {
@@ -1742,30 +1879,52 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
 
             let mut pending_inj: Option<(usize, usize)> = None;
             while generated < opts.n_predict && !tok.is_stop_token(next_id) {
+                let t_step = Instant::now();
                 let rem_gen = opts.n_predict - generated;
-                let max_k = opts
+                let cap_k = opts
                     .draft_max
                     .min(max_d_cfg)
                     .min(rem_gen.saturating_sub(1))
                     .min(tm_vulkan::MAX_INKLING2_SPEC_WINDOW - 1);
-                let draft_k = if pos + bs <= opts.max_ctx { max_k } else { 0 };
-                let (inj_pos, inj_cnt) = pending_inj.take().unwrap_or((0, 0));
-                let drafted = ds.inject_and_draft_greedy(
-                    &mut runner,
-                    &pool,
-                    kt,
-                    inj_pos,
-                    inj_cnt,
-                    pos,
-                    next_id,
-                    draft_k,
-                    &mut drafts[..draft_k],
-                )?;
+                let ask_k = if pos + bs <= opts.max_ctx {
+                    ctrl.choose_k(cap_k)
+                } else {
+                    0
+                };
+
+                let mut tap_slot = 0usize;
+                let drafted = if ask_k > 0 {
+                    let (inj_pos, inj_cnt) = pending_inj.take().unwrap_or((0, 0));
+                    let raw_d = ds.inject_and_draft_greedy_with_probs(
+                        &mut runner,
+                        &pool,
+                        kt,
+                        inj_pos,
+                        inj_cnt,
+                        pos,
+                        next_id,
+                        ask_k,
+                        &mut drafts[..ask_k],
+                        &mut draft_probs[..ask_k],
+                    )?;
+                    DSparkAdaptiveCtrl::gate_drafts(raw_d, &draft_probs[..raw_d])
+                } else {
+                    if let Some((inj_pos, inj_cnt)) = pending_inj {
+                        if inj_cnt >= tm_vulkan::MAX_INKLING2_SPEC_WINDOW {
+                            ds.inject_batch(&runner, &pool, kt, inj_pos, inj_cnt)?;
+                            pending_inj = None;
+                        } else {
+                            tap_slot = inj_cnt;
+                        }
+                    }
+                    0
+                };
 
                 let w = 1 + drafted;
                 win_toks[0] = next_id;
                 win_toks[1..w].copy_from_slice(&drafts[..drafted]);
 
+                runner.set_dspark_tap_slot(tap_slot);
                 let _ = eval_inkling2_vk_window(
                     &mut runner,
                     &mut host_helper,
@@ -1778,6 +1937,7 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
                     &target_visits,
                     Some(&mut win_argmax[..w]),
                 )?;
+                runner.set_dspark_tap_slot(0);
 
                 let mut accepted = 0usize;
                 let mut committed = 1usize;
@@ -1822,8 +1982,17 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
                     total_drafted += drafted;
                     total_accepted += accepted;
                 }
+                let step_s = t_step.elapsed().as_secs_f64();
+                if drafted > 0 {
+                    ctrl.observe(drafted, accepted, committed, step_s);
+                } else if ask_k == 0 {
+                    ctrl.observe(0, 0, 1, step_s);
+                }
                 verify_steps += 1;
-                pending_inj = Some((pos, committed));
+                pending_inj = match pending_inj {
+                    Some((inj_pos, inj_cnt)) => Some((inj_pos, inj_cnt + committed)),
+                    None => Some((pos, committed)),
+                };
                 pos += committed;
 
                 if stop_now || generated >= opts.n_predict {
@@ -2139,7 +2308,33 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
         };
         let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
+        // Warmup 1 token + pre-bake steady-state `BakedCb` / `BakedSpecPlan` before timing
         let _ = eval_inkling2_vk_greedy(&mut runner, &mut host_helper, &pool, kt, 1, 0)?;
+        let single_tok_s = if let Some(ref ds) = dspark_ctx {
+            let tw = Instant::now();
+            let _ = eval_inkling2_vk_greedy(&mut runner, &mut host_helper, &pool, kt, 1, 1)?;
+            let s_lat = tw.elapsed().as_secs_f64();
+            let warm_w = (1 + opts.draft_max.min(ds.max_draft_tokens()))
+                .min(tm_vulkan::MAX_INKLING2_SPEC_WINDOW);
+            let warm_toks = [1u32; tm_vulkan::MAX_INKLING2_SPEC_WINDOW];
+            let mut warm_am = [0u32; tm_vulkan::MAX_INKLING2_SPEC_WINDOW];
+            let warm_visits = ds.target_layers().to_vec();
+            let _ = eval_inkling2_vk_window(
+                &mut runner,
+                &mut host_helper,
+                &pool,
+                kt,
+                &warm_toks[..warm_w],
+                2,
+                false,
+                true,
+                &warm_visits,
+                Some(&mut warm_am[..warm_w]),
+            )?;
+            s_lat
+        } else {
+            0.0
+        };
         runner.reset_state()?;
         if let Some((_, ref mut hs)) = host_helper {
             hs.reset();
@@ -2204,41 +2399,62 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
         let t0 = Instant::now();
         if let Some(ref mut ds) = dspark_ctx {
             let mut drafts = [0u32; 8];
+            let mut draft_probs = [0.0f32; 8];
             let mut win_toks = [0u32; tm_vulkan::MAX_INKLING2_VK_WINDOW];
             let mut win_argmax = [0u32; tm_vulkan::MAX_INKLING2_VK_WINDOW];
             let target_visits = ds.target_layers().to_vec();
             let bs = ds.block_size();
             let max_d_cfg = ds.max_draft_tokens();
+            let mut ctrl = DSparkAdaptiveCtrl::new(opts.draft_max.min(max_d_cfg), single_tok_s);
             let mut pending_inj: Option<(usize, usize)> = None;
 
             while gen_tokens.len() < n_gen + 1 {
+                let t_step = Instant::now();
                 let rem = (n_gen + 1) - gen_tokens.len();
-                let max_k = opts
+                let cap_k = opts
                     .draft_max
                     .min(max_d_cfg)
                     .min(rem.saturating_sub(1))
                     .min(tm_vulkan::MAX_INKLING2_SPEC_WINDOW - 1);
-                let draft_k = if cur_pos + bs <= opts.max_ctx {
-                    max_k
+                let ask_k = if cur_pos + bs <= opts.max_ctx {
+                    ctrl.choose_k(cap_k)
                 } else {
                     0
                 };
-                let (inj_pos, inj_cnt) = pending_inj.take().unwrap_or((0, 0));
-                let drafted = ds.inject_and_draft_greedy(
-                    &mut runner,
-                    &pool,
-                    kt,
-                    inj_pos,
-                    inj_cnt,
-                    cur_pos,
-                    tok,
-                    draft_k,
-                    &mut drafts[..draft_k],
-                )?;
+
+                let mut tap_slot = 0usize;
+                let drafted = if ask_k > 0 {
+                    let (inj_pos, inj_cnt) = pending_inj.take().unwrap_or((0, 0));
+                    let raw_d = ds.inject_and_draft_greedy_with_probs(
+                        &mut runner,
+                        &pool,
+                        kt,
+                        inj_pos,
+                        inj_cnt,
+                        cur_pos,
+                        tok,
+                        ask_k,
+                        &mut drafts[..ask_k],
+                        &mut draft_probs[..ask_k],
+                    )?;
+                    DSparkAdaptiveCtrl::gate_drafts(raw_d, &draft_probs[..raw_d])
+                } else {
+                    if let Some((inj_pos, inj_cnt)) = pending_inj {
+                        if inj_cnt >= tm_vulkan::MAX_INKLING2_SPEC_WINDOW {
+                            ds.inject_batch(&runner, &pool, kt, inj_pos, inj_cnt)?;
+                            pending_inj = None;
+                        } else {
+                            tap_slot = inj_cnt;
+                        }
+                    }
+                    0
+                };
+
                 let w = 1 + drafted;
                 win_toks[0] = tok;
                 win_toks[1..w].copy_from_slice(&drafts[..drafted]);
 
+                runner.set_dspark_tap_slot(tap_slot);
                 let _ = eval_inkling2_vk_window(
                     &mut runner,
                     &mut host_helper,
@@ -2251,6 +2467,7 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
                     &target_visits,
                     Some(&mut win_argmax[..w]),
                 )?;
+                runner.set_dspark_tap_slot(0);
 
                 let mut accepted = 0usize;
                 let mut committed = 1usize;
@@ -2278,7 +2495,16 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
                     dspark_drafted += drafted;
                     dspark_accepted += accepted;
                 }
-                pending_inj = Some((cur_pos, committed));
+                let step_s = t_step.elapsed().as_secs_f64();
+                if drafted > 0 {
+                    ctrl.observe(drafted, accepted, committed, step_s);
+                } else if ask_k == 0 {
+                    ctrl.observe(0, 0, 1, step_s);
+                }
+                pending_inj = match pending_inj {
+                    Some((inj_pos, inj_cnt)) => Some((inj_pos, inj_cnt + committed)),
+                    None => Some((cur_pos, committed)),
+                };
                 cur_pos += committed;
             }
             if let Some((inj_pos, inj_cnt)) = pending_inj.take() {

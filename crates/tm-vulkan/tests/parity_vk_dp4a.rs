@@ -250,7 +250,7 @@ fn parity_vk_dp4a_qwen35_and_llama_and_inkling2() {
 
     // 1. Qwen3.5 (`n_embd = 256` -> triggers default `Auto` `use_dp4a_dec = true` on all DP4A GPUs!)
     let mut rng = Rng(0xD94A_3500_2026_1126);
-    let n_layers = 2usize; // layer 0 = GDN, layer 1 = FullAttn
+    let n_layers = 3usize; // layer 0 = GDN (Q8_0/Q5_K), layer 1 = FullAttn (Q5_K), layer 2 = GDN (Q6_K pair + Q6_K dp4a!)
     let n_embd = 256usize;
     let n_ff = 512usize;
     let n_head = 4usize;
@@ -301,8 +301,8 @@ fn parity_vk_dp4a_qwen35_and_llama_and_inkling2() {
         TensorEntry {
             name: "output.weight".into(),
             dims: vec![n_embd as u64, vocab as u64],
-            ggml_type: 2, // Q4_0 -> exercises `lm_head_dec` dp4a + `forward_batch` `rms_norm_q8_1`!
-            data: make_q4_0_bytes(&mut rng, vocab, n_embd),
+            ggml_type: 14, // Q6_K -> exercises `lm_head_dec` Q6_K dp4a + `forward_batch` `rms_norm_q8_1`!
+            data: make_q6_k_bytes(&mut rng, vocab, n_embd),
         },
         TensorEntry {
             name: "output_norm.weight".into(),
@@ -325,7 +325,9 @@ fn parity_vk_dp4a_qwen35_and_llama_and_inkling2() {
             ggml_type: 0,
             data: make_f32_bytes(&mut rng, n_embd, 1.0, 0.15),
         });
-        if l == 0 {
+        if l % 2 == 0 {
+            let alpha_beta_type = if l == 0 { 8u32 } else { 14u32 }; // l=0: Q8_0 pair, l=2: Q6_K pair!
+            let ssm_out_type = if l == 0 { 13u32 } else { 14u32 }; // l=0: Q5_K dp4a, l=2: Q6_K dp4a + residual!
             ts35.push(TensorEntry {
                 name: format!("{p}.attn_qkv.weight"),
                 dims: vec![n_embd as u64, conv_dim as u64],
@@ -341,14 +343,22 @@ fn parity_vk_dp4a_qwen35_and_llama_and_inkling2() {
             ts35.push(TensorEntry {
                 name: format!("{p}.ssm_alpha.weight"),
                 dims: vec![n_embd as u64, hv as u64],
-                ggml_type: 8, // Q8_0 pair!
-                data: make_q8_0_bytes(&mut rng, hv, n_embd),
+                ggml_type: alpha_beta_type,
+                data: if alpha_beta_type == 8 {
+                    make_q8_0_bytes(&mut rng, hv, n_embd)
+                } else {
+                    make_q6_k_bytes(&mut rng, hv, n_embd)
+                },
             });
             ts35.push(TensorEntry {
                 name: format!("{p}.ssm_beta.weight"),
                 dims: vec![n_embd as u64, hv as u64],
-                ggml_type: 8,
-                data: make_q8_0_bytes(&mut rng, hv, n_embd),
+                ggml_type: alpha_beta_type,
+                data: if alpha_beta_type == 8 {
+                    make_q8_0_bytes(&mut rng, hv, n_embd)
+                } else {
+                    make_q6_k_bytes(&mut rng, hv, n_embd)
+                },
             });
             ts35.push(TensorEntry {
                 name: format!("{p}.ssm_conv1d.weight"),
@@ -377,8 +387,12 @@ fn parity_vk_dp4a_qwen35_and_llama_and_inkling2() {
             ts35.push(TensorEntry {
                 name: format!("{p}.ssm_out.weight"),
                 dims: vec![d_inner as u64, n_embd as u64],
-                ggml_type: 13, // Q5_K dp4a!
-                data: make_q5_k_bytes(&mut rng, n_embd, d_inner),
+                ggml_type: ssm_out_type,
+                data: if ssm_out_type == 13 {
+                    make_q5_k_bytes(&mut rng, n_embd, d_inner)
+                } else {
+                    make_q6_k_bytes(&mut rng, n_embd, d_inner)
+                },
             });
         } else {
             ts35.push(TensorEntry {

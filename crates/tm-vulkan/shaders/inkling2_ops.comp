@@ -285,15 +285,23 @@ void main() {
             const float cap = uintBitsToFloat(pc.u5);
             const float v = b1[pc.p3 + gid];
             b0[pc.p2 + gid] = (cap > 0.0) ? (cap * accurate_tanh(v / cap)) : v;
+        } else if (pc.p1 == 3u) {
+            const uint base_tok = b4_u32[1];
+            b0[(base_tok * pc.p4 + pc.p2) * pc.p0 + gid] = b1[pc.p3 + gid];
         }
     } else if (pc.op == 7u) {
         // Strided 2D vector utility across `gl_WorkGroupID.y = tok`:
-        // `p0 = len`, `p1 = sub_op (0=add, 1=copy, 2=softcap)`, `p2 = dst_off`, `p3 = a_off`,
+        // `p0 = len`, `p1 = sub_op (0=add, 1=copy, 2=softcap, 3=dyn_tap_copy)`, `p2 = dst_off`, `p3 = a_off`,
         // `p4 = dst_stride`, `u5 = a_stride`, `u6 = b_off` (or `cap_bits` for `sub_op == 2`)
         if (gid >= pc.p0) return;
         const uint tok = gl_WorkGroupID.y;
-        const uint di = tok * pc.p4 + pc.p2 + gid;
         const uint ai = tok * pc.u5 + pc.p3 + gid;
+        if (pc.p1 == 3u) {
+            const uint base_tok = b4_u32[1];
+            b0[(base_tok + tok) * pc.p4 + pc.p2 + gid] = b1[ai];
+            return;
+        }
+        const uint di = tok * pc.p4 + pc.p2 + gid;
         if (pc.p1 == 0u) {
             b0[di] = b1[ai] + b2[tok * pc.p0 + pc.u6 + gid];
         } else if (pc.p1 == 1u) {

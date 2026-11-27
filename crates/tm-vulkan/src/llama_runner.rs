@@ -2514,7 +2514,7 @@ impl LlamaVkRunner {
                 }
                 if matches!(
                     mat.dtype,
-                    DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q5K
+                    DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q5K | DType::Q6K
                 ) {
                     let dt = dtype_code(mat.dtype)?;
                     let nr = gemv_nr(mat.dtype);

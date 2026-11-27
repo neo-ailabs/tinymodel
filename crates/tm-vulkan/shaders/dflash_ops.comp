@@ -46,6 +46,13 @@ shared float sg_total;
 shared float sh_v[256];
 shared uint  sh_i[256];
 
+uint pack_u8x4_df(int q0, int q1, int q2, int q3) {
+    return (uint(q0) & 0xFFu)
+         | ((uint(q1) & 0xFFu) << 8u)
+         | ((uint(q2) & 0xFFu) << 16u)
+         | ((uint(q3) & 0xFFu) << 24u);
+}
+
 float accurate_tanh(float x) {
     const float ax = abs(x);
     if (ax < 0.0625) {
@@ -228,8 +235,9 @@ void main() {
             }
         }
     } else if (pc.op == 4u) {
-        // `rmsnorm_rows`: `b0 = in [bs, n]`, `b1 = out [bs, n]`, `b2 = f32_params`
-        // `p0 = n`, `p1 = w_off`, `u5 = eps_bits`, `gl_WorkGroupID.y = row`
+        // `rmsnorm_rows` (+ optional fused `Q8_1` into `u4`=`xq`, `u5_buf`=`xd` when `pc.p2 != 0` and `WG == 128`):
+        // `b0 = in [bs, n]`, `b1 = out [bs, n]`, `b2 = f32_params`
+        // `p0 = n`, `p1 = w_off`, `p2 = fuse_q8`, `u5 = eps_bits`, `gl_WorkGroupID.y = row`
         const uint row = gl_WorkGroupID.y;
         const uint n = pc.p0;
         const uint base = row * n;
@@ -239,8 +247,90 @@ void main() {
             ss = fma(v, v, ss);
         }
         const float inv = inversesqrt(wg_reduce_sum(ss, tid) / float(n) + uintBitsToFloat(pc.u5));
-        for (uint i = tid; i < n; i += WG) {
-            b1[base + i] = b0[base + i] * inv * b2[pc.p1 + i];
+        if (pc.p2 == 0u) {
+            for (uint i = tid; i < n; i += WG) {
+                b1[base + i] = b0[base + i] * inv * b2[pc.p1 + i];
+            }
+            return;
+        }
+        const uint nb = n >> 5u;
+        const uint q_blk_base = row * nb;
+        if (gl_SubgroupSize == 32u) {
+            const uint s_loc = gl_SubgroupID;
+            const uint slane = gl_SubgroupInvocationID;
+            for (uint blk = s_loc; blk < nb; blk += 4u) {
+                const uint idx = (blk << 5u) + slane;
+                const float yn = b0[base + idx] * inv * b2[pc.p1 + idx];
+                b1[base + idx] = yn;
+                const float amax = subgroupMax(abs(yn));
+                const float sum_y = subgroupAdd(yn);
+                sh_v[s_loc * 32u + slane] = yn;
+                subgroupMemoryBarrierShared();
+                subgroupBarrier();
+                const float d = amax / 127.0;
+                const float inv_d = (amax > 0.0) ? (127.0 / amax) : 0.0;
+                const uint gblk = q_blk_base + blk;
+                if (slane == 0u) {
+                    u5_buf[gblk * 2u + 0u] = floatBitsToUint(d);
+                    u5_buf[gblk * 2u + 1u] = floatBitsToUint(sum_y);
+                }
+                if (slane < 8u) {
+                    const uint bs_off = s_loc * 32u + (slane << 2u);
+                    const int q0 = clamp(int(roundEven(sh_v[bs_off + 0u] * inv_d)), -127, 127);
+                    const int q1 = clamp(int(roundEven(sh_v[bs_off + 1u] * inv_d)), -127, 127);
+                    const int q2 = clamp(int(roundEven(sh_v[bs_off + 2u] * inv_d)), -127, 127);
+                    const int q3 = clamp(int(roundEven(sh_v[bs_off + 3u] * inv_d)), -127, 127);
+                    u4[gblk * 8u + slane] = pack_u8x4_df(q0, q1, q2, q3);
+                }
+                subgroupMemoryBarrierShared();
+                subgroupBarrier();
+            }
+            return;
+        }
+        const uint blk_loc = tid >> 5u;
+        const uint lane32 = tid & 31u;
+        for (uint b0_i = 0u; b0_i < nb; b0_i += 4u) {
+            const uint blk = b0_i + blk_loc;
+            float yn = 0.0;
+            if (blk < nb) {
+                const uint idx = (blk << 5u) + lane32;
+                yn = b0[base + idx] * inv * b2[pc.p1 + idx];
+                b1[base + idx] = yn;
+            }
+            sh_v[tid] = yn;
+            sh_i[tid] = floatBitsToUint(abs(yn));
+            barrier();
+            for (uint stride = 16u; stride > 0u; stride >>= 1u) {
+                if (lane32 < stride) {
+                    const float a0 = uintBitsToFloat(sh_i[blk_loc * 32u + lane32]);
+                    const float a1 = uintBitsToFloat(sh_i[blk_loc * 32u + lane32 + stride]);
+                    sh_i[blk_loc * 32u + lane32] = floatBitsToUint(max(a0, a1));
+                }
+                barrier();
+            }
+            if (blk < nb) {
+                const float amax = uintBitsToFloat(sh_i[blk_loc * 32u]);
+                const float d = amax / 127.0;
+                const float inv_d = (amax > 0.0) ? (127.0 / amax) : 0.0;
+                const uint gblk = q_blk_base + blk;
+                if (lane32 == 0u) {
+                    float sum_y = 0.0;
+                    for (uint m = 0u; m < 32u; ++m) {
+                        sum_y += sh_v[blk_loc * 32u + m];
+                    }
+                    u5_buf[gblk * 2u + 0u] = floatBitsToUint(d);
+                    u5_buf[gblk * 2u + 1u] = floatBitsToUint(sum_y);
+                }
+                if (lane32 < 8u) {
+                    const uint bs_off = blk_loc * 32u + (lane32 << 2u);
+                    const int q0 = clamp(int(roundEven(sh_v[bs_off + 0u] * inv_d)), -127, 127);
+                    const int q1 = clamp(int(roundEven(sh_v[bs_off + 1u] * inv_d)), -127, 127);
+                    const int q2 = clamp(int(roundEven(sh_v[bs_off + 2u] * inv_d)), -127, 127);
+                    const int q3 = clamp(int(roundEven(sh_v[bs_off + 3u] * inv_d)), -127, 127);
+                    u4[gblk * 8u + lane32] = pack_u8x4_df(q0, q1, q2, q3);
+                }
+            }
+            barrier();
         }
     } else if (pc.op == 5u) {
         // `vec_add`: `b0[i] += b1[i]` (`p0 = len`)
@@ -283,25 +373,116 @@ void main() {
         b1[gid] = cand + gate * (st - cand);
         b2[gid] = accurate_tanh(l_raw);
     } else if (pc.op == 8u) {
-        // `markov_corr_hidden`: `b0 = corr_hidden`, `b1 = hidden_blk`, `b2 = correction`, `b3 = f32_params`
-        // `p0 = n_embd`, `p1 = step_idx`, `p2 = hidden_out_b_off`
-        if (gid >= pc.p0) return;
+        // `markov_corr_hidden` (+ optional fused `Q8_1` when `pc.p3 != 0` and `WG == 128`):
+        // `b0 = corr_hidden`, `b1 = hidden_blk`, `b2 = correction`, `b3 = f32_params`,
+        // `u4 = out_xq`, `u5_buf = out_xd` (`p0 = n_embd`, `p1 = step_idx`, `p2 = hidden_out_b_off`, `p3 = fuse_q8`)
+        if (pc.p3 == 0u) {
+            if (gid >= pc.p0) return;
+            const uint hid_off = (pc.p1 + 1u) * pc.p0;
+            b0[gid] = b1[hid_off + gid] + b2[gid] + b3[pc.p2 + gid];
+            return;
+        }
+        const uint nb = pc.p0 >> 5u;
         const uint hid_off = (pc.p1 + 1u) * pc.p0;
-        b0[gid] = b1[hid_off + gid] + b2[gid] + b3[pc.p2 + gid];
+        const uint blk_loc = tid >> 5u;
+        const uint lane32 = tid & 31u;
+        const uint blk = gl_WorkGroupID.x * 4u + blk_loc;
+
+        if (gl_SubgroupSize == 32u) {
+            const uint s_loc = gl_SubgroupID;
+            const uint slane = gl_SubgroupInvocationID;
+            const uint gblk = gl_WorkGroupID.x * 4u + s_loc;
+            if (gblk >= nb) return;
+            const uint idx = (gblk << 5u) + slane;
+            const float yn = b1[hid_off + idx] + b2[idx] + b3[pc.p2 + idx];
+            b0[idx] = yn;
+            const float amax = subgroupMax(abs(yn));
+            const float sum_y = subgroupAdd(yn);
+            sh_v[s_loc * 32u + slane] = yn;
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+
+            const float d = amax / 127.0;
+            const float inv_d = (amax > 0.0) ? (127.0 / amax) : 0.0;
+            if (slane == 0u) {
+                u5_buf[gblk * 2u + 0u] = floatBitsToUint(d);
+                u5_buf[gblk * 2u + 1u] = floatBitsToUint(sum_y);
+            }
+            if (slane < 8u) {
+                const uint bs_off = s_loc * 32u + (slane << 2u);
+                const int q0 = clamp(int(roundEven(sh_v[bs_off + 0u] * inv_d)), -127, 127);
+                const int q1 = clamp(int(roundEven(sh_v[bs_off + 1u] * inv_d)), -127, 127);
+                const int q2 = clamp(int(roundEven(sh_v[bs_off + 2u] * inv_d)), -127, 127);
+                const int q3 = clamp(int(roundEven(sh_v[bs_off + 3u] * inv_d)), -127, 127);
+                u4[gblk * 8u + slane] = pack_u8x4_df(q0, q1, q2, q3);
+            }
+            return;
+        }
+
+        float yn = 0.0;
+        if (blk < nb) {
+            const uint idx = (blk << 5u) + lane32;
+            yn = b1[hid_off + idx] + b2[idx] + b3[pc.p2 + idx];
+            b0[idx] = yn;
+        }
+        sh_v[tid] = yn;
+        sh_i[tid] = floatBitsToUint(abs(yn));
+        barrier();
+        for (uint stride = 16u; stride > 0u; stride >>= 1u) {
+            if (lane32 < stride) {
+                const float a0 = uintBitsToFloat(sh_i[blk_loc * 32u + lane32]);
+                const float a1 = uintBitsToFloat(sh_i[blk_loc * 32u + lane32 + stride]);
+                sh_i[blk_loc * 32u + lane32] = floatBitsToUint(max(a0, a1));
+            }
+            barrier();
+        }
+        if (blk < nb) {
+            const float amax = uintBitsToFloat(sh_i[blk_loc * 32u]);
+            const float d = amax / 127.0;
+            const float inv_d = (amax > 0.0) ? (127.0 / amax) : 0.0;
+            if (lane32 == 0u) {
+                float sum_y = 0.0;
+                for (uint m = 0u; m < 32u; ++m) {
+                    sum_y += sh_v[blk_loc * 32u + m];
+                }
+                u5_buf[blk * 2u + 0u] = floatBitsToUint(d);
+                u5_buf[blk * 2u + 1u] = floatBitsToUint(sum_y);
+            }
+            if (lane32 < 8u) {
+                const uint bs_off = blk_loc * 32u + (lane32 << 2u);
+                const int q0 = clamp(int(roundEven(sh_v[bs_off + 0u] * inv_d)), -127, 127);
+                const int q1 = clamp(int(roundEven(sh_v[bs_off + 1u] * inv_d)), -127, 127);
+                const int q2 = clamp(int(roundEven(sh_v[bs_off + 2u] * inv_d)), -127, 127);
+                const int q3 = clamp(int(roundEven(sh_v[bs_off + 3u] * inv_d)), -127, 127);
+                u4[blk * 8u + lane32] = pack_u8x4_df(q0, q1, q2, q3);
+            }
+        }
     } else if (pc.op == 9u) {
         // `softcap_argmax_to_slot` (`1` WG of 256 threads):
         // `b0 = logits_raw`, `u4 = draft_toks`, `u5_buf = vocab_map`
-        // `p0 = n_vocab`, `p1 = dst_slot (step_idx + 1)`, `p2 = use_vocab_map`, `u5 = cap_bits`
+        // `p0 = n_vocab`, `p1 = dst_slot (step_idx + 1)`, `p2 = use_vocab_map`,
+        // `p3 = prob_slot_base` (`0` -> skip writing top-1 probability), `u5 = cap_bits`
         const uint n = pc.p0;
         const float cap = uintBitsToFloat(pc.u5);
         float best_v = -1.0 / 0.0;
         uint best_i = 0u;
+        float loc_s = 0.0;
         for (uint i = tid; i < n; i += WG) {
             const float raw = b0[i];
             const float v = (cap > 0.0) ? (cap * accurate_tanh(raw / cap)) : raw;
-            if (v > best_v || (v == best_v && i < best_i)) {
+            if (loc_s == 0.0) {
                 best_v = v;
                 best_i = i;
+                loc_s = 1.0;
+            } else if (v > best_v) {
+                loc_s = fma(loc_s, exp(best_v - v), 1.0);
+                best_v = v;
+                best_i = i;
+            } else {
+                if (v == best_v && i < best_i) {
+                    best_i = i;
+                }
+                loc_s += exp(v - best_v);
             }
         }
         sh_v[tid] = best_v;
@@ -321,8 +502,16 @@ void main() {
             }
             barrier();
         }
-        if (tid == 0u) {
-            const uint winner = sh_i[0];
+        const uint winner = sh_i[0];
+        const float global_max = sh_v[0];
+        if (pc.p3 != 0u) {
+            const float scaled_s = (loc_s > 0.0) ? (loc_s * exp(best_v - global_max)) : 0.0;
+            const float total_s = wg_reduce_sum(scaled_s, tid);
+            if (tid == 0u) {
+                u4[pc.p1] = (pc.p2 != 0u) ? u5_buf[winner] : winner;
+                u4[pc.p3 + pc.p1] = floatBitsToUint(1.0 / max(total_s, 1.0));
+            }
+        } else if (tid == 0u) {
             u4[pc.p1] = (pc.p2 != 0u) ? u5_buf[winner] : winner;
         }
     } else if (pc.op == 10u) {

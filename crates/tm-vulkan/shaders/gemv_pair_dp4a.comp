@@ -1,7 +1,7 @@
 #version 450
 // Fused 2-matrix AoS INT8 DP4A (`OpSDotKHR`) GEMV sharing Q8_1 input `(xq, xd)`:
 //   `ya = Wa * x`, `yb = Wb * x` in 1 dispatch.
-// DTYPE: 0 = Q4_0, 2 = Q8_0.
+// DTYPE: 0 = Q4_0, 2 = Q8_0, 4 = Q6_K.
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
@@ -114,7 +114,7 @@ void main() {
                 }
             }
         }
-    } else {
+    } else if (DTYPE == 2u) {
         // Coalesced 8-lane-per-block Q8_0 DP4A GEMV!
         const uint sub_blk = lane >> 3u;
         const uint sub_lane = lane & 7u;
@@ -143,6 +143,48 @@ void main() {
                         : ((wa32[q >> 1u] >> 16u) | (wa32[(q >> 1u) + 1u] << 16u));
                 }
                 acc[r] = fma(d * dx, float(sdot4x8(int(q32), xqv, 0)), acc[r]);
+            }
+        }
+    } else {
+        // Coalesced 8-lane-per-block Q6_K DP4A GEMV!
+        const uint sub_blk = lane >> 3u;
+        const uint sub_lane = lane & 7u;
+        const uint step_blk = sg_size >> 3u;
+        const uint l2_0 = sub_lane << 1u;
+        const int sc_hi_shift = int((sub_lane >> 2u) * 8u);
+        for (uint ib = sub_blk; ib < nb; ib += step_blk) {
+            const int xqv = xq[ib * 8u + sub_lane];
+            const float dx = xd[ib].x;
+            const uint isb = ib >> 3u;
+            const uint sub_b = ib & 7u;
+            const uint half_idx = sub_b >> 2u;
+            const uint quad = sub_b & 3u;
+            const uint ql_off = half_idx * 32u + (quad & 1u) * 16u + l2_0;
+            const uint qh_off = 64u + half_idx * 16u + l2_0;
+            const uint ql_shift = (quad >> 1u) * 4u;
+            const uint qh_shift = quad * 2u;
+            [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                const uint b = row_b[r] + isb * 105u;
+                float d;
+                int sc;
+                uint ql32, qh32;
+                if (is_b) {
+                    d = unpackHalf2x16(uint(wb[b + 104u])).x;
+                    sc = bitfieldExtract(int(uint(wb[b + 96u + sub_b])), sc_hi_shift, 8);
+                    ql32 = uint(wb[b + ql_off]) | (uint(wb[b + ql_off + 1u]) << 16u);
+                    qh32 = uint(wb[b + qh_off]) | (uint(wb[b + qh_off + 1u]) << 16u);
+                } else {
+                    d = unpackHalf2x16(uint(wa[b + 104u])).x;
+                    sc = bitfieldExtract(int(uint(wa[b + 96u + sub_b])), sc_hi_shift, 8);
+                    ql32 = uint(wa[b + ql_off]) | (uint(wa[b + ql_off + 1u]) << 16u);
+                    qh32 = uint(wa[b + qh_off]) | (uint(wa[b + qh_off + 1u]) << 16u);
+                }
+                const uint u6 = ((ql32 >> ql_shift) & 0x0F0F0F0Fu)
+                              | (((qh32 >> qh_shift) & 0x03030303u) << 4u);
+                const uint t6 = u6 ^ 0x20202020u;
+                const uint m6 = t6 & 0x20202020u;
+                const int q4s = int(t6 | (m6 << 1u) | (m6 << 2u));
+                acc[r] = fma((d * float(sc)) * dx, float(sdot4x8(q4s, xqv, 0)), acc[r]);
             }
         }
     }

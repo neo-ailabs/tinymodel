@@ -37,7 +37,7 @@ use crate::{VkResultExt, VulkanError};
 
 const VENDOR_AMD: u32 = 0x1002;
 const VENDOR_INTEL: u32 = 0x8086;
-const STAGING_BYTES: u64 = 64 << 20;
+const STAGING_RING_CHUNK: u64 = 8 << 20;
 const DESC_POOL_SETS: u32 = 65536;
 const DESC_POOL_BUFFERS: u32 = 65536 * 8;
 const CACHE_DESC_SETS: u32 = 32768;
@@ -205,7 +205,7 @@ struct ExecSlot {
 
 struct Exec {
     slots: [ExecSlot; 2],
-    staging: Option<VkBuffer>,
+    staging: [Option<VkBuffer>; 2],
 }
 
 /// A command buffer recorded on the CPU (`prepare_cb`) and ready for zero-latency `submit_prepared`.
@@ -890,7 +890,7 @@ impl VulkanContext {
         let s1 = Self::create_exec_slot(inner, queue_family)?;
         Ok(Exec {
             slots: [s0, s1],
-            staging: None,
+            staging: [None, None],
         })
     }
 
@@ -1342,73 +1342,146 @@ impl VulkanContext {
     }
 
     /// Copies `data` into `dst` at byte `offset` (direct `memcpy` on coherent mapped UMA slabs,
-    /// or chunked through the 64 MiB staging buffer on discrete GPUs).
+    /// or double-buffered pipelined DMA through two `8 MiB` staging buffers on discrete GPUs).
     pub fn write_bytes(&self, dst: &VkBuffer, offset: u64, data: &[u8]) -> Result<(), VulkanError> {
-        if offset + data.len() as u64 > dst.size {
+        self.write_bytes_from_chunks(dst, offset, data.len(), |done, out| {
+            out.copy_from_slice(&data[done..done + out.len()]);
+            Ok(())
+        })
+    }
+
+    /// Streams `total_len` bytes generated/read by `fill_chunk(done_offset, staging_slice)` into
+    /// `dst` starting at `offset`, overlapping CPU chunk preparation (`pread` / `memcpy`) on slot
+    /// `i & 1` with in-flight PCIe DMA `vkCmdCopyBuffer` on slot `1 - (i & 1)`.
+    pub(crate) fn write_bytes_from_chunks<F>(
+        &self,
+        dst: &VkBuffer,
+        offset: u64,
+        total_len: usize,
+        mut fill_chunk: F,
+    ) -> Result<(), VulkanError>
+    where
+        F: FnMut(usize, &mut [u8]) -> Result<(), VulkanError>,
+    {
+        if offset + total_len as u64 > dst.size {
             return Err(VulkanError::InvalidDimensions(format!(
-                "write of {} bytes at {offset} overflows buffer of {} bytes",
-                data.len(),
+                "write of {total_len} bytes at {offset} overflows buffer of {} bytes",
                 dst.size
             )));
         }
-        if data.is_empty() {
+        if total_len == 0 {
             return Ok(());
         }
         if let Some(dst_ptr) = dst.mapped {
             // SAFETY: `dst` is persistently mapped `HOST_VISIBLE | HOST_COHERENT`, idle on the GPU
-            // (all submissions in `VulkanContext` wait on their fence), and `offset + data.len() <= dst.size`.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    dst_ptr.add(offset as usize),
-                    data.len(),
-                );
-            }
-            return Ok(());
+            // (all submissions in `VulkanContext` wait on their fence), and `offset + total_len <= dst.size`.
+            let dst_slice =
+                unsafe { core::slice::from_raw_parts_mut(dst_ptr.add(offset as usize), total_len) };
+            return fill_chunk(0, dst_slice);
         }
-        let chunk = STAGING_BYTES as usize;
-        for (i, part) in data.chunks(chunk).enumerate() {
-            let staging_ptr = self.staging_ptr()?;
-            // SAFETY: the staging buffer is host-visible, coherent, `STAGING_BYTES` long and
-            // idle (previous copy was waited for); `part.len() <= STAGING_BYTES`.
-            unsafe { core::ptr::copy_nonoverlapping(part.as_ptr(), staging_ptr, part.len()) };
-            let dst_off = offset + (i * chunk) as u64;
-            self.run(|rec| {
-                let exec = rec.ctx.exec.lock().map_err(|_| VulkanError::NoDevice)?;
-                let src = exec
-                    .staging
-                    .as_ref()
-                    .map(|s| s.buf)
-                    .ok_or(VulkanError::NoDevice)?;
-                drop(exec);
-                // SAFETY: both buffers are valid with sufficient size (checked above).
+
+        let chunk = STAGING_RING_CHUNK as usize;
+        let mut in_flight: Option<InFlightCb> = None;
+        let mut copy_err: Option<VulkanError> = None;
+        let mut done = 0usize;
+        let mut step = 0usize;
+
+        while done < total_len {
+            let take = (total_len - done).min(chunk);
+            let slot_idx = step & 1;
+            let (src_buf, staging_ptr) = match self.ensure_staging_slot(slot_idx) {
+                Ok(v) => v,
+                Err(e) => {
+                    copy_err = Some(e);
+                    break;
+                }
+            };
+            // SAFETY: `staging[slot_idx]` is `HOST_VISIBLE | HOST_COHERENT`, `STAGING_RING_CHUNK`
+            // bytes long (`take <= chunk`), and idle because any prior DMA on `slot_idx` was waited
+            // for in the previous iteration (`in_flight` only ever holds `1 - slot_idx`).
+            let staging_slice = unsafe { core::slice::from_raw_parts_mut(staging_ptr, take) };
+            if let Err(e) = fill_chunk(done, staging_slice) {
+                copy_err = Some(e);
+                break;
+            }
+
+            if let Some(prev) = in_flight.take()
+                && let Err(e) = self.wait_in_flight(prev)
+            {
+                copy_err = Some(e);
+                break;
+            }
+
+            let dst_off = offset + done as u64;
+            let len = take as u64;
+            let prep = match self.prepare_cb(slot_idx, |rec| {
+                // SAFETY: both buffers are valid and `[0..len)` / `[dst_off..dst_off+len)` are in bounds.
                 unsafe {
                     rec.ctx.inner.device.cmd_copy_buffer(
                         rec.cb,
-                        src,
+                        src_buf,
                         dst.buf,
                         &[vk::BufferCopy {
                             src_offset: 0,
                             dst_offset: dst_off,
-                            size: part.len() as u64,
+                            size: len,
                         }],
-                    )
-                };
+                    );
+                }
                 Ok(())
-            })?;
+            }) {
+                Ok(p) => p,
+                Err(e) => {
+                    copy_err = Some(e);
+                    break;
+                }
+            };
+            match self.submit_prepared(prep) {
+                Ok(inf) => in_flight = Some(inf),
+                Err(e) => {
+                    copy_err = Some(e);
+                    break;
+                }
+            }
+
+            done += take;
+            step += 1;
+        }
+
+        if let Some(last) = in_flight {
+            let wait_res = self.wait_in_flight(last);
+            if copy_err.is_none() {
+                wait_res?;
+            }
+        }
+        if let Some(e) = copy_err {
+            return Err(e);
         }
         Ok(())
     }
 
-    fn staging_ptr(&self) -> Result<*mut u8, VulkanError> {
-        let mut exec = self.exec.lock().map_err(|_| VulkanError::NoDevice)?;
-        if exec.staging.is_none() {
-            exec.staging = Some(self.create_buffer(STAGING_BYTES, true)?);
+    fn ensure_staging_slot(&self, slot_idx: usize) -> Result<(vk::Buffer, *mut u8), VulkanError> {
+        {
+            let exec = self.exec.lock().map_err(|_| VulkanError::NoDevice)?;
+            if let Some(s) = exec.staging[slot_idx].as_ref() {
+                let ptr = s
+                    .mapped
+                    .ok_or(VulkanError::NoMemoryType("staging buffer"))?;
+                return Ok((s.buf, ptr));
+            }
         }
-        exec.staging
+        let created = self.create_buffer(STAGING_RING_CHUNK, true)?;
+        let mut exec = self.exec.lock().map_err(|_| VulkanError::NoDevice)?;
+        if exec.staging[slot_idx].is_none() {
+            exec.staging[slot_idx] = Some(created);
+        }
+        let s = exec.staging[slot_idx]
             .as_ref()
-            .and_then(|s| s.mapped)
-            .ok_or(VulkanError::NoMemoryType("staging buffer"))
+            .ok_or(VulkanError::NoDevice)?;
+        let ptr = s
+            .mapped
+            .ok_or(VulkanError::NoMemoryType("staging buffer"))?;
+        Ok((s.buf, ptr))
     }
 
     /// Reads back `n` floats from the start of `src`.
@@ -1432,25 +1505,18 @@ impl VulkanContext {
             }
             return Ok(out);
         }
-        let chunk = STAGING_BYTES;
+        let chunk = STAGING_RING_CHUNK;
         let mut off = 0u64;
         while off < bytes {
             let len = chunk.min(bytes - off);
-            let staging_ptr = self.staging_ptr()?;
+            let (dst_buf, staging_ptr) = self.ensure_staging_slot(0)?;
             self.run(|rec| {
-                let exec = rec.ctx.exec.lock().map_err(|_| VulkanError::NoDevice)?;
-                let dst = exec
-                    .staging
-                    .as_ref()
-                    .map(|s| s.buf)
-                    .ok_or(VulkanError::NoDevice)?;
-                drop(exec);
                 // SAFETY: valid buffers; range checked above.
                 unsafe {
                     rec.ctx.inner.device.cmd_copy_buffer(
                         rec.cb,
                         src.buf,
-                        dst,
+                        dst_buf,
                         &[vk::BufferCopy {
                             src_offset: off,
                             dst_offset: 0,
@@ -2139,7 +2205,7 @@ impl Drop for VulkanContext {
                 d.destroy_descriptor_pool(dc.pool, None);
             }
             if let Ok(mut e) = self.exec.lock() {
-                e.staging = None;
+                e.staging = [None, None];
                 for s in &e.slots {
                     d.destroy_descriptor_pool(s.desc_pool, None);
                     d.destroy_fence(s.fence, None);

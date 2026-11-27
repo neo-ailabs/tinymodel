@@ -14,9 +14,7 @@ use tm_gguf::{DirectTensorReader, GgufError, GgufFile, PageAlignedSlot};
 
 use crate::VulkanError;
 use crate::context::{Pipeline, Recorder, VkBuffer};
-use crate::inkling2_runner::{
-    Inkling2VkRunner, VkDenseMat, push_f32_param, upload_dense_mat, upload_range_uncached,
-};
+use crate::inkling2_runner::{Inkling2VkRunner, VkDenseMat, push_f32_param, upload_dense_mat};
 
 const SPV_DFLASH_OPS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dflash_ops.spv"));
 const SPV_DFLASH_ATTN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dflash_attn.spv"));
@@ -225,6 +223,8 @@ pub struct DFlashVkRunner {
     latent_buf: VkBuffer,
     correction_buf: VkBuffer,
     corr_hidden_buf: VkBuffer,
+    xq_buf: VkBuffer,
+    xd_buf: VkBuffer,
     draft_toks_buf: VkBuffer,
     vocab_map: Option<(VkBuffer, usize)>,
     // Pipelines
@@ -347,21 +347,37 @@ impl DFlashVkRunner {
         }
 
         // Upload `markov_w1.weight` (`BF16` -> raw `u16` bits; `F32`/`F16` converted cleanly to `BF16` `u16` bits)
+        // and compute per-token L2 norms `w1_norm2[0..vocab_size]` for importance-ranked draft vocab pruning.
+        let mut w1_norm2 = vec![0.0f32; cfg.vocab_size];
         let mw1_buf = if let Some(ref rdr) = direct_reader {
             let (ti, f_off, b_len) = gguf.req_tensor_file_range(
                 "markov_w1.weight",
                 "global",
                 &[rank, cfg.vocab_padded],
             )?;
+            let mut raw = vec![0u8; b_len];
+            rdr.read_exact_uncached(f_off, &mut raw, &mut io_slot)?;
             if ti.dtype == DType::BF16 {
-                let b = upload_range_uncached(ctx, rdr, f_off, b_len, &mut io_slot)?;
+                for (id, dst_n) in w1_norm2.iter_mut().enumerate() {
+                    let row_b = &raw[id * rank * 2..(id + 1) * rank * 2];
+                    let mut s = 0.0f32;
+                    for &c in row_b.as_chunks::<2>().0 {
+                        let u = u16::from_le_bytes(c) as u32;
+                        let v = f32::from_bits(u << 16);
+                        s += v * v;
+                    }
+                    *dst_n = s;
+                }
+                let b = ctx.upload_bytes(&raw)?;
                 vram_bytes += b_len as u64;
                 b
             } else {
-                let mut raw = vec![0u8; b_len];
-                rdr.read_exact_uncached(f_off, &mut raw, &mut io_slot)?;
                 let mut tmp_f32 = vec![0.0f32; rank * cfg.vocab_padded];
                 tm_core::dequantize_row_bytes(ti.dtype, &raw, &mut tmp_f32);
+                for (id, dst_n) in w1_norm2.iter_mut().enumerate() {
+                    let row = &tmp_f32[id * rank..(id + 1) * rank];
+                    *dst_n = row.iter().map(|&v| v * v).sum();
+                }
                 let bf16_u16: Vec<u16> = tmp_f32
                     .iter()
                     .map(|&v| {
@@ -377,12 +393,26 @@ impl DFlashVkRunner {
             let (ti, raw) =
                 gguf.req_tensor("markov_w1.weight", "global", &[rank, cfg.vocab_padded])?;
             if ti.dtype == DType::BF16 {
+                for (id, dst_n) in w1_norm2.iter_mut().enumerate() {
+                    let row_b = &raw[id * rank * 2..(id + 1) * rank * 2];
+                    let mut s = 0.0f32;
+                    for &c in row_b.as_chunks::<2>().0 {
+                        let u = u16::from_le_bytes(c) as u32;
+                        let v = f32::from_bits(u << 16);
+                        s += v * v;
+                    }
+                    *dst_n = s;
+                }
                 let b = ctx.upload_bytes(raw)?;
                 vram_bytes += raw.len() as u64;
                 b
             } else {
                 let mut tmp_f32 = vec![0.0f32; rank * cfg.vocab_padded];
                 tm_core::dequantize_row_bytes(ti.dtype, raw, &mut tmp_f32);
+                for (id, dst_n) in w1_norm2.iter_mut().enumerate() {
+                    let row = &tmp_f32[id * rank..(id + 1) * rank];
+                    *dst_n = row.iter().map(|&v| v * v).sum();
+                }
                 let bf16_u16: Vec<u16> = tmp_f32
                     .iter()
                     .map(|&v| {
@@ -617,9 +647,13 @@ impl DFlashVkRunner {
         let latent_buf = ctx.alloc_buffer((rank * 4).max(16) as u64)?;
         let correction_buf = ctx.alloc_buffer((n_embd * 4) as u64)?;
         let corr_hidden_buf = ctx.alloc_buffer((n_embd * 4) as u64)?;
-        let draft_toks_buf = ctx.create_host_buffer(((bs + 4) * 4) as u64)?;
+        let q8_blks = (bs * n_embd.max(n_ff).max(q_dim)).div_ceil(32).max(1);
+        let xq_buf = ctx.alloc_buffer((q8_blks * 32) as u64)?;
+        let xd_buf = ctx.alloc_buffer((q8_blks * 8).max(16) as u64)?;
+        let draft_toks_buf = ctx.create_host_buffer(((2 * bs + 8) * 4) as u64)?;
 
-        // Optional draft vocabulary pruning (`TM_VK_DRAFT_VOCAB=<N>`, retaining head BPE merges + tail special tokens)
+        // Optional draft vocabulary pruning (`TM_VK_DRAFT_VOCAB=<N>`, ranking active code/text
+        // tokens by learned `||markov_w1[id]||_2` + byte/ASCII head + special control tail tokens)
         let draft_vocab_limit = std::env::var("TM_VK_DRAFT_VOCAB")
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
@@ -629,17 +663,30 @@ impl DFlashVkRunner {
             && target.output.dtype_code == 2
         {
             let tail = (draft_vocab_limit / 16)
-                .clamp(256, 4096)
+                .clamp(256, 2048)
                 .min(draft_vocab_limit);
-            let head = draft_vocab_limit - tail;
+            let head_bytes = 512usize.min(draft_vocab_limit.saturating_sub(tail));
+            let tail_start = (cfg.vocab_size - tail).max(head_bytes);
+            let rem_budget =
+                draft_vocab_limit.saturating_sub(head_bytes + (cfg.vocab_size - tail_start));
+
+            let mut mid_cands: Vec<u32> = (head_bytes as u32..tail_start as u32).collect();
+            mid_cands.sort_unstable_by(|&a, &b| {
+                w1_norm2[b as usize]
+                    .total_cmp(&w1_norm2[a as usize])
+                    .then_with(|| a.cmp(&b))
+            });
+            mid_cands.truncate(rem_budget);
+
             let mut ids = Vec::with_capacity(draft_vocab_limit);
-            for id in 0..head {
+            for id in 0..head_bytes {
                 ids.push(id as u32);
             }
-            let tail_start = (cfg.vocab_size - tail).max(head);
+            ids.extend_from_slice(&mid_cands);
             for id in tail_start..cfg.vocab_size {
                 ids.push(id as u32);
             }
+            ids.sort_unstable();
             let n_v = ids.len();
             let map_buf = ctx.upload(&ids)?;
             Some((map_buf, n_v))
@@ -724,6 +771,8 @@ impl DFlashVkRunner {
             latent_buf,
             correction_buf,
             corr_hidden_buf,
+            xq_buf,
+            xd_buf,
             draft_toks_buf,
             vocab_map,
             pipe_ops,
@@ -786,7 +835,7 @@ impl DFlashVkRunner {
         let hd = self.cfg.head_dim;
         let nh_kv = self.cfg.n_head_kv;
         let eps_bits = self.cfg.rms_eps.to_bits();
-        let use_tc = count >= 16;
+        let use_tc = count >= 8;
 
         for il in 0..self.cfg.n_layers {
             let layer = &self.layers[il];
@@ -957,6 +1006,17 @@ impl DFlashVkRunner {
             self.elem_groups(bs * n_embd),
         )?;
 
+        let fuse_q8 = target.fused_q8_active()
+            && self.ops_wg == 128
+            && n_embd.is_multiple_of(32)
+            && n_ff.is_multiple_of(32);
+        let fuse_flag = u32::from(fuse_q8);
+        let (q8_xq, q8_xd) = if fuse_q8 {
+            (&self.xq_buf, &self.xd_buf)
+        } else {
+            (&target.dummy_buf, &target.dummy_buf)
+        };
+
         // 2. 3 non-causal block-attention Transformer stages (`bs = 8` rows in lockstep via `M = 8` single-read GEMV!)
         for il in 0..self.cfg.n_layers {
             let layer = &self.layers[il];
@@ -967,37 +1027,82 @@ impl DFlashVkRunner {
                     &self.norm_blk_buf,
                     &self.f32_params,
                     &target.dummy_buf,
-                    &target.dummy_buf,
-                    &target.dummy_buf,
+                    q8_xq,
+                    q8_xd,
                 ],
-                &[4, n_embd as u32, layer.attn_norm_off, 0, 0, eps_bits, 0, 0],
+                &[
+                    4,
+                    n_embd as u32,
+                    layer.attn_norm_off,
+                    fuse_flag,
+                    0,
+                    eps_bits,
+                    0,
+                    0,
+                ],
                 1,
                 bs as u32,
             )?;
-            target.dispatch_gemm_nb(
-                rec,
-                &layer.wq,
-                &self.norm_blk_buf,
-                &self.q_blk_buf,
-                bs,
-                false,
-            )?;
-            target.dispatch_gemm_nb(
-                rec,
-                &layer.wk,
-                &self.norm_blk_buf,
-                &self.k_blk_buf,
-                bs,
-                false,
-            )?;
-            target.dispatch_gemm(
-                rec,
-                &layer.wv,
-                &self.norm_blk_buf,
-                &self.v_blk_buf,
-                bs,
-                false,
-            )?;
+            if fuse_q8 {
+                target.dispatch_gemm_prequant(
+                    rec,
+                    &layer.wq,
+                    &self.norm_blk_buf,
+                    &self.xq_buf,
+                    &self.xd_buf,
+                    &self.q_blk_buf,
+                    bs,
+                    false,
+                    false,
+                )?;
+                target.dispatch_gemm_prequant(
+                    rec,
+                    &layer.wk,
+                    &self.norm_blk_buf,
+                    &self.xq_buf,
+                    &self.xd_buf,
+                    &self.k_blk_buf,
+                    bs,
+                    false,
+                    false,
+                )?;
+                target.dispatch_gemm_prequant(
+                    rec,
+                    &layer.wv,
+                    &self.norm_blk_buf,
+                    &self.xq_buf,
+                    &self.xd_buf,
+                    &self.v_blk_buf,
+                    bs,
+                    false,
+                    true,
+                )?;
+            } else {
+                target.dispatch_gemm_nb(
+                    rec,
+                    &layer.wq,
+                    &self.norm_blk_buf,
+                    &self.q_blk_buf,
+                    bs,
+                    false,
+                )?;
+                target.dispatch_gemm_nb(
+                    rec,
+                    &layer.wk,
+                    &self.norm_blk_buf,
+                    &self.k_blk_buf,
+                    bs,
+                    false,
+                )?;
+                target.dispatch_gemm(
+                    rec,
+                    &layer.wv,
+                    &self.norm_blk_buf,
+                    &self.v_blk_buf,
+                    bs,
+                    false,
+                )?;
+            }
 
             rec.dispatch_xy(
                 &self.pipe_ops,
@@ -1078,29 +1183,63 @@ impl DFlashVkRunner {
                     &self.norm_blk_buf,
                     &self.f32_params,
                     &target.dummy_buf,
-                    &target.dummy_buf,
-                    &target.dummy_buf,
+                    q8_xq,
+                    q8_xd,
                 ],
-                &[4, n_embd as u32, layer.ffn_norm_off, 0, 0, eps_bits, 0, 0],
+                &[
+                    4,
+                    n_embd as u32,
+                    layer.ffn_norm_off,
+                    fuse_flag,
+                    0,
+                    eps_bits,
+                    0,
+                    0,
+                ],
                 1,
                 bs as u32,
             )?;
-            target.dispatch_gemm_nb(
-                rec,
-                &layer.ffn_gate,
-                &self.norm_blk_buf,
-                &self.ffn_gate_blk_buf,
-                bs,
-                false,
-            )?;
-            target.dispatch_gemm(
-                rec,
-                &layer.ffn_up,
-                &self.norm_blk_buf,
-                &self.ffn_up_blk_buf,
-                bs,
-                false,
-            )?;
+            if fuse_q8 {
+                target.dispatch_gemm_prequant(
+                    rec,
+                    &layer.ffn_gate,
+                    &self.norm_blk_buf,
+                    &self.xq_buf,
+                    &self.xd_buf,
+                    &self.ffn_gate_blk_buf,
+                    bs,
+                    false,
+                    false,
+                )?;
+                target.dispatch_gemm_prequant(
+                    rec,
+                    &layer.ffn_up,
+                    &self.norm_blk_buf,
+                    &self.xq_buf,
+                    &self.xd_buf,
+                    &self.ffn_up_blk_buf,
+                    bs,
+                    false,
+                    true,
+                )?;
+            } else {
+                target.dispatch_gemm_nb(
+                    rec,
+                    &layer.ffn_gate,
+                    &self.norm_blk_buf,
+                    &self.ffn_gate_blk_buf,
+                    bs,
+                    false,
+                )?;
+                target.dispatch_gemm(
+                    rec,
+                    &layer.ffn_up,
+                    &self.norm_blk_buf,
+                    &self.ffn_up_blk_buf,
+                    bs,
+                    false,
+                )?;
+            }
             let total_ff = bs * n_ff;
             rec.dispatch(
                 &self.pipe_silu_mul,
@@ -1151,6 +1290,7 @@ impl DFlashVkRunner {
 
         // 4. Chained `k`-step Recurrent Markov Head + `lm_head` + Fused Softcap-Argmax (all inside ONE CB!)
         let ctx_ring_off = (ring_slot * n_embd) as u32;
+        let prob_slot_base = (bs + 2) as u32;
         let sg = target.ctx.info().subgroup_size;
         let idx_rows_per_wg = ((self.idx_lm_wg / sg) * self.idx_lm_nr) as usize;
 
@@ -1202,6 +1342,11 @@ impl DFlashVkRunner {
                 &self.latent_buf,
                 &self.correction_buf,
             )?;
+            let corr_groups = if fuse_q8 {
+                (n_embd / 32).div_ceil(4) as u32
+            } else {
+                self.elem_groups(n_embd)
+            };
             rec.dispatch(
                 &self.pipe_ops,
                 &[
@@ -1209,20 +1354,20 @@ impl DFlashVkRunner {
                     &self.hidden_blk_buf,
                     &self.correction_buf,
                     &self.f32_params,
-                    &target.dummy_buf,
-                    &target.dummy_buf,
+                    q8_xq,
+                    q8_xd,
                 ],
                 &[
                     8,
                     n_embd as u32,
                     step as u32,
                     self.hidden_out_b_off,
-                    0,
+                    fuse_flag,
                     0,
                     0,
                     0,
                 ],
-                self.elem_groups(n_embd),
+                corr_groups,
             )?;
 
             if let Some((ref map_buf, n_pruned)) = self.vocab_map {
@@ -1258,16 +1403,37 @@ impl DFlashVkRunner {
                         &self.draft_toks_buf,
                         map_buf,
                     ],
-                    &[9, n_pruned as u32, (step + 1) as u32, 1, 0, cap_bits, 0, 0],
+                    &[
+                        9,
+                        n_pruned as u32,
+                        (step + 1) as u32,
+                        1,
+                        prob_slot_base,
+                        cap_bits,
+                        0,
+                        0,
+                    ],
                     1,
                 )?;
             } else {
-                target.dispatch_gemv(
-                    rec,
-                    &target.output,
-                    &self.corr_hidden_buf,
-                    &target.logits_padded_buf,
-                )?;
+                if fuse_q8 {
+                    target.dispatch_gemv_prequant(
+                        rec,
+                        &target.output,
+                        &self.corr_hidden_buf,
+                        &self.xq_buf,
+                        &self.xd_buf,
+                        &target.logits_padded_buf,
+                        true,
+                    )?;
+                } else {
+                    target.dispatch_gemv(
+                        rec,
+                        &target.output,
+                        &self.corr_hidden_buf,
+                        &target.logits_padded_buf,
+                    )?;
+                }
                 rec.dispatch(
                     &self.pipe_argmax_cap,
                     &[
@@ -1283,7 +1449,7 @@ impl DFlashVkRunner {
                         self.cfg.vocab_size as u32,
                         (step + 1) as u32,
                         0,
-                        0,
+                        prob_slot_base,
                         cap_bits,
                         0,
                         0,
@@ -1321,10 +1487,39 @@ impl DFlashVkRunner {
         k_drafts: usize,
         out_drafts: &mut [u32],
     ) -> Result<usize, VulkanError> {
+        let mut probs = [0.0f32; MAX_DFLASH_VK_BLOCK];
+        let cap = k_drafts.min(MAX_DFLASH_VK_BLOCK);
+        self.inject_and_draft_greedy_with_probs(
+            target,
+            inject_start_pos,
+            inject_count,
+            draft_pos0,
+            anchor_token_id,
+            k_drafts,
+            out_drafts,
+            &mut probs[..cap],
+        )
+    }
+
+    /// Same as [`Self::inject_and_draft_greedy`], additionally returning exact per-step softmax
+    /// top-1 confidence probabilities (`p_top1 in (0, 1]`) for confidence-gated early stopping.
+    #[allow(clippy::too_many_arguments)]
+    pub fn inject_and_draft_greedy_with_probs(
+        &mut self,
+        target: &mut Inkling2VkRunner,
+        inject_start_pos: usize,
+        inject_count: usize,
+        draft_pos0: usize,
+        anchor_token_id: u32,
+        k_drafts: usize,
+        out_drafts: &mut [u32],
+        out_probs: &mut [f32],
+    ) -> Result<usize, VulkanError> {
         let bs = self.cfg.block_size;
         let k = k_drafts
             .min(self.cfg.max_draft_tokens())
-            .min(out_drafts.len());
+            .min(out_drafts.len())
+            .min(out_probs.len());
 
         // Check `can_draft` AFTER accounting for `inject_count` updating `ctx_feat_pos`!
         let prev_in_inj = inject_count > 0
@@ -1382,13 +1577,15 @@ impl DFlashVkRunner {
                 .draft_toks_buf
                 .mapped_ptr()
                 .ok_or(VulkanError::NoMemoryType("draft_toks_buf mapped"))?;
-            // SAFETY: `draft_toks_buf` is persistently mapped coherent memory, idle after `ctx.run`.
+            let prob_base = bs + 3;
+            // SAFETY: `draft_toks_buf` (`(2 * bs + 8) * 4` bytes) is persistently mapped coherent
+            // memory, idle after `ctx.run`, with `1 + run_k` and `prob_base + run_k` in bounds.
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    (ptr as *const u32).add(1),
-                    out_drafts.as_mut_ptr(),
-                    run_k,
-                );
+                let u32_ptr = ptr as *const u32;
+                core::ptr::copy_nonoverlapping(u32_ptr.add(1), out_drafts.as_mut_ptr(), run_k);
+                for (i, dst_p) in out_probs.iter_mut().enumerate().take(run_k) {
+                    *dst_p = f32::from_bits(*u32_ptr.add(prob_base + i));
+                }
             }
         }
         Ok(run_k)

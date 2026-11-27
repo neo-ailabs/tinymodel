@@ -1488,6 +1488,9 @@ impl<'a> Inkling2Model<'a> {
             let word = tok_i >> 6;
             let bit = 1u64 << (tok_i & 63);
             for k_idx in 0..top_k {
+                if top_weights_win[tok_i * top_k + k_idx] == 0.0 {
+                    continue;
+                }
                 let e_id = top_ids_win[tok_i * top_k + k_idx];
                 let u = if exp_to_u[e_id] != u16::MAX {
                     exp_to_u[e_id] as usize
@@ -1785,6 +1788,9 @@ impl<'a> Inkling2Model<'a> {
             let out_t = &mut moe_out_win[tok_i * n_embd..(tok_i + 1) * n_embd];
             for k_idx in 0..top_k {
                 let w_e = top_weights_win[tok_i * top_k + k_idx];
+                if w_e == 0.0 {
+                    continue;
+                }
                 let slot_o = &win_slot_outs
                     [(tok_i * top_k + k_idx) * n_embd..(tok_i * top_k + k_idx + 1) * n_embd];
                 for (m, &o) in out_t.iter_mut().zip(slot_o.iter()) {

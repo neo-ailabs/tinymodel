@@ -206,7 +206,9 @@ void main() {
         const uint x_base = tok * red_k;
         float acc = (pc.p2 != 0u) ? y[tok * n_embd + gid] : 0.0;
         for (uint k = 0u; k < red_k; ++k) {
-            acc = fma(top_weights[w_base + k], x[(x_base + k) * n_embd + gid], acc);
+            if (pc.p3 == 0u || top_ids[w_base + k] < pc.p3) {
+                acc = fma(top_weights[w_base + k], x[(x_base + k) * n_embd + gid], acc);
+            }
         }
         y[tok * n_embd + gid] = acc;
     } else if (pc.op == 4u) {

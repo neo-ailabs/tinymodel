@@ -32,6 +32,8 @@ const SPV_RMS_NORM_Q8_1: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rms_n
 const SPV_QK_NORM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qk_norm.spv"));
 const SPV_SPLIT_QG_QNORM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/split_qg_qnorm.spv"));
 const SPV_SIGMOID_MUL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sigmoid_mul.spv"));
+const SPV_SIGMOID_MUL_Q8_1: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/sigmoid_mul_q8_1.spv"));
 const SPV_ROPE_KV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_kv.spv"));
 const SPV_ROPE_KV_Q8: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_kv_q8.spv"));
 const SPV_GQA_ATTN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gqa_attn.spv"));
@@ -70,6 +72,7 @@ const SPV_GEMV_PAIR_SILU_Q4_0_SOA_DP4A: &[u8] = include_bytes!(concat!(
 ));
 const SPV_SILU_MUL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silu_mul.spv"));
 const SPV_GDN_GATES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gdn_gates.spv"));
+const SPV_GDN_PREP_DECODE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gdn_prep_decode.spv"));
 const SPV_GDN_CONV_SILU_L2: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gdn_conv_silu_l2.spv"));
 const SPV_GDN_RECURRENCE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gdn_recurrence.spv"));
@@ -77,6 +80,8 @@ const SPV_GDN_RECURRENCE_LDS: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gdn_recurrence_lds.spv"));
 const SPV_GDN_NORM_GATED_SILU: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gdn_norm_gated_silu.spv"));
+const SPV_GDN_NORM_GATED_SILU_Q8_1: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gdn_norm_gated_silu_q8_1.spv"));
 const SPV_GEMM_TILED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_tiled.spv"));
 const SPV_GEMM_TILED_DP4A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_tiled_dp4a.spv"));
 const SPV_GEMM_TILED_DP4A_Q4_SOA: &[u8] =
@@ -385,8 +390,11 @@ enum AttnLayerPlan {
         w_beta_batch: BatchGemmEntry,
         gates_set: vk::DescriptorSet,
         conv_set: vk::DescriptorSet,
+        prep_dec_set: vk::DescriptorSet,
         recur_set: vk::DescriptorSet,
         gnorm_set: vk::DescriptorSet,
+        gnorm_dec_set: vk::DescriptorSet,
+        gnorm_dec_fused_q8: bool,
         w_out_dec: GemvCall,
         w_out_dec_q8: bool,
         w_out_batch: BatchGemmEntry,
@@ -407,6 +415,8 @@ enum AttnLayerPlan {
         attn_dec_set: vk::DescriptorSet,
         attn_batch_set: vk::DescriptorSet,
         sigmoid_set: vk::DescriptorSet,
+        sigmoid_dec_set: vk::DescriptorSet,
+        sigmoid_dec_fused_q8: bool,
         wo_dec: GemvCall,
         wo_dec_q8: bool,
         wo_batch: BatchGemmEntry,
@@ -443,17 +453,20 @@ struct RunnerPipes {
     qk_norm: Arc<Pipeline>,
     split_qg_qnorm: Arc<Pipeline>,
     sigmoid_mul: Arc<Pipeline>,
+    sigmoid_mul_q8_1: Option<Arc<Pipeline>>,
     rope_dec: Arc<Pipeline>,
     rope_batch: Arc<Pipeline>,
     attn_dec: Arc<Pipeline>,
     attn_batch: Arc<Pipeline>,
     attn_batch_kind: BatchAttnKind,
     gdn_gates: Arc<Pipeline>,
+    gdn_prep_decode: Arc<Pipeline>,
     gdn_conv_silu_l2: Arc<Pipeline>,
     gdn_conv_batch: Arc<Pipeline>,
     gdn_conv_state_upd: Arc<Pipeline>,
     gdn_recurrence: Arc<Pipeline>,
     gdn_norm_gated_silu: Arc<Pipeline>,
+    gdn_norm_gated_silu_q8_1: Option<Arc<Pipeline>>,
     silu_mul: Arc<Pipeline>,
     quant_q8_1: Option<Arc<Pipeline>>,
     argmax: Arc<Pipeline>,
@@ -1288,6 +1301,24 @@ impl Qwen35VkRunner {
         } else {
             None
         };
+        let sigmoid_mul_q8_1 = if use_dp4a_dec && (n_head * head_dim).is_multiple_of(32) {
+            Some(ctx.pipeline("sigmoid_mul_q8_1", 256, SPV_SIGMOID_MUL_Q8_1, 4, 4, &[256])?)
+        } else {
+            None
+        };
+        let gdn_norm_gated_silu_q8_1 =
+            if use_dp4a_dec && ssm_state_size.is_multiple_of(32) && ssm_state_size <= 256 {
+                Some(ctx.pipeline(
+                    "gdn_norm_gated_silu_q8_1",
+                    128,
+                    SPV_GDN_NORM_GATED_SILU_Q8_1,
+                    5,
+                    12,
+                    &[128],
+                )?)
+            } else {
+                None
+            };
         let used_lds_recurrence = !info.subgroup_shuffle || ctx.force_lds_recurrence();
         let gdn_recurrence_pipe = if used_lds_recurrence {
             ctx.pipeline(
@@ -1317,6 +1348,7 @@ impl Qwen35VkRunner {
             qk_norm: ctx.pipeline("qk_norm", 0, SPV_QK_NORM, 2, 8, &[64])?,
             split_qg_qnorm: ctx.pipeline("split_qg_qnorm", 64, SPV_SPLIT_QG_QNORM, 4, 12, &[64])?,
             sigmoid_mul: ctx.pipeline("sigmoid_mul", 256, SPV_SIGMOID_MUL, 2, 4, &[256])?,
+            sigmoid_mul_q8_1,
             rope_dec: ctx.pipeline(rope_dec_name, 0, rope_spv, 7, 32, &[64, 0])?,
             rope_batch: ctx.pipeline(rope_batch_name, 1, rope_spv, 7, 32, &[64, 1])?,
             attn_dec: ctx.pipeline(
@@ -1330,6 +1362,14 @@ impl Qwen35VkRunner {
             attn_batch,
             attn_batch_kind,
             gdn_gates: ctx.pipeline("gdn_gates", 64, SPV_GDN_GATES, 5, 8, &[64])?,
+            gdn_prep_decode: ctx.pipeline(
+                "gdn_prep_decode",
+                128,
+                SPV_GDN_PREP_DECODE,
+                11,
+                24,
+                &[128],
+            )?,
             gdn_conv_silu_l2: ctx.pipeline(
                 "gdn_conv_silu_l2",
                 128,
@@ -1363,6 +1403,7 @@ impl Qwen35VkRunner {
                 12,
                 &[64],
             )?,
+            gdn_norm_gated_silu_q8_1,
             silu_mul: ctx.pipeline("silu_mul", 0, SPV_SILU_MUL, 2, 4, &[256])?,
             quant_q8_1,
             argmax: ctx.pipeline("argmax", 0, SPV_ARGMAX, 2, 4, &[256])?,
@@ -1510,7 +1551,7 @@ impl Qwen35VkRunner {
                 }
                 if matches!(
                     mat.dtype,
-                    DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q5K
+                    DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q5K | DType::Q6K
                 ) {
                     let dt = dtype_code(mat.dtype)?;
                     let nr = gemv_nr(mat.dtype);
@@ -1623,7 +1664,9 @@ impl Qwen35VkRunner {
                         });
                     }
                 }
-                if ma.dtype == mb.dtype && matches!(ma.dtype, DType::Q4_0 | DType::Q8_0) {
+                if ma.dtype == mb.dtype
+                    && matches!(ma.dtype, DType::Q4_0 | DType::Q8_0 | DType::Q6K)
+                {
                     let dt = dtype_code(ma.dtype)?;
                     let nr = if ma.rows.is_multiple_of(4) {
                         4u32
@@ -2122,6 +2165,22 @@ impl Qwen35VkRunner {
                             Binding::Arena(s_v),
                         ],
                     )?;
+                    let prep_dec_set = alloc_set(
+                        &pipes.gdn_prep_decode,
+                        &[
+                            Binding::Arena(s_qkv),
+                            Binding::Arena(conv1d.slice),
+                            Binding::Arena(*conv_hist_slice),
+                            Binding::Arena(s_q),
+                            Binding::Arena(s_k),
+                            Binding::Arena(s_v),
+                            Binding::Arena(s_alpha),
+                            Binding::Arena(s_beta),
+                            Binding::Arena(ssm_dt_bias.slice),
+                            Binding::Arena(ssm_a.slice),
+                            Binding::Arena(s_g_exp),
+                        ],
+                    )?;
                     let recur_set = alloc_set(
                         &pipes.gdn_recurrence,
                         &[
@@ -2145,6 +2204,26 @@ impl Qwen35VkRunner {
 
                     let ((p_out, s_out, g_out, push_out), w_out_dec_q8) =
                         alloc_gemv_call(&w_out.mat, s_attn_out, s_x, true)?;
+                    let (gnorm_dec_set, gnorm_dec_fused_q8) = if w_out_dec_q8
+                        && let (Some(p_gnq), Some(xq), Some(xd)) =
+                            (&pipes.gdn_norm_gated_silu_q8_1, s_xq, s_xd)
+                    {
+                        (
+                            alloc_set(
+                                p_gnq,
+                                &[
+                                    Binding::Arena(s_attn_out),
+                                    Binding::Arena(ssm_norm.slice),
+                                    Binding::Arena(s_gate),
+                                    Binding::Arena(xq),
+                                    Binding::Arena(xd),
+                                ],
+                            )?,
+                            true,
+                        )
+                    } else {
+                        (gnorm_set, false)
+                    };
                     let w_out_batch = make_batch_gemm(w_out.mat, s_attn_out, s_x)?;
 
                     AttnLayerPlan::Gdn {
@@ -2156,8 +2235,11 @@ impl Qwen35VkRunner {
                         w_beta_batch,
                         gates_set,
                         conv_set,
+                        prep_dec_set,
                         recur_set,
                         gnorm_set,
+                        gnorm_dec_set,
+                        gnorm_dec_fused_q8,
                         w_out_dec: (p_out, s_out, g_out, push_out),
                         w_out_dec_q8,
                         w_out_batch,
@@ -2440,6 +2522,25 @@ impl Qwen35VkRunner {
 
                     let ((p_wo, s_wo, g_wo, push_wo), wo_dec_q8) =
                         alloc_gemv_call(&wo.mat, s_attn_out, s_x, true)?;
+                    let (sigmoid_dec_set, sigmoid_dec_fused_q8) = if wo_dec_q8
+                        && let (Some(p_sq), Some(xq), Some(xd)) =
+                            (&pipes.sigmoid_mul_q8_1, s_xq, s_xd)
+                    {
+                        (
+                            alloc_set(
+                                p_sq,
+                                &[
+                                    Binding::Arena(s_attn_out),
+                                    Binding::Arena(s_gate),
+                                    Binding::Arena(xq),
+                                    Binding::Arena(xd),
+                                ],
+                            )?,
+                            true,
+                        )
+                    } else {
+                        (sigmoid_set, false)
+                    };
                     let wo_batch = make_batch_gemm(wo.mat, s_attn_out, s_x)?;
 
                     AttnLayerPlan::FullAttn {
@@ -2454,6 +2555,8 @@ impl Qwen35VkRunner {
                         attn_dec_set,
                         attn_batch_set,
                         sigmoid_set,
+                        sigmoid_dec_set,
+                        sigmoid_dec_fused_q8,
                         wo_dec: (p_wo, s_wo, g_wo, push_wo),
                         wo_dec_q8,
                         wo_batch,
@@ -3115,7 +3218,6 @@ impl Qwen35VkRunner {
         let hv = self.cfg.ssm_dt_rank as u32;
         let s_dim = self.cfg.ssm_state_size as u32;
         let d_conv = self.cfg.ssm_conv_kernel as u32;
-        let gates_push = [hv, 1];
         let conv_push = [hk, hv, s_dim, d_conv, 1, eps_bits];
         let recur_push = [hk, hv, s_dim, 1];
         let gnorm_push = [hv, s_dim, eps_bits];
@@ -3132,10 +3234,10 @@ impl Qwen35VkRunner {
                 AttnLayerPlan::Gdn {
                     qkv_z_dec,
                     alpha_beta_dec,
-                    gates_set,
-                    conv_set,
+                    prep_dec_set,
                     recur_set,
-                    gnorm_set,
+                    gnorm_dec_set,
+                    gnorm_dec_fused_q8,
                     w_out_dec,
                     w_out_dec_q8,
                     ..
@@ -3169,17 +3271,8 @@ impl Qwen35VkRunner {
 
                     self.cmd_dispatch_set(
                         cb,
-                        &self.pipes.gdn_gates,
-                        *gates_set,
-                        &gates_push,
-                        hv.div_ceil(64),
-                        1,
-                        false,
-                    )?;
-                    self.cmd_dispatch_set(
-                        cb,
-                        &self.pipes.gdn_conv_silu_l2,
-                        *conv_set,
+                        &self.pipes.gdn_prep_decode,
+                        *prep_dec_set,
                         &conv_push,
                         2 * hk + hv,
                         1,
@@ -3194,22 +3287,28 @@ impl Qwen35VkRunner {
                         hv,
                         true,
                     )?;
-                    self.cmd_dispatch_set(
-                        cb,
-                        &self.pipes.gdn_norm_gated_silu,
-                        *gnorm_set,
-                        &gnorm_push,
-                        hv,
-                        1,
-                        true,
-                    )?;
-                    self.cmd_quant_if_needed(
-                        cb,
-                        self.quant_attn_out_set,
-                        1,
-                        self.cfg.ssm_d_inner,
-                        *w_out_dec_q8,
-                    )?;
+                    if *gnorm_dec_fused_q8
+                        && let Some(ref p_gnq) = self.pipes.gdn_norm_gated_silu_q8_1
+                    {
+                        self.cmd_dispatch_set(cb, p_gnq, *gnorm_dec_set, &gnorm_push, hv, 1, true)?;
+                    } else {
+                        self.cmd_dispatch_set(
+                            cb,
+                            &self.pipes.gdn_norm_gated_silu,
+                            *gnorm_dec_set,
+                            &gnorm_push,
+                            hv,
+                            1,
+                            true,
+                        )?;
+                        self.cmd_quant_if_needed(
+                            cb,
+                            self.quant_attn_out_set,
+                            1,
+                            self.cfg.ssm_d_inner,
+                            *w_out_dec_q8,
+                        )?;
+                    }
                     self.cmd_dispatch_set(
                         cb,
                         &w_out_dec.0,
@@ -3232,7 +3331,8 @@ impl Qwen35VkRunner {
                     k_norm_set,
                     rope_dec_set,
                     attn_dec_set,
-                    sigmoid_set,
+                    sigmoid_dec_set,
+                    sigmoid_dec_fused_q8,
                     wo_dec,
                     wo_dec_q8,
                     ..
@@ -3307,16 +3407,35 @@ impl Qwen35VkRunner {
                         1,
                         true,
                     )?;
-                    self.cmd_dispatch_set(
-                        cb,
-                        &self.pipes.sigmoid_mul,
-                        *sigmoid_set,
-                        &[q_dim as u32],
-                        (q_dim as u32).div_ceil(256),
-                        1,
-                        true,
-                    )?;
-                    self.cmd_quant_if_needed(cb, self.quant_attn_out_set, 1, q_dim, *wo_dec_q8)?;
+                    if *sigmoid_dec_fused_q8 && let Some(ref p_sq) = self.pipes.sigmoid_mul_q8_1 {
+                        let n_blocks = (q_dim / 32) as u32;
+                        self.cmd_dispatch_set(
+                            cb,
+                            p_sq,
+                            *sigmoid_dec_set,
+                            &[n_blocks],
+                            n_blocks.div_ceil(8),
+                            1,
+                            true,
+                        )?;
+                    } else {
+                        self.cmd_dispatch_set(
+                            cb,
+                            &self.pipes.sigmoid_mul,
+                            *sigmoid_dec_set,
+                            &[q_dim as u32],
+                            (q_dim as u32).div_ceil(256),
+                            1,
+                            true,
+                        )?;
+                        self.cmd_quant_if_needed(
+                            cb,
+                            self.quant_attn_out_set,
+                            1,
+                            q_dim,
+                            *wo_dec_q8,
+                        )?;
+                    }
                     self.cmd_dispatch_set(cb, &wo_dec.0, wo_dec.1, &wo_dec.3, wo_dec.2, 1, true)?;
                     self.lora.cmd_record_linear(
                         &self.ctx,
@@ -4453,10 +4572,10 @@ impl Qwen35VkRunner {
                         AttnLayerPlan::Gdn {
                             qkv_z_dec,
                             alpha_beta_dec,
-                            gates_set,
-                            conv_set,
+                            prep_dec_set,
                             recur_set,
-                            gnorm_set,
+                            gnorm_dec_set,
+                            gnorm_dec_fused_q8,
                             w_out_dec,
                             w_out_dec_q8,
                             ..
@@ -4469,17 +4588,8 @@ impl Qwen35VkRunner {
 
                             self.cmd_dispatch_set(
                                 cb,
-                                &self.pipes.gdn_gates,
-                                *gates_set,
-                                &[hv_u32, 1],
-                                hv_u32.div_ceil(64),
-                                1,
-                                false,
-                            )?;
-                            self.cmd_dispatch_set(
-                                cb,
-                                &self.pipes.gdn_conv_silu_l2,
-                                *conv_set,
+                                &self.pipes.gdn_prep_decode,
+                                *prep_dec_set,
                                 &[hk_u32, hv_u32, s_u32, dc_u32, 1, eps_bits],
                                 2 * hk_u32 + hv_u32,
                                 1,
@@ -4498,26 +4608,42 @@ impl Qwen35VkRunner {
                                 hv_u32,
                                 true,
                             )?;
-                            self.cmd_dispatch_set(
-                                cb,
-                                &self.pipes.gdn_norm_gated_silu,
-                                *gnorm_set,
-                                &[hv_u32, s_u32, eps_bits],
-                                hv_u32,
-                                1,
-                                true,
-                            )?;
+                            if *gnorm_dec_fused_q8
+                                && let Some(ref p_gnq) = self.pipes.gdn_norm_gated_silu_q8_1
+                            {
+                                self.cmd_dispatch_set(
+                                    cb,
+                                    p_gnq,
+                                    *gnorm_dec_set,
+                                    &[hv_u32, s_u32, eps_bits],
+                                    hv_u32,
+                                    1,
+                                    true,
+                                )?;
+                            } else {
+                                self.cmd_dispatch_set(
+                                    cb,
+                                    &self.pipes.gdn_norm_gated_silu,
+                                    *gnorm_dec_set,
+                                    &[hv_u32, s_u32, eps_bits],
+                                    hv_u32,
+                                    1,
+                                    true,
+                                )?;
+                            }
                             let cur = mark(cb);
                             spans.push((4, prev, cur));
                             prev = cur;
 
-                            self.cmd_quant_if_needed(
-                                cb,
-                                self.quant_attn_out_set,
-                                1,
-                                self.cfg.ssm_d_inner,
-                                *w_out_dec_q8,
-                            )?;
+                            if !*gnorm_dec_fused_q8 {
+                                self.cmd_quant_if_needed(
+                                    cb,
+                                    self.quant_attn_out_set,
+                                    1,
+                                    self.cfg.ssm_d_inner,
+                                    *w_out_dec_q8,
+                                )?;
+                            }
                             self.cmd_dispatch_set(
                                 cb,
                                 &w_out_dec.0,
@@ -4537,7 +4663,8 @@ impl Qwen35VkRunner {
                             k_norm_set,
                             rope_dec_set,
                             attn_dec_set,
-                            sigmoid_set,
+                            sigmoid_dec_set,
+                            sigmoid_dec_fused_q8,
                             wo_dec,
                             wo_dec_q8,
                             ..
@@ -4601,26 +4728,43 @@ impl Qwen35VkRunner {
                                 1,
                                 true,
                             )?;
-                            self.cmd_dispatch_set(
-                                cb,
-                                &self.pipes.sigmoid_mul,
-                                *sigmoid_set,
-                                &[q_dim as u32],
-                                (q_dim as u32).div_ceil(256),
-                                1,
-                                true,
-                            )?;
+                            if *sigmoid_dec_fused_q8
+                                && let Some(ref p_sq) = self.pipes.sigmoid_mul_q8_1
+                            {
+                                let n_blocks = (q_dim / 32) as u32;
+                                self.cmd_dispatch_set(
+                                    cb,
+                                    p_sq,
+                                    *sigmoid_dec_set,
+                                    &[n_blocks],
+                                    n_blocks.div_ceil(8),
+                                    1,
+                                    true,
+                                )?;
+                            } else {
+                                self.cmd_dispatch_set(
+                                    cb,
+                                    &self.pipes.sigmoid_mul,
+                                    *sigmoid_dec_set,
+                                    &[q_dim as u32],
+                                    (q_dim as u32).div_ceil(256),
+                                    1,
+                                    true,
+                                )?;
+                            }
                             let cur = mark(cb);
                             spans.push((7, prev, cur));
                             prev = cur;
 
-                            self.cmd_quant_if_needed(
-                                cb,
-                                self.quant_attn_out_set,
-                                1,
-                                q_dim,
-                                *wo_dec_q8,
-                            )?;
+                            if !*sigmoid_dec_fused_q8 {
+                                self.cmd_quant_if_needed(
+                                    cb,
+                                    self.quant_attn_out_set,
+                                    1,
+                                    q_dim,
+                                    *wo_dec_q8,
+                                )?;
+                            }
                             self.cmd_dispatch_set(
                                 cb, &wo_dec.0, wo_dec.1, &wo_dec.3, wo_dec.2, 1, true,
                             )?;

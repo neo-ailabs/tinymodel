@@ -1,0 +1,110 @@
+#version 450
+// Fused Qwen3.5 GDN decode (`n_tok == 1`) preprocessing kernel:
+// combines `gdn_gates` + `gdn_conv_silu_l2` (`MODE == 0`) into a single dispatch!
+//   - Workgroups `0 .. 2*n_k_heads`: causal Conv1d + hist shift + SiLU (BEFORE split!) + L2 norm -> `q_out` / `k_out`
+//   - Workgroups `2*n_k_heads .. 2*n_k_heads + n_v_heads`:
+//       * causal Conv1d + hist shift + SiLU (NO L2 norm on V, `AGENTS.md` §9!) -> `v_out`
+//       * `tid == 0`: `g_exp[vh] = exp(softplus(alpha[vh] + dt_bias[vh]) * ssm_a[vh])` and `beta[vh] = sigmoid(beta[vh])`
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(constant_id = 0) const uint WG = 128;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer Qkv     { float qkv[]; };
+layout(std430, binding = 1) readonly buffer Conv1d  { float conv1d[]; };
+layout(std430, binding = 2) buffer ConvHist         { float conv_hist[]; };
+layout(std430, binding = 3) writeonly buffer QOut   { float q_out[]; };
+layout(std430, binding = 4) writeonly buffer KOut   { float k_out[]; };
+layout(std430, binding = 5) writeonly buffer VOut   { float v_out[]; };
+layout(std430, binding = 6) readonly buffer Alpha   { float alpha[]; };
+layout(std430, binding = 7) buffer Beta             { float beta[]; };
+layout(std430, binding = 8) readonly buffer DtBias  { float dt_bias[]; };
+layout(std430, binding = 9) readonly buffer SsmA    { float ssm_a[]; };
+layout(std430, binding = 10) writeonly buffer GExp  { float g_exp[]; };
+
+layout(push_constant) uniform PC {
+    uint n_k_heads;
+    uint n_v_heads;
+    uint s_dim;
+    uint d_conv;
+    uint n_tok;
+    float eps;
+} pc;
+
+shared float sg_sums[32];
+
+void main() {
+    const uint group = gl_WorkGroupID.x;
+    const uint total_groups = 2u * pc.n_k_heads + pc.n_v_heads;
+    if (group >= total_groups) return;
+
+    const uint tid = gl_LocalInvocationID.x;
+    const bool in_bounds = (tid < pc.s_dim);
+    const uint ch = group * pc.s_dim + tid;
+    const uint hist_len = pc.d_conv - 1u;
+    const bool is_qk = (group < 2u * pc.n_k_heads);
+
+    float val = 0.0;
+    if (in_bounds) {
+        const uint h_base = ch * hist_len;
+        const uint w_base = ch * pc.d_conv;
+        float raw = 0.0;
+        for (uint k = 0u; k < hist_len; ++k) {
+            raw = fma(conv_hist[h_base + k], conv1d[w_base + k], raw);
+        }
+        const float cur = qkv[ch];
+        raw = fma(cur, conv1d[w_base + hist_len], raw);
+
+        for (uint k = 0u; k + 1u < hist_len; ++k) {
+            conv_hist[h_base + k] = conv_hist[h_base + k + 1u];
+        }
+        if (hist_len > 0u) {
+            conv_hist[h_base + hist_len - 1u] = cur;
+        }
+
+        // AGENTS.md §9 invariant #1: SiLU BEFORE splitting into Q / K / V!
+        val = raw / (1.0 + exp(-raw));
+    }
+
+    if (is_qk) {
+        float ss = subgroupAdd(val * val);
+        if (subgroupElect()) {
+            sg_sums[gl_SubgroupID] = ss;
+        }
+        barrier();
+
+        if (tid == 0u) {
+            float tot = 0.0;
+            for (uint s = 0u; s < gl_NumSubgroups; ++s) {
+                tot += sg_sums[s];
+            }
+            sg_sums[0] = inversesqrt(tot + pc.eps);
+        }
+        barrier();
+
+        val *= sg_sums[0];
+
+        if (in_bounds) {
+            if (group < pc.n_k_heads) {
+                q_out[group * pc.s_dim + tid] = val;
+            } else {
+                const uint kh = group - pc.n_k_heads;
+                k_out[kh * pc.s_dim + tid] = val;
+            }
+        }
+    } else {
+        // AGENTS.md §9 invariant #2: NEVER L2-normalize V!
+        const uint vh = group - 2u * pc.n_k_heads;
+        if (in_bounds) {
+            v_out[vh * pc.s_dim + tid] = val;
+        }
+        if (tid == 0u) {
+            const float x = alpha[vh] + dt_bias[vh];
+            const float sp = (x > 20.0) ? x : log(1.0 + exp(x));
+            g_exp[vh] = exp(sp * ssm_a[vh]);
+            beta[vh] = 1.0 / (1.0 + exp(-beta[vh]));
+        }
+    }
+}

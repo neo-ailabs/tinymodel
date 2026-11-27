@@ -3,7 +3,7 @@
 // and register-batched multi-token (`M = 1, 4, 8`) execution (`0-ULP` bit-exact across `M`).
 //
 // DTYPE (constant_id = 1):
-//   0 = Q4_0, 1 = Q4_1, 2 = Q8_0, 3 = Q5_K
+//   0 = Q4_0, 1 = Q4_1, 2 = Q8_0, 3 = Q5_K, 4 = Q6_K
 // NR (constant_id = 2): rows per subgroup (1..4)
 // M  (constant_id = 3): 1 (decode / 2D `gl_WorkGroupID.y = tok`) or 4 / 8 (single-read multi-token)
 
@@ -138,6 +138,47 @@ void main() {
                         const float dx = xd[gblk].x;
                         [[unroll]] for (uint r = 0u; r < NR; ++r) {
                             b_acc[t][r] = fma(d_arr[r] * dx, float(sdot4x8(q32_arr[r], xqv, 0)), b_acc[t][r]);
+                        }
+                    }
+                }
+            }
+        } else if (DTYPE == 4u) {
+            const uint sub_blk = lane >> 3u;
+            const uint sub_lane = lane & 7u;
+            const uint step_blk = sg_size >> 3u;
+            const uint l2_0 = sub_lane << 1u;
+            const int sc_hi_shift = int((sub_lane >> 2u) * 8u);
+            for (uint ib = sub_blk; ib < nb; ib += step_blk) {
+                const uint isb = ib >> 3u;
+                const uint sub_b = ib & 7u;
+                const uint half_idx = sub_b >> 2u;
+                const uint quad = sub_b & 3u;
+                const uint ql_off = half_idx * 32u + (quad & 1u) * 16u + l2_0;
+                const uint qh_off = 64u + half_idx * 16u + l2_0;
+                const uint ql_shift = (quad >> 1u) * 4u;
+                const uint qh_shift = quad * 2u;
+                float d_sc_arr[NR];
+                int q4s_arr[NR];
+                [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                    const uint b = b_row[r] + isb * 105u;
+                    const float d = unpackHalf2x16(uint(w16[b + 104u])).x;
+                    const int sc = bitfieldExtract(int(uint(w16[b + 96u + sub_b])), sc_hi_shift, 8);
+                    const uint ql32 = uint(w16[b + ql_off]) | (uint(w16[b + ql_off + 1u]) << 16u);
+                    const uint qh32 = uint(w16[b + qh_off]) | (uint(w16[b + qh_off + 1u]) << 16u);
+                    const uint u6 = ((ql32 >> ql_shift) & 0x0F0F0F0Fu)
+                                  | (((qh32 >> qh_shift) & 0x03030303u) << 4u);
+                    const uint t6 = u6 ^ 0x20202020u;
+                    const uint m6 = t6 & 0x20202020u;
+                    d_sc_arr[r] = d * float(sc);
+                    q4s_arr[r] = int(t6 | (m6 << 1u) | (m6 << 2u));
+                }
+                [[unroll]] for (uint t = 0u; t < M; ++t) {
+                    if (t < n_tok) {
+                        const uint gblk = t * nb + ib;
+                        const int xqv = xq[gblk * 8u + sub_lane];
+                        const float dx = xd[gblk].x;
+                        [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                            b_acc[t][r] = fma(d_sc_arr[r] * dx, float(sdot4x8(q4s_arr[r], xqv, 0)), b_acc[t][r]);
                         }
                     }
                 }
@@ -308,6 +349,41 @@ void main() {
                 const int s = sdot4x8(int(lo0 | hi0), xq0, 0) + sdot4x8(int(lo1 | hi1), xq1, 0);
                 const float base = (sub == 0u) ? fma(mw, dm.y, acc[r]) : acc[r];
                 acc[r] = fma(dw * dm.x, float(s), base);
+            }
+        }
+    } else if (DTYPE == 4u) {
+        // Coalesced 8-lane-per-Q8_1-block Q6_K DP4A GEMV (256 elems = 8x32 sub-blocks = 210B = 105 u16):
+        // SWAR sign-extends 4x6-bit `(q - 32)` into `int8x4` with zero `dm.y` correction needed!
+        const uint sub_blk = lane >> 3u;
+        const uint sub_lane = lane & 7u;
+        const uint step_blk = sg_size >> 3u;
+        const uint l2_0 = sub_lane << 1u;
+        const int sc_hi_shift = int((sub_lane >> 2u) * 8u);
+        for (uint ib = sub_blk; ib < nb; ib += step_blk) {
+            const uint gblk = x_blk_off + ib;
+            const int xqv = xq[gblk * 8u + sub_lane];
+            const float dx = xd[gblk].x;
+            const uint isb = ib >> 3u;
+            const uint sub_b = ib & 7u;
+            const uint half_idx = sub_b >> 2u;
+            const uint quad = sub_b & 3u;
+            const uint ql_off = half_idx * 32u + (quad & 1u) * 16u + l2_0;
+            const uint qh_off = 64u + half_idx * 16u + l2_0;
+            const uint ql_shift = (quad >> 1u) * 4u;
+            const uint qh_shift = quad * 2u;
+
+            [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                const uint b = row_b[r] + isb * 105u;
+                const float d = unpackHalf2x16(uint(w16[b + 104u])).x;
+                const int sc = bitfieldExtract(int(uint(w16[b + 96u + sub_b])), sc_hi_shift, 8);
+                const uint ql32 = uint(w16[b + ql_off]) | (uint(w16[b + ql_off + 1u]) << 16u);
+                const uint qh32 = uint(w16[b + qh_off]) | (uint(w16[b + qh_off + 1u]) << 16u);
+                const uint u6 = ((ql32 >> ql_shift) & 0x0F0F0F0Fu)
+                              | (((qh32 >> qh_shift) & 0x03030303u) << 4u);
+                const uint t6 = u6 ^ 0x20202020u;
+                const uint m6 = t6 & 0x20202020u;
+                const int q4s = int(t6 | (m6 << 1u) | (m6 << 2u));
+                acc[r] = fma((d * float(sc)) * dx, float(sdot4x8(q4s, xqv, 0)), acc[r]);
             }
         }
     }

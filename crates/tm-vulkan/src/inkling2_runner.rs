@@ -34,6 +34,7 @@ const SPV_GEMM_COOPMAT_F16: &[u8] =
 const SPV_SIGMOID_MUL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sigmoid_mul.spv"));
 const SPV_ARGMAX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/argmax.spv"));
 const SPV_INKLING2_OPS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/inkling2_ops.spv"));
+const SPV_INKLING2_Q8_OPS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/inkling2_q8_ops.spv"));
 const SPV_INKLING2_REL_ATTN: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/inkling2_rel_attn.spv"));
 const SPV_INKLING2_MOE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/inkling2_moe.spv"));
@@ -435,6 +436,13 @@ pub struct Inkling2VkRunner {
     xd_buf: VkBuffer,
     ext_xq_buf: VkBuffer,
     ext_xd_buf: VkBuffer,
+    q_in_q8: (VkBuffer, VkBuffer),
+    k_in_q8: (VkBuffer, VkBuffer),
+    v_in_q8: (VkBuffer, VkBuffer),
+    attn_vec_q8: (VkBuffer, VkBuffer),
+    ffn_norm_q8: (VkBuffer, VkBuffer),
+    out_norm_q8: (VkBuffer, VkBuffer),
+    dspark_tap_slot: usize,
     // Persistently mapped coherent host-GPU bridge buffers (`9 KiB` activation transfer!)
     ffn_normed_bridge: VkBuffer,
     top_ids_bridge: VkBuffer,
@@ -449,6 +457,7 @@ pub struct Inkling2VkRunner {
     pipe_embed: Arc<Pipeline>,
     pipe_embed_batch: Arc<Pipeline>,
     pipe_ops: Arc<Pipeline>,
+    pipe_q8_ops: Option<Arc<Pipeline>>,
     pipe_rel_attn: Arc<Pipeline>,
     pipe_sigmoid_mul: Arc<Pipeline>,
     pipe_moe_ops: Arc<Pipeline>,
@@ -464,12 +473,12 @@ pub struct Inkling2VkRunner {
     gemv_m8_pipes: [Arc<Pipeline>; 6],
     gemv_small_m4_pipes: [Arc<Pipeline>; 6],
     gemv_small_m8_pipes: [Arc<Pipeline>; 6],
-    gemv_dp4a_pipes: Option<[Arc<Pipeline>; 4]>,
-    gemv_dp4a_small_pipes: Option<[Arc<Pipeline>; 4]>,
-    gemv_dp4a_m4_pipes: Option<[Arc<Pipeline>; 4]>,
-    gemv_dp4a_m8_pipes: Option<[Arc<Pipeline>; 4]>,
-    gemv_dp4a_small_m4_pipes: Option<[Arc<Pipeline>; 4]>,
-    gemv_dp4a_small_m8_pipes: Option<[Arc<Pipeline>; 4]>,
+    gemv_dp4a_pipes: Option<[Arc<Pipeline>; 5]>,
+    gemv_dp4a_small_pipes: Option<[Arc<Pipeline>; 5]>,
+    gemv_dp4a_m4_pipes: Option<[Arc<Pipeline>; 5]>,
+    gemv_dp4a_m8_pipes: Option<[Arc<Pipeline>; 5]>,
+    gemv_dp4a_small_m4_pipes: Option<[Arc<Pipeline>; 5]>,
+    gemv_dp4a_small_m8_pipes: Option<[Arc<Pipeline>; 5]>,
     dp4a_min_dim: usize,
     dp4a_q8_enabled: bool,
     gemm_pipes: [Option<Arc<Pipeline>>; 6],
@@ -483,6 +492,20 @@ pub struct Inkling2VkRunner {
     hybrid_gpu_exps: usize,
     baked_decode_cbs: [Option<Vec<BakedCb>>; 3],
     baked_ext_moe_cbs: Vec<Option<BakedCb>>,
+    baked_spec_plans: Vec<BakedSpecPlan>,
+}
+
+struct BakedSpecPlan {
+    w: usize,
+    compute_last_logits: bool,
+    compute_all_argmax: bool,
+    save_conv_snapshots: bool,
+    taps_len: usize,
+    taps: [usize; 8],
+    n_segs: usize,
+    segs: [GpuSegSpec; 64],
+    seg_cbs: Vec<BakedCb>,
+    ext_cbs: Vec<Option<BakedCb>>,
 }
 
 fn read_u_or_arr(
@@ -716,14 +739,10 @@ pub(crate) fn upload_range_uncached(
     slot: &mut PageAlignedSlot,
 ) -> Result<VkBuffer, VulkanError> {
     let dst = ctx.create_device_slab(byte_len as u64)?;
-    let max_chunk = 16 * 1024 * 1024usize;
-    let mut done = 0usize;
-    while done < byte_len {
-        let take = (byte_len - done).min(max_chunk);
-        let slice = rdr.read_into_slot(file_offset + done as u64, take, slot)?;
-        ctx.write_bytes(&dst, done as u64, slice)?;
-        done += take;
-    }
+    ctx.write_bytes_from_chunks(&dst, 0, byte_len, |done, staging_dst| {
+        rdr.read_exact_uncached(file_offset + done as u64, staging_dst, slot)?;
+        Ok(())
+    })?;
     Ok(dst)
 }
 
@@ -1490,6 +1509,20 @@ impl Inkling2VkRunner {
         let ext_xq_buf = ctx.alloc_buffer((ext_q8_blks * 32).max(32) as u64)?;
         let ext_xd_buf = ctx.alloc_buffer((ext_q8_blks * 8).max(16) as u64)?;
 
+        let alloc_q8_pair = |elems: usize| -> Result<(VkBuffer, VkBuffer), VulkanError> {
+            let blks = elems.max(32).div_ceil(32);
+            Ok((
+                ctx.alloc_buffer((blks * 32) as u64)?,
+                ctx.alloc_buffer((blks * 8).max(16) as u64)?,
+            ))
+        };
+        let q_in_q8 = alloc_q8_pair(MAX_INKLING2_SPEC_WINDOW * n_embd)?;
+        let k_in_q8 = alloc_q8_pair(MAX_INKLING2_SPEC_WINDOW * n_embd)?;
+        let v_in_q8 = alloc_q8_pair(MAX_INKLING2_SPEC_WINDOW * n_embd)?;
+        let attn_vec_q8 = alloc_q8_pair(MAX_INKLING2_SPEC_WINDOW * max_q_dim)?;
+        let ffn_norm_q8 = alloc_q8_pair(MAX_INKLING2_SPEC_WINDOW * n_embd)?;
+        let out_norm_q8 = alloc_q8_pair(MAX_INKLING2_SPEC_WINDOW * n_embd)?;
+
         let ffn_normed_bridge =
             ctx.create_host_buffer((MAX_INKLING2_VK_WINDOW * n_embd * 4) as u64)?;
         let top_ids_bridge = ctx
@@ -1693,9 +1726,8 @@ impl Inkling2VkRunner {
                     if VkPrefillMode::from_env() == VkPrefillMode::Fallback {
                         (usize::MAX, false)
                     } else {
-                        // In `auto` mode, enable `dp4a` for 4/5-bit (`Q4_0`/`Q4_1`/`Q5_K`) matrices while
-                        // keeping `Q8_0` on zero-barrier 8-lane coalesced `w32` GEMV (avoids 336 unfused
-                        // `quantize_q8_1` barriers per token across 48 loop visits; measured +2.0 tok/s on L4).
+                        // Enable `OpSDotKHR` (`dp4a`) automatically for 4/5/6-bit matrices (`Q4_0/Q4_1/Q5_K/Q6_K`);
+                        // `Q8_0` (`gemv_res` already reaches ~95% GDDR6 bandwidth) opts in via `TM_VK_DP4A=1`.
                         (256, false)
                     }
                 }
@@ -1703,6 +1735,7 @@ impl Inkling2VkRunner {
         };
         let (
             pipe_quant_q8_1,
+            pipe_q8_ops,
             pipe_moe_dp4a,
             gemv_dp4a_pipes,
             gemv_dp4a_small_pipes,
@@ -1712,6 +1745,11 @@ impl Inkling2VkRunner {
             gemv_dp4a_small_m8_pipes,
         ) = if dp4a_min_dim < usize::MAX {
             let p_q = ctx.pipeline("quantize_q8_1", 256, SPV_QUANTIZE_Q8_1, 3, 4, &[256])?;
+            let p_q8_ops = if ops_wg == 128 {
+                Some(ctx.pipeline("inkling2_q8_ops", 128, SPV_INKLING2_Q8_OPS, 6, 32, &[128])?)
+            } else {
+                None
+            };
             let p_moe = ctx.pipeline(
                 "inkling2_moe_dp4a",
                 moe_wg | (moe_nr << 16),
@@ -1720,13 +1758,13 @@ impl Inkling2VkRunner {
                 32,
                 &[moe_wg, moe_nr],
             )?;
-            let mut dv = Vec::with_capacity(4);
-            let mut ds = Vec::with_capacity(4);
-            let mut dm4 = Vec::with_capacity(4);
-            let mut dm8 = Vec::with_capacity(4);
-            let mut dsm4 = Vec::with_capacity(4);
-            let mut dsm8 = Vec::with_capacity(4);
-            for dt_code in 0u32..4 {
+            let mut dv = Vec::with_capacity(5);
+            let mut ds = Vec::with_capacity(5);
+            let mut dm4 = Vec::with_capacity(5);
+            let mut dm8 = Vec::with_capacity(5);
+            let mut dsm4 = Vec::with_capacity(5);
+            let mut dsm8 = Vec::with_capacity(5);
+            for dt_code in 0u32..5 {
                 dv.push(ctx.pipeline(
                     "gemv_dp4a",
                     (gemv_wg << 8) | (gemv_nr << 4) | dt_code,
@@ -1776,11 +1814,12 @@ impl Inkling2VkRunner {
                     &[gemv_small_wg, dt_code, 1, 8],
                 )?);
             }
-            let cv = |v: Vec<Arc<Pipeline>>| -> [Arc<Pipeline>; 4] {
-                v.try_into().unwrap_or_else(|_| unreachable!("4"))
+            let cv = |v: Vec<Arc<Pipeline>>| -> [Arc<Pipeline>; 5] {
+                v.try_into().unwrap_or_else(|_| unreachable!("5"))
             };
             (
                 Some(p_q),
+                p_q8_ops,
                 Some(p_moe),
                 Some(cv(dv)),
                 Some(cv(ds)),
@@ -1790,7 +1829,7 @@ impl Inkling2VkRunner {
                 Some(cv(dsm8)),
             )
         } else {
-            (None, None, None, None, None, None, None, None)
+            (None, None, None, None, None, None, None, None, None)
         };
 
         let use_cm_f16 = VkPrefillMode::from_env() != VkPrefillMode::Fallback
@@ -2009,6 +2048,13 @@ impl Inkling2VkRunner {
             xd_buf,
             ext_xq_buf,
             ext_xd_buf,
+            q_in_q8,
+            k_in_q8,
+            v_in_q8,
+            attn_vec_q8,
+            ffn_norm_q8,
+            out_norm_q8,
+            dspark_tap_slot: 0,
             ffn_normed_bridge,
             top_ids_bridge,
             top_weights_bridge,
@@ -2021,6 +2067,7 @@ impl Inkling2VkRunner {
             pipe_embed,
             pipe_embed_batch,
             pipe_ops,
+            pipe_q8_ops,
             pipe_rel_attn,
             pipe_sigmoid_mul,
             pipe_moe_ops,
@@ -2055,6 +2102,7 @@ impl Inkling2VkRunner {
             hybrid_gpu_exps,
             baked_decode_cbs: [None, None, None],
             baked_ext_moe_cbs,
+            baked_spec_plans: Vec::new(),
             cfg,
         })
     }
@@ -2247,6 +2295,37 @@ impl Inkling2VkRunner {
         self.baked_decode_cbs = [None, None, None];
         for slot in &mut self.baked_ext_moe_cbs {
             *slot = None;
+        }
+        self.baked_spec_plans.clear();
+    }
+
+    /// Sets the `dspark_taps_buf` token slot offset (`dyn_pos_buf[1]`) used when accumulating
+    /// `W = 1` single-token taps across multiple non-drafted steps before a batched `inject_batch`.
+    #[inline]
+    pub fn set_dspark_tap_slot(&mut self, slot: usize) {
+        self.dspark_tap_slot = slot;
+    }
+
+    #[inline]
+    pub(crate) fn fused_q8_active(&self) -> bool {
+        self.dp4a_q8_enabled
+            && self.ops_wg == 128
+            && self.moe_wg == 128
+            && self.cfg.n_embd.is_multiple_of(32)
+    }
+
+    #[inline]
+    fn layer_gpu_ext_experts_for_window(&self, ip: usize, w: usize) -> usize {
+        if self.layers[ip].vram_experts.is_some() || self.layers[ip].host_imported_experts.is_none()
+        {
+            0
+        } else if w >= 2 && self.hybrid_gpu_exps > 0 && !self.ctx.info().unified_memory {
+            (self.hybrid_gpu_exps + 1)
+                .min(self.cfg.n_expert_used / 2)
+                .max(self.hybrid_gpu_exps)
+                .min(self.cfg.n_expert_used)
+        } else {
+            self.hybrid_gpu_exps.min(self.cfg.n_expert_used)
         }
     }
 
@@ -2674,10 +2753,156 @@ impl Inkling2VkRunner {
     fn use_mat_dp4a(&self, mat: &VkDenseMat) -> bool {
         (mat.dtype_code <= 1
             || mat.dtype_code == 3
+            || mat.dtype_code == 4
             || (mat.dtype_code == 2 && self.dp4a_q8_enabled))
             && mat.cols >= self.dp4a_min_dim
             && mat.rows >= self.dp4a_min_dim
             && mat.cols.is_multiple_of(32)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_gemv_prequant(
+        &self,
+        rec: &mut Recorder<'_>,
+        mat: &VkDenseMat,
+        x_f32: &VkBuffer,
+        xq: &VkBuffer,
+        xd: &VkBuffer,
+        y: &VkBuffer,
+        emit_barrier: bool,
+    ) -> Result<(), VulkanError> {
+        if self.use_mat_dp4a(mat)
+            && let Some((p, gx)) = self.select_gemv_dp4a(mat.rows, mat.dtype_code)
+        {
+            let args = [mat.cols as u32, mat.rows as u32, 0, mat.row_u16s];
+            if emit_barrier {
+                return rec.dispatch(p, &[&mat.buf, xq, xd, y], &args, gx);
+            } else {
+                return rec.dispatch_nb(p, &[&mat.buf, xq, xd, y], &args, gx);
+            }
+        }
+        let (p, gx) = self.select_gemv(mat.rows, mat.dtype_code);
+        let args = [mat.cols as u32, mat.rows as u32, 0, mat.row_u16s];
+        if emit_barrier {
+            rec.dispatch(p, &[&mat.buf, x_f32, y], &args, gx)
+        } else {
+            rec.dispatch_nb(p, &[&mat.buf, x_f32, y], &args, gx)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_gemm_prequant(
+        &self,
+        rec: &mut Recorder<'_>,
+        mat: &VkDenseMat,
+        x_win: &VkBuffer,
+        xq_win: &VkBuffer,
+        xd_win: &VkBuffer,
+        y_win: &VkBuffer,
+        n_tok: usize,
+        use_tc: bool,
+        emit_barrier: bool,
+    ) -> Result<(), VulkanError> {
+        if !use_tc
+            && (2..=8).contains(&n_tok)
+            && (mat.dtype_code <= 2 || mat.dtype_code == 4)
+            && self.use_mat_dp4a(mat)
+            && let Some((p, gx)) = self.select_gemv_dp4a_batch(mat.rows, mat.dtype_code, n_tok)
+        {
+            let push = [
+                mat.cols as u32,
+                mat.rows as u32,
+                (n_tok as u32) << 8,
+                mat.row_u16s,
+            ];
+            if emit_barrier {
+                return rec.dispatch(p, &[&mat.buf, xq_win, xd_win, y_win], &push, gx);
+            } else {
+                return rec.dispatch_nb(p, &[&mat.buf, xq_win, xd_win, y_win], &push, gx);
+            }
+        }
+        self.dispatch_gemm_inner(rec, mat, x_win, y_win, n_tok, use_tc, emit_barrier)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_rmsnorm_q8_rows(
+        &self,
+        rec: &mut Recorder<'_>,
+        src: &VkBuffer,
+        in_off: u32,
+        in_tok_stride: u32,
+        dst: &VkBuffer,
+        q8_pair: &(VkBuffer, VkBuffer),
+        dim: usize,
+        w_off: u32,
+        wy: u32,
+        fuse_q8: bool,
+        emit_barrier: bool,
+    ) -> Result<(), VulkanError> {
+        let (pipe, op, xq, xd) = if fuse_q8 && let Some(ref p_q8) = self.pipe_q8_ops {
+            (p_q8, 0u32, &q8_pair.0, &q8_pair.1)
+        } else {
+            (&self.pipe_ops, 0u32, &self.dummy_buf, &self.dummy_buf)
+        };
+        let bufs = [src, dst, &self.f32_params, &self.dummy_buf, xq, xd];
+        let args = [
+            op,
+            dim as u32,
+            in_off,
+            0,
+            1,
+            self.cfg.rms_eps.to_bits(),
+            in_tok_stride,
+            w_off,
+        ];
+        if wy <= 1 {
+            if emit_barrier {
+                rec.dispatch(pipe, &bufs, &args, 1)
+            } else {
+                rec.dispatch_nb(pipe, &bufs, &args, 1)
+            }
+        } else if emit_barrier {
+            rec.dispatch_xy(pipe, &bufs, &args, 1, wy)
+        } else {
+            rec.dispatch_xy_nb(pipe, &bufs, &args, 1, wy)
+        }
+    }
+
+    fn record_sigmoid_mul_q8(
+        &self,
+        rec: &mut Recorder<'_>,
+        attn_vec: &VkBuffer,
+        gate: &VkBuffer,
+        q8_pair: &(VkBuffer, VkBuffer),
+        total_elems: usize,
+        fuse_q8: bool,
+    ) -> Result<(), VulkanError> {
+        if fuse_q8
+            && total_elems.is_multiple_of(32)
+            && let Some(ref p_q8) = self.pipe_q8_ops
+        {
+            let gx = (total_elems / 32).div_ceil(4) as u32;
+            rec.dispatch(
+                p_q8,
+                &[
+                    attn_vec,
+                    gate,
+                    &self.dummy_buf,
+                    &self.dummy_buf,
+                    &q8_pair.0,
+                    &q8_pair.1,
+                ],
+                &[1, total_elems as u32, 0, 0, 0, 0, 0, 0],
+                gx,
+            )
+        } else {
+            rec.dispatch(
+                &self.pipe_sigmoid_mul,
+                &[attn_vec, gate],
+                &[total_elems as u32],
+                self.elem_groups(total_elems),
+            )
+        }
     }
 
     pub(crate) fn dispatch_gemv(
@@ -3069,7 +3294,7 @@ impl Inkling2VkRunner {
         let ratio = ((pos + 1) as f32) / (self.cfg.log_scale_floor as f32);
         let tau = 1.0 + self.cfg.log_scale_alpha * ratio.max(1.0).ln();
         write_mapped_u32(&self.ctx, &self.step_buf, &[token_id])?;
-        write_mapped_u32(&self.ctx, &self.dyn_pos_buf, &[pos as u32])?;
+        write_mapped_u32(&self.ctx, &self.dyn_pos_buf, &[pos as u32, 0])?;
         write_mapped_f32(&self.ctx, &self.win_taus_buf, &[tau])?;
 
         let n_embd = self.cfg.n_embd;
@@ -3916,109 +4141,159 @@ impl Inkling2VkRunner {
             self.record_controls_qkv(rec, loop_w)?;
         }
 
-        // Input RMSNorm into `q_in_buf`, `k_in_buf`, `v_in_buf`
+        // Input RMSNorm (+ zero-barrier fused `Q8_1`!) into `q_in_buf`, `k_in_buf`, `v_in_buf`
+        let fq8 = self.fused_q8_active();
+        let share_q_in = swa && !has_messages;
         if swa && has_messages {
-            for (j, dst_b) in [&self.q_in_buf, &self.k_in_buf, &self.v_in_buf]
-                .into_iter()
-                .enumerate()
-            {
-                let args = [
-                    0,
-                    n_embd as u32,
+            let pairs = [
+                (0usize, &self.q_in_buf, &self.q_in_q8),
+                (1usize, &self.k_in_buf, &self.k_in_q8),
+                (2usize, &self.v_in_buf, &self.v_in_q8),
+            ];
+            for (j, dst_b, q8p) in pairs {
+                self.record_rmsnorm_q8_rows(
+                    rec,
+                    &self.inputs_buf,
                     (j * n_embd) as u32,
                     0,
-                    1,
-                    self.cfg.rms_eps.to_bits(),
-                    0,
-                    layer.attn_norm_off,
-                ];
-                let bufs = [
-                    &self.inputs_buf,
                     dst_b,
-                    &self.f32_params,
-                    &self.dummy_buf,
-                    &self.dummy_buf,
-                    &self.dummy_buf,
-                ];
-                if j < 2 {
-                    rec.dispatch_nb(&self.pipe_ops, &bufs, &args, 1)?;
-                } else {
-                    rec.dispatch(&self.pipe_ops, &bufs, &args, 1)?;
-                }
+                    q8p,
+                    n_embd,
+                    layer.attn_norm_off,
+                    1,
+                    fq8,
+                    j == 2,
+                )?;
             }
         } else if swa {
-            rec.dispatch(
-                &self.pipe_ops,
-                &[
-                    &self.inputs_buf,
-                    &self.q_in_buf,
-                    &self.f32_params,
-                    &self.dummy_buf,
-                    &self.dummy_buf,
-                    &self.dummy_buf,
-                ],
-                &[
-                    0,
-                    n_embd as u32,
-                    0,
-                    0,
-                    1,
-                    self.cfg.rms_eps.to_bits(),
-                    0,
-                    layer.attn_norm_off,
-                ],
+            self.record_rmsnorm_q8_rows(
+                rec,
+                &self.inputs_buf,
+                0,
+                0,
+                &self.q_in_buf,
+                &self.q_in_q8,
+                n_embd,
+                layer.attn_norm_off,
                 1,
+                fq8,
+                true,
             )?;
-            self.record_vec_copy_nb(rec, &self.k_in_buf, 0, &self.q_in_buf, 0, n_embd)?;
-            self.record_vec_copy(rec, &self.v_in_buf, 0, &self.q_in_buf, 0, n_embd)?;
         } else {
             let pairs = [
-                (0usize, &self.q_in_buf, layer.q_inp_norm_off),
-                (1usize, &self.k_in_buf, layer.k_inp_norm_off),
-                (2usize, &self.v_in_buf, layer.v_inp_norm_off),
+                (0usize, &self.q_in_buf, &self.q_in_q8, layer.q_inp_norm_off),
+                (1usize, &self.k_in_buf, &self.k_in_q8, layer.k_inp_norm_off),
+                (2usize, &self.v_in_buf, &self.v_in_q8, layer.v_inp_norm_off),
             ];
-            for (j, dst_b, norm_off) in pairs {
-                let args = [
-                    0,
-                    n_embd as u32,
+            for (j, dst_b, q8p, norm_off) in pairs {
+                self.record_rmsnorm_q8_rows(
+                    rec,
+                    &self.inputs_buf,
                     (j * n_embd) as u32,
                     0,
-                    1,
-                    self.cfg.rms_eps.to_bits(),
-                    0,
-                    norm_off,
-                ];
-                let bufs = [
-                    &self.inputs_buf,
                     dst_b,
-                    &self.f32_params,
-                    &self.dummy_buf,
-                    &self.dummy_buf,
-                    &self.dummy_buf,
-                ];
-                if j < 2 {
-                    rec.dispatch_nb(&self.pipe_ops, &bufs, &args, 1)?;
-                } else {
-                    rec.dispatch(&self.pipe_ops, &bufs, &args, 1)?;
-                }
+                    q8p,
+                    n_embd,
+                    norm_off,
+                    1,
+                    fq8,
+                    j == 2,
+                )?;
             }
         }
         TsRecorder::mark(ts, rec, STAGE_LOOP_MIX_NORM);
 
-        // Self-Attention projections (all read `q_in`/`k_in`/`v_in` and write disjoint buffers)
-        self.dispatch_gemv_nb(rec, &layer.wq, &self.q_in_buf, &self.q_buf)?;
-        self.dispatch_gemv_nb(rec, &layer.wk, &self.k_in_buf, &self.k_buf)?;
-        self.dispatch_gemv_nb(rec, &layer.wv, &self.v_in_buf, &self.v_buf)?;
-        self.dispatch_gemv_nb(rec, &layer.attn_rel, &self.q_in_buf, &self.r_buf)?;
-        self.dispatch_gemv_nb(rec, &layer.attn_sink_proj, &self.q_in_buf, &self.sinks_buf)?;
-        if swa {
-            self.dispatch_gemv(rec, &layer.wqkv_gate, &self.q_in_buf, &self.gate_buf)?;
+        // Self-Attention projections (all read pre-quantized `Q8_1` and launch in ONE barrier wave!)
+        let (k_src_f32, k_src_q8, v_src_f32, v_src_q8) = if share_q_in {
+            (&self.q_in_buf, &self.q_in_q8, &self.q_in_buf, &self.q_in_q8)
         } else {
-            self.dispatch_gemv_nb(rec, &layer.wqkv_gate, &self.q_in_buf, &self.gate_buf)?;
+            (&self.k_in_buf, &self.k_in_q8, &self.v_in_buf, &self.v_in_q8)
+        };
+        self.dispatch_gemv_prequant(
+            rec,
+            &layer.wq,
+            &self.q_in_buf,
+            &self.q_in_q8.0,
+            &self.q_in_q8.1,
+            &self.q_buf,
+            false,
+        )?;
+        self.dispatch_gemv_prequant(
+            rec,
+            &layer.wk,
+            k_src_f32,
+            &k_src_q8.0,
+            &k_src_q8.1,
+            &self.k_buf,
+            false,
+        )?;
+        self.dispatch_gemv_prequant(
+            rec,
+            &layer.wv,
+            v_src_f32,
+            &v_src_q8.0,
+            &v_src_q8.1,
+            &self.v_buf,
+            false,
+        )?;
+        self.dispatch_gemv_prequant(
+            rec,
+            &layer.attn_rel,
+            &self.q_in_buf,
+            &self.q_in_q8.0,
+            &self.q_in_q8.1,
+            &self.r_buf,
+            false,
+        )?;
+        self.dispatch_gemv_prequant(
+            rec,
+            &layer.attn_sink_proj,
+            &self.q_in_buf,
+            &self.q_in_q8.0,
+            &self.q_in_q8.1,
+            &self.sinks_buf,
+            false,
+        )?;
+        if swa {
+            self.dispatch_gemv_prequant(
+                rec,
+                &layer.wqkv_gate,
+                &self.q_in_buf,
+                &self.q_in_q8.0,
+                &self.q_in_q8.1,
+                &self.gate_buf,
+                true,
+            )?;
+        } else {
+            self.dispatch_gemv_prequant(
+                rec,
+                &layer.wqkv_gate,
+                &self.q_in_buf,
+                &self.q_in_q8.0,
+                &self.q_in_q8.1,
+                &self.gate_buf,
+                false,
+            )?;
             let kp = layer.attn_k_conv_proj.as_ref().expect("k_conv_proj");
             let vp = layer.attn_v_conv_proj.as_ref().expect("v_conv_proj");
-            self.dispatch_gemv_nb(rec, kp, &self.k_in_buf, &self.k_dyn_buf)?;
-            self.dispatch_gemv(rec, vp, &self.v_in_buf, &self.v_dyn_buf)?;
+            self.dispatch_gemv_prequant(
+                rec,
+                kp,
+                k_src_f32,
+                &k_src_q8.0,
+                &k_src_q8.1,
+                &self.k_dyn_buf,
+                false,
+            )?;
+            self.dispatch_gemv_prequant(
+                rec,
+                vp,
+                v_src_f32,
+                &v_src_q8.0,
+                &v_src_q8.1,
+                &self.v_dyn_buf,
+                true,
+            )?;
         }
 
         let dyn_heads = if swa { 0u32 } else { nh_kv as u32 };
@@ -4218,14 +4493,24 @@ impl Inkling2VkRunner {
             nh as u32,
         )?;
 
-        // Sigmoid output gate + `wo` + `attn_post_conv`
-        rec.dispatch(
-            &self.pipe_sigmoid_mul,
-            &[&self.attn_vec_buf, &self.gate_buf],
-            &[q_dim as u32],
-            self.elem_groups(q_dim),
+        // Sigmoid output gate (+ fused `Q8_1`!) + `wo` + `attn_post_conv`
+        self.record_sigmoid_mul_q8(
+            rec,
+            &self.attn_vec_buf,
+            &self.gate_buf,
+            &self.attn_vec_q8,
+            q_dim,
+            fq8,
         )?;
-        self.dispatch_gemv(rec, &layer.wo, &self.attn_vec_buf, &self.wo_out_buf)?;
+        self.dispatch_gemv_prequant(
+            rec,
+            &layer.wo,
+            &self.attn_vec_buf,
+            &self.attn_vec_q8.0,
+            &self.attn_vec_q8.1,
+            &self.wo_out_buf,
+            true,
+        )?;
         rec.dispatch(
             &self.pipe_ops,
             &[
@@ -4302,35 +4587,29 @@ impl Inkling2VkRunner {
                 (LOOP_CTRL_FFN * n_embd) as u32,
             )?;
         }
-        rec.dispatch(
-            &self.pipe_ops,
-            &[
-                &self.inp_sa_buf,
-                ffn_norm_dst,
-                &self.f32_params,
-                &self.dummy_buf,
-                &self.dummy_buf,
-                &self.dummy_buf,
-            ],
-            &[
-                0,
-                n_embd as u32,
-                0,
-                0,
-                1,
-                self.cfg.rms_eps.to_bits(),
-                0,
-                layer.ffn_norm_off,
-            ],
+        self.record_rmsnorm_q8_rows(
+            rec,
+            &self.inp_sa_buf,
+            0,
+            0,
+            ffn_norm_dst,
+            &self.ffn_norm_q8,
+            n_embd,
+            layer.ffn_norm_off,
             1,
+            fq8,
+            true,
         )?;
 
         // Router GEMV + GPU top-k selection
-        self.dispatch_gemv(
+        self.dispatch_gemv_prequant(
             rec,
             &layer.ffn_gate_inp,
             ffn_norm_dst,
+            &self.ffn_norm_q8.0,
+            &self.ffn_norm_q8.1,
             &self.router_logits_buf,
+            true,
         )?;
         let (has_b, b_off) = match layer.exp_probs_b_off {
             Some(off) => (1u32, off),
@@ -4380,6 +4659,7 @@ impl Inkling2VkRunner {
         let sg = self.ctx.info().subgroup_size;
         let rows_per_wg = ((self.moe_wg / sg) * self.moe_nr) as usize;
 
+        let fq8 = self.fused_q8_active();
         let use_moe_dp4a = self.dp4a_q8_enabled
             && n_embd >= self.dp4a_min_dim
             && n_ff >= self.dp4a_min_dim
@@ -4388,13 +4668,18 @@ impl Inkling2VkRunner {
 
         // 1. Indexed `gate_up` `Q8_0` GEMV (`[2 * n_ff]` rows x `top_k` experts)
         if use_moe_dp4a && let Some(ref p_dp4a) = self.pipe_moe_dp4a {
-            self.record_quant_q8_1(rec, x_buf, &self.xq_buf, &self.xd_buf, n_embd)?;
+            let (in_xq, in_xd) = if fq8 {
+                (&self.ffn_norm_q8.0, &self.ffn_norm_q8.1)
+            } else {
+                self.record_quant_q8_1(rec, x_buf, &self.xq_buf, &self.xd_buf, n_embd)?;
+                (&self.xq_buf, &self.xd_buf)
+            };
             rec.dispatch_xy(
                 p_dp4a,
                 &[
                     &vexp.gate_up,
-                    &self.xq_buf,
-                    &self.xd_buf,
+                    in_xq,
+                    in_xd,
                     top_ids_buf,
                     &self.exp_gate_up_buf,
                 ],
@@ -4436,38 +4721,62 @@ impl Inkling2VkRunner {
                 top_k as u32,
             )?;
         }
-        // 2. SiTU-GLU (`[top_k * n_ff]`)
-        rec.dispatch(
-            &self.pipe_moe_ops,
-            &[
-                &self.dummy_buf,
-                &self.exp_gate_up_buf,
-                &self.dummy_buf,
-                top_ids_buf,
-                top_w_buf,
-                &self.exp_hidden_buf,
-            ],
-            &[
-                2,
-                (top_k * n_ff) as u32,
-                n_ff as u32,
-                0,
-                0,
-                0,
-                self.cfg.situ_beta.to_bits(),
-                self.cfg.situ_linear_beta.to_bits(),
-            ],
-            (top_k * n_ff).div_ceil(self.moe_wg as usize) as u32,
-        )?;
-        // 3. Indexed `down` `Q8_0` GEMV (`[n_embd]` rows x `top_k` experts)
+        // 2. SiTU-GLU (+ fused `Q8_1`!) & 3. Indexed `down` `Q8_0` GEMV
         if use_moe_dp4a && let Some(ref p_dp4a) = self.pipe_moe_dp4a {
-            self.record_quant_q8_1(
-                rec,
-                &self.exp_hidden_buf,
-                &self.xq_buf,
-                &self.xd_buf,
-                top_k * n_ff,
-            )?;
+            if let Some(ref p_q8) = self.pipe_q8_ops {
+                rec.dispatch(
+                    p_q8,
+                    &[
+                        &self.dummy_buf,
+                        &self.exp_gate_up_buf,
+                        &self.exp_hidden_buf,
+                        &self.dummy_buf,
+                        &self.xq_buf,
+                        &self.xd_buf,
+                    ],
+                    &[
+                        2,
+                        (top_k * n_ff) as u32,
+                        n_ff as u32,
+                        0,
+                        0,
+                        self.cfg.situ_beta.to_bits(),
+                        self.cfg.situ_linear_beta.to_bits(),
+                        0,
+                    ],
+                    ((top_k * n_ff) / 32).div_ceil(4) as u32,
+                )?;
+            } else {
+                rec.dispatch(
+                    &self.pipe_moe_ops,
+                    &[
+                        &self.dummy_buf,
+                        &self.exp_gate_up_buf,
+                        &self.dummy_buf,
+                        top_ids_buf,
+                        top_w_buf,
+                        &self.exp_hidden_buf,
+                    ],
+                    &[
+                        2,
+                        (top_k * n_ff) as u32,
+                        n_ff as u32,
+                        0,
+                        0,
+                        0,
+                        self.cfg.situ_beta.to_bits(),
+                        self.cfg.situ_linear_beta.to_bits(),
+                    ],
+                    (top_k * n_ff).div_ceil(self.moe_wg as usize) as u32,
+                )?;
+                self.record_quant_q8_1(
+                    rec,
+                    &self.exp_hidden_buf,
+                    &self.xq_buf,
+                    &self.xd_buf,
+                    top_k * n_ff,
+                )?;
+            }
             rec.dispatch_xy(
                 p_dp4a,
                 &[
@@ -4491,6 +4800,28 @@ impl Inkling2VkRunner {
                 top_k as u32,
             )?;
         } else {
+            rec.dispatch(
+                &self.pipe_moe_ops,
+                &[
+                    &self.dummy_buf,
+                    &self.exp_gate_up_buf,
+                    &self.dummy_buf,
+                    top_ids_buf,
+                    top_w_buf,
+                    &self.exp_hidden_buf,
+                ],
+                &[
+                    2,
+                    (top_k * n_ff) as u32,
+                    n_ff as u32,
+                    0,
+                    0,
+                    0,
+                    self.cfg.situ_beta.to_bits(),
+                    self.cfg.situ_linear_beta.to_bits(),
+                ],
+                (top_k * n_ff).div_ceil(self.moe_wg as usize) as u32,
+            )?;
             rec.dispatch_xy(
                 &self.pipe_moe_ops,
                 &[
@@ -4554,6 +4885,7 @@ impl Inkling2VkRunner {
         let pack_u7 = ((top_k as u32) << 16) | (k_gpu as u32);
         let sg = self.ctx.info().subgroup_size;
         let rows_per_wg = ((self.moe_wg / sg) * self.moe_nr) as usize;
+        let fq8 = self.fused_q8_active() && w <= MAX_INKLING2_SPEC_WINDOW;
         let use_moe_dp4a = self.dp4a_q8_enabled
             && n_embd >= self.dp4a_min_dim
             && n_ff >= self.dp4a_min_dim
@@ -4561,13 +4893,18 @@ impl Inkling2VkRunner {
             && n_ff.is_multiple_of(32);
 
         if use_moe_dp4a && let Some(ref p_dp4a) = self.pipe_moe_dp4a {
-            self.record_quant_q8_1(rec, x_buf, &self.ext_xq_buf, &self.ext_xd_buf, w * n_embd)?;
+            let (in_xq, in_xd) = if fq8 {
+                (&self.ffn_norm_q8.0, &self.ffn_norm_q8.1)
+            } else {
+                self.record_quant_q8_1(rec, x_buf, &self.ext_xq_buf, &self.ext_xd_buf, w * n_embd)?;
+                (&self.ext_xq_buf, &self.ext_xd_buf)
+            };
             rec.dispatch_xy(
                 p_dp4a,
                 &[
                     &vexp.gate_up,
-                    &self.ext_xq_buf,
-                    &self.ext_xd_buf,
+                    in_xq,
+                    in_xd,
                     top_ids_buf,
                     &self.exp_gate_up_buf,
                 ],
@@ -4609,36 +4946,61 @@ impl Inkling2VkRunner {
                 total_gpu_k as u32,
             )?;
         }
-        rec.dispatch(
-            &self.pipe_moe_ops,
-            &[
-                &self.dummy_buf,
-                &self.exp_gate_up_buf,
-                &self.dummy_buf,
-                top_ids_buf,
-                &self.dummy_buf,
-                &self.exp_hidden_buf,
-            ],
-            &[
-                2,
-                (total_gpu_k * n_ff) as u32,
-                n_ff as u32,
-                0,
-                0,
-                0,
-                self.cfg.situ_beta.to_bits(),
-                self.cfg.situ_linear_beta.to_bits(),
-            ],
-            (total_gpu_k * n_ff).div_ceil(self.moe_wg as usize) as u32,
-        )?;
         if use_moe_dp4a && let Some(ref p_dp4a) = self.pipe_moe_dp4a {
-            self.record_quant_q8_1(
-                rec,
-                &self.exp_hidden_buf,
-                &self.ext_xq_buf,
-                &self.ext_xd_buf,
-                total_gpu_k * n_ff,
-            )?;
+            if let Some(ref p_q8) = self.pipe_q8_ops {
+                rec.dispatch(
+                    p_q8,
+                    &[
+                        &self.dummy_buf,
+                        &self.exp_gate_up_buf,
+                        &self.exp_hidden_buf,
+                        &self.dummy_buf,
+                        &self.ext_xq_buf,
+                        &self.ext_xd_buf,
+                    ],
+                    &[
+                        2,
+                        (total_gpu_k * n_ff) as u32,
+                        n_ff as u32,
+                        0,
+                        0,
+                        self.cfg.situ_beta.to_bits(),
+                        self.cfg.situ_linear_beta.to_bits(),
+                        0,
+                    ],
+                    ((total_gpu_k * n_ff) / 32).div_ceil(4) as u32,
+                )?;
+            } else {
+                rec.dispatch(
+                    &self.pipe_moe_ops,
+                    &[
+                        &self.dummy_buf,
+                        &self.exp_gate_up_buf,
+                        &self.dummy_buf,
+                        top_ids_buf,
+                        &self.dummy_buf,
+                        &self.exp_hidden_buf,
+                    ],
+                    &[
+                        2,
+                        (total_gpu_k * n_ff) as u32,
+                        n_ff as u32,
+                        0,
+                        0,
+                        0,
+                        self.cfg.situ_beta.to_bits(),
+                        self.cfg.situ_linear_beta.to_bits(),
+                    ],
+                    (total_gpu_k * n_ff).div_ceil(self.moe_wg as usize) as u32,
+                )?;
+                self.record_quant_q8_1(
+                    rec,
+                    &self.exp_hidden_buf,
+                    &self.ext_xq_buf,
+                    &self.ext_xd_buf,
+                    total_gpu_k * n_ff,
+                )?;
+            }
             rec.dispatch_xy(
                 p_dp4a,
                 &[
@@ -4662,6 +5024,28 @@ impl Inkling2VkRunner {
                 total_gpu_k as u32,
             )
         } else {
+            rec.dispatch(
+                &self.pipe_moe_ops,
+                &[
+                    &self.dummy_buf,
+                    &self.exp_gate_up_buf,
+                    &self.dummy_buf,
+                    top_ids_buf,
+                    &self.dummy_buf,
+                    &self.exp_hidden_buf,
+                ],
+                &[
+                    2,
+                    (total_gpu_k * n_ff) as u32,
+                    n_ff as u32,
+                    0,
+                    0,
+                    0,
+                    self.cfg.situ_beta.to_bits(),
+                    self.cfg.situ_linear_beta.to_bits(),
+                ],
+                (total_gpu_k * n_ff).div_ceil(self.moe_wg as usize) as u32,
+            )?;
             rec.dispatch_xy(
                 &self.pipe_moe_ops,
                 &[
@@ -4778,10 +5162,41 @@ impl Inkling2VkRunner {
         top_w_buf: &VkBuffer,
         out_win_buf: &VkBuffer,
     ) -> Result<(), VulkanError> {
+        self.record_moe_window_subset(
+            rec,
+            vexp,
+            w,
+            use_grouped,
+            0,
+            x_win_buf,
+            top_ids_buf,
+            top_w_buf,
+            out_win_buf,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_moe_window_subset(
+        &self,
+        rec: &mut Recorder<'_>,
+        vexp: &VkVramExperts,
+        w: usize,
+        use_grouped: bool,
+        max_expert_excl: usize,
+        x_win_buf: &VkBuffer,
+        top_ids_buf: &VkBuffer,
+        top_w_buf: &VkBuffer,
+        out_win_buf: &VkBuffer,
+    ) -> Result<(), VulkanError> {
         let n_embd = self.cfg.n_embd;
         let n_ff = self.cfg.n_ff_exp;
         let top_k = self.cfg.n_expert_used;
         let total_k = w * top_k;
+        let active_n_exp = if max_expert_excl > 0 {
+            max_expert_excl.min(self.cfg.n_expert)
+        } else {
+            self.cfg.n_expert
+        };
 
         if use_grouped
             && w > 8
@@ -4791,9 +5206,9 @@ impl Inkling2VkRunner {
         {
             let bm = self.moe_grouped_bm;
             let bn = self.moe_grouped_bn;
-            let max_tiles = total_k.min(self.cfg.n_expert + total_k.div_ceil(bm)) as u32;
+            let max_tiles = total_k.min(active_n_exp + total_k.div_ceil(bm)).max(1) as u32;
 
-            // 1. Build `BM` expert-grouped tile descriptors on GPU (`1` workgroup)
+            // 1. Build `BM` expert-grouped tile descriptors on GPU (`1` workgroup; filters `e < active_n_exp`)
             rec.dispatch(
                 &self.pipe_moe_ops,
                 &[
@@ -4806,7 +5221,7 @@ impl Inkling2VkRunner {
                 ],
                 &[
                     4,
-                    self.cfg.n_expert as u32,
+                    active_n_exp as u32,
                     total_k as u32,
                     bm as u32,
                     0,
@@ -4816,7 +5231,7 @@ impl Inkling2VkRunner {
                 ],
                 1,
             )?;
-            // 2. Expert-grouped `gate_up` (`CoopMat F16` on T4/RDNA4, `LDS Tiled` fallback)
+            // 2. Expert-grouped `gate_up` (`CoopMat F16` on L4/T4/RDNA4, `LDS Tiled` fallback)
             rec.dispatch_xy(
                 p_grp,
                 &[
@@ -4858,7 +5273,7 @@ impl Inkling2VkRunner {
                 ],
                 (total_k * n_ff).div_ceil(self.moe_wg as usize) as u32,
             )?;
-            // 4. Expert-grouped `down` (`CoopMat F16` on T4/RDNA4, `LDS Tiled` fallback)
+            // 4. Expert-grouped `down` (`CoopMat F16` on L4/T4/RDNA4, `LDS Tiled` fallback)
             rec.dispatch_xy(
                 p_grp,
                 &[
@@ -4877,6 +5292,10 @@ impl Inkling2VkRunner {
                 n_embd.div_ceil(bn) as u32,
                 max_tiles,
             )?;
+            if max_expert_excl > 0 {
+                // In split-expert prefill mode, `seg.prev_host` reduces `exp_down_buf` onto `moe_out_bridge`.
+                return Ok(());
+            }
             // 5. Batched deterministic `0..top_k` reduction into `out_win_buf` (`[w, n_embd]`)
             return rec.dispatch_xy(
                 &self.pipe_moe_ops,
@@ -4901,6 +5320,7 @@ impl Inkling2VkRunner {
             // Exact `0-ULP` expert-deduplicated register GEMV (`op=4` + `op=5`, `tile_cnt <= 8`):
             // reads every shared expert ONCE across the `w`-token verify window while remaining
             // bit-for-bit identical to single-token `op=1`!
+            let fq8 = self.fused_q8_active() && x_win_buf.buf == self.win_ffn_norm_buf.buf;
             let use_moe_dp4a = self.dp4a_q8_enabled
                 && n_embd >= self.dp4a_min_dim
                 && n_ff >= self.dp4a_min_dim
@@ -4921,13 +5341,18 @@ impl Inkling2VkRunner {
                 1,
             )?;
             if use_moe_dp4a && let Some(ref p_dp4a) = self.pipe_moe_dp4a {
-                self.record_quant_q8_1(rec, x_win_buf, &self.xq_buf, &self.xd_buf, w * n_embd)?;
+                let (in_xq, in_xd) = if fq8 {
+                    (&self.ffn_norm_q8.0, &self.ffn_norm_q8.1)
+                } else {
+                    self.record_quant_q8_1(rec, x_win_buf, &self.xq_buf, &self.xd_buf, w * n_embd)?;
+                    (&self.xq_buf, &self.xd_buf)
+                };
                 rec.dispatch_xy(
                     p_dp4a,
                     &[
                         &vexp.gate_up,
-                        &self.xq_buf,
-                        &self.xd_buf,
+                        in_xq,
+                        in_xd,
                         &self.moe_tiles_buf,
                         &self.exp_gate_up_buf,
                     ],
@@ -4942,6 +5367,82 @@ impl Inkling2VkRunner {
                         0,
                     ],
                     (2 * n_ff).div_ceil(rows_per_wg) as u32,
+                    max_tiles,
+                )?;
+                if let Some(ref p_q8) = self.pipe_q8_ops {
+                    rec.dispatch(
+                        p_q8,
+                        &[
+                            &self.dummy_buf,
+                            &self.exp_gate_up_buf,
+                            &self.exp_hidden_buf,
+                            &self.dummy_buf,
+                            &self.xq_buf,
+                            &self.xd_buf,
+                        ],
+                        &[
+                            2,
+                            (total_k * n_ff) as u32,
+                            n_ff as u32,
+                            0,
+                            0,
+                            self.cfg.situ_beta.to_bits(),
+                            self.cfg.situ_linear_beta.to_bits(),
+                            0,
+                        ],
+                        ((total_k * n_ff) / 32).div_ceil(4) as u32,
+                    )?;
+                } else {
+                    rec.dispatch(
+                        &self.pipe_moe_ops,
+                        &[
+                            &self.dummy_buf,
+                            &self.exp_gate_up_buf,
+                            &self.dummy_buf,
+                            top_ids_buf,
+                            top_w_buf,
+                            &self.exp_hidden_buf,
+                        ],
+                        &[
+                            2,
+                            (total_k * n_ff) as u32,
+                            n_ff as u32,
+                            0,
+                            0,
+                            0,
+                            self.cfg.situ_beta.to_bits(),
+                            self.cfg.situ_linear_beta.to_bits(),
+                        ],
+                        (total_k * n_ff).div_ceil(self.moe_wg as usize) as u32,
+                    )?;
+                    self.record_quant_q8_1(
+                        rec,
+                        &self.exp_hidden_buf,
+                        &self.xq_buf,
+                        &self.xd_buf,
+                        total_k * n_ff,
+                    )?;
+                }
+                rec.dispatch_xy(
+                    p_dp4a,
+                    &[
+                        &vexp.down,
+                        &self.xq_buf,
+                        &self.xd_buf,
+                        &self.moe_tiles_buf,
+                        &self.exp_down_buf,
+                    ],
+                    &[
+                        5,
+                        n_ff as u32,
+                        n_embd as u32,
+                        vexp.down_row_u16s,
+                        vexp.down_expert_u16s,
+                        0,
+                        0,
+                        0,
+                    ],
+                    n_embd.div_ceil(rows_per_wg) as u32,
                     max_tiles,
                 )?;
             } else {
@@ -4968,60 +5469,28 @@ impl Inkling2VkRunner {
                     (2 * n_ff).div_ceil(rows_per_wg) as u32,
                     max_tiles,
                 )?;
-            }
-            rec.dispatch(
-                &self.pipe_moe_ops,
-                &[
-                    &self.dummy_buf,
-                    &self.exp_gate_up_buf,
-                    &self.dummy_buf,
-                    top_ids_buf,
-                    top_w_buf,
-                    &self.exp_hidden_buf,
-                ],
-                &[
-                    2,
-                    (total_k * n_ff) as u32,
-                    n_ff as u32,
-                    0,
-                    0,
-                    0,
-                    self.cfg.situ_beta.to_bits(),
-                    self.cfg.situ_linear_beta.to_bits(),
-                ],
-                (total_k * n_ff).div_ceil(self.moe_wg as usize) as u32,
-            )?;
-            if use_moe_dp4a && let Some(ref p_dp4a) = self.pipe_moe_dp4a {
-                self.record_quant_q8_1(
-                    rec,
-                    &self.exp_hidden_buf,
-                    &self.xq_buf,
-                    &self.xd_buf,
-                    total_k * n_ff,
-                )?;
-                rec.dispatch_xy(
-                    p_dp4a,
+                rec.dispatch(
+                    &self.pipe_moe_ops,
                     &[
-                        &vexp.down,
-                        &self.xq_buf,
-                        &self.xd_buf,
-                        &self.moe_tiles_buf,
-                        &self.exp_down_buf,
+                        &self.dummy_buf,
+                        &self.exp_gate_up_buf,
+                        &self.dummy_buf,
+                        top_ids_buf,
+                        top_w_buf,
+                        &self.exp_hidden_buf,
                     ],
                     &[
-                        5,
+                        2,
+                        (total_k * n_ff) as u32,
                         n_ff as u32,
-                        n_embd as u32,
-                        vexp.down_row_u16s,
-                        vexp.down_expert_u16s,
                         0,
                         0,
                         0,
+                        self.cfg.situ_beta.to_bits(),
+                        self.cfg.situ_linear_beta.to_bits(),
                     ],
-                    n_embd.div_ceil(rows_per_wg) as u32,
-                    max_tiles,
+                    (total_k * n_ff).div_ceil(self.moe_wg as usize) as u32,
                 )?;
-            } else {
                 rec.dispatch_xy(
                     &self.pipe_moe_ops,
                     &[
@@ -5219,30 +5688,30 @@ impl Inkling2VkRunner {
             ],
             1,
         )?;
-        rec.dispatch(
-            &self.pipe_ops,
-            &[
-                &self.inp_sa_buf,
-                &self.wo_out_buf,
-                &self.f32_params,
-                &self.dummy_buf,
-                &self.dummy_buf,
-                &self.dummy_buf,
-            ],
-            &[
-                0,
-                n_embd as u32,
-                0,
-                0,
-                1,
-                self.cfg.rms_eps.to_bits(),
-                0,
-                self.out_norm_off,
-            ],
+        let fq8 = self.fused_q8_active();
+        self.record_rmsnorm_q8_rows(
+            rec,
+            &self.inp_sa_buf,
+            0,
+            0,
+            &self.wo_out_buf,
+            &self.out_norm_q8,
+            n_embd,
+            self.out_norm_off,
             1,
+            fq8,
+            true,
         )?;
         if compute_logits {
-            self.dispatch_gemv(rec, &self.output, &self.wo_out_buf, &self.logits_padded_buf)?;
+            self.dispatch_gemv_prequant(
+                rec,
+                &self.output,
+                &self.wo_out_buf,
+                &self.out_norm_q8.0,
+                &self.out_norm_q8.1,
+                &self.logits_padded_buf,
+                true,
+            )?;
             rec.dispatch(
                 &self.pipe_ops,
                 &[
@@ -5672,14 +6141,78 @@ impl Inkling2VkRunner {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn record_strided_dyn_tap_copy(
+        &self,
+        rec: &mut Recorder<'_>,
+        dst_off: u32,
+        dst_stride: u32,
+        src: &VkBuffer,
+        src_off: u32,
+        src_stride: u32,
+        len: usize,
+        w: usize,
+        emit_barrier: bool,
+    ) -> Result<(), VulkanError> {
+        if len == 0 || w == 0 {
+            return Ok(());
+        }
+        let bufs = [
+            &self.dspark_taps_buf,
+            src,
+            &self.dummy_buf,
+            &self.dummy_buf,
+            &self.dyn_pos_buf,
+            &self.dummy_buf,
+        ];
+        let args = [
+            7, len as u32, 3, dst_off, src_off, src_stride, 0, dst_stride,
+        ];
+        let gx = self.elem_groups(len);
+        if emit_barrier {
+            rec.dispatch_xy(&self.pipe_ops, &bufs, &args, gx, w as u32)
+        } else {
+            rec.dispatch_xy_nb(&self.pipe_ops, &bufs, &args, gx, w as u32)
+        }
+    }
+
+    fn record_single_dyn_tap_copy(
+        &self,
+        rec: &mut Recorder<'_>,
+        t_pos: usize,
+        n_taps: usize,
+        src: &VkBuffer,
+        src_off: u32,
+        len: usize,
+    ) -> Result<(), VulkanError> {
+        if len == 0 {
+            return Ok(());
+        }
+        rec.dispatch(
+            &self.pipe_ops,
+            &[
+                &self.dspark_taps_buf,
+                src,
+                &self.dummy_buf,
+                &self.dummy_buf,
+                &self.dyn_pos_buf,
+                &self.dummy_buf,
+            ],
+            &[6, len as u32, 3, t_pos as u32, src_off, 0, 0, n_taps as u32],
+            self.elem_groups(len),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn record_window_segment(
         &self,
         rec: &mut Recorder<'_>,
         seg: GpuSegSpec,
         w: usize,
         start_pos: usize,
+        dynamic_pos: bool,
         taus: &[f32],
         can_batch_gemm: bool,
+        prefill_split_e: usize,
         compute_last_logits: bool,
         compute_all_argmax: bool,
         save_conv_snapshots: bool,
@@ -5783,91 +6316,147 @@ impl Inkling2VkRunner {
         }
 
         if let Some((prev_il, prev_ip)) = seg.prev_host {
-            let k_gpu = self.layer_gpu_ext_experts(prev_ip);
-            let k_cpu = top_k - k_gpu;
-            if can_batch_gemm {
-                if k_gpu > 0 {
-                    if k_cpu > 0 {
-                        self.record_vec_copy(
-                            rec,
-                            &self.win_moe_out_dev_buf,
-                            0,
-                            &self.moe_out_bridge,
-                            0,
-                            w * n_embd,
-                        )?;
-                    }
-                    self.record_ext_moe_reduce(
-                        rec,
-                        w,
-                        k_cpu,
-                        k_gpu,
+            if prefill_split_e > 0 && self.layers[prev_ip].host_imported_experts.is_some() {
+                self.record_vec_copy(
+                    rec,
+                    &self.win_moe_out_dev_buf,
+                    0,
+                    &self.moe_out_bridge,
+                    0,
+                    w * n_embd,
+                )?;
+                rec.dispatch_xy(
+                    &self.pipe_moe_ops,
+                    &[
+                        &self.dummy_buf,
+                        &self.exp_down_buf,
+                        &self.dummy_buf,
+                        &self.top_ids_bridge,
                         &self.top_weights_bridge,
                         &self.win_moe_out_dev_buf,
-                    )?;
-                    self.record_win_post_moe(rec, prev_il, prev_ip, w, true, save_conv_snapshots)?;
-                } else {
-                    self.record_win_post_moe(rec, prev_il, prev_ip, w, false, save_conv_snapshots)?;
-                }
+                    ],
+                    &[
+                        3,
+                        n_embd as u32,
+                        top_k as u32,
+                        1,
+                        prefill_split_e as u32,
+                        0,
+                        0,
+                        0,
+                    ],
+                    n_embd.div_ceil(self.moe_wg as usize) as u32,
+                    w as u32,
+                )?;
+                self.record_win_post_moe(rec, prev_il, prev_ip, w, true, save_conv_snapshots)?;
             } else {
-                let moe_src = if k_gpu > 0 {
-                    if k_cpu > 0 {
-                        self.record_vec_copy(
+                let k_gpu = self.layer_gpu_ext_experts_for_window(prev_ip, w);
+                let k_cpu = top_k - k_gpu;
+                if can_batch_gemm {
+                    if k_gpu > 0 {
+                        if k_cpu > 0 {
+                            self.record_vec_copy(
+                                rec,
+                                &self.win_moe_out_dev_buf,
+                                0,
+                                &self.moe_out_bridge,
+                                0,
+                                w * n_embd,
+                            )?;
+                        }
+                        self.record_ext_moe_reduce(
                             rec,
+                            w,
+                            k_cpu,
+                            k_gpu,
+                            &self.top_weights_bridge,
                             &self.win_moe_out_dev_buf,
-                            0,
-                            &self.moe_out_bridge,
-                            0,
-                            w * n_embd,
+                        )?;
+                        self.record_win_post_moe(
+                            rec,
+                            prev_il,
+                            prev_ip,
+                            w,
+                            true,
+                            save_conv_snapshots,
+                        )?;
+                    } else {
+                        self.record_win_post_moe(
+                            rec,
+                            prev_il,
+                            prev_ip,
+                            w,
+                            false,
+                            save_conv_snapshots,
                         )?;
                     }
-                    self.record_ext_moe_reduce(
-                        rec,
-                        w,
-                        k_cpu,
-                        k_gpu,
-                        &self.top_weights_bridge,
-                        &self.win_moe_out_dev_buf,
-                    )?;
-                    &self.win_moe_out_dev_buf
                 } else {
-                    &self.moe_out_bridge
-                };
-                let prev_kv_dim = self.cfg.kv_dim(prev_ip);
-                let ffn_conv_off_f32 =
-                    self.slot_conv_bases[prev_il] as usize + (2 * prev_kv_dim + n_embd) * hist_len;
-                let ffn_conv_len_f32 = n_embd * hist_len;
-                for tok_i in 0..w {
-                    let base = (tok_i * self.per_tok_state_f32s) as u32;
-                    self.record_vec_copy(
-                        rec,
-                        &self.ffn_inp_buf,
-                        0,
-                        &self.win_state_buf,
-                        base + n_embd as u32,
-                        n_embd,
-                    )?;
-                    self.record_vec_copy(
-                        rec,
-                        &self.wo_out_buf,
-                        0,
-                        moe_src,
-                        (tok_i * n_embd) as u32,
-                        n_embd,
-                    )?;
-                    self.record_layer_post_moe(rec, prev_il, prev_ip, true)?;
-                    if save_conv_snapshots && ffn_conv_len_f32 > 0 {
-                        let snap_dst = tok_i * self.total_conv_f32s + ffn_conv_off_f32;
+                    let moe_src = if k_gpu > 0 {
+                        if k_cpu > 0 {
+                            self.record_vec_copy(
+                                rec,
+                                &self.win_moe_out_dev_buf,
+                                0,
+                                &self.moe_out_bridge,
+                                0,
+                                w * n_embd,
+                            )?;
+                        }
+                        self.record_ext_moe_reduce(
+                            rec,
+                            w,
+                            k_cpu,
+                            k_gpu,
+                            &self.top_weights_bridge,
+                            &self.win_moe_out_dev_buf,
+                        )?;
+                        &self.win_moe_out_dev_buf
+                    } else {
+                        &self.moe_out_bridge
+                    };
+                    let prev_kv_dim = self.cfg.kv_dim(prev_ip);
+                    let ffn_conv_off_f32 = self.slot_conv_bases[prev_il] as usize
+                        + (2 * prev_kv_dim + n_embd) * hist_len;
+                    let ffn_conv_len_f32 = n_embd * hist_len;
+                    for tok_i in 0..w {
+                        let base = (tok_i * self.per_tok_state_f32s) as u32;
                         self.record_vec_copy(
                             rec,
-                            &self.conv_snapshots_buf,
-                            snap_dst as u32,
-                            &self.conv_hist,
-                            ffn_conv_off_f32 as u32,
-                            ffn_conv_len_f32,
+                            &self.ffn_inp_buf,
+                            0,
+                            &self.win_state_buf,
+                            base + n_embd as u32,
+                            n_embd,
+                        )?;
+                        self.record_vec_copy(
+                            rec,
+                            &self.wo_out_buf,
+                            0,
+                            moe_src,
+                            (tok_i * n_embd) as u32,
+                            n_embd,
+                        )?;
+                        self.record_layer_post_moe(rec, prev_il, prev_ip, true)?;
+                        if save_conv_snapshots && ffn_conv_len_f32 > 0 {
+                            let snap_dst = tok_i * self.total_conv_f32s + ffn_conv_off_f32;
+                            self.record_vec_copy(
+                                rec,
+                                &self.conv_snapshots_buf,
+                                snap_dst as u32,
+                                &self.conv_hist,
+                                ffn_conv_off_f32 as u32,
+                                ffn_conv_len_f32,
+                            )?;
+                        }
+                        self.record_vec_copy(
+                            rec,
+                            &self.win_state_buf,
+                            base,
+                            &self.cur_buf,
+                            0,
+                            n_embd,
                         )?;
                     }
-                    self.record_vec_copy(rec, &self.win_state_buf, base, &self.cur_buf, 0, n_embd)?;
                 }
             }
             TsRecorder::mark(ts, rec, STAGE_POST_MOE);
@@ -5880,6 +6469,7 @@ impl Inkling2VkRunner {
         let use_tc = w > 8 && !save_conv_snapshots;
         let allow_host_imported = can_batch_gemm
             && use_tc
+            && prefill_split_e == 0
             && self.pipe_moe_grouped.is_some()
             && self.cfg.n_ff_exp.is_multiple_of(32);
 
@@ -5910,6 +6500,7 @@ impl Inkling2VkRunner {
                     st.reset_pass_before,
                     w,
                     start_pos,
+                    dynamic_pos,
                     tap_slot,
                     n_taps,
                     batch_gpu_vexp.is_some(),
@@ -5952,17 +6543,29 @@ impl Inkling2VkRunner {
                     )?;
 
                     if let Some(t_pos) = tap_slot {
-                        self.record_vec_copy(
-                            rec,
-                            &self.dspark_taps_buf,
-                            ((tok_i * n_taps + t_pos) * n_embd) as u32,
-                            &self.cur_buf,
-                            0,
-                            n_embd,
-                        )?;
+                        if dynamic_pos && w == 1 {
+                            self.record_single_dyn_tap_copy(
+                                rec,
+                                t_pos,
+                                n_taps,
+                                &self.cur_buf,
+                                0,
+                                n_embd,
+                            )?;
+                        } else {
+                            self.record_vec_copy(
+                                rec,
+                                &self.dspark_taps_buf,
+                                ((tok_i * n_taps + t_pos) * n_embd) as u32,
+                                &self.cur_buf,
+                                0,
+                                n_embd,
+                            )?;
+                        }
                     }
                     TsRecorder::mark(ts, rec, STAGE_EMBED_STATE);
 
+                    let dyn_tok = dynamic_pos && w == 1;
                     if in_vram && w == 1 {
                         self.record_layer_pre_moe_into(
                             rec,
@@ -5970,7 +6573,7 @@ impl Inkling2VkRunner {
                             st.ip,
                             start_pos + tok_i,
                             tau_t,
-                            false,
+                            dyn_tok,
                             st.pass > 0,
                             &mut b_t,
                             bk_t,
@@ -6019,7 +6622,7 @@ impl Inkling2VkRunner {
                             st.ip,
                             start_pos + tok_i,
                             tau_t,
-                            false,
+                            dyn_tok,
                             st.pass > 0,
                             &mut b_t,
                             bk_t,
@@ -6137,6 +6740,7 @@ impl Inkling2VkRunner {
                 rec,
                 w,
                 seg.end_b,
+                dynamic_pos,
                 compute_last_logits,
                 compute_all_argmax,
                 dspark_target_visits,
@@ -6144,6 +6748,117 @@ impl Inkling2VkRunner {
             TsRecorder::mark(ts, rec, STAGE_LM_HEAD);
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_baked_spec_plan(
+        &mut self,
+        w: usize,
+        can_batch_gemm: bool,
+        max_visits_per_cb: usize,
+        compute_last_logits: bool,
+        compute_all_argmax: bool,
+        save_conv_snapshots: bool,
+        dspark_target_visits: &[usize],
+    ) -> Result<(usize, u64), VulkanError> {
+        let mut taps = [0usize; 8];
+        let taps_len = dspark_target_visits.len().min(8);
+        taps[..taps_len].copy_from_slice(&dspark_target_visits[..taps_len]);
+
+        if let Some(pos_idx) = self.baked_spec_plans.iter().position(|p| {
+            p.w == w
+                && p.compute_last_logits == compute_last_logits
+                && p.compute_all_argmax == compute_all_argmax
+                && p.save_conv_snapshots == save_conv_snapshots
+                && p.taps_len == taps_len
+                && p.taps[..taps_len] == taps[..taps_len]
+        }) {
+            return Ok((pos_idx, 0));
+        }
+
+        let mut segs = [GpuSegSpec {
+            need_embed: false,
+            prev_host: None,
+            start_cur: 0,
+            end_cur: 0,
+            stop_host: None,
+            run_outputs: false,
+            init_b: 0,
+            init_pb: 0,
+            init_bk: 0,
+            end_b: 0,
+        }; 64];
+        let n_segs = self.build_window_segments(false, max_visits_per_cb, &mut segs);
+        let dummy_taus = [1.0f32; MAX_INKLING2_SPEC_WINDOW];
+        let mut rec_total_ns = 0u64;
+        let mut seg_cbs = Vec::with_capacity(n_segs);
+        for &seg in &segs[..n_segs] {
+            let (baked, r_ns) = self.ctx.bake_cb(|rec| {
+                let mut no_ts = None;
+                self.record_window_segment(
+                    rec,
+                    seg,
+                    w,
+                    0,
+                    true,
+                    &dummy_taus[..w],
+                    can_batch_gemm,
+                    0,
+                    compute_last_logits,
+                    compute_all_argmax,
+                    save_conv_snapshots,
+                    &taps[..taps_len],
+                    &mut no_ts,
+                )
+            })?;
+            rec_total_ns += r_ns;
+            seg_cbs.push(baked);
+        }
+
+        let n_phys = self.cfg.n_layers_phys;
+        let mut ext_cbs: Vec<Option<BakedCb>> = (0..n_phys).map(|_| None).collect();
+        let top_k = self.cfg.n_expert_used;
+        let ext_x_buf = if can_batch_gemm {
+            &self.win_ffn_norm_buf
+        } else {
+            &self.ffn_normed_bridge
+        };
+        for seg in &segs[..n_segs] {
+            if let Some((_, h_ip)) = seg.stop_host {
+                let k_gpu = self.layer_gpu_ext_experts_for_window(h_ip, w);
+                if k_gpu > 0 && ext_cbs[h_ip].is_none() {
+                    let k_cpu = top_k - k_gpu;
+                    let (baked_ext, r_ns) = self.ctx.bake_cb(|rec| {
+                        self.record_ext_moe_tail(
+                            rec,
+                            h_ip,
+                            w,
+                            k_cpu,
+                            k_gpu,
+                            ext_x_buf,
+                            &self.top_ids_bridge,
+                        )
+                    })?;
+                    rec_total_ns += r_ns;
+                    ext_cbs[h_ip] = Some(baked_ext);
+                }
+            }
+        }
+
+        let plan_idx = self.baked_spec_plans.len();
+        self.baked_spec_plans.push(BakedSpecPlan {
+            w,
+            compute_last_logits,
+            compute_all_argmax,
+            save_conv_snapshots,
+            taps_len,
+            taps,
+            n_segs,
+            segs,
+            seg_cbs,
+            ext_cbs,
+        });
+        Ok((plan_idx, rec_total_ns))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6170,6 +6885,11 @@ impl Inkling2VkRunner {
             *tau_slot = 1.0 + self.cfg.log_scale_alpha * ratio.max(1.0).ln();
         }
         write_mapped_u32(&self.ctx, &self.step_buf, window_tokens)?;
+        write_mapped_u32(
+            &self.ctx,
+            &self.dyn_pos_buf,
+            &[start_pos as u32, self.dspark_tap_slot as u32],
+        )?;
         write_mapped_f32(&self.ctx, &self.win_taus_buf, &taus[..w])?;
 
         let can_batch_gemm = w >= 2
@@ -6179,17 +6899,172 @@ impl Inkling2VkRunner {
             && self.cfg.shortconv_l_cache <= 9
             && self.ctx.info().subgroup_size <= 128
             && self.ctx.info().max_workgroup_invocations >= 128;
-        let allow_host_imported = can_batch_gemm
+        let can_grouped_imported = can_batch_gemm
             && w > 8
             && !save_conv_snapshots
             && self.pipe_moe_grouped.is_some()
             && self.cfg.n_ff_exp.is_multiple_of(32)
             && (0..self.cfg.n_layers_phys).all(|ip| self.cfg.q_dim(ip).is_multiple_of(32));
+        let has_imported = self
+            .layers
+            .iter()
+            .any(|l| l.host_imported_experts.is_some());
+        // Concurrent PCIe (`e_id < split_e`) + Host DDR4 (`e_id >= split_e`) prefill partitioning
+        // for short/medium windows (`9..=64`, splitting 50/50 between GPU PCIe and Host DDR4);
+        // larger windows (`w > 64`, e.g. `pp512`) amortize each expert read across many tokens via
+        // GPU `CoopMatF16` grouped MoE over PCIe (`allow_host_imported`).
+        let prefill_split_e = if can_grouped_imported
+            && w <= 64
+            && has_imported
+            && host_moe_win.is_some()
+            && !self.ctx.info().unified_memory
+            && self.cfg.n_expert >= 16
+        {
+            (self.cfg.n_expert / 2).clamp(1, self.cfg.n_expert - 1)
+        } else {
+            0
+        };
+        let allow_host_imported = can_grouped_imported && prefill_split_e == 0;
         let max_visits_per_cb = if can_batch_gemm {
             64usize
         } else {
             (256 / w.max(1)).clamp(1, 64)
         };
+
+        // Zero-record `BakedCb` fast path for ALL `w in 1..=MAX_INKLING2_SPEC_WINDOW` windows!
+        if w <= MAX_INKLING2_SPEC_WINDOW && self.prof_qp.is_none() {
+            let (plan_idx, bake_ns) = self.ensure_baked_spec_plan(
+                w,
+                can_batch_gemm,
+                max_visits_per_cb,
+                compute_last_logits,
+                compute_all_argmax,
+                save_conv_snapshots,
+                dspark_target_visits,
+            )?;
+            if self.prof_on {
+                self.prof.gpu_record_ns += bake_ns;
+            }
+            let n_segs = self.baked_spec_plans[plan_idx].n_segs;
+            if n_segs == 0 {
+                return Ok(());
+            }
+            let segs = self.baked_spec_plans[plan_idx].segs;
+            let mut inflight = Some(
+                self.ctx
+                    .submit_baked(&self.baked_spec_plans[plan_idx].seg_cbs[0])?,
+            );
+
+            for (idx, seg) in segs[..n_segs].iter().enumerate() {
+                let inf = inflight.take().expect("active baked spec segment");
+                let wait_ns = self.ctx.wait_baked(inf)?;
+                if self.prof_on {
+                    self.prof.gpu_submits += 1;
+                    self.prof.gpu_wait_ns += wait_ns;
+                }
+
+                if let Some((_, h_ip)) = seg.stop_host {
+                    let k_gpu = self.layer_gpu_ext_experts_for_window(h_ip, w);
+                    let k_cpu = top_k - k_gpu;
+                    let ext_inf = if k_gpu > 0 {
+                        let ext_cb = self.baked_spec_plans[plan_idx].ext_cbs[h_ip]
+                            .as_ref()
+                            .expect("baked spec ext_cb initialized");
+                        Some(self.ctx.submit_baked(ext_cb)?)
+                    } else {
+                        None
+                    };
+
+                    if k_cpu > 0 {
+                        let t_br0 = std::time::Instant::now();
+                        let eval_win = match host_moe_win.as_deref_mut() {
+                            Some(f) => f,
+                            None => {
+                                if let Some(ei) = ext_inf {
+                                    let _ = self.ctx.wait_baked(ei);
+                                }
+                                return Err(VulkanError::InvalidDimensions(format!(
+                                    "layer {h_ip} MoE experts are offloaded from VRAM, but no HostMoeWindowFn was supplied"
+                                )));
+                            }
+                        };
+                        let mut raw_ids = [0u32; MAX_INKLING2_SPEC_WINDOW * 32];
+                        let mut raw_w = [0.0f32; MAX_INKLING2_SPEC_WINDOW * 32];
+                        if let Err(e) = read_mapped_f32(
+                            &self.ctx,
+                            &self.ffn_normed_bridge,
+                            &mut self.host_cur_scratch[..w * n_embd],
+                        )
+                        .and_then(|()| {
+                            read_mapped_u32(&self.top_ids_bridge, &mut raw_ids[..w * top_k])
+                        })
+                        .and_then(|()| {
+                            read_mapped_f32(
+                                &self.ctx,
+                                &self.top_weights_bridge,
+                                &mut raw_w[..w * top_k],
+                            )
+                        }) {
+                            if let Some(ei) = ext_inf {
+                                let _ = self.ctx.wait_baked(ei);
+                            }
+                            return Err(e);
+                        }
+                        for tok_i in 0..w {
+                            for j in 0..k_cpu {
+                                self.host_ids_scratch[tok_i * k_cpu + j] =
+                                    raw_ids[tok_i * top_k + j] as usize;
+                                self.host_weights_scratch[tok_i * k_cpu + j] =
+                                    raw_w[tok_i * top_k + j];
+                            }
+                        }
+                        let t_moe0 = std::time::Instant::now();
+                        eval_win(
+                            h_ip,
+                            w,
+                            &self.host_cur_scratch[..w * n_embd],
+                            &self.host_ids_scratch[..w * k_cpu],
+                            &self.host_weights_scratch[..w * k_cpu],
+                            &mut self.host_moe_out_scratch[..w * n_embd],
+                        );
+                        let t_moe1 = std::time::Instant::now();
+                        if let Err(e) = write_mapped_f32(
+                            &self.ctx,
+                            &self.moe_out_bridge,
+                            &self.host_moe_out_scratch[..w * n_embd],
+                        ) {
+                            if let Some(ei) = ext_inf {
+                                let _ = self.ctx.wait_baked(ei);
+                            }
+                            return Err(e);
+                        }
+                        if self.prof_on {
+                            let moe_ns = (t_moe1 - t_moe0).as_nanos() as u64;
+                            self.prof.host_moe_calls += 1;
+                            self.prof.host_moe_ns += moe_ns;
+                            self.prof.bridge_ns +=
+                                (t_br0.elapsed().as_nanos() as u64).saturating_sub(moe_ns);
+                        }
+                    }
+
+                    if let Some(ei) = ext_inf {
+                        let ext_wait_ns = self.ctx.wait_baked(ei)?;
+                        if self.prof_on {
+                            self.prof.gpu_submits += 1;
+                            self.prof.gpu_wait_ns += ext_wait_ns;
+                        }
+                    }
+                }
+
+                if idx + 1 < n_segs {
+                    inflight = Some(
+                        self.ctx
+                            .submit_baked(&self.baked_spec_plans[plan_idx].seg_cbs[idx + 1])?,
+                    );
+                }
+            }
+            return Ok(());
+        }
 
         let mut segs = [GpuSegSpec {
             need_embed: false,
@@ -6219,8 +7094,10 @@ impl Inkling2VkRunner {
                 segs[0],
                 w,
                 start_pos,
+                false,
                 &taus[..w],
                 can_batch_gemm,
+                prefill_split_e,
                 compute_last_logits,
                 compute_all_argmax,
                 save_conv_snapshots,
@@ -6251,8 +7128,10 @@ impl Inkling2VkRunner {
                         segs[idx + 1],
                         w,
                         start_pos,
+                        false,
                         &taus[..w],
                         can_batch_gemm,
+                        prefill_split_e,
                         compute_last_logits,
                         compute_all_argmax,
                         save_conv_snapshots,
@@ -6286,14 +7165,49 @@ impl Inkling2VkRunner {
             self.prof_finish_submit(sub_t, n_queries_slots[cur_slot], &spans_slots[cur_slot]);
 
             if let Some((_, h_ip)) = segs[idx].stop_host {
-                let k_gpu = self.layer_gpu_ext_experts(h_ip);
-                let k_cpu = top_k - k_gpu;
+                let use_split_e =
+                    prefill_split_e > 0 && self.layers[h_ip].host_imported_experts.is_some();
+                let k_gpu = if use_split_e {
+                    0
+                } else {
+                    self.layer_gpu_ext_experts_for_window(h_ip, w)
+                };
+                let k_cpu = if use_split_e { top_k } else { top_k - k_gpu };
                 let ext_x_buf = if can_batch_gemm {
                     &self.win_ffn_norm_buf
                 } else {
                     &self.ffn_normed_bridge
                 };
-                let ext_inf = if k_gpu > 0 {
+                let ext_inf = if use_split_e {
+                    let vexp_ref = &self.layers[h_ip]
+                        .host_imported_experts
+                        .as_ref()
+                        .expect("host_imported_experts")
+                        .vexp;
+                    match self
+                        .ctx
+                        .prepare_cb(cur_slot, |rec| {
+                            self.record_moe_window_subset(
+                                rec,
+                                vexp_ref,
+                                w,
+                                true,
+                                prefill_split_e,
+                                &self.win_ffn_norm_buf,
+                                &self.top_ids_bridge,
+                                &self.top_weights_bridge,
+                                &self.win_moe_out_dev_buf,
+                            )
+                        })
+                        .and_then(|p| self.ctx.submit_prepared(p))
+                    {
+                        Ok(ei) => Some(ei),
+                        Err(e) => {
+                            loop_res = Err(e);
+                            break;
+                        }
+                    }
+                } else if k_gpu > 0 {
                     match self
                         .ctx
                         .prepare_cb(cur_slot, |rec| {
@@ -6356,9 +7270,14 @@ impl Inkling2VkRunner {
                     }
                     for tok_i in 0..w {
                         for j in 0..k_cpu {
-                            self.host_ids_scratch[tok_i * k_cpu + j] =
-                                raw_ids[tok_i * top_k + j] as usize;
-                            self.host_weights_scratch[tok_i * k_cpu + j] = raw_w[tok_i * top_k + j];
+                            let eid = raw_ids[tok_i * top_k + j] as usize;
+                            self.host_ids_scratch[tok_i * k_cpu + j] = eid;
+                            self.host_weights_scratch[tok_i * k_cpu + j] =
+                                if use_split_e && eid < prefill_split_e {
+                                    0.0
+                                } else {
+                                    raw_w[tok_i * top_k + j]
+                                };
                         }
                     }
                     let t_moe0 = std::time::Instant::now();
@@ -6417,11 +7336,13 @@ impl Inkling2VkRunner {
         loop_res
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_window_outputs(
         &self,
         rec: &mut Recorder<'_>,
         w: usize,
         blocks_len: usize,
+        dynamic_pos: bool,
         compute_last_logits: bool,
         compute_all_argmax: bool,
         dspark_target_visits: &[usize],
@@ -6432,11 +7353,33 @@ impl Inkling2VkRunner {
             .iter()
             .position(|&v| v == self.cfg.n_layers);
 
-        if (2..=MAX_INKLING2_SPEC_WINDOW).contains(&w) && n_embd.is_multiple_of(32) {
+        if w >= 2
+            && (!compute_all_argmax || w <= MAX_INKLING2_SPEC_WINDOW)
+            && n_embd.is_multiple_of(32)
+        {
             if !compute_all_argmax && !compute_last_logits && final_tap.is_none() {
                 return Ok(());
             }
+            // If only `compute_last_logits` is requested (no `final_tap`, no `compute_all_argmax`),
+            // only evaluate token `w - 1` instead of all `w` rows!
+            if !compute_all_argmax && final_tap.is_none() && compute_last_logits {
+                let base = ((w - 1) * self.per_tok_state_f32s) as u32;
+                self.record_vec_copy(rec, &self.cur_buf, 0, &self.win_state_buf, base, n_embd)?;
+                if blocks_len > 0 {
+                    self.record_vec_copy(
+                        rec,
+                        &self.blocks_buf,
+                        0,
+                        &self.win_state_buf,
+                        base + (4 * n_embd) as u32,
+                        blocks_len * n_embd,
+                    )?;
+                }
+                return self.record_output_stage(rec, blocks_len, true, false);
+            }
+
             let wy = w as u32;
+            let fq8 = self.fused_q8_active() && w <= MAX_INKLING2_SPEC_WINDOW;
             let stride = self.per_tok_state_f32s as u32;
             let off_blocks = (4 * n_embd) as u32;
             rec.dispatch_xy(
@@ -6462,52 +7405,59 @@ impl Inkling2VkRunner {
                 1,
                 wy,
             )?;
-            rec.dispatch_xy(
-                &self.pipe_ops,
-                &[
-                    &self.win_q_in_buf,
-                    &self.win_wo_out_buf,
-                    &self.f32_params,
-                    &self.dummy_buf,
-                    &self.dummy_buf,
-                    &self.dummy_buf,
-                ],
-                &[
-                    0,
-                    n_embd as u32,
-                    0,
-                    0,
-                    1,
-                    self.cfg.rms_eps.to_bits(),
-                    n_embd as u32,
-                    self.out_norm_off,
-                ],
-                1,
+            self.record_rmsnorm_q8_rows(
+                rec,
+                &self.win_q_in_buf,
+                0,
+                n_embd as u32,
+                &self.win_wo_out_buf,
+                &self.out_norm_q8,
+                n_embd,
+                self.out_norm_off,
                 wy,
+                fq8,
+                true,
             )?;
             if let Some(t_pos) = final_tap {
-                self.record_strided_copy(
-                    rec,
-                    &self.dspark_taps_buf,
-                    (t_pos * n_embd) as u32,
-                    (n_taps * n_embd) as u32,
-                    &self.win_wo_out_buf,
-                    0,
-                    n_embd as u32,
-                    n_embd,
-                    w,
-                    true,
-                )?;
+                if dynamic_pos {
+                    self.record_strided_dyn_tap_copy(
+                        rec,
+                        (t_pos * n_embd) as u32,
+                        (n_taps * n_embd) as u32,
+                        &self.win_wo_out_buf,
+                        0,
+                        n_embd as u32,
+                        n_embd,
+                        w,
+                        true,
+                    )?;
+                } else {
+                    self.record_strided_copy(
+                        rec,
+                        &self.dspark_taps_buf,
+                        (t_pos * n_embd) as u32,
+                        (n_taps * n_embd) as u32,
+                        &self.win_wo_out_buf,
+                        0,
+                        n_embd as u32,
+                        n_embd,
+                        w,
+                        true,
+                    )?;
+                }
             }
             if compute_all_argmax {
                 // Single-read `M = 4` / `M = 8` `output.weight` projection across ALL `w` tokens!
-                self.dispatch_gemm(
+                self.dispatch_gemm_prequant(
                     rec,
                     &self.output,
                     &self.win_wo_out_buf,
+                    &self.out_norm_q8.0,
+                    &self.out_norm_q8.1,
                     &self.win_logits_padded_buf,
                     w,
                     false,
+                    true,
                 )?;
                 rec.dispatch_xy(
                     &self.pipe_ops,
@@ -6606,14 +7556,25 @@ impl Inkling2VkRunner {
             }
             self.record_output_stage(rec, blocks_len, want_lg, want_am)?;
             if let Some(t_pos) = final_tap {
-                self.record_vec_copy(
-                    rec,
-                    &self.dspark_taps_buf,
-                    ((tok_i * n_taps + t_pos) * n_embd) as u32,
-                    &self.wo_out_buf,
-                    0,
-                    n_embd,
-                )?;
+                if dynamic_pos && w == 1 {
+                    self.record_single_dyn_tap_copy(
+                        rec,
+                        t_pos,
+                        n_taps,
+                        &self.wo_out_buf,
+                        0,
+                        n_embd,
+                    )?;
+                } else {
+                    self.record_vec_copy(
+                        rec,
+                        &self.dspark_taps_buf,
+                        ((tok_i * n_taps + t_pos) * n_embd) as u32,
+                        &self.wo_out_buf,
+                        0,
+                        n_embd,
+                    )?;
+                }
             }
             if want_am {
                 self.record_buf_copy_bytes(
@@ -6848,6 +7809,7 @@ impl Inkling2VkRunner {
         reset_pass_before: bool,
         w: usize,
         start_pos: usize,
+        dynamic_pos: bool,
         tap_slot: Option<usize>,
         n_taps: usize,
         in_vram: bool,
@@ -6973,18 +7935,32 @@ impl Inkling2VkRunner {
         }
 
         if let Some(t_pos) = tap_slot {
-            self.record_strided_copy(
-                rec,
-                &self.dspark_taps_buf,
-                (t_pos * n_embd) as u32,
-                (n_taps * n_embd) as u32,
-                &self.win_state_buf,
-                off_cur,
-                stride,
-                n_embd,
-                w,
-                false,
-            )?;
+            if dynamic_pos {
+                self.record_strided_dyn_tap_copy(
+                    rec,
+                    (t_pos * n_embd) as u32,
+                    (n_taps * n_embd) as u32,
+                    &self.win_state_buf,
+                    off_cur,
+                    stride,
+                    n_embd,
+                    w,
+                    false,
+                )?;
+            } else {
+                self.record_strided_copy(
+                    rec,
+                    &self.dspark_taps_buf,
+                    (t_pos * n_embd) as u32,
+                    (n_taps * n_embd) as u32,
+                    &self.win_state_buf,
+                    off_cur,
+                    stride,
+                    n_embd,
+                    w,
+                    false,
+                )?;
+            }
         }
 
         if has_messages {
@@ -7114,105 +8090,78 @@ impl Inkling2VkRunner {
             self.record_win_controls_qkv(rec, loop_w, w, use_tc)?;
         }
 
+        let fq8 = !use_tc && w <= MAX_INKLING2_SPEC_WINDOW && self.fused_q8_active();
+        let share_q_in = swa && !has_messages;
         if swa && has_messages {
-            for (j, dst_b) in [&self.win_q_in_buf, &self.win_k_in_buf, &self.win_v_in_buf]
-                .into_iter()
-                .enumerate()
-            {
-                let args = [
-                    0,
-                    n_embd as u32,
-                    (j * n_embd) as u32,
-                    0,
-                    1,
-                    self.cfg.rms_eps.to_bits(),
-                    (3 * n_embd) as u32,
-                    layer.attn_norm_off,
-                ];
-                let bufs = [
+            let pairs = [
+                (0usize, &self.win_q_in_buf, &self.q_in_q8),
+                (1usize, &self.win_k_in_buf, &self.k_in_q8),
+                (2usize, &self.win_v_in_buf, &self.v_in_q8),
+            ];
+            for (j, dst_b, q8p) in pairs {
+                self.record_rmsnorm_q8_rows(
+                    rec,
                     &self.win_inputs_buf,
+                    (j * n_embd) as u32,
+                    (3 * n_embd) as u32,
                     dst_b,
-                    &self.f32_params,
-                    &self.dummy_buf,
-                    &self.dummy_buf,
-                    &self.dummy_buf,
-                ];
-                if j < 2 {
-                    rec.dispatch_xy_nb(&self.pipe_ops, &bufs, &args, 1, wy)?;
-                } else {
-                    rec.dispatch_xy(&self.pipe_ops, &bufs, &args, 1, wy)?;
-                }
+                    q8p,
+                    n_embd,
+                    layer.attn_norm_off,
+                    wy,
+                    fq8,
+                    j == 2,
+                )?;
             }
         } else if swa {
-            rec.dispatch_xy(
-                &self.pipe_ops,
-                &[
-                    &self.win_inputs_buf,
-                    &self.win_q_in_buf,
-                    &self.f32_params,
-                    &self.dummy_buf,
-                    &self.dummy_buf,
-                    &self.dummy_buf,
-                ],
-                &[
-                    0,
-                    n_embd as u32,
-                    0,
-                    0,
-                    1,
-                    self.cfg.rms_eps.to_bits(),
-                    (3 * n_embd) as u32,
-                    layer.attn_norm_off,
-                ],
-                1,
+            self.record_rmsnorm_q8_rows(
+                rec,
+                &self.win_inputs_buf,
+                0,
+                (3 * n_embd) as u32,
+                &self.win_q_in_buf,
+                &self.q_in_q8,
+                n_embd,
+                layer.attn_norm_off,
                 wy,
-            )?;
-            self.record_vec_copy_nb(
-                rec,
-                &self.win_k_in_buf,
-                0,
-                &self.win_q_in_buf,
-                0,
-                w * n_embd,
-            )?;
-            self.record_vec_copy(
-                rec,
-                &self.win_v_in_buf,
-                0,
-                &self.win_q_in_buf,
-                0,
-                w * n_embd,
+                fq8,
+                true,
             )?;
         } else {
             let pairs = [
-                (0usize, &self.win_q_in_buf, layer.q_inp_norm_off),
-                (1usize, &self.win_k_in_buf, layer.k_inp_norm_off),
-                (2usize, &self.win_v_in_buf, layer.v_inp_norm_off),
+                (
+                    0usize,
+                    &self.win_q_in_buf,
+                    &self.q_in_q8,
+                    layer.q_inp_norm_off,
+                ),
+                (
+                    1usize,
+                    &self.win_k_in_buf,
+                    &self.k_in_q8,
+                    layer.k_inp_norm_off,
+                ),
+                (
+                    2usize,
+                    &self.win_v_in_buf,
+                    &self.v_in_q8,
+                    layer.v_inp_norm_off,
+                ),
             ];
-            for (j, dst_b, norm_off) in pairs {
-                let args = [
-                    0,
-                    n_embd as u32,
-                    (j * n_embd) as u32,
-                    0,
-                    1,
-                    self.cfg.rms_eps.to_bits(),
-                    (3 * n_embd) as u32,
-                    norm_off,
-                ];
-                let bufs = [
+            for (j, dst_b, q8p, norm_off) in pairs {
+                self.record_rmsnorm_q8_rows(
+                    rec,
                     &self.win_inputs_buf,
+                    (j * n_embd) as u32,
+                    (3 * n_embd) as u32,
                     dst_b,
-                    &self.f32_params,
-                    &self.dummy_buf,
-                    &self.dummy_buf,
-                    &self.dummy_buf,
-                ];
-                if j < 2 {
-                    rec.dispatch_xy_nb(&self.pipe_ops, &bufs, &args, 1, wy)?;
-                } else {
-                    rec.dispatch_xy(&self.pipe_ops, &bufs, &args, 1, wy)?;
-                }
+                    q8p,
+                    n_embd,
+                    norm_off,
+                    wy,
+                    fq8,
+                    j == 2,
+                )?;
             }
         }
         TsRecorder::mark(ts, rec, STAGE_LOOP_MIX_NORM);
@@ -7229,68 +8178,124 @@ impl Inkling2VkRunner {
         };
 
         // Phase 2: Batched QKV / Rel / Sink / Gate (+ dynamic ShortConv tap) GEMMs across ALL `w` tokens!
-        self.dispatch_gemm_nb(
+        let (k_src_f32, k_src_q8, v_src_f32, v_src_q8) = if share_q_in {
+            (
+                &self.win_q_in_buf,
+                &self.q_in_q8,
+                &self.win_q_in_buf,
+                &self.q_in_q8,
+            )
+        } else {
+            (
+                &self.win_k_in_buf,
+                &self.k_in_q8,
+                &self.win_v_in_buf,
+                &self.v_in_q8,
+            )
+        };
+        self.dispatch_gemm_prequant(
             rec,
             &layer.wq,
             &self.win_q_in_buf,
+            &self.q_in_q8.0,
+            &self.q_in_q8.1,
             &self.win_q_buf,
             w,
             use_tc,
+            false,
         )?;
-        self.dispatch_gemm_nb(
+        self.dispatch_gemm_prequant(
             rec,
             &layer.wk,
-            &self.win_k_in_buf,
+            k_src_f32,
+            &k_src_q8.0,
+            &k_src_q8.1,
             &self.win_k_buf,
             w,
             use_tc,
+            false,
         )?;
-        self.dispatch_gemm_nb(
+        self.dispatch_gemm_prequant(
             rec,
             &layer.wv,
-            &self.win_v_in_buf,
+            v_src_f32,
+            &v_src_q8.0,
+            &v_src_q8.1,
             &self.win_v_buf,
             w,
             use_tc,
+            false,
         )?;
-        self.dispatch_gemm_nb(
+        self.dispatch_gemm_prequant(
             rec,
             &layer.attn_rel,
             &self.win_q_in_buf,
+            &self.q_in_q8.0,
+            &self.q_in_q8.1,
             &self.win_r_buf,
             w,
             use_tc,
+            false,
         )?;
-        self.dispatch_gemm_nb(
+        self.dispatch_gemm_prequant(
             rec,
             &layer.attn_sink_proj,
             &self.win_q_in_buf,
+            &self.q_in_q8.0,
+            &self.q_in_q8.1,
             &self.win_sinks_buf,
             w,
             use_tc,
+            false,
         )?;
         if swa {
-            self.dispatch_gemm(
+            self.dispatch_gemm_prequant(
                 rec,
                 &layer.wqkv_gate,
                 &self.win_q_in_buf,
+                &self.q_in_q8.0,
+                &self.q_in_q8.1,
                 &self.win_gate_buf,
                 w,
                 use_tc,
+                true,
             )?;
         } else {
-            self.dispatch_gemm_nb(
+            self.dispatch_gemm_prequant(
                 rec,
                 &layer.wqkv_gate,
                 &self.win_q_in_buf,
+                &self.q_in_q8.0,
+                &self.q_in_q8.1,
                 &self.win_gate_buf,
                 w,
                 use_tc,
+                false,
             )?;
             let kp = layer.attn_k_conv_proj.as_ref().expect("k_conv_proj");
             let vp = layer.attn_v_conv_proj.as_ref().expect("v_conv_proj");
-            self.dispatch_gemm_nb(rec, kp, &self.win_k_in_buf, &self.win_k_dyn_buf, w, use_tc)?;
-            self.dispatch_gemm(rec, vp, &self.win_v_in_buf, &self.win_v_dyn_buf, w, use_tc)?;
+            self.dispatch_gemm_prequant(
+                rec,
+                kp,
+                k_src_f32,
+                &k_src_q8.0,
+                &k_src_q8.1,
+                &self.win_k_dyn_buf,
+                w,
+                use_tc,
+                false,
+            )?;
+            self.dispatch_gemm_prequant(
+                rec,
+                vp,
+                v_src_f32,
+                &v_src_q8.0,
+                &v_src_q8.1,
+                &self.win_v_dyn_buf,
+                w,
+                use_tc,
+                true,
+            )?;
         }
 
         // Phase 3: Multi-token ShortConv (`op=8`) + 2D Clip/Norm + 2D KV Pack + 2D RelAttn (`8` dispatches total!)
@@ -7426,23 +8431,36 @@ impl Inkling2VkRunner {
         )?;
 
         let kv_pairs = kv_dim / 2;
-        let dst_u32_off = self.slot_kv_u32_bases[il] + (start_pos * kv_pairs) as u32;
+        let (dst_u32_off, pack_dyn, pack_pos_buf) = if dynamic_pos {
+            (self.slot_kv_u32_bases[il], 1u32, &self.dyn_pos_buf)
+        } else {
+            (
+                self.slot_kv_u32_bases[il] + (start_pos * kv_pairs) as u32,
+                0u32,
+                &self.dummy_buf,
+            )
+        };
         rec.dispatch_xy(
             &self.pipe_ops,
             &[
                 &self.win_k_buf,
                 &self.win_v_norm_buf,
-                &self.dummy_buf,
+                pack_pos_buf,
                 &self.dummy_buf,
                 &self.k_cache,
                 &self.v_cache,
             ],
-            &[5, kv_pairs as u32, dst_u32_off, 0, 0, 0, 0, 0],
+            &[5, kv_pairs as u32, dst_u32_off, pack_dyn, 0, 0, 0, 0],
             self.elem_groups(kv_pairs),
             wy,
         )?;
 
         let swa_win = if swa { self.cfg.n_swa as u32 } else { 0 };
+        let pc_pos = if dynamic_pos {
+            0xFFFF_FFFFu32
+        } else {
+            start_pos as u32
+        };
         rec.dispatch_xy(
             &self.pipe_rel_attn,
             &[
@@ -7459,7 +8477,7 @@ impl Inkling2VkRunner {
                 (nh as u32) | ((nh_kv as u32) << 16),
                 (hd as u32) | ((n_rel as u32) << 16),
                 extent as u32,
-                start_pos as u32,
+                pc_pos,
                 swa_win,
                 self.slot_kv_vec4_bases[il],
                 layer.rel_bias_off,
@@ -7468,20 +8486,25 @@ impl Inkling2VkRunner {
             wy,
         )?;
 
-        // Phase 4: Batched `sigmoid_mul` + Batched `wo` GEMM across ALL `w` tokens!
-        rec.dispatch(
-            &self.pipe_sigmoid_mul,
-            &[&self.win_attn_vec_buf, &self.win_gate_buf],
-            &[(w * q_dim) as u32],
-            self.elem_groups(w * q_dim),
+        // Phase 4: Batched `sigmoid_mul` (+ fused `Q8_1`!) + Batched `wo` GEMM across ALL `w` tokens!
+        self.record_sigmoid_mul_q8(
+            rec,
+            &self.win_attn_vec_buf,
+            &self.win_gate_buf,
+            &self.attn_vec_q8,
+            w * q_dim,
+            fq8,
         )?;
-        self.dispatch_gemm(
+        self.dispatch_gemm_prequant(
             rec,
             &layer.wo,
             &self.win_attn_vec_buf,
+            &self.attn_vec_q8.0,
+            &self.attn_vec_q8.1,
             &self.win_wo_out_buf,
             w,
             use_tc,
+            true,
         )?;
         TsRecorder::mark(ts, rec, STAGE_ATTN_DENSE);
 
@@ -7603,38 +8626,31 @@ impl Inkling2VkRunner {
             let loop_w = &self.loop_layers[ip - self.cfg.core_start];
             self.record_win_control_ffn(rec, loop_w, &self.win_q_in_buf, w, use_tc)?;
         }
-        rec.dispatch_xy(
-            &self.pipe_ops,
-            &[
-                &self.win_q_in_buf,
-                &self.win_ffn_norm_buf,
-                &self.f32_params,
-                &self.dummy_buf,
-                &self.dummy_buf,
-                &self.dummy_buf,
-            ],
-            &[
-                0,
-                n_embd as u32,
-                0,
-                0,
-                1,
-                self.cfg.rms_eps.to_bits(),
-                n_embd as u32,
-                layer.ffn_norm_off,
-            ],
-            1,
+        self.record_rmsnorm_q8_rows(
+            rec,
+            &self.win_q_in_buf,
+            0,
+            n_embd as u32,
+            &self.win_ffn_norm_buf,
+            &self.ffn_norm_q8,
+            n_embd,
+            layer.ffn_norm_off,
             wy,
+            fq8,
+            true,
         )?;
 
         // Phase 6: Batched `ffn_gate_inp` Router GEMM + single 2D `top_k` dispatch across ALL `w` tokens!
-        self.dispatch_gemm(
+        self.dispatch_gemm_prequant(
             rec,
             &layer.ffn_gate_inp,
             &self.win_ffn_norm_buf,
+            &self.ffn_norm_q8.0,
+            &self.ffn_norm_q8.1,
             &self.win_router_logits_buf,
             w,
             use_tc,
+            true,
         )?;
         let (has_b, b_off) = match layer.exp_probs_b_off {
             Some(off) => (1u32, off),
