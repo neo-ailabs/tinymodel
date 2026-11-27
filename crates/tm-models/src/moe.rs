@@ -306,7 +306,7 @@ pub fn parse_moe_arch_params(
     // Per `qwen2moe.cpp:45` & `qwen3moe.cpp:50`, Qwen MoEs fallback to `n_ff / n_expert_used` when
     // `expert_feed_forward_length` is omitted; `olmoe` / `granite*` store `n_ff_exp` in `feed_forward_length`.
     let fallback_ff_exp =
-        if matches!(arch, "qwen2moe" | "qwen3moe") && n_ff_default >= n_expert_used {
+        if matches!(arch, "qwen2moe" | "qwen3moe" | "qwen35moe") && n_ff_default >= n_expert_used {
             n_ff_default / n_expert_used
         } else {
             n_ff_default
@@ -336,7 +336,7 @@ pub fn parse_moe_arch_params(
 
     let default_norm_w = matches!(
         arch,
-        "granite" | "granitemoe" | "granitehybrid" | "granitemoehybrid" | "qwen3moe"
+        "granite" | "granitemoe" | "granitehybrid" | "granitemoehybrid" | "qwen3moe" | "qwen35moe"
     );
     let norm_weights = gguf
         .get_meta(&format!("{pfx}.expert_weights_norm"))

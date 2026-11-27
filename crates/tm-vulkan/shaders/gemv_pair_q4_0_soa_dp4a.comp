@@ -1,0 +1,94 @@
+#version 450
+// Fused 2-matrix Q4_0 SoA INT8 DP4A (`OpSDotKHR`) GEMV using 64-bit coalesced loads (`LDG.E.64`).
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_spirv_intrinsics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+spirv_instruction(extensions = ["SPV_KHR_integer_dot_product"], capabilities = [6018, 6019], id = 4450)
+int sdot4x8(int a, int b, spirv_literal int packed_fmt);
+
+layout(constant_id = 0) const uint WG = 128;
+layout(constant_id = 1) const uint NR = 4;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer WAQ { uvec2 wa_q[]; };
+layout(std430, binding = 1) readonly buffer WAD { uint16_t wa_d[]; };
+layout(std430, binding = 2) readonly buffer WBQ { uvec2 wb_q[]; };
+layout(std430, binding = 3) readonly buffer WBD { uint16_t wb_d[]; };
+layout(std430, binding = 4) readonly buffer XQ  { int xq[]; };
+layout(std430, binding = 5) readonly buffer XD  { vec2 xd[]; };
+layout(std430, binding = 6) writeonly buffer YA { float ya[]; };
+layout(std430, binding = 7) writeonly buffer YB { float yb[]; };
+
+layout(push_constant) uniform PC {
+    uint n_in;
+    uint a_rows;
+    uint b_rows;
+    uint _pad;
+} pc;
+
+void main() {
+    const uint global_row0 = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * NR;
+    const uint total_rows = pc.a_rows + pc.b_rows;
+    if (global_row0 >= total_rows) return;
+
+    const bool is_b = (global_row0 >= pc.a_rows);
+    const uint local_row0 = is_b ? (global_row0 - pc.a_rows) : global_row0;
+    const uint mat_rows = is_b ? pc.b_rows : pc.a_rows;
+
+    const uint nb = pc.n_in >> 5u;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sub = lane & 1u;
+    const uint blk_step = gl_SubgroupSize >> 1u;
+
+    float acc[NR];
+    uint row_b[NR];
+    [[unroll]] for (uint r = 0u; r < NR; ++r) {
+        acc[r] = 0.0;
+        row_b[r] = min(local_row0 + r, mat_rows - 1u) * nb;
+    }
+
+    for (uint ib = (lane >> 1u); ib < nb; ib += blk_step) {
+        const uint xb = ib * 8u + sub * 2u;
+        const int xlo0 = xq[xb];
+        const int xlo1 = xq[xb + 1u];
+        const int xhi0 = xq[xb + 4u];
+        const int xhi1 = xq[xb + 5u];
+        const vec2 dm = xd[ib];
+        const float m8 = (sub == 0u) ? (-8.0 * dm.y) : 0.0;
+
+        [[unroll]] for (uint r = 0u; r < NR; ++r) {
+            const uint bi = row_b[r] + ib;
+            float d;
+            uvec2 q2;
+            if (is_b) {
+                d = unpackHalf2x16(uint(wb_d[bi])).x;
+                q2 = wb_q[bi * 2u + sub];
+            } else {
+                d = unpackHalf2x16(uint(wa_d[bi])).x;
+                q2 = wa_q[bi * 2u + sub];
+            }
+            const uint u0 = q2.x;
+            const uint u1 = q2.y;
+            const int s = sdot4x8(int(u0 & 0x0F0F0F0Fu), xlo0, 0)
+                        + sdot4x8(int((u0 >> 4u) & 0x0F0F0F0Fu), xhi0, 0)
+                        + sdot4x8(int(u1 & 0x0F0F0F0Fu), xlo1, 0)
+                        + sdot4x8(int((u1 >> 4u) & 0x0F0F0F0Fu), xhi1, 0);
+            acc[r] = fma(d, fma(float(s), dm.x, m8), acc[r]);
+        }
+    }
+
+    [[unroll]] for (uint r = 0u; r < NR; ++r) {
+        const float out_v = subgroupAdd(acc[r]);
+        if (subgroupElect() && local_row0 + r < mat_rows) {
+            if (is_b) {
+                yb[local_row0 + r] = out_v;
+            } else {
+                ya[local_row0 + r] = out_v;
+            }
+        }
+    }
+}

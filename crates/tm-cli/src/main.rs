@@ -876,6 +876,27 @@ fn cmd_run_metal(opts: RunOpts) -> Result<()> {
 fn compute_active_decode_bytes(gguf: &GgufFile) -> u64 {
     let arch = gguf.req_str("general.architecture").unwrap_or("");
     let is_inkling2 = arch == "inkling2" || arch == "inkling2_loop";
+    let raw_blocks = gguf
+        .get_meta(&format!("{arch}.block_count"))
+        .and_then(|v| v.as_usize())
+        .unwrap_or(usize::MAX);
+    let nextn_layers = gguf
+        .get_meta(&format!("{arch}.nextn_predict_layers"))
+        .and_then(|v| v.as_usize())
+        .unwrap_or(0);
+    let n_trunk_layers = raw_blocks.saturating_sub(nextn_layers);
+    let gen_n_exp = gguf
+        .get_meta(&format!("{arch}.expert_count"))
+        .and_then(|v| v.as_usize())
+        .unwrap_or(1)
+        .max(1);
+    let gen_n_exp_used = gguf
+        .get_meta(&format!("{arch}.expert_used_count"))
+        .and_then(|v| {
+            v.as_usize()
+                .or_else(|| v.as_usize_array().and_then(|a| a.first().copied()))
+        })
+        .unwrap_or(gen_n_exp);
     let (core_start, core_end, n_passes, n_exp, n_exp_used) = if is_inkling2 {
         let cs = gguf
             .get_meta(&format!("{arch}.loop.start"))
@@ -889,21 +910,9 @@ fn compute_active_decode_bytes(gguf: &GgufFile) -> u64 {
             .get_meta(&format!("{arch}.loop.count"))
             .and_then(|v| v.as_usize())
             .unwrap_or(1);
-        let ne = gguf
-            .get_meta(&format!("{arch}.expert_count"))
-            .and_then(|v| v.as_usize())
-            .unwrap_or(1)
-            .max(1);
-        let eu = gguf
-            .get_meta(&format!("{arch}.expert_used_count"))
-            .and_then(|v| {
-                v.as_usize()
-                    .or_else(|| v.as_usize_array().and_then(|a| a.first().copied()))
-            })
-            .unwrap_or(ne);
-        (cs, ce, np, ne, eu)
+        (cs, ce, np, gen_n_exp, gen_n_exp_used)
     } else {
-        (0, 0, 1, 1, 1)
+        (0, 0, 1, gen_n_exp, gen_n_exp_used)
     };
 
     let mut total = 0u64;
@@ -924,26 +933,37 @@ fn compute_active_decode_bytes(gguf: &GgufFile) -> u64 {
                 }
                 continue;
             }
-            if is_inkling2
-                && let Some(rest) = name.strip_prefix("blk.")
+            if let Some(rest) = name.strip_prefix("blk.")
                 && let Some((idx_str, suffix)) = rest.split_once('.')
                 && let Ok(ip) = idx_str.parse::<usize>()
             {
-                let in_core = (core_start..core_end).contains(&ip) && n_passes > 1;
-                let mult = if suffix.starts_with("loop_") {
-                    n_passes.saturating_sub(1) as u64
-                } else if in_core {
-                    n_passes as u64
-                } else {
-                    1
-                };
-                if suffix.ends_with("_exps.weight") || suffix.ends_with("_exps.scale") {
-                    let per_exp = (info.byte_len / n_exp) as u64;
-                    total += mult * (n_exp_used as u64) * per_exp;
-                } else {
-                    total += mult * (info.byte_len as u64);
+                if ip >= n_trunk_layers {
+                    continue;
                 }
-                continue;
+                if is_inkling2 {
+                    let in_core = (core_start..core_end).contains(&ip) && n_passes > 1;
+                    let mult = if suffix.starts_with("loop_") {
+                        n_passes.saturating_sub(1) as u64
+                    } else if in_core {
+                        n_passes as u64
+                    } else {
+                        1
+                    };
+                    if suffix.ends_with("_exps.weight") || suffix.ends_with("_exps.scale") {
+                        let per_exp = (info.byte_len / n_exp) as u64;
+                        total += mult * (n_exp_used as u64) * per_exp;
+                    } else {
+                        total += mult * (info.byte_len as u64);
+                    }
+                    continue;
+                }
+                if n_exp > 1
+                    && (suffix.ends_with("_exps.weight") || suffix.ends_with("_exps.scale"))
+                {
+                    let per_exp = (info.byte_len / n_exp) as u64;
+                    total += (n_exp_used as u64) * per_exp;
+                    continue;
+                }
             }
             total += info.byte_len as u64;
         }
@@ -1303,11 +1323,297 @@ fn print_vulkan_profile_report(
 }
 
 #[cfg(feature = "vulkan")]
-struct VkDSparkCtx<'a> {
-    model: tm_models::DFlashModel<'a>,
-    state: tm_models::DFlashState,
-    taps_buf: Vec<f32>,
-    emb_tmp: Vec<f32>,
+enum VkDSparkCtx<'a> {
+    Gpu(Box<tm_vulkan::DFlashVkRunner>),
+    Cpu {
+        model: Box<tm_models::DFlashModel<'a>>,
+        state: Box<tm_models::DFlashState>,
+        taps_buf: Vec<f32>,
+        emb_tmp: Vec<f32>,
+    },
+}
+
+#[cfg(feature = "vulkan")]
+impl<'a> VkDSparkCtx<'a> {
+    fn from_gguf(
+        target: &tm_vulkan::Inkling2VkRunner,
+        dg: &'a GgufFile,
+        max_ctx: usize,
+    ) -> Result<Self> {
+        if let Ok(gpu_runner) = tm_vulkan::DFlashVkRunner::from_gguf(target, dg, max_ctx) {
+            return Ok(Self::Gpu(Box::new(gpu_runner)));
+        }
+        let dm = tm_models::DFlashModel::from_gguf(dg)?;
+        let ds = tm_models::DFlashState::new(&dm, max_ctx);
+        let n_taps = dm.cfg.target_layers.len();
+        let n_embd = dm.cfg.n_embd;
+        Ok(Self::Cpu {
+            model: Box::new(dm),
+            state: Box::new(ds),
+            taps_buf: vec![0.0; tm_vulkan::MAX_INKLING2_VK_WINDOW * n_taps * n_embd],
+            emb_tmp: vec![0.0; n_embd],
+        })
+    }
+
+    fn target_layers(&self) -> &[usize] {
+        match self {
+            Self::Gpu(g) => &g.cfg.target_layers,
+            Self::Cpu { model, .. } => &model.cfg.target_layers,
+        }
+    }
+
+    fn block_size(&self) -> usize {
+        match self {
+            Self::Gpu(g) => g.cfg.block_size,
+            Self::Cpu { model, .. } => model.cfg.block_size,
+        }
+    }
+
+    fn max_draft_tokens(&self) -> usize {
+        match self {
+            Self::Gpu(g) => g.cfg.max_draft_tokens(),
+            Self::Cpu { model, .. } => model.cfg.max_draft_tokens(),
+        }
+    }
+
+    fn is_gpu(&self) -> bool {
+        matches!(self, Self::Gpu(_))
+    }
+
+    fn reset(&mut self, target: &tm_vulkan::Inkling2VkRunner) -> Result<()> {
+        match self {
+            Self::Gpu(g) => Ok(g.reset_state(target)?),
+            Self::Cpu { state, .. } => {
+                state.reset();
+                Ok(())
+            }
+        }
+    }
+
+    fn inject_batch(
+        &mut self,
+        target: &tm_vulkan::Inkling2VkRunner,
+        pool: &ThreadPool,
+        kt: &tm_cpu::KernelTable,
+        start_pos: usize,
+        count: usize,
+    ) -> Result<()> {
+        match self {
+            Self::Gpu(g) => Ok(g.inject_batch(target, start_pos, count)?),
+            Self::Cpu {
+                model,
+                state,
+                taps_buf,
+                ..
+            } => {
+                let n_taps = model.cfg.target_layers.len();
+                let tap_len = count * n_taps * model.cfg.n_embd;
+                target.read_dspark_taps(count, n_taps, &mut taps_buf[..tap_len])?;
+                model.inject_batch(state, pool, kt, start_pos, count, &taps_buf[..tap_len])?;
+                Ok(())
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn inject_and_draft_greedy_with_probs(
+        &mut self,
+        target: &mut tm_vulkan::Inkling2VkRunner,
+        pool: &ThreadPool,
+        kt: &tm_cpu::KernelTable,
+        inject_start_pos: usize,
+        inject_count: usize,
+        draft_pos0: usize,
+        anchor_token_id: u32,
+        max_k: usize,
+        out_drafts: &mut [u32],
+        out_probs: &mut [f32],
+    ) -> Result<usize> {
+        match self {
+            Self::Gpu(g) => Ok(g.inject_and_draft_greedy_with_probs(
+                target,
+                inject_start_pos,
+                inject_count,
+                draft_pos0,
+                anchor_token_id,
+                max_k,
+                out_drafts,
+                out_probs,
+            )?),
+            Self::Cpu {
+                model,
+                state,
+                taps_buf,
+                emb_tmp,
+            } => {
+                if inject_count > 0 {
+                    let n_taps = model.cfg.target_layers.len();
+                    let tap_len = inject_count * n_taps * model.cfg.n_embd;
+                    target.read_dspark_taps(inject_count, n_taps, &mut taps_buf[..tap_len])?;
+                    model.inject_batch(
+                        state,
+                        pool,
+                        kt,
+                        inject_start_pos,
+                        inject_count,
+                        &taps_buf[..tap_len],
+                    )?;
+                }
+                if max_k == 0 || draft_pos0 + model.cfg.block_size > state.max_ctx {
+                    return Ok(0);
+                }
+                target.embed_token_normed(anchor_token_id, emb_tmp)?;
+                let n = model.draft_block_greedy(
+                    state,
+                    pool,
+                    kt,
+                    draft_pos0,
+                    anchor_token_id,
+                    max_k,
+                    |_, out| out.copy_from_slice(emb_tmp),
+                    |corr_hid, cap| {
+                        target
+                            .project_dspark_greedy(corr_hid, cap)
+                            .expect("GPU DSpark project_dspark_greedy failed")
+                    },
+                    &mut out_drafts[..max_k],
+                )?;
+                out_probs[..n].fill(1.0);
+                Ok(n)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "vulkan")]
+struct DSparkAdaptiveCtrl {
+    max_k: usize,
+    active_k: usize,
+    ema_acc: f32,
+    ema_tok_per_step: f64,
+    ema_step_s: f64,
+    single_step_s: f64,
+    spec_steps: usize,
+    cooldown: usize,
+}
+
+#[cfg(feature = "vulkan")]
+impl DSparkAdaptiveCtrl {
+    fn new(max_k: usize, single_step_s: f64) -> Self {
+        Self {
+            max_k,
+            active_k: max_k,
+            ema_acc: 0.75,
+            ema_tok_per_step: 1.0 + 0.75 * (max_k as f64),
+            ema_step_s: 0.0,
+            single_step_s,
+            spec_steps: 0,
+            cooldown: 0,
+        }
+    }
+
+    #[inline]
+    fn choose_k(&mut self, cap_k: usize) -> usize {
+        if cap_k == 0 || self.max_k == 0 {
+            return 0;
+        }
+        if self.cooldown > 0 {
+            self.cooldown -= 1;
+            if self.cooldown == 0 {
+                // Probe 1 draft token to detect transition back to predictable text/code.
+                self.active_k = 1.min(cap_k);
+                return self.active_k;
+            }
+            return 0;
+        }
+        self.active_k.min(cap_k)
+    }
+
+    #[inline]
+    fn gate_drafts(drafted: usize, probs: &[f32]) -> usize {
+        let mut keep = 0usize;
+        let mut cum_p = 1.0f32;
+        for (j, &p) in probs.iter().enumerate().take(drafted) {
+            cum_p *= p;
+            // Calibrated for 201k-vocab `logit_softcap = 30.0` softmax:
+            // confident code/boilerplate tokens satisfy `p >= 0.10`, while uncertain open-class
+            // prose tails (`p < 0.06..0.10` or cumulative `< 0.03`) are truncated early.
+            let ok = if j == 0 {
+                p >= 0.06
+            } else {
+                p >= 0.10 && cum_p >= 0.03
+            };
+            if !ok {
+                break;
+            }
+            keep = j + 1;
+        }
+        keep
+    }
+
+    fn observe(&mut self, drafted: usize, accepted: usize, committed: usize, step_s: f64) {
+        if drafted == 0 {
+            if step_s > 0.0 {
+                self.single_step_s = if self.single_step_s <= 0.0 {
+                    step_s
+                } else {
+                    0.80 * self.single_step_s + 0.20 * step_s
+                };
+            }
+            return;
+        }
+        self.spec_steps += 1;
+        let step_acc = (accepted as f32) / (drafted as f32);
+        self.ema_acc = 0.84 * self.ema_acc + 0.16 * step_acc;
+        self.ema_tok_per_step = 0.84 * self.ema_tok_per_step + 0.16 * (committed as f64);
+        self.ema_step_s = if self.ema_step_s <= 0.0 {
+            step_s
+        } else {
+            0.84 * self.ema_step_s + 0.16 * step_s
+        };
+
+        // If a probe at k=1 succeeded (`accepted == 1`), ramp right back up!
+        if self.active_k == 1 && drafted == 1 && accepted == 1 && self.ema_acc < 0.52 {
+            self.ema_acc = 0.52;
+        }
+
+        if self.spec_steps < 6 {
+            return;
+        }
+
+        let target_k = if self.ema_acc >= 0.52 {
+            self.max_k
+        } else if self.ema_acc >= 0.38 {
+            self.max_k.min(2)
+        } else if self.ema_acc >= 0.24 {
+            self.max_k.min(1)
+        } else {
+            0
+        };
+
+        // Profitability guard against measured pure single-token `W=1` latency:
+        if self.single_step_s > 0.0 && self.ema_step_s > 0.0 {
+            let spec_tps = self.ema_tok_per_step / self.ema_step_s;
+            let base_tps = 1.0 / self.single_step_s;
+            if spec_tps < 0.94 * base_tps {
+                if self.active_k > 1 {
+                    self.active_k = (self.active_k - 1).min(target_k.max(1));
+                    self.ema_step_s = 0.0;
+                    return;
+                } else {
+                    self.active_k = 0;
+                    self.cooldown = 10;
+                    self.ema_step_s = 0.0;
+                    return;
+                }
+            }
+        }
+
+        self.active_k = target_k;
+        if self.active_k == 0 {
+            self.cooldown = 10;
+        }
+    }
 }
 
 #[cfg(feature = "vulkan")]
@@ -1387,14 +1693,14 @@ fn eval_inkling2_vk_batch<'a>(
     }
     let max_w = tm_vulkan::MAX_INKLING2_VK_WINDOW;
     let total = token_ids.len();
+    let visits: Vec<usize> = match dspark.as_deref() {
+        Some(ds) => ds.target_layers().to_vec(),
+        None => Vec::new(),
+    };
     let mut off = 0usize;
     while off < total {
         let w = (total - off).min(max_w);
         let is_last = off + w == total;
-        let visits: &[usize] = match dspark.as_deref() {
-            Some(ds) => &ds.model.cfg.target_layers,
-            None => &[],
-        };
         let _ = eval_inkling2_vk_window(
             runner,
             host_helper,
@@ -1404,21 +1710,11 @@ fn eval_inkling2_vk_batch<'a>(
             start_pos + off,
             compute_last_logits && is_last,
             false,
-            visits,
+            &visits,
             None,
         )?;
         if let Some(ds) = dspark.as_deref_mut() {
-            let n_taps = ds.model.cfg.target_layers.len();
-            let tap_len = w * n_taps * ds.model.cfg.n_embd;
-            runner.read_dspark_taps(w, n_taps, &mut ds.taps_buf[..tap_len])?;
-            ds.model.inject_batch(
-                &mut ds.state,
-                pool,
-                kt,
-                start_pos + off,
-                w,
-                &ds.taps_buf[..tap_len],
-            )?;
+            ds.inject_batch(runner, pool, kt, start_pos + off, w)?;
         }
         off += w;
     }
@@ -1515,22 +1811,20 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
             Some(ref dp) => Some(GgufFile::open(dp)?),
             None => None,
         };
+        let draft_reserve = if draft_gguf.is_some() {
+            512 * 1024 * 1024u64
+        } else {
+            0
+        };
+        let mut runner = tm_vulkan::Inkling2VkRunner::from_gguf_with_draft_reserve(
+            gguf.clone(),
+            opts.max_ctx,
+            draft_reserve,
+        )?;
         let mut dspark_ctx = match draft_gguf {
-            Some(ref dg) => {
-                let dm = tm_models::DFlashModel::from_gguf(dg)?;
-                let ds = tm_models::DFlashState::new(&dm, opts.max_ctx);
-                let n_taps = dm.cfg.target_layers.len();
-                let n_embd = dm.cfg.n_embd;
-                Some(VkDSparkCtx {
-                    model: dm,
-                    state: ds,
-                    taps_buf: vec![0.0; tm_vulkan::MAX_INKLING2_VK_WINDOW * n_taps * n_embd],
-                    emb_tmp: vec![0.0; n_embd],
-                })
-            }
+            Some(ref dg) => Some(VkDSparkCtx::from_gguf(&runner, dg, opts.max_ctx)?),
             None => None,
         };
-        let mut runner = tm_vulkan::Inkling2VkRunner::from_gguf(gguf.clone(), opts.max_ctx)?;
         let mut host_helper = if runner.has_host_offload_layers() {
             let hm = tm_models::Inkling2Model::from_gguf_with_options(
                 &gguf,
@@ -1540,6 +1834,11 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
                     host_moe_only: true,
                 },
             )?;
+            for ip in 0..hm.cfg.n_layers_phys {
+                if let Some((gu_pin, gu_len, dn_pin, dn_len)) = hm.host_importable_expert_pins(ip) {
+                    let _ = runner.register_host_moe_layer(ip, gu_pin, gu_len, dn_pin, dn_len);
+                }
+            }
             let hs = tm_models::Inkling2State::new_host_moe_only(&hm);
             Some((hm, hs))
         } else {
@@ -1558,8 +1857,12 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
         } else {
             "all-vram".to_string()
         };
-        let draft_tag = if dspark_ctx.is_some() {
-            format!(" · dspark(k={})", opts.draft_max)
+        let draft_tag = if let Some(ref ds) = dspark_ctx {
+            format!(
+                " · dspark-{}(k={})",
+                if ds.is_gpu() { "gpu" } else { "cpu" },
+                opts.draft_max
+            )
         } else {
             String::new()
         };
@@ -1605,10 +1908,13 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
 
         if is_pure_greedy && let Some(ref mut ds) = dspark_ctx {
             let mut drafts = [0u32; 8];
+            let mut draft_probs = [0.0f32; 8];
             let mut win_toks = [0u32; tm_vulkan::MAX_INKLING2_VK_WINDOW];
             let mut win_argmax = [0u32; tm_vulkan::MAX_INKLING2_VK_WINDOW];
-            let n_taps = ds.model.cfg.target_layers.len();
-            let n_embd = ds.model.cfg.n_embd;
+            let target_visits = ds.target_layers().to_vec();
+            let bs = ds.block_size();
+            let max_d_cfg = ds.max_draft_tokens();
+            let mut ctrl = DSparkAdaptiveCtrl::new(opts.draft_max.min(max_d_cfg), 0.0);
 
             // Emit `next_id` (first token predicted from prompt) immediately
             if !tok.is_stop_token(next_id) {
@@ -1618,34 +1924,46 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
                 generated += 1;
             }
 
+            let mut pending_inj: Option<(usize, usize)> = None;
             while generated < opts.n_predict && !tok.is_stop_token(next_id) {
+                let t_step = Instant::now();
                 let rem_gen = opts.n_predict - generated;
-                let max_k = opts
+                let cap_k = opts
                     .draft_max
-                    .min(ds.model.cfg.max_draft_tokens())
+                    .min(max_d_cfg)
                     .min(rem_gen.saturating_sub(1))
                     .min(tm_vulkan::MAX_INKLING2_SPEC_WINDOW - 1);
-                let can_draft = max_k > 0 && pos + ds.model.cfg.block_size <= opts.max_ctx;
+                let ask_k = if pos + bs <= opts.max_ctx {
+                    ctrl.choose_k(cap_k)
+                } else {
+                    0
+                };
 
-                let drafted = if can_draft {
-                    let emb_tmp = &mut ds.emb_tmp;
-                    runner.embed_token_normed(next_id, emb_tmp)?;
-                    ds.model.draft_block_greedy(
-                        &mut ds.state,
+                let mut tap_slot = 0usize;
+                let drafted = if ask_k > 0 {
+                    let (inj_pos, inj_cnt) = pending_inj.take().unwrap_or((0, 0));
+                    let raw_d = ds.inject_and_draft_greedy_with_probs(
+                        &mut runner,
                         &pool,
                         kt,
+                        inj_pos,
+                        inj_cnt,
                         pos,
                         next_id,
-                        max_k,
-                        |_, out| out.copy_from_slice(emb_tmp),
-                        |corr_hid, cap| {
-                            runner
-                                .project_dspark_greedy(corr_hid, cap)
-                                .expect("GPU DSpark project_dspark_greedy failed")
-                        },
-                        &mut drafts[..max_k],
-                    )?
+                        ask_k,
+                        &mut drafts[..ask_k],
+                        &mut draft_probs[..ask_k],
+                    )?;
+                    DSparkAdaptiveCtrl::gate_drafts(raw_d, &draft_probs[..raw_d])
                 } else {
+                    if let Some((inj_pos, inj_cnt)) = pending_inj {
+                        if inj_cnt >= tm_vulkan::MAX_INKLING2_SPEC_WINDOW {
+                            ds.inject_batch(&runner, &pool, kt, inj_pos, inj_cnt)?;
+                            pending_inj = None;
+                        } else {
+                            tap_slot = inj_cnt;
+                        }
+                    }
                     0
                 };
 
@@ -1653,6 +1971,7 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
                 win_toks[0] = next_id;
                 win_toks[1..w].copy_from_slice(&drafts[..drafted]);
 
+                runner.set_dspark_tap_slot(tap_slot);
                 let _ = eval_inkling2_vk_window(
                     &mut runner,
                     &mut host_helper,
@@ -1662,9 +1981,10 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
                     pos,
                     false,
                     drafted > 0,
-                    &ds.model.cfg.target_layers,
+                    &target_visits,
                     Some(&mut win_argmax[..w]),
                 )?;
+                runner.set_dspark_tap_slot(0);
 
                 let mut accepted = 0usize;
                 let mut committed = 1usize;
@@ -1709,22 +2029,25 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
                     total_drafted += drafted;
                     total_accepted += accepted;
                 }
+                let step_s = t_step.elapsed().as_secs_f64();
+                if drafted > 0 {
+                    ctrl.observe(drafted, accepted, committed, step_s);
+                } else if ask_k == 0 {
+                    ctrl.observe(0, 0, 1, step_s);
+                }
                 verify_steps += 1;
-                let tap_len = committed * n_taps * n_embd;
-                runner.read_dspark_taps(committed, n_taps, &mut ds.taps_buf[..tap_len])?;
-                ds.model.inject_batch(
-                    &mut ds.state,
-                    &pool,
-                    kt,
-                    pos,
-                    committed,
-                    &ds.taps_buf[..tap_len],
-                )?;
+                pending_inj = match pending_inj {
+                    Some((inj_pos, inj_cnt)) => Some((inj_pos, inj_cnt + committed)),
+                    None => Some((pos, committed)),
+                };
                 pos += committed;
 
                 if stop_now || generated >= opts.n_predict {
                     break;
                 }
+            }
+            if let Some((inj_pos, inj_cnt)) = pending_inj.take() {
+                ds.inject_batch(&runner, &pool, kt, inj_pos, inj_cnt)?;
             }
         } else {
             while generated < opts.n_predict {
@@ -1796,7 +2119,7 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
         return Ok(());
     }
 
-    if arch == "qwen35" {
+    if matches!(arch.as_str(), "qwen35" | "qwen35moe") {
         let vision_embeds = if !opts.image_paths.is_empty() {
             encode_cli_images_vulkan(&opts)?
         } else {
@@ -1809,7 +2132,8 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
         }
         let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
         eprintln!(
-            "[tinymodel] arch=qwen35 backend=vulkan ({} · {} · {}) loras={} load={:.1}ms prompt_tokens={} vocab={} layers={} (gdn={}, full={})",
+            "[tinymodel] arch={} backend=vulkan ({} · {} · {}) loras={} load={:.1}ms prompt_tokens={} vocab={} layers={} (gdn={}, full={})",
+            arch,
             runner.device_name(),
             runner.driver_info(),
             runner.weights_mode(),
@@ -1997,22 +2321,20 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
             Some(ref dp) => Some(GgufFile::open(dp)?),
             None => None,
         };
+        let draft_reserve = if draft_gguf.is_some() {
+            512 * 1024 * 1024u64
+        } else {
+            0
+        };
+        let mut runner = tm_vulkan::Inkling2VkRunner::from_gguf_with_draft_reserve(
+            gguf.clone(),
+            opts.max_ctx,
+            draft_reserve,
+        )?;
         let mut dspark_ctx = match draft_gguf {
-            Some(ref dg) => {
-                let dm = tm_models::DFlashModel::from_gguf(dg)?;
-                let ds = tm_models::DFlashState::new(&dm, opts.max_ctx);
-                let n_taps = dm.cfg.target_layers.len();
-                let n_embd = dm.cfg.n_embd;
-                Some(VkDSparkCtx {
-                    model: dm,
-                    state: ds,
-                    taps_buf: vec![0.0; tm_vulkan::MAX_INKLING2_VK_WINDOW * n_taps * n_embd],
-                    emb_tmp: vec![0.0; n_embd],
-                })
-            }
+            Some(ref dg) => Some(VkDSparkCtx::from_gguf(&runner, dg, opts.max_ctx)?),
             None => None,
         };
-        let mut runner = tm_vulkan::Inkling2VkRunner::from_gguf(gguf.clone(), opts.max_ctx)?;
         let mut host_helper = if runner.has_host_offload_layers() {
             let hm = tm_models::Inkling2Model::from_gguf_with_options(
                 &gguf,
@@ -2022,6 +2344,11 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
                     host_moe_only: true,
                 },
             )?;
+            for ip in 0..hm.cfg.n_layers_phys {
+                if let Some((gu_pin, gu_len, dn_pin, dn_len)) = hm.host_importable_expert_pins(ip) {
+                    let _ = runner.register_host_moe_layer(ip, gu_pin, gu_len, dn_pin, dn_len);
+                }
+            }
             let hs = tm_models::Inkling2State::new_host_moe_only(&hm);
             Some((hm, hs))
         } else {
@@ -2029,15 +2356,42 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
         };
         let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
+        // Warmup 1 token + pre-bake steady-state `BakedCb` / `BakedSpecPlan` before timing
         let _ = eval_inkling2_vk_greedy(&mut runner, &mut host_helper, &pool, kt, 1, 0)?;
+        let single_tok_s = if let Some(ref ds) = dspark_ctx {
+            let tw = Instant::now();
+            let _ = eval_inkling2_vk_greedy(&mut runner, &mut host_helper, &pool, kt, 1, 1)?;
+            let s_lat = tw.elapsed().as_secs_f64();
+            let warm_w = (1 + opts.draft_max.min(ds.max_draft_tokens()))
+                .min(tm_vulkan::MAX_INKLING2_SPEC_WINDOW);
+            let warm_toks = [1u32; tm_vulkan::MAX_INKLING2_SPEC_WINDOW];
+            let mut warm_am = [0u32; tm_vulkan::MAX_INKLING2_SPEC_WINDOW];
+            let warm_visits = ds.target_layers().to_vec();
+            let _ = eval_inkling2_vk_window(
+                &mut runner,
+                &mut host_helper,
+                &pool,
+                kt,
+                &warm_toks[..warm_w],
+                2,
+                false,
+                true,
+                &warm_visits,
+                Some(&mut warm_am[..warm_w]),
+            )?;
+            s_lat
+        } else {
+            0.0
+        };
         runner.reset_state()?;
         if let Some((_, ref mut hs)) = host_helper {
             hs.reset();
         }
         if let Some(ref mut ds) = dspark_ctx {
-            ds.state.reset();
+            ds.reset(&runner)?;
         }
 
+        runner.reset_prof();
         let t_pp = Instant::now();
         let pp_logits = eval_inkling2_vk_batch(
             &mut runner,
@@ -2052,6 +2406,9 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
         let first_tok = if corpus_mode { argmax(pp_logits) } else { 0 };
         let pp_sec = t_pp.elapsed().as_secs_f64();
         let pp_tps = (n_pp as f64) / pp_sec.max(1e-9);
+        if let Some(rep) = runner.prof_report() {
+            eprintln!("{rep} (prefill)");
+        }
 
         let n_gen = opts.n_predict;
         let mut gen_tokens = Vec::with_capacity(n_gen + 1);
@@ -2063,7 +2420,7 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
                 hs.reset();
             }
             if let Some(ref mut ds) = dspark_ctx {
-                ds.state.reset();
+                ds.reset(&runner)?;
                 let lg0 = eval_inkling2_vk_batch(
                     &mut runner,
                     &mut host_helper,
@@ -2086,46 +2443,66 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
 
         let mut dspark_accepted = 0usize;
         let mut dspark_drafted = 0usize;
+        runner.reset_prof();
         let t0 = Instant::now();
         if let Some(ref mut ds) = dspark_ctx {
             let mut drafts = [0u32; 8];
+            let mut draft_probs = [0.0f32; 8];
             let mut win_toks = [0u32; tm_vulkan::MAX_INKLING2_VK_WINDOW];
             let mut win_argmax = [0u32; tm_vulkan::MAX_INKLING2_VK_WINDOW];
-            let n_taps = ds.model.cfg.target_layers.len();
-            let n_embd = ds.model.cfg.n_embd;
+            let target_visits = ds.target_layers().to_vec();
+            let bs = ds.block_size();
+            let max_d_cfg = ds.max_draft_tokens();
+            let mut ctrl = DSparkAdaptiveCtrl::new(opts.draft_max.min(max_d_cfg), single_tok_s);
+            let mut pending_inj: Option<(usize, usize)> = None;
 
             while gen_tokens.len() < n_gen + 1 {
+                let t_step = Instant::now();
                 let rem = (n_gen + 1) - gen_tokens.len();
-                let max_k = opts
+                let cap_k = opts
                     .draft_max
-                    .min(ds.model.cfg.max_draft_tokens())
+                    .min(max_d_cfg)
                     .min(rem.saturating_sub(1))
                     .min(tm_vulkan::MAX_INKLING2_SPEC_WINDOW - 1);
-                let drafted = if max_k > 0 && cur_pos + ds.model.cfg.block_size <= opts.max_ctx {
-                    let emb_tmp = &mut ds.emb_tmp;
-                    runner.embed_token_normed(tok, emb_tmp)?;
-                    ds.model.draft_block_greedy(
-                        &mut ds.state,
-                        &pool,
-                        kt,
-                        cur_pos,
-                        tok,
-                        max_k,
-                        |_, out| out.copy_from_slice(emb_tmp),
-                        |corr_hid, cap| {
-                            runner
-                                .project_dspark_greedy(corr_hid, cap)
-                                .expect("GPU DSpark project_dspark_greedy failed")
-                        },
-                        &mut drafts[..max_k],
-                    )?
+                let ask_k = if cur_pos + bs <= opts.max_ctx {
+                    ctrl.choose_k(cap_k)
                 } else {
                     0
                 };
+
+                let mut tap_slot = 0usize;
+                let drafted = if ask_k > 0 {
+                    let (inj_pos, inj_cnt) = pending_inj.take().unwrap_or((0, 0));
+                    let raw_d = ds.inject_and_draft_greedy_with_probs(
+                        &mut runner,
+                        &pool,
+                        kt,
+                        inj_pos,
+                        inj_cnt,
+                        cur_pos,
+                        tok,
+                        ask_k,
+                        &mut drafts[..ask_k],
+                        &mut draft_probs[..ask_k],
+                    )?;
+                    DSparkAdaptiveCtrl::gate_drafts(raw_d, &draft_probs[..raw_d])
+                } else {
+                    if let Some((inj_pos, inj_cnt)) = pending_inj {
+                        if inj_cnt >= tm_vulkan::MAX_INKLING2_SPEC_WINDOW {
+                            ds.inject_batch(&runner, &pool, kt, inj_pos, inj_cnt)?;
+                            pending_inj = None;
+                        } else {
+                            tap_slot = inj_cnt;
+                        }
+                    }
+                    0
+                };
+
                 let w = 1 + drafted;
                 win_toks[0] = tok;
                 win_toks[1..w].copy_from_slice(&drafts[..drafted]);
 
+                runner.set_dspark_tap_slot(tap_slot);
                 let _ = eval_inkling2_vk_window(
                     &mut runner,
                     &mut host_helper,
@@ -2135,9 +2512,10 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
                     cur_pos,
                     false,
                     drafted > 0,
-                    &ds.model.cfg.target_layers,
+                    &target_visits,
                     Some(&mut win_argmax[..w]),
                 )?;
+                runner.set_dspark_tap_slot(0);
 
                 let mut accepted = 0usize;
                 let mut committed = 1usize;
@@ -2165,17 +2543,20 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
                     dspark_drafted += drafted;
                     dspark_accepted += accepted;
                 }
-                let tap_len = committed * n_taps * n_embd;
-                runner.read_dspark_taps(committed, n_taps, &mut ds.taps_buf[..tap_len])?;
-                ds.model.inject_batch(
-                    &mut ds.state,
-                    &pool,
-                    kt,
-                    cur_pos,
-                    committed,
-                    &ds.taps_buf[..tap_len],
-                )?;
+                let step_s = t_step.elapsed().as_secs_f64();
+                if drafted > 0 {
+                    ctrl.observe(drafted, accepted, committed, step_s);
+                } else if ask_k == 0 {
+                    ctrl.observe(0, 0, 1, step_s);
+                }
+                pending_inj = match pending_inj {
+                    Some((inj_pos, inj_cnt)) => Some((inj_pos, inj_cnt + committed)),
+                    None => Some((cur_pos, committed)),
+                };
                 cur_pos += committed;
+            }
+            if let Some((inj_pos, inj_cnt)) = pending_inj.take() {
+                ds.inject_batch(&runner, &pool, kt, inj_pos, inj_cnt)?;
             }
         } else {
             for step in 0..n_gen {
@@ -2192,12 +2573,16 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
         }
         let sec = t0.elapsed().as_secs_f64();
         let tps = (n_gen as f64) / sec.max(1e-9);
+        if let Some(rep) = runner.prof_report() {
+            eprintln!("{rep} (decode)");
+        }
         let tel_after = probe::collect_telemetry();
         let dev_name = runner.device_name().to_string();
-        let wmode = if dspark_ctx.is_some() {
+        let wmode = if let Some(ref ds) = dspark_ctx {
             format!(
-                "{}+dspark_k{}({}/{})",
+                "{}+dspark_{}_k{}({}/{})",
                 runner.weights_mode(),
+                if ds.is_gpu() { "gpu" } else { "cpu" },
                 opts.draft_max,
                 dspark_accepted,
                 dspark_drafted
@@ -2248,7 +2633,7 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
         return Ok(());
     }
 
-    if arch == "qwen35" {
+    if matches!(arch.as_str(), "qwen35" | "qwen35moe") {
         let mut runner =
             tm_vulkan::Qwen35VkRunner::from_gguf_with_kv(gguf, opts.max_ctx, opts.kv_type)?;
         if let Some(ref ls) = loras {
@@ -2431,7 +2816,7 @@ fn cmd_profile_vulkan(opts: RunOpts) -> Result<()> {
         None
     };
     let n_runs = opts.n_predict.max(16);
-    if arch == "qwen35" {
+    if matches!(arch.as_str(), "qwen35" | "qwen35moe") {
         let mut runner =
             tm_vulkan::Qwen35VkRunner::from_gguf_with_kv(gguf, opts.max_ctx, opts.kv_type)?;
         if let Some(ref ls) = loras {
@@ -3211,7 +3596,7 @@ fn cmd_profile(opts: RunOpts) -> Result<()> {
         return Ok(());
     }
 
-    if arch == "qwen35" {
+    if matches!(arch.as_str(), "qwen35" | "qwen35moe") {
         let model = Qwen35Model::from_gguf(&gguf)?;
         let mut state = Qwen35State::new(&model, opts.max_ctx);
         for i in 0..4 {
@@ -3497,7 +3882,7 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
                 );
                 return Ok(());
             }
-            if arch == "qwen35" {
+            if matches!(arch.as_str(), "qwen35" | "qwen35moe") {
                 let mut runner =
                     tm_vulkan::Qwen35VkRunner::from_gguf_with_kv(gguf, opts.max_ctx, opts.kv_type)?;
                 if let Some(ref ls) = loras {
@@ -3517,9 +3902,10 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
                 }
                 writer.flush()?;
                 eprintln!(
-                    "[tinymodel logits] wrote {} steps x {} vocab (vulkan qwen35, loras={}) -> {}",
+                    "[tinymodel logits] wrote {} steps x {} vocab (vulkan {}, loras={}) -> {}",
                     n_steps,
                     vocab,
+                    arch,
                     opts.lora_specs.len(),
                     out_path.display()
                 );

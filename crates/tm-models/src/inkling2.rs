@@ -17,19 +17,21 @@
 //!   so `25.91 GiB` `Inkling-2-Mini-Q8_0.gguf` runs at full precision on 16 GB RAM hosts without
 //!   Linux page-cache duplication or swap thrashing.
 
+use std::sync::Arc;
+
 use tm_core::{DType, KvType, QK8_0, dequantize_row_bytes, probe_system_memory};
 use tm_cpu::{
-    KernelTable, MAX_CPU_BATCH, MatvecScratch, ThreadPool, matmul_f32,
-    matvec_batch_f32_unquant_act, matvec_f32, matvec_f32_unquant_act, rms_norm,
-    rms_norm_unit_inplace, softcap_inplace_parallel,
+    HugePageAlignedPin, HugePageBytes, KernelTable, MAX_CPU_BATCH, MatvecScratch, ThreadPool,
+    matmul_f32, matvec_batch_f32_unquant_act, matvec_f32, matvec_f32_unquant_act,
+    release_mmap_page_cache, rms_norm, rms_norm_unit_inplace, softcap_inplace_parallel,
 };
 use tm_gguf::{DirectTensorReader, GgufError, GgufFile, PageAlignedSlot};
 
 use crate::llama::ModelError;
 use crate::state::{LayerState, MAX_SPEC_WINDOW, SpecVerifyBuf, decode_embedding_row};
 
-/// Maximum multi-token lockstep window for `eval_moe_experts_window_f32` (`DSpark` verify + 32-tok prefill).
-pub const MAX_INKLING2_WINDOW: usize = 32;
+/// Maximum multi-token lockstep window for `eval_moe_experts_window_f32` (`DSpark` verify + 256-tok prefill).
+pub const MAX_INKLING2_WINDOW: usize = 256;
 
 /// Controller indices for `inkling2_loop` cross-pass messages (`inkling2-loop.cpp:48-50`).
 pub const LOOP_CTRL_Q: usize = 0;
@@ -203,10 +205,11 @@ pub struct Inkling2DecodeProfile {
     pub lm_head_bytes: u64,
 }
 
-/// Backing bytes for a matrix (either zero-copy borrowed from `GgufFile` or uncached anonymous RAM).
+/// Backing bytes for a matrix (zero-copy `GgufFile` slice, `Vec<u8>`, or `2 MiB` `MADV_HUGEPAGE` RAM).
 pub enum BytesBacking<'a> {
     Borrowed(&'a [u8]),
     Owned(Vec<u8>),
+    HugePage(Arc<HugePageBytes>),
 }
 
 impl<'a> BytesBacking<'a> {
@@ -215,6 +218,7 @@ impl<'a> BytesBacking<'a> {
         match self {
             BytesBacking::Borrowed(b) => b,
             BytesBacking::Owned(v) => v.as_slice(),
+            BytesBacking::HugePage(hp) => hp.as_slice(),
         }
     }
 }
@@ -1229,15 +1233,38 @@ impl<'a> Inkling2Model<'a> {
                     &ltag,
                     &[n_ff, n_embd, n_exp],
                 )?;
-                stats.ram_mmap_expert_layers += 1;
+                let (gu_backing, dn_backing) = if skip_dense {
+                    // Hybrid GPU+CPU mode: stage host experts into `2 MiB` `MADV_HUGEPAGE`
+                    // anonymous memory (enabling both zero-TLB-miss CPU `AVX2` decode AND zero-copy
+                    // `VK_EXT_external_memory_host` PCIe TensorCore prefill!) and immediately
+                    // release the `4 KiB` file-backed page cache (`MADV_DONTNEED`).
+                    let mut gu_hp = HugePageBytes::new_zeroed(gu_bytes.len());
+                    gu_hp.as_mut_slice().copy_from_slice(gu_bytes);
+                    release_mmap_page_cache(gu_bytes);
+                    let mut dn_hp = HugePageBytes::new_zeroed(dn_bytes.len());
+                    dn_hp.as_mut_slice().copy_from_slice(dn_bytes);
+                    release_mmap_page_cache(dn_bytes);
+                    stats.ram_owned_expert_layers += 1;
+                    stats.ram_owned_bytes += (gu_bytes.len() + dn_bytes.len()) as u64;
+                    (
+                        BytesBacking::HugePage(Arc::new(gu_hp)),
+                        BytesBacking::HugePage(Arc::new(dn_hp)),
+                    )
+                } else {
+                    stats.ram_mmap_expert_layers += 1;
+                    (
+                        BytesBacking::Borrowed(gu_bytes),
+                        BytesBacking::Borrowed(dn_bytes),
+                    )
+                };
                 if is_core {
                     stats.core_layers_in_fast_tiers += 1;
                 }
                 ExpertLayerStore::InMemory {
-                    gate_up: BytesBacking::Borrowed(gu_bytes),
+                    gate_up: gu_backing,
                     gate_up_dtype: gu_info.dtype,
                     gate_up_expert_bytes: gu_bytes.len() / n_exp,
-                    down: BytesBacking::Borrowed(dn_bytes),
+                    down: dn_backing,
                     down_dtype: dn_info.dtype,
                     down_expert_bytes: dn_bytes.len() / n_exp,
                 }
@@ -1255,20 +1282,32 @@ impl<'a> Inkling2Model<'a> {
                     &[n_ff, n_embd, n_exp],
                 )?;
                 let dn_dt = dn_info.dtype;
-                let mut gu_owned = vec![0u8; gu_len];
-                rdr.read_exact_uncached(gu_off, &mut gu_owned, &mut io_slot)?;
-                let mut dn_owned = vec![0u8; dn_len];
-                rdr.read_exact_uncached(dn_off, &mut dn_owned, &mut io_slot)?;
+                let (gu_backing, dn_backing) = if skip_dense || gu_len >= 2 * 1024 * 1024 {
+                    let mut gu_hp = HugePageBytes::new_zeroed(gu_len);
+                    rdr.read_exact_uncached(gu_off, gu_hp.as_mut_slice(), &mut io_slot)?;
+                    let mut dn_hp = HugePageBytes::new_zeroed(dn_len);
+                    rdr.read_exact_uncached(dn_off, dn_hp.as_mut_slice(), &mut io_slot)?;
+                    (
+                        BytesBacking::HugePage(Arc::new(gu_hp)),
+                        BytesBacking::HugePage(Arc::new(dn_hp)),
+                    )
+                } else {
+                    let mut gu_owned = vec![0u8; gu_len];
+                    rdr.read_exact_uncached(gu_off, &mut gu_owned, &mut io_slot)?;
+                    let mut dn_owned = vec![0u8; dn_len];
+                    rdr.read_exact_uncached(dn_off, &mut dn_owned, &mut io_slot)?;
+                    (BytesBacking::Owned(gu_owned), BytesBacking::Owned(dn_owned))
+                };
                 stats.ram_owned_expert_layers += 1;
                 stats.ram_owned_bytes += (gu_len + dn_len) as u64;
                 if is_core {
                     stats.core_layers_in_fast_tiers += 1;
                 }
                 ExpertLayerStore::InMemory {
-                    gate_up: BytesBacking::Owned(gu_owned),
+                    gate_up: gu_backing,
                     gate_up_dtype: gu_dt,
                     gate_up_expert_bytes: gu_len / n_exp,
-                    down: BytesBacking::Owned(dn_owned),
+                    down: dn_backing,
                     down_dtype: dn_dt,
                     down_expert_bytes: dn_len / n_exp,
                 }
@@ -1469,6 +1508,36 @@ impl<'a> Inkling2Model<'a> {
         }
     }
 
+    /// Returns `(gate_up_pin, gate_up_logical_bytes, down_pin, down_logical_bytes)` if physical
+    /// layer `ip` holds `Q8_0` experts in `2 MiB`-aligned anonymous `HugePageBytes`, enabling
+    /// zero-copy `VK_EXT_external_memory_host` GPU TensorCore prefill without extra RAM/VRAM!
+    #[allow(clippy::type_complexity)]
+    pub fn host_importable_expert_pins(
+        &self,
+        ip: usize,
+    ) -> Option<(
+        Arc<dyn AsRef<[u8]> + Send + Sync>,
+        usize,
+        Arc<dyn AsRef<[u8]> + Send + Sync>,
+        usize,
+    )> {
+        match self.layers.get(ip)?.experts {
+            ExpertLayerStore::InMemory {
+                gate_up: BytesBacking::HugePage(ref gu_hp),
+                gate_up_dtype: DType::Q8_0,
+                down: BytesBacking::HugePage(ref dn_hp),
+                down_dtype: DType::Q8_0,
+                ..
+            } => Some((
+                Arc::new(HugePageAlignedPin(Arc::clone(gu_hp))),
+                gu_hp.as_slice().len(),
+                Arc::new(HugePageAlignedPin(Arc::clone(dn_hp))),
+                dn_hp.as_slice().len(),
+            )),
+            _ => None,
+        }
+    }
+
     /// Evaluates selected MoE experts across a window of `window_len` (`1 <= W <= MAX_SPEC_WINDOW`)
     /// tokens simultaneously by **grouping unique expert IDs** (`0..n_expert`), so every requested
     /// NVMe `O_DIRECT` or Host RAM expert is read **at most once** across all `W` tokens while
@@ -1527,10 +1596,11 @@ impl<'a> Inkling2Model<'a> {
     ) {
         let n_embd = self.cfg.n_embd;
         let n_ff = self.cfg.n_ff_exp;
-        let top_k = self.cfg.n_expert_used;
+        assert!((1..=MAX_INKLING2_WINDOW).contains(&window_len));
+        let top_k = top_ids_win.len() / window_len;
+        assert!(top_k <= self.cfg.n_expert_used);
         let beta = self.cfg.situ_beta;
         let lb = self.cfg.situ_linear_beta;
-        assert!((1..=MAX_INKLING2_WINDOW).contains(&window_len));
         assert_eq!(cur_normed_win.len(), window_len * n_embd);
         assert_eq!(top_ids_win.len(), window_len * top_k);
         assert_eq!(top_weights_win.len(), window_len * top_k);
@@ -1554,41 +1624,54 @@ impl<'a> Inkling2Model<'a> {
             return;
         }
 
-        // Build deduplicated expert table on stack (`MAX_INKLING2_WINDOW * 32 <= 1024`, zero heap allocs!)
-        const MAX_REQS: usize = MAX_INKLING2_WINDOW * 32;
-        let total_reqs = window_len * top_k;
-        assert!(total_reqs <= MAX_REQS);
-        let mut uniq_exps = [0usize; MAX_REQS];
-        let mut uniq_mask = [0u32; MAX_REQS];
-        let mut uniq_kslot = [[0u8; MAX_INKLING2_WINDOW]; MAX_REQS];
+        // Build deduplicated expert table (`n_uniq <= n_expert`, 256-bit token mask per unique expert)
+        // with zero heap allocations (`AGENTS.md` Rule #4).
+        const MAX_UNIQ_EXPS: usize = 512;
+        let n_expert = self.cfg.n_expert;
+        assert!(n_expert <= MAX_UNIQ_EXPS);
+        let mut uniq_exps = [0usize; MAX_UNIQ_EXPS];
+        let mut uniq_mask = [[0u64; 4]; MAX_UNIQ_EXPS];
+        let mut exp_to_u = [u16::MAX; MAX_UNIQ_EXPS];
+        let mut uniq_kslot = [[0u8; MAX_INKLING2_WINDOW]; MAX_UNIQ_EXPS];
         let mut n_uniq = 0usize;
 
         for tok_i in 0..window_len {
+            let word = tok_i >> 6;
+            let bit = 1u64 << (tok_i & 63);
             for k_idx in 0..top_k {
-                let e_id = top_ids_win[tok_i * top_k + k_idx];
-                let mut found = None;
-                for (u, &ue) in uniq_exps.iter().enumerate().take(n_uniq) {
-                    if ue == e_id {
-                        found = Some(u);
-                        break;
-                    }
+                if top_weights_win[tok_i * top_k + k_idx] == 0.0 {
+                    continue;
                 }
-                let u = match found {
-                    Some(u) => u,
-                    None => {
-                        let u = n_uniq;
-                        uniq_exps[u] = e_id;
-                        n_uniq += 1;
-                        u
-                    }
+                let e_id = top_ids_win[tok_i * top_k + k_idx];
+                let u = if exp_to_u[e_id] != u16::MAX {
+                    exp_to_u[e_id] as usize
+                } else {
+                    let u = n_uniq;
+                    exp_to_u[e_id] = u as u16;
+                    uniq_exps[u] = e_id;
+                    n_uniq += 1;
+                    u
                 };
-                uniq_mask[u] |= 1u32 << tok_i;
+                uniq_mask[u][word] |= bit;
                 uniq_kslot[u][tok_i] = k_idx as u8;
             }
         }
 
         let gu_scales = self.layers[ip].ffn_gate_up_exps_scale.as_deref();
         let dn_scales = self.layers[ip].ffn_down_exps_scale.as_deref();
+        // Longest-Processing-Time-First (LPT) sort by descending token count `m_cnt` so parallel
+        // expert waves have homogeneous batch sizes (eliminates Zipf hot-expert barrier stragglers).
+        let mut uniq_mcnt = [0usize; MAX_UNIQ_EXPS];
+        let mut order = [0usize; MAX_UNIQ_EXPS];
+        for u in 0..n_uniq {
+            uniq_mcnt[u] = (uniq_mask[u][0].count_ones()
+                + uniq_mask[u][1].count_ones()
+                + uniq_mask[u][2].count_ones()
+                + uniq_mask[u][3].count_ones()) as usize;
+            order[u] = u;
+        }
+        order[..n_uniq]
+            .sort_unstable_by(|&a, &b| uniq_mcnt[b].cmp(&uniq_mcnt[a]).then_with(|| a.cmp(&b)));
 
         match &self.layers[ip].experts {
             ExpertLayerStore::InMemory {
@@ -1602,11 +1685,128 @@ impl<'a> Inkling2Model<'a> {
                 let gu_all = gate_up.as_slice();
                 let dn_all = down.as_slice();
                 let n_workers = expert_slots.len().max(1);
-                let mut base_u = 0usize;
-                while base_u < n_uniq {
-                    let batch_u = (n_uniq - base_u).min(n_workers);
+                let mut base_ord = 0usize;
+
+                // Hot experts (`m_cnt >= 12` on multi-threaded pool): split `gate_up` & `down` rows
+                // across ALL worker threads so popular experts never bottleneck a single core.
+                while base_ord < n_uniq
+                    && pool.num_threads() > 1
+                    && uniq_mcnt[order[base_ord]] >= 12
+                {
+                    let u = order[base_ord];
+                    let e_id = uniq_exps[u];
+                    let mask = uniq_mask[u];
+                    let gu_slice =
+                        &gu_all[e_id * gate_up_expert_bytes..(e_id + 1) * gate_up_expert_bytes];
+                    let dn_slice =
+                        &dn_all[e_id * down_expert_bytes..(e_id + 1) * down_expert_bytes];
+                    let ws = &mut expert_slots[0];
+
+                    let mut m_cnt = 0usize;
+                    for tok_i in 0..window_len {
+                        if (mask[tok_i >> 6] & (1u64 << (tok_i & 63))) != 0 {
+                            ws.win_in_buf[m_cnt * n_embd..(m_cnt + 1) * n_embd].copy_from_slice(
+                                &cur_normed_win[tok_i * n_embd..(tok_i + 1) * n_embd],
+                            );
+                            m_cnt += 1;
+                        }
+                    }
+                    if float_act {
+                        matvec_batch_f32_unquant_act(
+                            pool,
+                            kt,
+                            *gate_up_dtype,
+                            gu_slice,
+                            &ws.win_in_buf[..m_cnt * n_embd],
+                            m_cnt,
+                            &mut ws.mv_scratch,
+                            &mut ws.win_gate_up_buf[..m_cnt * 2 * n_ff],
+                            2 * n_ff,
+                            n_embd,
+                        );
+                    } else {
+                        matmul_f32(
+                            pool,
+                            kt,
+                            *gate_up_dtype,
+                            gu_slice,
+                            &ws.win_in_buf[..m_cnt * n_embd],
+                            &mut ws.mv_scratch,
+                            &mut ws.win_gate_up_buf[..m_cnt * 2 * n_ff],
+                            2 * n_ff,
+                            n_embd,
+                            m_cnt,
+                        );
+                    }
+                    if let Some(sc) = gu_scales {
+                        let s_e = sc[e_id];
+                        for v in &mut ws.win_gate_up_buf[..m_cnt * 2 * n_ff] {
+                            *v *= s_e;
+                        }
+                    }
+                    for m in 0..m_cnt {
+                        let gu_m = &ws.win_gate_up_buf[m * 2 * n_ff..(m + 1) * 2 * n_ff];
+                        apply_situ_glu(
+                            &gu_m[..n_ff],
+                            &gu_m[n_ff..2 * n_ff],
+                            &mut ws.win_hidden_buf[m * n_ff..(m + 1) * n_ff],
+                            beta,
+                            lb,
+                        );
+                    }
+                    if float_act {
+                        matvec_batch_f32_unquant_act(
+                            pool,
+                            kt,
+                            *down_dtype,
+                            dn_slice,
+                            &ws.win_hidden_buf[..m_cnt * n_ff],
+                            m_cnt,
+                            &mut ws.mv_scratch,
+                            &mut ws.out_buf[..m_cnt * n_embd],
+                            n_embd,
+                            n_ff,
+                        );
+                    } else {
+                        matmul_f32(
+                            pool,
+                            kt,
+                            *down_dtype,
+                            dn_slice,
+                            &ws.win_hidden_buf[..m_cnt * n_ff],
+                            &mut ws.mv_scratch,
+                            &mut ws.out_buf[..m_cnt * n_embd],
+                            n_embd,
+                            n_ff,
+                            m_cnt,
+                        );
+                    }
+                    if let Some(sc) = dn_scales {
+                        let s_e = sc[e_id];
+                        for v in &mut ws.out_buf[..m_cnt * n_embd] {
+                            *v *= s_e;
+                        }
+                    }
+                    let kslots = &uniq_kslot[u];
+                    let mut m_idx = 0usize;
+                    for (tok_i, &ks) in kslots.iter().enumerate().take(window_len) {
+                        if (mask[tok_i >> 6] & (1u64 << (tok_i & 63))) == 0 {
+                            continue;
+                        }
+                        let k_idx = ks as usize;
+                        let dst_off = (tok_i * top_k + k_idx) * n_embd;
+                        win_slot_outs[dst_off..dst_off + n_embd]
+                            .copy_from_slice(&ws.out_buf[m_idx * n_embd..(m_idx + 1) * n_embd]);
+                        m_idx += 1;
+                    }
+                    base_ord += 1;
+                }
+
+                // Remaining experts in LPT order: homogeneous `m_cnt` within each parallel wave.
+                while base_ord < n_uniq {
+                    let batch_u = (n_uniq - base_ord).min(n_workers);
                     pool.parallel_for_each_mut(&mut expert_slots[..batch_u], |rel_u, ws| {
-                        let u = base_u + rel_u;
+                        let u = order[base_ord + rel_u];
                         let e_id = uniq_exps[u];
                         let mask = uniq_mask[u];
                         let gu_slice =
@@ -1616,7 +1816,7 @@ impl<'a> Inkling2Model<'a> {
 
                         let mut m_cnt = 0usize;
                         for tok_i in 0..window_len {
-                            if (mask & (1u32 << tok_i)) != 0 {
+                            if (mask[tok_i >> 6] & (1u64 << (tok_i & 63))) != 0 {
                                 ws.win_in_buf[m_cnt * n_embd..(m_cnt + 1) * n_embd]
                                     .copy_from_slice(
                                         &cur_normed_win[tok_i * n_embd..(tok_i + 1) * n_embd],
@@ -1702,12 +1902,12 @@ impl<'a> Inkling2Model<'a> {
                         }
                     });
                     for (rel_u, ws) in expert_slots.iter().enumerate().take(batch_u) {
-                        let u = base_u + rel_u;
+                        let u = order[base_ord + rel_u];
                         let mask = uniq_mask[u];
                         let kslots = &uniq_kslot[u];
                         let mut m_idx = 0usize;
                         for (tok_i, &ks) in kslots.iter().enumerate().take(window_len) {
-                            if (mask & (1u32 << tok_i)) == 0 {
+                            if (mask[tok_i >> 6] & (1u64 << (tok_i & 63))) == 0 {
                                 continue;
                             }
                             let k_idx = ks as usize;
@@ -1717,7 +1917,7 @@ impl<'a> Inkling2Model<'a> {
                             m_idx += 1;
                         }
                     }
-                    base_u += batch_u;
+                    base_ord += batch_u;
                 }
             }
             ExpertLayerStore::NvmeDirect {
@@ -1737,16 +1937,16 @@ impl<'a> Inkling2Model<'a> {
                     _ => pool,
                 };
                 let n_workers = expert_slots.len().max(1);
-                let mut base_u = 0usize;
-                while base_u < n_uniq {
-                    let batch_u = (n_uniq - base_u).min(n_workers);
+                let mut base_ord = 0usize;
+                while base_ord < n_uniq {
+                    let batch_u = (n_uniq - base_ord).min(n_workers);
                     nvme_pool.parallel_for_each_mut(&mut expert_slots[..batch_u], |rel_u, ws| {
-                        let u = base_u + rel_u;
+                        let u = order[base_ord + rel_u];
                         let e_id = uniq_exps[u];
                         let mask = uniq_mask[u];
                         let mut m_cnt = 0usize;
                         for tok_i in 0..window_len {
-                            if (mask & (1u32 << tok_i)) != 0 {
+                            if (mask[tok_i >> 6] & (1u64 << (tok_i & 63))) != 0 {
                                 ws.win_in_buf[m_cnt * n_embd..(m_cnt + 1) * n_embd]
                                     .copy_from_slice(
                                         &cur_normed_win[tok_i * n_embd..(tok_i + 1) * n_embd],
@@ -1840,12 +2040,12 @@ impl<'a> Inkling2Model<'a> {
                         }
                     });
                     for (rel_u, ws) in expert_slots.iter().enumerate().take(batch_u) {
-                        let u = base_u + rel_u;
+                        let u = order[base_ord + rel_u];
                         let mask = uniq_mask[u];
                         let kslots = &uniq_kslot[u];
                         let mut m_idx = 0usize;
                         for (tok_i, &ks) in kslots.iter().enumerate().take(window_len) {
-                            if (mask & (1u32 << tok_i)) == 0 {
+                            if (mask[tok_i >> 6] & (1u64 << (tok_i & 63))) == 0 {
                                 continue;
                             }
                             let k_idx = ks as usize;
@@ -1855,7 +2055,7 @@ impl<'a> Inkling2Model<'a> {
                             m_idx += 1;
                         }
                     }
-                    base_u += batch_u;
+                    base_ord += batch_u;
                 }
             }
             ExpertLayerStore::DeviceVram => {
@@ -1871,6 +2071,9 @@ impl<'a> Inkling2Model<'a> {
             let out_t = &mut moe_out_win[tok_i * n_embd..(tok_i + 1) * n_embd];
             for k_idx in 0..top_k {
                 let w_e = top_weights_win[tok_i * top_k + k_idx];
+                if w_e == 0.0 {
+                    continue;
+                }
                 let slot_o = &win_slot_outs
                     [(tok_i * top_k + k_idx) * n_embd..(tok_i * top_k + k_idx + 1) * n_embd];
                 for (m, &o) in out_t.iter_mut().zip(slot_o.iter()) {

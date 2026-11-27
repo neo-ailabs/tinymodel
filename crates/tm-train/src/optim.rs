@@ -323,38 +323,77 @@ pub fn init_lora_adapter_qwen35(
                 }
             }
         }
-        if targets.gate {
-            push_linear_pair(
-                &mut rng,
-                &mut pairs,
-                &mut order,
-                lw.w_gate.name,
-                lw.w_gate.cols,
-                lw.w_gate.rows,
-                rank,
-            );
-        }
-        if targets.up {
-            push_linear_pair(
-                &mut rng,
-                &mut pairs,
-                &mut order,
-                lw.w_up.name,
-                lw.w_up.cols,
-                lw.w_up.rows,
-                rank,
-            );
-        }
-        if targets.down {
-            push_linear_pair(
-                &mut rng,
-                &mut pairs,
-                &mut order,
-                lw.w_down.name,
-                lw.w_down.cols,
-                lw.w_down.rows,
-                rank,
-            );
+        match &lw.ffn {
+            tm_models::Qwen35FfnWeights::Dense {
+                w_gate,
+                w_up,
+                w_down,
+            } => {
+                if targets.gate {
+                    push_linear_pair(
+                        &mut rng,
+                        &mut pairs,
+                        &mut order,
+                        w_gate.name,
+                        w_gate.cols,
+                        w_gate.rows,
+                        rank,
+                    );
+                }
+                if targets.up {
+                    push_linear_pair(
+                        &mut rng, &mut pairs, &mut order, w_up.name, w_up.cols, w_up.rows, rank,
+                    );
+                }
+                if targets.down {
+                    push_linear_pair(
+                        &mut rng,
+                        &mut pairs,
+                        &mut order,
+                        w_down.name,
+                        w_down.cols,
+                        w_down.rows,
+                        rank,
+                    );
+                }
+            }
+            tm_models::Qwen35FfnWeights::Moe(moe) => {
+                if let Some(ref sh) = moe.shared_expert {
+                    if targets.gate {
+                        push_linear_pair(
+                            &mut rng,
+                            &mut pairs,
+                            &mut order,
+                            sh.w_gate.name,
+                            sh.w_gate.cols,
+                            sh.w_gate.rows,
+                            rank,
+                        );
+                    }
+                    if targets.up {
+                        push_linear_pair(
+                            &mut rng,
+                            &mut pairs,
+                            &mut order,
+                            sh.w_up.name,
+                            sh.w_up.cols,
+                            sh.w_up.rows,
+                            rank,
+                        );
+                    }
+                    if targets.down {
+                        push_linear_pair(
+                            &mut rng,
+                            &mut pairs,
+                            &mut order,
+                            sh.w_down.name,
+                            sh.w_down.cols,
+                            sh.w_down.rows,
+                            rank,
+                        );
+                    }
+                }
+            }
         }
     }
 

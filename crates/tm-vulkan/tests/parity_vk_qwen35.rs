@@ -1041,3 +1041,468 @@ fn vk_qwen35_gdn_layer_vs_fp64_oracle() {
         );
     }
 }
+
+#[test]
+fn vk_qwen35moe_parity_shared_expert_and_mtp_trim() {
+    // Exercises `qwen35moe` (`Qwen3.6-35B-A3B` architecture) on BOTH exact `F32` (`rel <= 1e-5`)
+    // and quantized `Q8_0` (`moe_indexed_gemv.comp` `DTYPE == 2u` 8-lane coalesced `w32` + `vec4`,
+    // `CoopMatF16`, `Fallback`, `reset_state`, and CPU `0-ULP` batch-vs-step determinism):
+    // - `block_count = 5`, `nextn_predict_layers = 1` -> trims `blk.4` (`nextn.*` MTP block) to 4 trunk layers!
+    // - `HK = 2, HV = 4` (`kh = vh % HK` tiled GDN grouping on layers 0..2 + gated FullAttn on layer 3)
+    // - `expert_count = 8, expert_used_count = 2`, Softmax + `norm_weights = true` (`default_norm_w` for `qwen35moe`)
+    // - Sigmoid-gated shared expert (`ffn_gate_inp_shexp.weight` + `ffn_{gate,up,down}_shexp.weight`)
+    // - Omitted `qwen35moe.feed_forward_length` (matching Unsloth `Qwen3.6-35B-A3B-Q8_0.gguf`!)
+    let n_trunk = 4usize;
+    let raw_blocks = 5usize;
+    let n_embd = 64usize;
+    let n_ff_exp = 32usize;
+    let n_ff_sh = 64usize;
+    let n_exp = 8usize;
+    let n_exp_used = 2usize;
+    let n_head = 4usize;
+    let n_head_kv = 2usize;
+    let head_dim = 32usize;
+    let rope_dim = 16usize;
+    let d_conv = 4usize;
+    let s_dim = 32usize;
+    let hk = 2usize;
+    let hv = 4usize;
+    let d_inner = hv * s_dim;
+    let conv_dim = 2 * hk * s_dim + d_inner;
+    let q_dim = n_head * head_dim;
+    let qg_dim = q_dim * 2;
+    let kv_dim = n_head_kv * head_dim;
+    let vocab = 96usize;
+
+    fn mat_entry(
+        rng: &mut Rng,
+        use_q8: bool,
+        name: String,
+        rows: usize,
+        cols: usize,
+    ) -> TensorEntry {
+        if use_q8 {
+            let nb = rows * cols / 32;
+            let mut data = Vec::with_capacity(nb * 34);
+            for _ in 0..nb {
+                let d = f32_to_f16(rng.f32() * 0.0012);
+                data.extend_from_slice(&d.to_le_bytes());
+                for _ in 0..32 {
+                    data.push(rng.u8());
+                }
+            }
+            TensorEntry {
+                name,
+                dims: vec![cols as u64, rows as u64],
+                ggml_type: 8,
+                data,
+            }
+        } else {
+            TensorEntry {
+                name,
+                dims: vec![cols as u64, rows as u64],
+                ggml_type: 0,
+                data: make_f32_bytes(rng, rows * cols, 0.0, 0.08),
+            }
+        }
+    }
+    fn mat3d_entry(
+        rng: &mut Rng,
+        use_q8: bool,
+        name: String,
+        n_e: usize,
+        rows: usize,
+        cols: usize,
+    ) -> TensorEntry {
+        let mut e = mat_entry(rng, use_q8, name, n_e * rows, cols);
+        e.dims = vec![cols as u64, rows as u64, n_e as u64];
+        e
+    }
+
+    let build_moe_gguf = |use_q8: bool| -> Vec<u8> {
+        let mut rng = Rng(0x3635_A3B0_2026_1127);
+        let mut ts = vec![
+            mat_entry(&mut rng, use_q8, "token_embd.weight".into(), vocab, n_embd),
+            TensorEntry {
+                name: "output_norm.weight".into(),
+                dims: vec![n_embd as u64],
+                ggml_type: 0,
+                data: make_f32_bytes(&mut rng, n_embd, 1.0, 0.1),
+            },
+            mat_entry(&mut rng, use_q8, "output.weight".into(), vocab, n_embd),
+        ];
+
+        for l in 0..raw_blocks {
+            let p = format!("blk.{l}");
+            ts.push(TensorEntry {
+                name: format!("{p}.attn_norm.weight"),
+                dims: vec![n_embd as u64],
+                ggml_type: 0,
+                data: make_f32_bytes(&mut rng, n_embd, 1.0, 0.1),
+            });
+            ts.push(TensorEntry {
+                name: format!("{p}.post_attention_norm.weight"),
+                dims: vec![n_embd as u64],
+                ggml_type: 0,
+                data: make_f32_bytes(&mut rng, n_embd, 1.0, 0.1),
+            });
+            if l < 3 {
+                ts.push(mat_entry(
+                    &mut rng,
+                    use_q8,
+                    format!("{p}.attn_qkv.weight"),
+                    conv_dim,
+                    n_embd,
+                ));
+                ts.push(mat_entry(
+                    &mut rng,
+                    use_q8,
+                    format!("{p}.attn_gate.weight"),
+                    d_inner,
+                    n_embd,
+                ));
+                ts.push(mat_entry(
+                    &mut rng,
+                    use_q8,
+                    format!("{p}.ssm_alpha.weight"),
+                    hv,
+                    n_embd,
+                ));
+                ts.push(mat_entry(
+                    &mut rng,
+                    use_q8,
+                    format!("{p}.ssm_beta.weight"),
+                    hv,
+                    n_embd,
+                ));
+                ts.push(TensorEntry {
+                    name: format!("{p}.ssm_conv1d.weight"),
+                    dims: vec![d_conv as u64, conv_dim as u64],
+                    ggml_type: 0,
+                    data: make_f32_bytes(&mut rng, conv_dim * d_conv, 0.0, 0.25),
+                });
+                ts.push(TensorEntry {
+                    name: format!("{p}.ssm_a"),
+                    dims: vec![hv as u64],
+                    ggml_type: 0,
+                    data: make_f32_bytes(&mut rng, hv, -0.5, 0.2),
+                });
+                ts.push(TensorEntry {
+                    name: format!("{p}.ssm_dt.bias"),
+                    dims: vec![hv as u64],
+                    ggml_type: 0,
+                    data: make_f32_bytes(&mut rng, hv, 0.1, 0.1),
+                });
+                ts.push(TensorEntry {
+                    name: format!("{p}.ssm_norm.weight"),
+                    dims: vec![s_dim as u64],
+                    ggml_type: 0,
+                    data: make_f32_bytes(&mut rng, s_dim, 1.0, 0.1),
+                });
+                ts.push(mat_entry(
+                    &mut rng,
+                    use_q8,
+                    format!("{p}.ssm_out.weight"),
+                    n_embd,
+                    d_inner,
+                ));
+            } else {
+                ts.push(TensorEntry {
+                    name: format!("{p}.attn_q_norm.weight"),
+                    dims: vec![head_dim as u64],
+                    ggml_type: 0,
+                    data: make_f32_bytes(&mut rng, head_dim, 1.0, 0.1),
+                });
+                ts.push(TensorEntry {
+                    name: format!("{p}.attn_k_norm.weight"),
+                    dims: vec![head_dim as u64],
+                    ggml_type: 0,
+                    data: make_f32_bytes(&mut rng, head_dim, 1.0, 0.1),
+                });
+                ts.push(mat_entry(
+                    &mut rng,
+                    use_q8,
+                    format!("{p}.attn_q.weight"),
+                    qg_dim,
+                    n_embd,
+                ));
+                ts.push(mat_entry(
+                    &mut rng,
+                    use_q8,
+                    format!("{p}.attn_k.weight"),
+                    kv_dim,
+                    n_embd,
+                ));
+                ts.push(mat_entry(
+                    &mut rng,
+                    use_q8,
+                    format!("{p}.attn_v.weight"),
+                    kv_dim,
+                    n_embd,
+                ));
+                ts.push(mat_entry(
+                    &mut rng,
+                    use_q8,
+                    format!("{p}.attn_output.weight"),
+                    n_embd,
+                    q_dim,
+                ));
+            }
+
+            ts.push(TensorEntry {
+                name: format!("{p}.ffn_gate_inp.weight"),
+                dims: vec![n_embd as u64, n_exp as u64],
+                ggml_type: 0,
+                data: make_f32_bytes(&mut rng, n_exp * n_embd, 0.0, 0.35),
+            });
+            ts.push(mat3d_entry(
+                &mut rng,
+                use_q8,
+                format!("{p}.ffn_gate_exps.weight"),
+                n_exp,
+                n_ff_exp,
+                n_embd,
+            ));
+            ts.push(mat3d_entry(
+                &mut rng,
+                use_q8,
+                format!("{p}.ffn_up_exps.weight"),
+                n_exp,
+                n_ff_exp,
+                n_embd,
+            ));
+            ts.push(mat3d_entry(
+                &mut rng,
+                use_q8,
+                format!("{p}.ffn_down_exps.weight"),
+                n_exp,
+                n_embd,
+                n_ff_exp,
+            ));
+            ts.push(TensorEntry {
+                name: format!("{p}.ffn_gate_inp_shexp.weight"),
+                dims: vec![n_embd as u64],
+                ggml_type: 0,
+                data: make_f32_bytes(&mut rng, n_embd, 0.1, 0.3),
+            });
+            ts.push(mat_entry(
+                &mut rng,
+                use_q8,
+                format!("{p}.ffn_gate_shexp.weight"),
+                n_ff_sh,
+                n_embd,
+            ));
+            ts.push(mat_entry(
+                &mut rng,
+                use_q8,
+                format!("{p}.ffn_up_shexp.weight"),
+                n_ff_sh,
+                n_embd,
+            ));
+            ts.push(mat_entry(
+                &mut rng,
+                use_q8,
+                format!("{p}.ffn_down_shexp.weight"),
+                n_embd,
+                n_ff_sh,
+            ));
+        }
+
+        let mut kv = Vec::new();
+        kv_str(&mut kv, "general.architecture", "qwen35moe");
+        kv_u32(&mut kv, "qwen35moe.block_count", raw_blocks as u32);
+        kv_u32(&mut kv, "qwen35moe.nextn_predict_layers", 1);
+        kv_u32(&mut kv, "qwen35moe.embedding_length", n_embd as u32);
+        kv_u32(&mut kv, "qwen35moe.expert_count", n_exp as u32);
+        kv_u32(&mut kv, "qwen35moe.expert_used_count", n_exp_used as u32);
+        kv_u32(
+            &mut kv,
+            "qwen35moe.expert_feed_forward_length",
+            n_ff_exp as u32,
+        );
+        kv_u32(
+            &mut kv,
+            "qwen35moe.expert_shared_feed_forward_length",
+            n_ff_sh as u32,
+        );
+        kv_u32(&mut kv, "qwen35moe.attention.head_count", n_head as u32);
+        kv_u32(
+            &mut kv,
+            "qwen35moe.attention.head_count_kv",
+            n_head_kv as u32,
+        );
+        kv_u32(&mut kv, "qwen35moe.attention.key_length", head_dim as u32);
+        kv_u32(&mut kv, "qwen35moe.rope.dimension_count", rope_dim as u32);
+        kv_f32(&mut kv, "qwen35moe.rope.freq_base", 10_000_000.0);
+        kv_f32(&mut kv, "qwen35moe.attention.layer_norm_rms_epsilon", 1e-6);
+        kv_u32(&mut kv, "qwen35moe.full_attention_interval", 4);
+        kv_u32(&mut kv, "qwen35moe.ssm.conv_kernel", d_conv as u32);
+        kv_u32(&mut kv, "qwen35moe.ssm.state_size", s_dim as u32);
+        kv_u32(&mut kv, "qwen35moe.ssm.group_count", hk as u32);
+        kv_u32(&mut kv, "qwen35moe.ssm.time_step_rank", hv as u32);
+        kv_u32(&mut kv, "qwen35moe.ssm.inner_size", d_inner as u32);
+        kv_u32(&mut kv, "qwen35moe.vocab_size", vocab as u32);
+        kv_u32(&mut kv, "qwen35moe.context_length", 128);
+
+        let mut tinfos = Vec::new();
+        let mut offset = 0u64;
+        for t in &ts {
+            push_str(&mut tinfos, &t.name);
+            tinfos.extend_from_slice(&(t.dims.len() as u32).to_le_bytes());
+            for &d in &t.dims {
+                tinfos.extend_from_slice(&d.to_le_bytes());
+            }
+            tinfos.extend_from_slice(&t.ggml_type.to_le_bytes());
+            tinfos.extend_from_slice(&offset.to_le_bytes());
+            offset += (t.data.len() as u64).div_ceil(32) * 32;
+        }
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&(ts.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&22u64.to_le_bytes());
+        bytes.extend_from_slice(&kv);
+        bytes.extend_from_slice(&tinfos);
+        while !bytes.len().is_multiple_of(32) {
+            bytes.push(0);
+        }
+        for t in &ts {
+            bytes.extend_from_slice(&t.data);
+            while !bytes.len().is_multiple_of(32) {
+                bytes.push(0);
+            }
+        }
+        bytes
+    };
+
+    let pool = ThreadPool::new(2);
+    let kt = active_kernels();
+    let prompt: Vec<u32> = (0..17).map(|i| ((i * 7 + 3) % vocab) as u32).collect();
+
+    // 1. Exact F32 `qwen35moe` parity (`rel <= 1e-5` across batch + 6 multi-token decode steps!)
+    let gguf_f32 = open_temp_gguf("qwen35moe_f32", &build_moe_gguf(false));
+    let cpu_f32 = Qwen35Model::from_gguf(&gguf_f32).expect("cpu qwen35moe f32");
+    assert_eq!(cpu_f32.cfg.n_layers, n_trunk);
+    let mut st_f32 = Qwen35State::new(&cpu_f32, 64);
+    cpu_f32
+        .forward_batch(&mut st_f32, &pool, kt, &prompt, 0, true)
+        .expect("cpu f32 batch");
+    let cpu_f32_pp = st_f32.logits().to_vec();
+    let mut cpu_f32_dec = Vec::new();
+    for step in 0..6 {
+        let tid = ((step * 11 + 5) % vocab) as u32;
+        cpu_f32
+            .forward_token(&mut st_f32, &pool, kt, tid, prompt.len() + step, true)
+            .expect("cpu f32 tok");
+        cpu_f32_dec.push(st_f32.logits().to_vec());
+    }
+
+    // 2. Quantized Q8_0 `qwen35moe` (`moe_indexed_gemv.comp` `DTYPE == 2u` 8-lane coalesced path)
+    let gguf_q8 = open_temp_gguf("qwen35moe_q8", &build_moe_gguf(true));
+    let cpu_q8 = Qwen35Model::from_gguf(&gguf_q8).expect("cpu qwen35moe q8");
+    let mut st_q8 = Qwen35State::new(&cpu_q8, 64);
+    cpu_q8
+        .forward_batch(&mut st_q8, &pool, kt, &prompt, 0, true)
+        .expect("cpu q8 batch");
+    let cpu_q8_pp = st_q8.logits().to_vec();
+    let mut cpu_q8_dec = Vec::new();
+    for step in 0..6 {
+        let tid = ((step * 11 + 5) % vocab) as u32;
+        cpu_q8
+            .forward_token(&mut st_q8, &pool, kt, tid, prompt.len() + step, true)
+            .expect("cpu q8 tok");
+        cpu_q8_dec.push(st_q8.logits().to_vec());
+    }
+
+    // Verify CPU `forward_batch` vs `forward_token` 0-ULP determinism on `qwen35moe`
+    st_q8.reset();
+    for (pos, &tid) in prompt.iter().enumerate() {
+        cpu_q8
+            .forward_token(&mut st_q8, &pool, kt, tid, pos, pos + 1 == prompt.len())
+            .expect("cpu q8 step");
+    }
+    for (i, (&a, &b)) in st_q8.logits().iter().zip(cpu_q8_pp.iter()).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "CPU qwen35moe batch vs step bit mismatch at {i}: {a} vs {b}"
+        );
+    }
+
+    let Some(ctx_f32) = ctx() else {
+        return;
+    };
+    ctx_f32.set_prefill_mode(VkPrefillMode::Fallback);
+    let mut vk_f32 =
+        Qwen35VkRunner::from_gguf_with_context(ctx_f32, gguf_f32, 64).expect("vk f32 load");
+    assert_eq!(vk_f32.cfg.n_layers, n_trunk);
+    let vk_f32_pp = vk_f32.forward_batch(&prompt, 0, true).expect("vk f32 pp");
+    let (rel_pp, abs_pp) = max_rel_err(vk_f32_pp, &cpu_f32_pp);
+    assert!(
+        rel_pp <= 1e-5 && abs_pp <= 1e-3,
+        "F32 qwen35moe prefill mismatch: rel={rel_pp:.3e} abs={abs_pp:.3e}"
+    );
+    for (step, ref_l) in cpu_f32_dec.iter().enumerate() {
+        let tid = ((step * 11 + 5) % vocab) as u32;
+        let vk_l = vk_f32
+            .forward_token(tid, prompt.len() + step, true)
+            .expect("vk f32 dec");
+        let (rel, abs) = max_rel_err(vk_l, ref_l);
+        assert!(
+            rel <= 1e-5 && abs <= 1e-3 && argmax(vk_l) == argmax(ref_l),
+            "F32 qwen35moe decode step {step} mismatch: rel={rel:.3e} abs={abs:.3e}"
+        );
+    }
+
+    // Q8_0 Vulkan Fallback decode vs batch invariance (`rel <= 1e-5`) + CoopMat + CPU Q8 KL
+    let ctx_q8_fb = VulkanContext::new().expect("ctx q8 fb");
+    ctx_q8_fb.set_prefill_mode(VkPrefillMode::Fallback);
+    let mut vk_q8_fb = Qwen35VkRunner::from_gguf_with_context(ctx_q8_fb, gguf_q8.clone(), 64)
+        .expect("vk q8 fb load");
+    let mut seq_all = prompt.clone();
+    for step in 0..6 {
+        seq_all.push(((step * 11 + 5) % vocab) as u32);
+    }
+    let fb_all = vk_q8_fb
+        .forward_batch(&seq_all, 0, true)
+        .expect("vk q8 fb batch(23)")
+        .to_vec();
+    vk_q8_fb.reset_state().expect("reset q8 fb");
+    let fb_pp = vk_q8_fb
+        .forward_batch(&prompt, 0, true)
+        .expect("vk q8 fb pp")
+        .to_vec();
+    assert!(kl_divergence(&cpu_q8_pp, &fb_pp) < 5e-4 && argmax(&cpu_q8_pp) == argmax(&fb_pp));
+    let mut fb_last = Vec::new();
+    for (step, ref_l) in cpu_q8_dec.iter().enumerate() {
+        let tid = ((step * 11 + 5) % vocab) as u32;
+        let vk_l = vk_q8_fb
+            .forward_token(tid, prompt.len() + step, true)
+            .expect("vk q8 fb dec");
+        let kl = kl_divergence(ref_l, vk_l);
+        assert!(
+            kl < 5e-4 && argmax(ref_l) == argmax(vk_l),
+            "Q8_0 qwen35moe step {step} mismatch: kl={kl:.3e}"
+        );
+        if step == 5 {
+            fb_last = vk_l.to_vec();
+        }
+    }
+    let (rel_inv, _) = max_rel_err(&fb_all, &fb_last);
+    assert!(
+        rel_inv <= 1e-5,
+        "Q8_0 qwen35moe batch(23) vs pp(17)+dec(6) mismatch: rel={rel_inv:.3e}"
+    );
+
+    let ctx_auto = VulkanContext::new().expect("ctx auto");
+    let mut vk_auto =
+        Qwen35VkRunner::from_gguf_with_context(ctx_auto, gguf_q8, 64).expect("vk auto load");
+    let auto_all = vk_auto
+        .forward_batch(&seq_all, 0, true)
+        .expect("vk auto batch(23)");
+    let kl_auto = kl_divergence(&fb_all, auto_all);
+    assert!(
+        kl_auto < 2e-4 && argmax(&fb_all) == argmax(auto_all),
+        "CoopMat/Auto qwen35moe batch mismatch: kl={kl_auto:.3e}"
+    );
+}

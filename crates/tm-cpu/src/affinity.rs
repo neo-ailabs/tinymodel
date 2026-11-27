@@ -247,6 +247,115 @@ pub fn mlock_slice(bytes: &[u8]) -> bool {
     }
 }
 
+/// 2 MiB-aligned anonymous buffer backed by Linux Transparent Huge Pages (`MADV_HUGEPAGE`),
+/// eliminating `4 KiB` nested KVM EPT / TLB misses across multi-GiB randomly-indexed MoE experts.
+pub struct HugePageBytes {
+    buf: Vec<u8>,
+    pad: usize,
+    len: usize,
+}
+
+impl HugePageBytes {
+    /// Allocates `len` bytes aligned to `2 MiB` and marks the range `MADV_HUGEPAGE` on Linux/Android
+    /// **before** caller writes tensor bytes so the kernel faults in contiguous `2 MiB` PMD pages.
+    pub fn new_zeroed(len: usize) -> Self {
+        const HP_ALIGN: usize = 2 * 1024 * 1024;
+        if len == 0 {
+            return Self {
+                buf: Vec::new(),
+                pad: 0,
+                len: 0,
+            };
+        }
+        let alloc_len = len.next_multiple_of(HP_ALIGN) + HP_ALIGN;
+        let mut buf = vec![0u8; alloc_len];
+        let addr = buf.as_ptr() as usize;
+        let pad = (HP_ALIGN - (addr & (HP_ALIGN - 1))) & (HP_ALIGN - 1);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            const MADV_HUGEPAGE: i32 = 14;
+            unsafe extern "C" {
+                fn madvise(addr: *mut core::ffi::c_void, length: usize, advice: i32) -> i32;
+            }
+            let aligned_len = len.next_multiple_of(HP_ALIGN);
+            // SAFETY: `buf[pad .. pad + aligned_len]` lies within `buf` (`alloc_len >= pad + aligned_len`)
+            // and `buf.as_mut_ptr().add(pad)` is 2 MiB-aligned.
+            unsafe {
+                let _ = madvise(buf.as_mut_ptr().add(pad).cast(), aligned_len, MADV_HUGEPAGE);
+            }
+        }
+        Self { buf, pad, len }
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf[self.pad..self.pad + self.len]
+    }
+
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buf[self.pad..self.pad + self.len]
+    }
+
+    /// Returns the `2 MiB`-aligned backing slice rounded up to the `2 MiB` page boundary
+    /// (`>= self.len`), safe for `VK_EXT_external_memory_host` (`vkGetBufferMemoryRequirements`
+    /// 4 KiB / 64 KiB rounding).
+    #[inline]
+    pub fn aligned_backing_slice(&self) -> &[u8] {
+        if self.len == 0 {
+            return &[];
+        }
+        const HP_ALIGN: usize = 2 * 1024 * 1024;
+        let aligned_len = self.len.next_multiple_of(HP_ALIGN);
+        &self.buf[self.pad..self.pad + aligned_len]
+    }
+}
+
+/// Reference-counted `2 MiB`-aligned host backing pin implementing `AsRef<[u8]>` over the full
+/// `2 MiB`-aligned region so Vulkan `VK_EXT_external_memory_host` buffers keep the host pages
+/// alive until `vkFreeMemory` completes.
+pub struct HugePageAlignedPin(pub std::sync::Arc<HugePageBytes>);
+
+impl AsRef<[u8]> for HugePageAlignedPin {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.0.aligned_backing_slice()
+    }
+}
+
+/// Advises the OS kernel (`MADV_DONTNEED`) that read-only file-backed `mmap` pages fully contained
+/// inside `slice` are no longer needed in the page cache (used after copying experts into `HugePageBytes`
+/// or GPU VRAM so host RAM never double-caches GGUF pages).
+pub fn release_mmap_page_cache(slice: &[u8]) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        const PAGE: usize = 4096;
+        const MADV_DONTNEED: i32 = 4;
+        unsafe extern "C" {
+            fn madvise(addr: *mut core::ffi::c_void, length: usize, advice: i32) -> i32;
+        }
+        let start = slice.as_ptr() as usize;
+        let end = start + slice.len();
+        let aligned_start = start.next_multiple_of(PAGE);
+        let aligned_end = end & !(PAGE - 1);
+        if aligned_end > aligned_start {
+            // SAFETY: `[aligned_start .. aligned_end)` is a whole-page sub-range strictly inside
+            // `slice` (`start <= aligned_start < aligned_end <= end`).
+            unsafe {
+                let _ = madvise(
+                    aligned_start as *mut core::ffi::c_void,
+                    aligned_end - aligned_start,
+                    MADV_DONTNEED,
+                );
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = slice;
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn macos_perf_physical_cpus() -> Option<usize> {
     unsafe extern "C" {

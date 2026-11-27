@@ -87,7 +87,7 @@ impl CudaRunner {
             | "bailingmoe2" => Ok(CudaRunner::Llama(LlamaCudaRunner::from_gguf_with_kv_type(
                 gguf, max_ctx, kv_type,
             )?)),
-            "qwen35" => Ok(CudaRunner::Qwen35(
+            "qwen35" | "qwen35moe" => Ok(CudaRunner::Qwen35(
                 Qwen35CudaRunner::from_gguf_with_kv_type(gguf, max_ctx, kv_type)?,
             )),
             other => Err(CudaError::UnsupportedArch(other.to_string())),

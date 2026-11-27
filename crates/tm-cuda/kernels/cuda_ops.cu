@@ -28,6 +28,12 @@ using namespace nvcuda;
 #define DTYPE_Q6_K  14
 #define DTYPE_BF16  30
 #define DTYPE_NVFP4 40
+#define DTYPE_Q2_0  42
+
+struct BlockQ2_0 {
+    half d;
+    uint8_t qs[16];
+}; // 18 bytes (64 weights, 2-byte aligned)
 
 struct BlockNvFp4 {
     uint8_t d[4];
@@ -74,6 +80,7 @@ struct BlockQ6K {
     half d;
 }; // 210 bytes (2-byte aligned)
 
+static_assert(sizeof(BlockQ2_0) == 18 && alignof(BlockQ2_0) == 2, "BlockQ2_0 layout");
 static_assert(sizeof(BlockQ4_0) == 18 && alignof(BlockQ4_0) == 2, "BlockQ4_0 layout");
 static_assert(sizeof(BlockQ4_1) == 20 && alignof(BlockQ4_1) == 4, "BlockQ4_1 layout");
 static_assert(sizeof(BlockQ8_0) == 34 && alignof(BlockQ8_0) == 2, "BlockQ8_0 layout");
@@ -128,6 +135,13 @@ __device__ __forceinline__ void decode_q4k_scale_min(int j, const uint8_t* q, ui
     }
 }
 
+// Unpack one byte of `BlockQ2_0` (4 x 2-bit codes in 0..3) into signed int8x4 `(c - 1)` in {-1, 0, +1, +2} with zero borrow.
+__device__ __forceinline__ int unpack_q2_0_byte_s8x4(uint8_t byte) {
+    const uint32_t u = uint32_t(byte);
+    const uint32_t p = (u & 3u) | (((u >> 2) & 3u) << 8) | (((u >> 4) & 3u) << 16) | (((u >> 6) & 3u) << 24);
+    return int(((p | 0x80808080u) - 0x01010101u) ^ 0x80808080u);
+}
+
 // Dequantize one element `elem_in_row` (0..cols-1) from row `w_row` of any supported GGUF dtype.
 __device__ __forceinline__ float dequant_elem(
     int dtype,
@@ -167,6 +181,14 @@ __device__ __forceinline__ float dequant_elem(
             const int i = col & 31;
             const BlockQ8_0& blk = reinterpret_cast<const BlockQ8_0*>(w_row)[b];
             return __half2float(blk.d) * float(blk.qs[i]);
+        }
+        case DTYPE_Q2_0: {
+            const int b = col >> 6;
+            const int in64 = col & 63;
+            const BlockQ2_0& blk = reinterpret_cast<const BlockQ2_0*>(w_row)[b];
+            const uint8_t byte = blk.qs[in64 >> 2];
+            const int code = (byte >> (2 * (in64 & 3))) & 3;
+            return __half2float(blk.d) * float(code - 1);
         }
         case DTYPE_NVFP4: {
             static constexpr float kFp4Lut[16] = {
@@ -315,6 +337,38 @@ __global__ void swiglu_quantize_q8_1_f32(
     const int8_t qs = int8_t(max(-127, min(127, q)));
 
     BlockQ8_1& dst = out[size_t(tok) * n_blocks + blk_idx];
+    dst.qs[lane] = qs;
+    if (lane == 0) {
+        dst.ds = __floats2half2_rn(d, sum_x);
+    }
+}
+
+// Fused `[gate, up]` (`[n_rows, 2 * n_ff]`) SwiGLU + `Q8_1` quantization (`[n_rows, n_ff / 32]`).
+// Grid: (ceil(n_blocks / 4), n_rows, 1), Block: (32, 4, 1)
+__global__ void swiglu_fused_quantize_q8_1_f32(
+    const float* __restrict__ gate_up,
+    BlockQ8_1* __restrict__ out,
+    int n_ff,
+    int n_rows
+) {
+    const int n_blocks = n_ff >> 5;
+    const int blk_idx = int(blockIdx.x) * int(blockDim.y) + int(threadIdx.y);
+    const int row = int(blockIdx.y);
+    const int lane = int(threadIdx.x);
+    if (blk_idx >= n_blocks || row >= n_rows) return;
+
+    const float* src = gate_up + size_t(row) * (2 * n_ff);
+    const int col = blk_idx * 32 + lane;
+    const float g = src[col];
+    const float val = (g / (1.0f + expf(-g))) * src[n_ff + col];
+    const float amax = warp_reduce_max(fabsf(val));
+    const float sum_x = warp_reduce_sum(val);
+    const float d = amax / 127.0f;
+    const float id = (amax != 0.0f) ? (127.0f / amax) : 0.0f;
+    const int q = __float2int_rn(val * id);
+    const int8_t qs = int8_t(max(-127, min(127, q)));
+
+    BlockQ8_1& dst = out[size_t(row) * n_blocks + blk_idx];
     dst.qs[lane] = qs;
     if (lane == 0) {
         dst.ds = __floats2half2_rn(d, sum_x);
@@ -581,7 +635,57 @@ __global__ void __launch_bounds__(128, 1) mmvq_q8_0_q8_1(
     }
 }
 
-// Fast cooperative warp-per-row K-quant MMVQ (`Q4_K`, `Q5_K`, `Q6_K`) using `__dp4a`!
+// `Q2_0 x Q8_1` MMVQ (`BlockQ2_0`: 64 weights in 18B = 2 x `BlockQ8_1`):
+// 4 lanes cooperate on one `BlockQ2_0` (`sub = lane & 3`, reading 4 bytes = 16 weights = 4 `dp4a_i8` calls!).
+__global__ void __launch_bounds__(128, 1) mmvq_q2_0_q8_1(
+    const BlockQ2_0* __restrict__ w,
+    const BlockQ8_1* __restrict__ xq,
+    float* __restrict__ out,
+    int rows,
+    int cols,
+    int n_tok
+) {
+    const int n_b64 = cols >> 6;
+    const int n_q8 = cols >> 5;
+    const int lane = int(threadIdx.x);
+    const int warp_id = int(threadIdx.y);
+    const int row = int(blockIdx.x) * 4 + warp_id;
+    if (row >= rows) return;
+
+    const BlockQ2_0* w_row = w + size_t(row) * n_b64;
+    const int sub = lane & 3;         // 0..3 -> 16 weights each
+    const int q8_half = sub >> 1;     // 0 or 1 (which of the two 32-elem BlockQ8_1s)
+    const int q8_quad = (sub & 1) * 4;// 0 or 4 (int32 offset inside BlockQ8_1.qs)
+    float acc[MMVQ_MAX_TOK] = {0.0f};
+
+    for (int b64 = lane >> 2; b64 < n_b64; b64 += 8) {
+        const BlockQ2_0& wb = w_row[b64];
+        const float d_w = __half2float(wb.d);
+        const uint32_t raw4 = uint32_t(load_i32_2b(wb.qs + 4 * sub));
+        const int s0 = unpack_q2_0_byte_s8x4(uint8_t(raw4 & 0xFFu));
+        const int s1 = unpack_q2_0_byte_s8x4(uint8_t((raw4 >> 8) & 0xFFu));
+        const int s2 = unpack_q2_0_byte_s8x4(uint8_t((raw4 >> 16) & 0xFFu));
+        const int s3 = unpack_q2_0_byte_s8x4(uint8_t((raw4 >> 24) & 0xFFu));
+
+        for (int t = 0; t < n_tok; ++t) {
+            const BlockQ8_1& xb = xq[size_t(t) * n_q8 + 2 * b64 + q8_half];
+            const int* xqs = reinterpret_cast<const int*>(xb.qs) + q8_quad;
+            int sumi = 0;
+            sumi = dp4a_i8(s0, xqs[0], sumi);
+            sumi = dp4a_i8(s1, xqs[1], sumi);
+            sumi = dp4a_i8(s2, xqs[2], sumi);
+            sumi = dp4a_i8(s3, xqs[3], sumi);
+            acc[t] += d_w * __low2float(xb.ds) * float(sumi);
+        }
+    }
+
+    for (int t = 0; t < n_tok; ++t) {
+        const float sum = warp_reduce_sum(acc[t]);
+        if (lane == 0) {
+            out[size_t(t) * rows + row] = sum;
+        }
+    }
+}
 // Each superblock has 256 elements = 8 sub-blocks of 32 (`BlockQ8_1`).
 // Across 32 lanes: `sub = lane >> 2` (0..7), `quad = lane & 3` (0..3, 4 bytes = 4 elements per quad!).
 // Wait: 8 sub-blocks * 8 quads/sub-block = 64 quads per 256-elem superblock -> each lane handles 2 quads!
@@ -1206,6 +1310,22 @@ __global__ void sigmoid_gate_mul_f32(
     dst[idx] *= 1.0f / (1.0f + expf(-g));
 }
 
+// Per-row scalar sigmoid gate multiply (`dst[t * cols + c] *= sigmoid(gate[t])`) — stream-ordered, CUDA-Graph safe!
+// Grid: (ceil(cols / 256), n_tok, 1), Block: (256, 1, 1)
+__global__ void scale_rows_by_sigmoid_scalar_f32(
+    float* __restrict__ dst,
+    const float* __restrict__ gate,
+    int cols,
+    int n_tok
+) {
+    const int c = int(blockIdx.x) * int(blockDim.x) + int(threadIdx.x);
+    const int t = int(blockIdx.y);
+    if (c >= cols || t >= n_tok) return;
+    const float g = gate[t];
+    const float sig = 1.0f / (1.0f + expf(-g));
+    dst[size_t(t) * cols + c] *= sig;
+}
+
 // Split Qwen3.5 interleaved `[n_head * 2 * head_dim]` (`[q_h, gate_h]` per head!) into `q` and `gate`!
 __global__ void split_qwen35_q_gate_f32(
     const float* __restrict__ qg,
@@ -1774,9 +1894,10 @@ __global__ void gdn_rms_norm_gated_f32(
 }
 
 // ============================================================================
-// 8. Fine-Grained Sparse MoE Router + Indexed Expert Projection (`ADR-018`)
+// 8. Fine-Grained Sparse MoE Router + Parallel `__dp4a` Indexed Expert Projection
 // ============================================================================
-// Grid: (n_tok, 1, 1), Block: (32, 1, 1) — deterministic top-k selection matching CPU & Metal!
+// Grid: (n_tok, 1, 1), Block: (64, 1, 1) — supports up to 512 experts (`Qwen3.8` & `Hy4`),
+// deterministic `<` index tie-breaking matching CPU, Metal, and Vulkan!
 __global__ void moe_router_topk_f32(
     const float* __restrict__ logits,       // [n_tok, n_expert]
     const float* __restrict__ probs_bias,   // optional [n_expert] (null if absent)
@@ -1789,84 +1910,333 @@ __global__ void moe_router_topk_f32(
     float norm_eps,
     float weights_scale
 ) {
-    if (threadIdx.x != 0) return;
+    const int tid = int(threadIdx.x); // 0..63
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;     // 0..1
     const int t = int(blockIdx.x);
     const float* row = logits + size_t(t) * n_expert;
     uint32_t* out_ids = top_ids + size_t(t) * k_used;
     float* out_w = top_weights + size_t(t) * k_used;
 
-    float probs[256];
-    float sel[256];
-    const int ne = min(n_expert, 256);
+    __shared__ float sh_probs[512];
+    __shared__ float sh_sel[512];
+    __shared__ float sh_max[2];
+    __shared__ float sh_sum[2];
+    __shared__ float sh_w0[2];
+    __shared__ int sh_i0[2];
+    const int ne = min(n_expert, 512);
 
     if (gating_func == 2) {
-        for (int e = 0; e < ne; ++e) {
-            probs[e] = 1.0f / (1.0f + expf(-row[e]));
+        for (int e = tid; e < ne; e += 64) {
+            sh_probs[e] = 1.0f / (1.0f + expf(-row[e]));
         }
     } else if (gating_func == 4) {
-        for (int e = 0; e < ne; ++e) {
+        for (int e = tid; e < ne; e += 64) {
             const float x = row[e];
             const float sp = (x > 20.0f) ? x : log1pf(expf(x));
-            probs[e] = sqrtf(fmaxf(sp, 0.0f));
+            sh_probs[e] = sqrtf(fmaxf(sp, 0.0f));
         }
     } else if (gating_func == 3) {
-        for (int e = 0; e < ne; ++e) probs[e] = row[e];
-    } else {
-        float mx = -CUDART_INF_F;
-        for (int e = 0; e < ne; ++e) mx = fmaxf(mx, row[e]);
-        float s = 0.0f;
-        for (int e = 0; e < ne; ++e) {
-            probs[e] = expf(row[e] - mx);
-            s += probs[e];
+        for (int e = tid; e < ne; e += 64) {
+            sh_probs[e] = row[e];
         }
-        const float inv = 1.0f / s;
-        for (int e = 0; e < ne; ++e) probs[e] *= inv;
+    } else {
+        float local_mx = -CUDART_INF_F;
+        for (int e = tid; e < ne; e += 64) local_mx = fmaxf(local_mx, row[e]);
+        local_mx = warp_reduce_max(local_mx);
+        if (lane == 0) sh_max[warp_id] = local_mx;
+        __syncthreads();
+        const float mx = fmaxf(sh_max[0], sh_max[1]);
+
+        float local_s = 0.0f;
+        for (int e = tid; e < ne; e += 64) {
+            const float p = expf(row[e] - mx);
+            sh_probs[e] = p;
+            local_s += p;
+        }
+        local_s = warp_reduce_sum(local_s);
+        if (lane == 0) sh_sum[warp_id] = local_s;
+        __syncthreads();
+        const float inv = 1.0f / (sh_sum[0] + sh_sum[1]);
+        for (int e = tid; e < ne; e += 64) sh_probs[e] *= inv;
     }
 
-    for (int e = 0; e < ne; ++e) {
-        sel[e] = probs[e] + (probs_bias ? probs_bias[e] : 0.0f);
+    for (int e = tid; e < ne; e += 64) {
+        sh_sel[e] = sh_probs[e] + (probs_bias ? probs_bias[e] : 0.0f);
     }
+    __syncthreads();
 
     for (int k = 0; k < k_used; ++k) {
-        int best_i = 0;
         float best_v = -CUDART_INF_F;
-        for (int e = 0; e < ne; ++e) {
-            if (sel[e] > best_v) {
-                best_v = sel[e];
+        int best_i = 0x7fffffff;
+        for (int e = tid; e < ne; e += 64) {
+            const float v = sh_sel[e];
+            if (v > best_v || (v == best_v && e < best_i)) {
+                best_v = v;
                 best_i = e;
             }
         }
-        out_ids[k] = uint32_t(best_i);
-        out_w[k] = probs[best_i];
-        sel[best_i] = -CUDART_INF_F;
-    }
-
-    if (gating_func == 3) {
-        float mx = -CUDART_INF_F;
-        for (int k = 0; k < k_used; ++k) mx = fmaxf(mx, out_w[k]);
-        float s = 0.0f;
-        for (int k = 0; k < k_used; ++k) {
-            out_w[k] = expf(out_w[k] - mx);
-            s += out_w[k];
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, best_v, offset, 32);
+            const int oi = __shfl_xor_sync(0xffffffffu, best_i, offset, 32);
+            if (ov > best_v || (ov == best_v && oi < best_i)) {
+                best_v = ov;
+                best_i = oi;
+            }
         }
-        for (int k = 0; k < k_used; ++k) out_w[k] /= s;
-    } else if (norm_weights) {
-        float s = 0.0f;
-        for (int k = 0; k < k_used; ++k) s += out_w[k];
-        const float denom = (norm_eps > 0.0f) ? (s + norm_eps) : fmaxf(s, 6.1035156e-5f);
-        for (int k = 0; k < k_used; ++k) out_w[k] /= denom;
+        if (lane == 0) {
+            sh_w0[warp_id] = best_v;
+            sh_i0[warp_id] = best_i;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            int win_i = sh_i0[0];
+            float win_v = sh_w0[0];
+            if (sh_w0[1] > win_v || (sh_w0[1] == win_v && sh_i0[1] < win_i)) {
+                win_v = sh_w0[1];
+                win_i = sh_i0[1];
+            }
+            out_ids[k] = uint32_t(win_i);
+            out_w[k] = sh_probs[win_i];
+            sh_sel[win_i] = -CUDART_INF_F;
+        }
+        __syncthreads();
     }
 
-    if (weights_scale != 0.0f && fabsf(weights_scale - 1.0f) > 1e-12f) {
-        for (int k = 0; k < k_used; ++k) {
-            out_w[k] *= weights_scale;
+    if (tid == 0) {
+        if (gating_func == 3) {
+            float mx = -CUDART_INF_F;
+            for (int k = 0; k < k_used; ++k) mx = fmaxf(mx, out_w[k]);
+            float s = 0.0f;
+            for (int k = 0; k < k_used; ++k) {
+                out_w[k] = expf(out_w[k] - mx);
+                s += out_w[k];
+            }
+            for (int k = 0; k < k_used; ++k) out_w[k] /= s;
+        } else if (norm_weights) {
+            float s = 0.0f;
+            for (int k = 0; k < k_used; ++k) s += out_w[k];
+            const float denom = (norm_eps > 0.0f) ? (s + norm_eps) : fmaxf(s, 6.1035156e-5f);
+            for (int k = 0; k < k_used; ++k) out_w[k] /= denom;
+        }
+
+        if (weights_scale != 0.0f && fabsf(weights_scale - 1.0f) > 1e-12f) {
+            for (int k = 0; k < k_used; ++k) {
+                out_w[k] *= weights_scale;
+            }
         }
     }
 }
 
-// Indexed expert projection for single-token decode (`slot_idx in 0..k_used`):
-// Reads `exp_id = top_ids[slot_idx]`, projects `w_exps[exp_id]` (`[rows, cols]`) against `x` (`[cols]`),
-// and writes/accumulates scaled by `scale_slot ? top_weights[slot_idx] : 1.0f`!
+// Parallel multi-slot `__dp4a` MoE expert projection across ALL `(rows, slot_count, n_tok)` simultaneously!
+// Grid: (ceil(rows / 4), slot_count, n_tok), Block: (32, 4, 1)
+// - `x_mode == 0`: `xq` is `[n_tok, cols/32]`, `x_f32` is `[n_tok, cols]` (shared input per token, e.g. `gate`/`up`)
+// - `x_mode == 1`: `xq` is `[n_tok * slot_count, cols/32]`, `x_f32` is `[n_tok * slot_count, cols]` (per-slot input, e.g. `down`)
+// - `out_mode == 0`: writes `out[(t * slot_count + slot) * rows + row] = acc`
+// - `out_mode == 1`: writes `out[(t * slot_count + slot) * rows + row] = top_weights[t * slot_count + slot] * acc`
+__global__ void __launch_bounds__(128, 2) moe_indexed_gemv_q8_1(
+    const uint8_t* __restrict__ w_exps,
+    const BlockQ8_1* __restrict__ xq,
+    const float* __restrict__ x_f32,
+    const uint32_t* __restrict__ top_ids,
+    const float* __restrict__ top_weights,
+    const float* __restrict__ exp_scales,
+    float* __restrict__ out,
+    int dtype,
+    int rows,
+    int cols,
+    size_t row_bytes,
+    size_t expert_stride_bytes,
+    int slot_count,
+    int x_mode,
+    int out_mode
+) {
+    const int row = int(blockIdx.x) * 4 + int(threadIdx.y);
+    const int slot = int(blockIdx.y);
+    const int tok = int(blockIdx.z);
+    const int lane = int(threadIdx.x);
+    if (row >= rows) return;
+
+    const size_t ts_idx = size_t(tok) * slot_count + slot;
+    const uint32_t exp_id = top_ids[ts_idx];
+    const uint8_t* w_row = w_exps + size_t(exp_id) * expert_stride_bytes + size_t(row) * row_bytes;
+    const size_t x_row_idx = (x_mode == 0) ? size_t(tok) : ts_idx;
+    const int n_q8 = cols >> 5;
+
+    float acc = 0.0f;
+
+    if (dtype == DTYPE_Q8_0 && xq != nullptr && (cols & 31) == 0) {
+        const BlockQ8_0* wr = reinterpret_cast<const BlockQ8_0*>(w_row);
+        const BlockQ8_1* xr = xq + x_row_idx * n_q8;
+        const int iqs = 2 * (lane & 3);
+        for (int kbx = lane >> 2; kbx < n_q8; kbx += 8) {
+            const BlockQ8_0& wb = wr[kbx];
+            const BlockQ8_1& xb = xr[kbx];
+            const int* xqs = reinterpret_cast<const int*>(xb.qs);
+            int sumi = 0;
+            sumi = dp4a_i8(load_i32_2b(wb.qs + 4 * iqs), xqs[iqs], sumi);
+            sumi = dp4a_i8(load_i32_2b(wb.qs + 4 * (iqs + 1)), xqs[iqs + 1], sumi);
+            acc += __half2float(wb.d) * __low2float(xb.ds) * float(sumi);
+        }
+    } else if (dtype == DTYPE_Q4_0 && xq != nullptr && (cols & 31) == 0) {
+        const BlockQ4_0* wr = reinterpret_cast<const BlockQ4_0*>(w_row);
+        const BlockQ8_1* xr = xq + x_row_idx * n_q8;
+        const int iqs = 2 * (lane & 1);
+        for (int kbx = lane >> 1; kbx < n_q8; kbx += 16) {
+            acc += dot_q4_0_q8_1_half(wr[kbx], xr[kbx], iqs);
+        }
+    } else if (dtype == DTYPE_Q4_1 && xq != nullptr && (cols & 31) == 0) {
+        const BlockQ4_1* wr = reinterpret_cast<const BlockQ4_1*>(w_row);
+        const BlockQ8_1* xr = xq + x_row_idx * n_q8;
+        const int iqs = 2 * (lane & 1);
+        for (int kbx = lane >> 1; kbx < n_q8; kbx += 16) {
+            const BlockQ4_1& wb = wr[kbx];
+            const BlockQ8_1& xb = xr[kbx];
+            const int* wqs = reinterpret_cast<const int*>(wb.qs);
+            const int* xqs = reinterpret_cast<const int*>(xb.qs);
+            int sumi = 0;
+            const int v0 = wqs[iqs];
+            const int v1 = wqs[iqs + 1];
+            sumi = dp4a_i8(v0 & 0x0F0F0F0F, xqs[iqs], sumi);
+            sumi = dp4a_i8((v0 >> 4) & 0x0F0F0F0F, xqs[iqs + 4], sumi);
+            sumi = dp4a_i8(v1 & 0x0F0F0F0F, xqs[iqs + 1], sumi);
+            sumi = dp4a_i8((v1 >> 4) & 0x0F0F0F0F, xqs[iqs + 5], sumi);
+            const float2 dm = __half22float2(wb.dm);
+            const float2 ds = __half22float2(xb.ds);
+            acc += dm.x * ds.x * float(sumi) + 0.5f * dm.y * ds.y;
+        }
+    } else if (dtype == DTYPE_Q2_0 && xq != nullptr && (cols & 63) == 0) {
+        const BlockQ2_0* wr = reinterpret_cast<const BlockQ2_0*>(w_row);
+        const BlockQ8_1* xr = xq + x_row_idx * n_q8;
+        const int n_b64 = cols >> 6;
+        const int sub = lane & 3;
+        const int q8_half = sub >> 1;
+        const int q8_quad = (sub & 1) * 4;
+        for (int b64 = lane >> 2; b64 < n_b64; b64 += 8) {
+            const BlockQ2_0& wb = wr[b64];
+            const BlockQ8_1& xb = xr[2 * b64 + q8_half];
+            const uint32_t raw4 = uint32_t(load_i32_2b(wb.qs + 4 * sub));
+            const int* xqs = reinterpret_cast<const int*>(xb.qs) + q8_quad;
+            int sumi = 0;
+            sumi = dp4a_i8(unpack_q2_0_byte_s8x4(uint8_t(raw4 & 0xFFu)), xqs[0], sumi);
+            sumi = dp4a_i8(unpack_q2_0_byte_s8x4(uint8_t((raw4 >> 8) & 0xFFu)), xqs[1], sumi);
+            sumi = dp4a_i8(unpack_q2_0_byte_s8x4(uint8_t((raw4 >> 16) & 0xFFu)), xqs[2], sumi);
+            sumi = dp4a_i8(unpack_q2_0_byte_s8x4(uint8_t((raw4 >> 24) & 0xFFu)), xqs[3], sumi);
+            acc += __half2float(wb.d) * __low2float(xb.ds) * float(sumi);
+        }
+    } else if (dtype == DTYPE_Q4_K && xq != nullptr && (cols & 255) == 0) {
+        const BlockQ4K* wr = reinterpret_cast<const BlockQ4K*>(w_row);
+        const BlockQ8_1* xr = xq + x_row_idx * n_q8;
+        const int n_sb = cols >> 8;
+        const int chunk64 = lane >> 3;
+        const int q_idx = lane & 7;
+        for (int sb = 0; sb < n_sb; ++sb) {
+            const BlockQ4K& blk = wr[sb];
+            const float2 dm = __half22float2(blk.dm);
+            uint8_t sc0, m0, sc1, m1;
+            decode_q4k_scale_min(2 * chunk64 + 0, blk.scales, sc0, m0);
+            decode_q4k_scale_min(2 * chunk64 + 1, blk.scales, sc1, m1);
+            const int packed = reinterpret_cast<const int*>(blk.qs)[chunk64 * 8 + q_idx];
+            const BlockQ8_1& xb0 = xr[sb * 8 + 2 * chunk64 + 0];
+            const BlockQ8_1& xb1 = xr[sb * 8 + 2 * chunk64 + 1];
+            const int dot0 = dp4a_i8(packed & 0x0F0F0F0F, reinterpret_cast<const int*>(xb0.qs)[q_idx], 0);
+            const int dot1 = dp4a_i8((packed >> 4) & 0x0F0F0F0F, reinterpret_cast<const int*>(xb1.qs)[q_idx], 0);
+            const float2 ds0 = __half22float2(xb0.ds);
+            const float2 ds1 = __half22float2(xb1.ds);
+            float term = dm.x * (float(sc0) * ds0.x * float(dot0) + float(sc1) * ds1.x * float(dot1));
+            if (q_idx == 0) term -= dm.y * (float(m0) * ds0.y + float(m1) * ds1.y);
+            acc += term;
+        }
+    } else if (dtype == DTYPE_Q5_K && xq != nullptr && (cols & 255) == 0) {
+        const BlockQ5K* wr = reinterpret_cast<const BlockQ5K*>(w_row);
+        const BlockQ8_1* xr = xq + x_row_idx * n_q8;
+        const int n_sb = cols >> 8;
+        const int chunk64 = lane >> 3;
+        const int q_idx = lane & 7;
+        for (int sb = 0; sb < n_sb; ++sb) {
+            const BlockQ5K& blk = wr[sb];
+            const float2 dm = __half22float2(blk.dm);
+            uint8_t sc0, m0, sc1, m1;
+            decode_q4k_scale_min(2 * chunk64 + 0, blk.scales, sc0, m0);
+            decode_q4k_scale_min(2 * chunk64 + 1, blk.scales, sc1, m1);
+            const int packed = reinterpret_cast<const int*>(blk.qs)[chunk64 * 8 + q_idx];
+            const int qh4 = reinterpret_cast<const int*>(blk.qh)[q_idx];
+            const int q0 = (packed & 0x0F0F0F0F) | (((qh4 >> (2 * chunk64)) & 0x01010101) << 4);
+            const int q1 = ((packed >> 4) & 0x0F0F0F0F) | (((qh4 >> (2 * chunk64 + 1)) & 0x01010101) << 4);
+            const BlockQ8_1& xb0 = xr[sb * 8 + 2 * chunk64 + 0];
+            const BlockQ8_1& xb1 = xr[sb * 8 + 2 * chunk64 + 1];
+            const int dot0 = dp4a_i8(q0, reinterpret_cast<const int*>(xb0.qs)[q_idx], 0);
+            const int dot1 = dp4a_i8(q1, reinterpret_cast<const int*>(xb1.qs)[q_idx], 0);
+            const float2 ds0 = __half22float2(xb0.ds);
+            const float2 ds1 = __half22float2(xb1.ds);
+            float term = dm.x * (float(sc0) * ds0.x * float(dot0) + float(sc1) * ds1.x * float(dot1));
+            if (q_idx == 0) term -= dm.y * (float(m0) * ds0.y + float(m1) * ds1.y);
+            acc += term;
+        }
+    } else if (dtype == DTYPE_Q6_K && xq != nullptr && (cols & 255) == 0) {
+        const BlockQ6K* wr = reinterpret_cast<const BlockQ6K*>(w_row);
+        const BlockQ8_1* xr = xq + x_row_idx * n_q8;
+        const int n_sb = cols >> 8;
+        const int half128 = lane >> 4;
+        const int sub_pair = (lane >> 3) & 1;
+        const int q_idx = lane & 7;
+        const int sc_half = q_idx >> 2;
+        const int quad_a = sub_pair;
+        const int quad_b = sub_pair + 2;
+        for (int sb = 0; sb < n_sb; ++sb) {
+            const BlockQ6K& blk = wr[sb];
+            const float d = __half2float(blk.d);
+            const int ql4 = load_i32_2b(blk.ql + half128 * 64 + sub_pair * 32 + q_idx * 4);
+            const int qh4 = load_i32_2b(blk.qh + half128 * 32 + q_idx * 4);
+            const int8_t* sc_ptr = blk.scales + half128 * 8;
+            const int qa = (((ql4 & 0x0F0F0F0F) | (((qh4 >> (2 * quad_a)) & 0x03030303) << 4)) + 0x60606060) ^ 0x80808080;
+            const int qb = ((((ql4 >> 4) & 0x0F0F0F0F) | (((qh4 >> (2 * quad_b)) & 0x03030303) << 4)) + 0x60606060) ^ 0x80808080;
+            const BlockQ8_1& xba = xr[sb * 8 + half128 * 4 + quad_a];
+            const BlockQ8_1& xbb = xr[sb * 8 + half128 * 4 + quad_b];
+            const int dota = dp4a_i8(qa, reinterpret_cast<const int*>(xba.qs)[q_idx], 0);
+            const int dotb = dp4a_i8(qb, reinterpret_cast<const int*>(xbb.qs)[q_idx], 0);
+            acc += d * (float(sc_ptr[sc_half + 2 * quad_a]) * __low2float(xba.ds) * float(dota)
+                      + float(sc_ptr[sc_half + 2 * quad_b]) * __low2float(xbb.ds) * float(dotb));
+        }
+    } else {
+        const float* xt = x_f32 + x_row_idx * cols;
+        for (int c = lane; c < cols; c += 32) {
+            acc += dequant_elem(dtype, w_row, c) * xt[c];
+        }
+    }
+
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) {
+        if (exp_scales != nullptr) {
+            acc *= exp_scales[exp_id];
+        }
+        const float w_slot = (out_mode == 1) ? top_weights[ts_idx] : 1.0f;
+        out[ts_idx * rows + row] = w_slot * acc;
+    }
+}
+
+// Deterministic ordered reduction of `[n_tok, slot_count, rows]` -> `[n_tok, rows]` (`0..slot_count` in order, zero atomicAdd!).
+// Grid: (ceil(rows / 256), n_tok, 1), Block: (256, 1, 1)
+__global__ void moe_reduce_slots_f32(
+    const float* __restrict__ slot_outs,
+    float* __restrict__ out,
+    int rows,
+    int slot_count,
+    int n_tok
+) {
+    const int r = int(blockIdx.x) * int(blockDim.x) + int(threadIdx.x);
+    const int t = int(blockIdx.y);
+    if (r >= rows || t >= n_tok) return;
+    const float* base = slot_outs + size_t(t) * slot_count * rows + r;
+    float sum = 0.0f;
+    for (int s = 0; s < slot_count; ++s) {
+        sum += base[size_t(s) * rows];
+    }
+    out[size_t(t) * rows + r] = sum;
+}
+
+// Legacy single-slot scalar helper kept for direct unit tests:
 // Grid: (ceil(rows / 4), 1, 1), Block: (32, 4, 1)
 __global__ void moe_indexed_gemv_f32(
     const uint8_t* __restrict__ w_exps,

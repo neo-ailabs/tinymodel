@@ -2,17 +2,49 @@
 
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[derive(Default)]
+pub(crate) struct FxHasher(u64);
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(b)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+type FxBuildHasher = BuildHasherDefault<FxHasher>;
+
 use ash::vk;
+use ash::vk::Handle;
 
 use crate::{VkResultExt, VulkanError};
 
 const VENDOR_AMD: u32 = 0x1002;
 const VENDOR_INTEL: u32 = 0x8086;
-const STAGING_BYTES: u64 = 64 << 20;
+const STAGING_RING_CHUNK: u64 = 8 << 20;
 const DESC_POOL_SETS: u32 = 65536;
 const DESC_POOL_BUFFERS: u32 = 65536 * 8;
+const CACHE_DESC_SETS: u32 = 32768;
+const CACHE_DESC_BUFFERS: u32 = 32768 * 10;
+const MAX_CACHED_BINDINGS: usize = 12;
+
+static NEXT_BUF_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Batched prefill kernel selection policy for [`VulkanContext`] / [`crate::LlamaVkRunner`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +150,7 @@ impl Drop for Inner {
 /// A device buffer (storage + transfer usage). Device-local unless created as host-visible.
 pub struct VkBuffer {
     inner: Arc<Inner>,
+    pub(crate) id: u64,
     pub(crate) buf: vk::Buffer,
     mem: vk::DeviceMemory,
     size: u64,
@@ -162,12 +195,62 @@ pub(crate) struct Pipeline {
     pub(crate) name: &'static str,
 }
 
-struct Exec {
+struct ExecSlot {
     pool: vk::CommandPool,
     cb: vk::CommandBuffer,
     fence: vk::Fence,
     desc_pool: vk::DescriptorPool,
-    staging: Option<VkBuffer>,
+    dirty_desc: bool,
+}
+
+struct Exec {
+    slots: [ExecSlot; 2],
+    staging: [Option<VkBuffer>; 2],
+}
+
+/// A command buffer recorded on the CPU (`prepare_cb`) and ready for zero-latency `submit_prepared`.
+pub(crate) struct PreparedCb {
+    pub(crate) slot_idx: usize,
+    pub(crate) rec_ns: u64,
+}
+
+/// A submitted command buffer currently executing on the GPU (`wait_in_flight`).
+pub(crate) struct InFlightCb {
+    pub(crate) slot_idx: usize,
+    pub(crate) rec_ns: u64,
+    submit_t0: std::time::Instant,
+}
+
+/// A pre-recorded reusable command buffer (`0.00 ms` per-token CPU recording!).
+pub(crate) struct BakedCb {
+    inner: Arc<Inner>,
+    pool: vk::CommandPool,
+    pub(crate) cb: vk::CommandBuffer,
+    fence: vk::Fence,
+}
+
+impl Drop for BakedCb {
+    fn drop(&mut self) {
+        let d = &self.inner.device;
+        // SAFETY: `pool` and `fence` were created from `self.inner.device`; waiting on `fence`
+        // (or device idle if needed) ensures no submitted GPU work still uses `cb`.
+        unsafe {
+            let _ = d.device_wait_idle();
+            d.destroy_fence(self.fence, None);
+            d.destroy_command_pool(self.pool, None);
+        }
+    }
+}
+
+/// An in-flight submission of a [`BakedCb`].
+pub(crate) struct InFlightBaked {
+    fence: vk::Fence,
+    submit_t0: std::time::Instant,
+}
+
+pub(crate) struct DescCache {
+    pool: vk::DescriptorPool,
+    map: HashMap<(u64, [u64; MAX_CACHED_BINDINGS]), vk::DescriptorSet, FxBuildHasher>,
 }
 
 /// One recorded dispatch-batch; created by [`VulkanContext::run`].
@@ -175,6 +258,9 @@ pub(crate) struct Recorder<'a> {
     pub(crate) ctx: &'a VulkanContext,
     pub(crate) cb: vk::CommandBuffer,
     desc_pool: vk::DescriptorPool,
+    desc_cache: &'a mut DescCache,
+    last_pipeline: vk::Pipeline,
+    used_transient_descs: bool,
 }
 
 /// The selected Vulkan device, its compute queue, and a pipeline cache.
@@ -182,6 +268,7 @@ pub struct VulkanContext {
     pub(crate) inner: Arc<Inner>,
     info: DeviceInfo,
     exec: Mutex<Exec>,
+    desc_cache: Mutex<DescCache>,
     pub(crate) pipelines: Mutex<HashMap<(&'static str, u32), Arc<Pipeline>>>,
     pub(crate) gemv_cfg: Mutex<(u32, u32)>,
     prefill_mode: Mutex<VkPrefillMode>,
@@ -560,10 +647,12 @@ impl VulkanContext {
                     ext_host,
                 });
                 let exec = Self::create_exec(&inner, queue_family)?;
+                let desc_cache = Self::create_desc_cache(&inner)?;
                 Ok(Self {
                     inner,
                     info: pdev_probe.info,
                     exec: Mutex::new(exec),
+                    desc_cache: Mutex::new(desc_cache),
                     pipelines: Mutex::new(HashMap::new()),
                     gemv_cfg: Mutex::new((
                         crate::kernels::DEFAULT_GEMV_WG,
@@ -751,7 +840,7 @@ impl VulkanContext {
         Ok((probe, pdev, device, queue))
     }
 
-    fn create_exec(inner: &Arc<Inner>, queue_family: u32) -> Result<Exec, VulkanError> {
+    fn create_exec_slot(inner: &Arc<Inner>, queue_family: u32) -> Result<ExecSlot, VulkanError> {
         let d = &inner.device;
         // SAFETY: valid device; created objects are destroyed in `VulkanContext::drop`.
         unsafe {
@@ -786,14 +875,45 @@ impl VulkanContext {
                     None,
                 )
                 .ctx("vkCreateDescriptorPool")?;
-            Ok(Exec {
+            Ok(ExecSlot {
                 pool,
                 cb,
                 fence,
                 desc_pool,
-                staging: None,
+                dirty_desc: false,
             })
         }
+    }
+
+    fn create_exec(inner: &Arc<Inner>, queue_family: u32) -> Result<Exec, VulkanError> {
+        let s0 = Self::create_exec_slot(inner, queue_family)?;
+        let s1 = Self::create_exec_slot(inner, queue_family)?;
+        Ok(Exec {
+            slots: [s0, s1],
+            staging: [None, None],
+        })
+    }
+
+    fn create_desc_cache(inner: &Arc<Inner>) -> Result<DescCache, VulkanError> {
+        let d = &inner.device;
+        let sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: CACHE_DESC_BUFFERS,
+        }];
+        // SAFETY: valid device; destroyed in `VulkanContext::drop`.
+        let pool = unsafe {
+            d.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(CACHE_DESC_SETS)
+                    .pool_sizes(&sizes),
+                None,
+            )
+            .ctx("vkCreateDescriptorPool(cache)")?
+        };
+        Ok(DescCache {
+            pool,
+            map: HashMap::with_capacity_and_hasher(2048, FxBuildHasher::default()),
+        })
     }
 
     pub fn info(&self) -> &DeviceInfo {
@@ -836,6 +956,13 @@ impl VulkanContext {
         if size > limit {
             return Err(VulkanError::BufferTooLarge { bytes: size, limit });
         }
+        // Pad device-local storage buffers by >= 4 bytes (rounded to 4B) so 32-bit `w32[]` loads
+        // at the end of odd-u16 quantized blocks (`BlockQ8_0` = 34B) never cross `VkBuffer` bounds.
+        let vk_size = if host_visible {
+            size
+        } else {
+            (size.saturating_add(7) & !3).min(limit).max(size)
+        };
         let d = &self.inner.device;
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::TRANSFER_SRC
@@ -845,7 +972,7 @@ impl VulkanContext {
             let buf = d
                 .create_buffer(
                     &vk::BufferCreateInfo::default()
-                        .size(size)
+                        .size(vk_size)
                         .usage(usage)
                         .sharing_mode(vk::SharingMode::EXCLUSIVE),
                     None,
@@ -918,6 +1045,7 @@ impl VulkanContext {
             };
             let mut out = VkBuffer {
                 inner: self.inner.clone(),
+                id: NEXT_BUF_ID.fetch_add(1, Ordering::Relaxed),
                 buf,
                 mem,
                 size,
@@ -1060,9 +1188,122 @@ impl VulkanContext {
             }
             Some(VkBuffer {
                 inner: self.inner.clone(),
+                id: NEXT_BUF_ID.fetch_add(1, Ordering::Relaxed),
                 buf,
                 mem,
                 size: import_len as u64,
+                mapped: None,
+            })
+        }
+    }
+
+    /// Imports a writable (`PROT_READ | PROT_WRITE`), page/2MiB-aligned anonymous host memory
+    /// backing (`HugePageBytes`) zero-copy into Vulkan via `VK_EXT_external_memory_host`
+    /// (`HOST_ALLOCATION_EXT`), allowing discrete GPUs (e.g. Tesla T4, Radeon RX 9060 XT) and
+    /// UMA GPUs to stream host-resident MoE experts directly over PCIe/UMA into TensorCore /
+    /// tiled compute shaders with `0` extra host RAM and `0` `DEVICE_LOCAL` VRAM!
+    ///
+    /// Unlike `PROT_READ` file `mmap`, `HugePageBytes` is writable anonymous memory, so Linux
+    /// DRM/NVIDIA `get_user_pages(FOLL_WRITE)` pinning succeeds cleanly on all drivers.
+    pub(crate) fn try_import_host_rw_pinned(&self, aligned_data: &[u8]) -> Option<VkBuffer> {
+        if !self.info.external_memory_host || self.force_slab_copy() {
+            return None;
+        }
+        let ext_host = self.inner.ext_host.as_ref()?;
+        let align = self.info.external_memory_host_align as usize;
+        if align == 0 || !align.is_power_of_two() || aligned_data.is_empty() {
+            return None;
+        }
+        let ptr_addr = aligned_data.as_ptr() as usize;
+        if !ptr_addr.is_multiple_of(align) || !aligned_data.len().is_multiple_of(align) {
+            return None;
+        }
+        let import_len = aligned_data.len() as u64;
+        let max_buf = self
+            .info
+            .max_alloc_bytes
+            .min(self.info.max_storage_buffer_range);
+        if import_len > max_buf {
+            return None;
+        }
+
+        let d = &self.inner.device;
+        // SAFETY: `aligned_data` is backed by an immutable `Arc<HugePageBytes>` (`PROT_READ | PROT_WRITE`,
+        // `2 MiB` aligned & padded) stored alongside the returned `VkBuffer` and dropped strictly AFTER
+        // `VkBuffer` destroys its `VkBuffer` + `VkDeviceMemory` handles.
+        unsafe {
+            let mut ptr_props = vk::MemoryHostPointerPropertiesEXT::default();
+            if (ext_host.fp().get_memory_host_pointer_properties_ext)(
+                ext_host.device(),
+                vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
+                aligned_data.as_ptr() as *const core::ffi::c_void,
+                &mut ptr_props,
+            ) != vk::Result::SUCCESS
+            {
+                return None;
+            }
+
+            let mut ext_buf_ci = vk::ExternalMemoryBufferCreateInfo::default()
+                .handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+            let buf_ci = vk::BufferCreateInfo::default()
+                .size(import_len)
+                .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .push_next(&mut ext_buf_ci);
+            let buf = d.create_buffer(&buf_ci, None).ok()?;
+            let req = d.get_buffer_memory_requirements(buf);
+            if req.size > import_len || req.size > self.info.max_alloc_bytes {
+                d.destroy_buffer(buf, None);
+                return None;
+            }
+            let allowed = req.memory_type_bits & ptr_props.memory_type_bits;
+            let ty = match self
+                .find_memory_type(
+                    allowed,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_CACHED,
+                    "imported host rw buffer",
+                )
+                .or_else(|_| {
+                    self.find_memory_type(
+                        allowed,
+                        vk::MemoryPropertyFlags::empty(),
+                        vk::MemoryPropertyFlags::HOST_CACHED,
+                        "imported host rw buffer",
+                    )
+                }) {
+                Ok(t) => t,
+                Err(_) => {
+                    d.destroy_buffer(buf, None);
+                    return None;
+                }
+            };
+
+            let mut import_info = vk::ImportMemoryHostPointerInfoEXT::default()
+                .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT)
+                .host_pointer(aligned_data.as_ptr() as *mut core::ffi::c_void);
+            let alloc_ci = vk::MemoryAllocateInfo::default()
+                .allocation_size(import_len)
+                .memory_type_index(ty)
+                .push_next(&mut import_info);
+            let mem = match d.allocate_memory(&alloc_ci, None) {
+                Ok(m) => m,
+                Err(_) => {
+                    d.destroy_buffer(buf, None);
+                    return None;
+                }
+            };
+            if d.bind_buffer_memory(buf, mem, 0).is_err() {
+                d.destroy_buffer(buf, None);
+                d.free_memory(mem, None);
+                return None;
+            }
+            Some(VkBuffer {
+                inner: self.inner.clone(),
+                id: NEXT_BUF_ID.fetch_add(1, Ordering::Relaxed),
+                buf,
+                mem,
+                size: import_len,
                 mapped: None,
             })
         }
@@ -1101,73 +1342,146 @@ impl VulkanContext {
     }
 
     /// Copies `data` into `dst` at byte `offset` (direct `memcpy` on coherent mapped UMA slabs,
-    /// or chunked through the 64 MiB staging buffer on discrete GPUs).
+    /// or double-buffered pipelined DMA through two `8 MiB` staging buffers on discrete GPUs).
     pub fn write_bytes(&self, dst: &VkBuffer, offset: u64, data: &[u8]) -> Result<(), VulkanError> {
-        if offset + data.len() as u64 > dst.size {
+        self.write_bytes_from_chunks(dst, offset, data.len(), |done, out| {
+            out.copy_from_slice(&data[done..done + out.len()]);
+            Ok(())
+        })
+    }
+
+    /// Streams `total_len` bytes generated/read by `fill_chunk(done_offset, staging_slice)` into
+    /// `dst` starting at `offset`, overlapping CPU chunk preparation (`pread` / `memcpy`) on slot
+    /// `i & 1` with in-flight PCIe DMA `vkCmdCopyBuffer` on slot `1 - (i & 1)`.
+    pub(crate) fn write_bytes_from_chunks<F>(
+        &self,
+        dst: &VkBuffer,
+        offset: u64,
+        total_len: usize,
+        mut fill_chunk: F,
+    ) -> Result<(), VulkanError>
+    where
+        F: FnMut(usize, &mut [u8]) -> Result<(), VulkanError>,
+    {
+        if offset + total_len as u64 > dst.size {
             return Err(VulkanError::InvalidDimensions(format!(
-                "write of {} bytes at {offset} overflows buffer of {} bytes",
-                data.len(),
+                "write of {total_len} bytes at {offset} overflows buffer of {} bytes",
                 dst.size
             )));
         }
-        if data.is_empty() {
+        if total_len == 0 {
             return Ok(());
         }
         if let Some(dst_ptr) = dst.mapped {
             // SAFETY: `dst` is persistently mapped `HOST_VISIBLE | HOST_COHERENT`, idle on the GPU
-            // (all submissions in `VulkanContext` wait on their fence), and `offset + data.len() <= dst.size`.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    dst_ptr.add(offset as usize),
-                    data.len(),
-                );
-            }
-            return Ok(());
+            // (all submissions in `VulkanContext` wait on their fence), and `offset + total_len <= dst.size`.
+            let dst_slice =
+                unsafe { core::slice::from_raw_parts_mut(dst_ptr.add(offset as usize), total_len) };
+            return fill_chunk(0, dst_slice);
         }
-        let chunk = STAGING_BYTES as usize;
-        for (i, part) in data.chunks(chunk).enumerate() {
-            let staging_ptr = self.staging_ptr()?;
-            // SAFETY: the staging buffer is host-visible, coherent, `STAGING_BYTES` long and
-            // idle (previous copy was waited for); `part.len() <= STAGING_BYTES`.
-            unsafe { core::ptr::copy_nonoverlapping(part.as_ptr(), staging_ptr, part.len()) };
-            let dst_off = offset + (i * chunk) as u64;
-            self.run(|rec| {
-                let exec = rec.ctx.exec.lock().map_err(|_| VulkanError::NoDevice)?;
-                let src = exec
-                    .staging
-                    .as_ref()
-                    .map(|s| s.buf)
-                    .ok_or(VulkanError::NoDevice)?;
-                drop(exec);
-                // SAFETY: both buffers are valid with sufficient size (checked above).
+
+        let chunk = STAGING_RING_CHUNK as usize;
+        let mut in_flight: Option<InFlightCb> = None;
+        let mut copy_err: Option<VulkanError> = None;
+        let mut done = 0usize;
+        let mut step = 0usize;
+
+        while done < total_len {
+            let take = (total_len - done).min(chunk);
+            let slot_idx = step & 1;
+            let (src_buf, staging_ptr) = match self.ensure_staging_slot(slot_idx) {
+                Ok(v) => v,
+                Err(e) => {
+                    copy_err = Some(e);
+                    break;
+                }
+            };
+            // SAFETY: `staging[slot_idx]` is `HOST_VISIBLE | HOST_COHERENT`, `STAGING_RING_CHUNK`
+            // bytes long (`take <= chunk`), and idle because any prior DMA on `slot_idx` was waited
+            // for in the previous iteration (`in_flight` only ever holds `1 - slot_idx`).
+            let staging_slice = unsafe { core::slice::from_raw_parts_mut(staging_ptr, take) };
+            if let Err(e) = fill_chunk(done, staging_slice) {
+                copy_err = Some(e);
+                break;
+            }
+
+            if let Some(prev) = in_flight.take()
+                && let Err(e) = self.wait_in_flight(prev)
+            {
+                copy_err = Some(e);
+                break;
+            }
+
+            let dst_off = offset + done as u64;
+            let len = take as u64;
+            let prep = match self.prepare_cb(slot_idx, |rec| {
+                // SAFETY: both buffers are valid and `[0..len)` / `[dst_off..dst_off+len)` are in bounds.
                 unsafe {
                     rec.ctx.inner.device.cmd_copy_buffer(
                         rec.cb,
-                        src,
+                        src_buf,
                         dst.buf,
                         &[vk::BufferCopy {
                             src_offset: 0,
                             dst_offset: dst_off,
-                            size: part.len() as u64,
+                            size: len,
                         }],
-                    )
-                };
+                    );
+                }
                 Ok(())
-            })?;
+            }) {
+                Ok(p) => p,
+                Err(e) => {
+                    copy_err = Some(e);
+                    break;
+                }
+            };
+            match self.submit_prepared(prep) {
+                Ok(inf) => in_flight = Some(inf),
+                Err(e) => {
+                    copy_err = Some(e);
+                    break;
+                }
+            }
+
+            done += take;
+            step += 1;
+        }
+
+        if let Some(last) = in_flight {
+            let wait_res = self.wait_in_flight(last);
+            if copy_err.is_none() {
+                wait_res?;
+            }
+        }
+        if let Some(e) = copy_err {
+            return Err(e);
         }
         Ok(())
     }
 
-    fn staging_ptr(&self) -> Result<*mut u8, VulkanError> {
-        let mut exec = self.exec.lock().map_err(|_| VulkanError::NoDevice)?;
-        if exec.staging.is_none() {
-            exec.staging = Some(self.create_buffer(STAGING_BYTES, true)?);
+    fn ensure_staging_slot(&self, slot_idx: usize) -> Result<(vk::Buffer, *mut u8), VulkanError> {
+        {
+            let exec = self.exec.lock().map_err(|_| VulkanError::NoDevice)?;
+            if let Some(s) = exec.staging[slot_idx].as_ref() {
+                let ptr = s
+                    .mapped
+                    .ok_or(VulkanError::NoMemoryType("staging buffer"))?;
+                return Ok((s.buf, ptr));
+            }
         }
-        exec.staging
+        let created = self.create_buffer(STAGING_RING_CHUNK, true)?;
+        let mut exec = self.exec.lock().map_err(|_| VulkanError::NoDevice)?;
+        if exec.staging[slot_idx].is_none() {
+            exec.staging[slot_idx] = Some(created);
+        }
+        let s = exec.staging[slot_idx]
             .as_ref()
-            .and_then(|s| s.mapped)
-            .ok_or(VulkanError::NoMemoryType("staging buffer"))
+            .ok_or(VulkanError::NoDevice)?;
+        let ptr = s
+            .mapped
+            .ok_or(VulkanError::NoMemoryType("staging buffer"))?;
+        Ok((s.buf, ptr))
     }
 
     /// Reads back `n` floats from the start of `src`.
@@ -1191,25 +1505,18 @@ impl VulkanContext {
             }
             return Ok(out);
         }
-        let chunk = STAGING_BYTES;
+        let chunk = STAGING_RING_CHUNK;
         let mut off = 0u64;
         while off < bytes {
             let len = chunk.min(bytes - off);
-            let staging_ptr = self.staging_ptr()?;
+            let (dst_buf, staging_ptr) = self.ensure_staging_slot(0)?;
             self.run(|rec| {
-                let exec = rec.ctx.exec.lock().map_err(|_| VulkanError::NoDevice)?;
-                let dst = exec
-                    .staging
-                    .as_ref()
-                    .map(|s| s.buf)
-                    .ok_or(VulkanError::NoDevice)?;
-                drop(exec);
                 // SAFETY: valid buffers; range checked above.
                 unsafe {
                     rec.ctx.inner.device.cmd_copy_buffer(
                         rec.cb,
                         src.buf,
-                        dst,
+                        dst_buf,
                         &[vk::BufferCopy {
                             src_offset: off,
                             dst_offset: 0,
@@ -1361,18 +1668,33 @@ impl VulkanContext {
     where
         F: FnOnce(&mut Recorder<'_>) -> Result<(), VulkanError>,
     {
-        let (cb, fence, desc_pool) = {
-            let e = self.exec.lock().map_err(|_| VulkanError::NoDevice)?;
-            (e.cb, e.fence, e.desc_pool)
+        self.run_timed(f).map(|_| ())
+    }
+
+    /// Records commands via `f` into slot `slot_idx` (`0` or `1`) **without** submitting yet,
+    /// allowing CPU recording of segment `s + 1` in `slot_idx = 1 - cur` to overlap GPU execution
+    /// of segment `s` in `cur`.
+    pub(crate) fn prepare_cb<F>(&self, slot_idx: usize, f: F) -> Result<PreparedCb, VulkanError>
+    where
+        F: FnOnce(&mut Recorder<'_>) -> Result<(), VulkanError>,
+    {
+        let (cb, desc_pool, was_dirty) = {
+            let mut e = self.exec.lock().map_err(|_| VulkanError::NoDevice)?;
+            let s = &mut e.slots[slot_idx];
+            let dirty = s.dirty_desc;
+            s.dirty_desc = false;
+            (s.cb, s.desc_pool, dirty)
         };
         let d = &self.inner.device;
-        // SAFETY: single-threaded use of the command buffer is enforced by taking `&self`
-        // in synchronous calls only (each call waits for completion before returning).
+        // SAFETY: caller guarantees `slots[slot_idx]` has no in-flight GPU work (`wait_in_flight`
+        // completed for any prior submission on `slot_idx`).
         unsafe {
             d.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
                 .ctx("vkResetCommandBuffer")?;
-            d.reset_descriptor_pool(desc_pool, vk::DescriptorPoolResetFlags::empty())
-                .ctx("vkResetDescriptorPool")?;
+            if was_dirty {
+                d.reset_descriptor_pool(desc_pool, vk::DescriptorPoolResetFlags::empty())
+                    .ctx("vkResetDescriptorPool")?;
+            }
             d.begin_command_buffer(
                 cb,
                 &vk::CommandBufferBeginInfo::default()
@@ -1394,16 +1716,26 @@ impl VulkanContext {
                 &[],
             );
         }
+        let mut dc_guard = self.desc_cache.lock().map_err(|_| VulkanError::NoDevice)?;
         let mut rec = Recorder {
             ctx: self,
             cb,
             desc_pool,
+            desc_cache: &mut dc_guard,
+            last_pipeline: vk::Pipeline::null(),
+            used_transient_descs: false,
         };
+        let t_rec = std::time::Instant::now();
         let r = f(&mut rec);
-        // SAFETY: as above; the fence is unsignaled (reset after every wait).
+        let rec_ns = t_rec.elapsed().as_nanos() as u64;
+        let used_transient = rec.used_transient_descs;
+        drop(dc_guard);
+        if used_transient {
+            let mut e = self.exec.lock().map_err(|_| VulkanError::NoDevice)?;
+            e.slots[slot_idx].dirty_desc = true;
+        }
+        // SAFETY: `cb` is recording; record explicit `HOST_READ` epilogue barrier before ending.
         unsafe {
-            // Vulkan 1.2 §7.9: `vkWaitForFences` alone does not flush discrete GPU L2/Mall caches
-            // (`SHADER_WRITE | TRANSFER_WRITE`) to `HOST_READ`; record an explicit epilogue barrier.
             let host_out = [vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::HOST_READ)];
@@ -1417,20 +1749,235 @@ impl VulkanContext {
                 &[],
             );
             d.end_command_buffer(cb).ctx("vkEndCommandBuffer")?;
-            r?;
-            let cbs = [cb];
-            let submit = [vk::SubmitInfo::default().command_buffers(&cbs)];
-            d.queue_submit(self.inner.queue, &submit, fence)
+        }
+        r?;
+        Ok(PreparedCb { slot_idx, rec_ns })
+    }
+
+    /// Submits a previously prepared command buffer to the compute queue and returns immediately.
+    pub(crate) fn submit_prepared(&self, prep: PreparedCb) -> Result<InFlightCb, VulkanError> {
+        let (cb, fence) = {
+            let e = self.exec.lock().map_err(|_| VulkanError::NoDevice)?;
+            let s = &e.slots[prep.slot_idx];
+            (s.cb, s.fence)
+        };
+        let cbs = [cb];
+        let submit = [vk::SubmitInfo::default().command_buffers(&cbs)];
+        let submit_t0 = std::time::Instant::now();
+        // SAFETY: `cb` is in the executable state, no other submission uses `fence`, and queue
+        // submissions are serialized on the caller thread.
+        unsafe {
+            self.inner
+                .device
+                .queue_submit(self.inner.queue, &submit, fence)
                 .ctx("vkQueueSubmit")?;
+        }
+        Ok(InFlightCb {
+            slot_idx: prep.slot_idx,
+            rec_ns: prep.rec_ns,
+            submit_t0,
+        })
+    }
+
+    /// Waits for an in-flight command buffer to complete and returns `(record_ns, total_ns)`.
+    pub(crate) fn wait_in_flight(&self, inf: InFlightCb) -> Result<(u64, u64), VulkanError> {
+        let fence = {
+            let e = self.exec.lock().map_err(|_| VulkanError::NoDevice)?;
+            e.slots[inf.slot_idx].fence
+        };
+        let d = &self.inner.device;
+        // SAFETY: `fence` was signaled by `submit_prepared` and is reset upon completion.
+        unsafe {
             d.wait_for_fences(&[fence], true, u64::MAX)
                 .ctx("vkWaitForFences")?;
             d.reset_fences(&[fence]).ctx("vkResetFences")?;
         }
-        Ok(())
+        let wait_ns = inf.submit_t0.elapsed().as_nanos() as u64;
+        Ok((inf.rec_ns, inf.rec_ns.saturating_add(wait_ns)))
+    }
+
+    /// Same as [`Self::run`], returning `(record_ns, total_ns)` wall-clock timings
+    /// (`record_ns` = time inside `f`; `total_ns` = whole call incl. submit + fence wait).
+    pub(crate) fn run_timed<F>(&self, f: F) -> Result<(u64, u64), VulkanError>
+    where
+        F: FnOnce(&mut Recorder<'_>) -> Result<(), VulkanError>,
+    {
+        let prep = self.prepare_cb(0, f)?;
+        let inf = self.submit_prepared(prep)?;
+        self.wait_in_flight(inf)
+    }
+
+    /// Pre-records a reusable primary command buffer (`vk::CommandBufferUsageFlags::empty()`)
+    /// backed exclusively by persistent cached descriptor sets, eliminating per-step CPU
+    /// command-buffer recording overhead (`0.00 ms/tok` on subsequent `submit_baked` calls).
+    pub(crate) fn bake_cb<F>(&self, f: F) -> Result<(BakedCb, u64), VulkanError>
+    where
+        F: FnOnce(&mut Recorder<'_>) -> Result<(), VulkanError>,
+    {
+        let d = &self.inner.device;
+        let qf = self.inner.queue_family;
+        // SAFETY: valid device; any error path cleans up `fence` and `pool`.
+        let (pool, cb, fence) = unsafe {
+            let pool = d
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(qf),
+                    None,
+                )
+                .ctx("vkCreateCommandPool(baked)")?;
+            let cb = match d.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            ) {
+                Ok(v) => v[0],
+                Err(code) => {
+                    d.destroy_command_pool(pool, None);
+                    return Err(VulkanError::Vk {
+                        call: "vkAllocateCommandBuffers(baked)",
+                        code,
+                    });
+                }
+            };
+            let fence = match d.create_fence(&vk::FenceCreateInfo::default(), None) {
+                Ok(f) => f,
+                Err(code) => {
+                    d.destroy_command_pool(pool, None);
+                    return Err(VulkanError::Vk {
+                        call: "vkCreateFence(baked)",
+                        code,
+                    });
+                }
+            };
+            (pool, cb, fence)
+        };
+
+        let baked = BakedCb {
+            inner: self.inner.clone(),
+            pool,
+            cb,
+            fence,
+        };
+
+        let transient_pool = {
+            let e = self.exec.lock().map_err(|_| VulkanError::NoDevice)?;
+            e.slots[0].desc_pool
+        };
+
+        // SAFETY: `cb` is newly allocated and recorded with HOST->COMPUTE prologue and COMPUTE->HOST epilogue barriers.
+        unsafe {
+            d.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default())
+                .ctx("vkBeginCommandBuffer(baked)")?;
+            let host_in = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_READ)];
+            d.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &host_in,
+                &[],
+                &[],
+            );
+        }
+
+        let mut dc_guard = self.desc_cache.lock().map_err(|_| VulkanError::NoDevice)?;
+        let mut rec = Recorder {
+            ctx: self,
+            cb,
+            desc_pool: transient_pool,
+            desc_cache: &mut dc_guard,
+            last_pipeline: vk::Pipeline::null(),
+            used_transient_descs: false,
+        };
+        let t_rec = std::time::Instant::now();
+        let r = f(&mut rec);
+        let rec_ns = t_rec.elapsed().as_nanos() as u64;
+        let used_transient = rec.used_transient_descs;
+        drop(dc_guard);
+
+        // SAFETY: finish recording `cb`.
+        unsafe {
+            let host_out = [vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)];
+            d.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &host_out,
+                &[],
+                &[],
+            );
+            d.end_command_buffer(cb).ctx("vkEndCommandBuffer(baked)")?;
+        }
+        r?;
+        if used_transient {
+            return Err(VulkanError::InvalidDimensions(
+                "BakedCb overflowed persistent descriptor cache".to_string(),
+            ));
+        }
+        Ok((baked, rec_ns))
+    }
+
+    /// Submits a pre-recorded [`BakedCb`] and returns immediately without waiting.
+    pub(crate) fn submit_baked(&self, baked: &BakedCb) -> Result<InFlightBaked, VulkanError> {
+        let cbs = [baked.cb];
+        let submit = [vk::SubmitInfo::default().command_buffers(&cbs)];
+        let submit_t0 = std::time::Instant::now();
+        // SAFETY: caller guarantees `baked` is not currently in flight; `baked.fence` is unsignaled.
+        unsafe {
+            self.inner
+                .device
+                .queue_submit(self.inner.queue, &submit, baked.fence)
+                .ctx("vkQueueSubmit(baked)")?;
+        }
+        Ok(InFlightBaked {
+            fence: baked.fence,
+            submit_t0,
+        })
+    }
+
+    /// Waits for an [`InFlightBaked`] submission and resets its fence, returning elapsed `ns`.
+    pub(crate) fn wait_baked(&self, inf: InFlightBaked) -> Result<u64, VulkanError> {
+        let d = &self.inner.device;
+        // SAFETY: `inf.fence` was signaled by `submit_baked` and is reset upon completion.
+        unsafe {
+            d.wait_for_fences(&[inf.fence], true, u64::MAX)
+                .ctx("vkWaitForFences(baked)")?;
+            d.reset_fences(&[inf.fence]).ctx("vkResetFences(baked)")?;
+        }
+        Ok(inf.submit_t0.elapsed().as_nanos() as u64)
     }
 }
 
 impl Recorder<'_> {
+    /// Records a compute→compute/transfer memory barrier.
+    pub(crate) fn barrier(&mut self) {
+        let d = &self.ctx.inner.device;
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(
+                vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_READ,
+            );
+        // SAFETY: `self.cb` is actively recording.
+        unsafe {
+            d.cmd_pipeline_barrier(
+                self.cb,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+        }
+    }
+
     /// Records one 1D dispatch followed by a compute→compute/transfer memory barrier.
     pub(crate) fn dispatch(
         &mut self,
@@ -1439,7 +1986,19 @@ impl Recorder<'_> {
         push: &[u32],
         groups: u32,
     ) -> Result<(), VulkanError> {
-        self.dispatch_xy(p, bufs, push, groups, 1)
+        self.dispatch_xy_inner(p, bufs, push, groups, 1, true)
+    }
+
+    /// Records one 1D dispatch **without** a trailing barrier (caller must emit [`Self::barrier`]
+    /// or a barriered [`Self::dispatch`] before reading outputs).
+    pub(crate) fn dispatch_nb(
+        &mut self,
+        p: &Pipeline,
+        bufs: &[&VkBuffer],
+        push: &[u32],
+        groups: u32,
+    ) -> Result<(), VulkanError> {
+        self.dispatch_xy_inner(p, bufs, push, groups, 1, false)
     }
 
     /// Records one 2D dispatch `(gx, gy, 1)` followed by a compute→compute/transfer barrier.
@@ -1450,6 +2009,30 @@ impl Recorder<'_> {
         push: &[u32],
         gx: u32,
         gy: u32,
+    ) -> Result<(), VulkanError> {
+        self.dispatch_xy_inner(p, bufs, push, gx, gy, true)
+    }
+
+    /// Records one 2D dispatch `(gx, gy, 1)` **without** a trailing barrier.
+    pub(crate) fn dispatch_xy_nb(
+        &mut self,
+        p: &Pipeline,
+        bufs: &[&VkBuffer],
+        push: &[u32],
+        gx: u32,
+        gy: u32,
+    ) -> Result<(), VulkanError> {
+        self.dispatch_xy_inner(p, bufs, push, gx, gy, false)
+    }
+
+    fn dispatch_xy_inner(
+        &mut self,
+        p: &Pipeline,
+        bufs: &[&VkBuffer],
+        push: &[u32],
+        gx: u32,
+        gy: u32,
+        emit_barrier: bool,
     ) -> Result<(), VulkanError> {
         if bufs.len() as u32 != p.n_bindings {
             return Err(VulkanError::InvalidDimensions(format!(
@@ -1474,39 +2057,109 @@ impl Recorder<'_> {
             )));
         }
         let d = &self.ctx.inner.device;
-        let infos: Vec<vk::DescriptorBufferInfo> = bufs
-            .iter()
-            .map(|b| vk::DescriptorBufferInfo {
-                buffer: b.buf,
-                offset: 0,
-                range: vk::WHOLE_SIZE,
-            })
-            .collect();
-        let push_bytes: Vec<u8> = push.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        // SAFETY: the pipeline, layout and buffers are valid for the lifetime of this
-        // recording; descriptor set is freshly allocated from the per-run pool.
-        unsafe {
-            let layouts = [p.set_layout];
-            let set = d
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(self.desc_pool)
-                        .set_layouts(&layouts),
-                )
-                .ctx("vkAllocateDescriptorSets")?[0];
-            let writes: Vec<vk::WriteDescriptorSet> = infos
+        let nb = bufs.len();
+
+        // Fast persistent `(set_layout, buffer_ids)` descriptor-set cache with zero heap allocations:
+        let set = if nb <= MAX_CACHED_BINDINGS {
+            let mut key_ids = [0u64; MAX_CACHED_BINDINGS];
+            for (dst_id, b) in key_ids.iter_mut().zip(bufs.iter()) {
+                *dst_id = b.id;
+            }
+            let key = (p.set_layout.as_raw(), key_ids);
+            if let Some(&cached_set) = self.desc_cache.map.get(&key) {
+                cached_set
+            } else {
+                let target_pool = if self.desc_cache.map.len() < (CACHE_DESC_SETS as usize) {
+                    Some(self.desc_cache.pool)
+                } else {
+                    None
+                };
+                let alloc_pool = target_pool.unwrap_or(self.desc_pool);
+                let mut infos = [vk::DescriptorBufferInfo::default(); MAX_CACHED_BINDINGS];
+                let mut writes = [vk::WriteDescriptorSet::default(); MAX_CACHED_BINDINGS];
+                for (i, b) in bufs.iter().enumerate() {
+                    infos[i] = vk::DescriptorBufferInfo {
+                        buffer: b.buf,
+                        offset: 0,
+                        range: vk::WHOLE_SIZE,
+                    };
+                }
+                // SAFETY: `p.set_layout` and all buffers in `bufs` are valid; `infos` outlives `update_descriptor_sets`.
+                let new_set = unsafe {
+                    let layouts = [p.set_layout];
+                    let s = d
+                        .allocate_descriptor_sets(
+                            &vk::DescriptorSetAllocateInfo::default()
+                                .descriptor_pool(alloc_pool)
+                                .set_layouts(&layouts),
+                        )
+                        .ctx("vkAllocateDescriptorSets")?[0];
+                    for i in 0..nb {
+                        writes[i] = vk::WriteDescriptorSet::default()
+                            .dst_set(s)
+                            .dst_binding(i as u32)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(core::slice::from_ref(&infos[i]));
+                    }
+                    d.update_descriptor_sets(&writes[..nb], &[]);
+                    s
+                };
+                if target_pool.is_some() {
+                    self.desc_cache.map.insert(key, new_set);
+                } else {
+                    self.used_transient_descs = true;
+                }
+                new_set
+            }
+        } else {
+            self.used_transient_descs = true;
+            let infos: Vec<vk::DescriptorBufferInfo> = bufs
                 .iter()
-                .enumerate()
-                .map(|(i, info)| {
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(set)
-                        .dst_binding(i as u32)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .buffer_info(core::slice::from_ref(info))
+                .map(|b| vk::DescriptorBufferInfo {
+                    buffer: b.buf,
+                    offset: 0,
+                    range: vk::WHOLE_SIZE,
                 })
                 .collect();
-            d.update_descriptor_sets(&writes, &[]);
-            d.cmd_bind_pipeline(self.cb, vk::PipelineBindPoint::COMPUTE, p.pipeline);
+            // SAFETY: valid layout and transient `desc_pool`.
+            unsafe {
+                let layouts = [p.set_layout];
+                let s = d
+                    .allocate_descriptor_sets(
+                        &vk::DescriptorSetAllocateInfo::default()
+                            .descriptor_pool(self.desc_pool)
+                            .set_layouts(&layouts),
+                    )
+                    .ctx("vkAllocateDescriptorSets")?[0];
+                let writes: Vec<vk::WriteDescriptorSet> = infos
+                    .iter()
+                    .enumerate()
+                    .map(|(i, info)| {
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(s)
+                            .dst_binding(i as u32)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(core::slice::from_ref(info))
+                    })
+                    .collect();
+                d.update_descriptor_sets(&writes, &[]);
+                s
+            }
+        };
+
+        let mut push_buf = [0u8; 128];
+        let push_byte_len = push.len() * 4;
+        assert!(push_byte_len <= push_buf.len());
+        for (i, &w) in push.iter().enumerate() {
+            push_buf[i * 4..i * 4 + 4].copy_from_slice(&w.to_ne_bytes());
+        }
+
+        // SAFETY: `p.pipeline`, `p.layout`, and `set` are valid for the lifetime of this recording.
+        unsafe {
+            if self.last_pipeline != p.pipeline {
+                d.cmd_bind_pipeline(self.cb, vk::PipelineBindPoint::COMPUTE, p.pipeline);
+                self.last_pipeline = p.pipeline;
+            }
             d.cmd_bind_descriptor_sets(
                 self.cb,
                 vk::PipelineBindPoint::COMPUTE,
@@ -1515,32 +2168,19 @@ impl Recorder<'_> {
                 &[set],
                 &[],
             );
-            if !push_bytes.is_empty() {
+            if push_byte_len > 0 {
                 d.cmd_push_constants(
                     self.cb,
                     p.layout,
                     vk::ShaderStageFlags::COMPUTE,
                     0,
-                    &push_bytes,
+                    &push_buf[..push_byte_len],
                 );
             }
             d.cmd_dispatch(self.cb, gx, gy, 1);
-            let barrier = vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(
-                    vk::AccessFlags::SHADER_READ
-                        | vk::AccessFlags::SHADER_WRITE
-                        | vk::AccessFlags::TRANSFER_READ,
-                );
-            d.cmd_pipeline_barrier(
-                self.cb,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[barrier],
-                &[],
-                &[],
-            );
+        }
+        if emit_barrier {
+            self.barrier();
         }
         Ok(())
     }
@@ -1560,11 +2200,17 @@ impl Drop for VulkanContext {
                     d.destroy_descriptor_set_layout(p.set_layout, None);
                 }
             }
+            if let Ok(mut dc) = self.desc_cache.lock() {
+                dc.map.clear();
+                d.destroy_descriptor_pool(dc.pool, None);
+            }
             if let Ok(mut e) = self.exec.lock() {
-                e.staging = None;
-                d.destroy_descriptor_pool(e.desc_pool, None);
-                d.destroy_fence(e.fence, None);
-                d.destroy_command_pool(e.pool, None);
+                e.staging = [None, None];
+                for s in &e.slots {
+                    d.destroy_descriptor_pool(s.desc_pool, None);
+                    d.destroy_fence(s.fence, None);
+                    d.destroy_command_pool(s.pool, None);
+                }
             }
         }
     }

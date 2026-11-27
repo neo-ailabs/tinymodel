@@ -23,6 +23,7 @@ layout(std430, binding = 3) readonly buffer Sinks   { float sinks[]; };
 layout(std430, binding = 4) readonly buffer KCache  { uvec2 k_cache4[]; };
 layout(std430, binding = 5) readonly buffer VCache  { uvec2 v_cache4[]; };
 layout(std430, binding = 6) writeonly buffer OutBuf { vec4  out4[]; };
+layout(std430, binding = 7) readonly buffer PosBuf  { uint  pos_u32[]; };
 
 layout(push_constant) uniform PC {
     uint nh_packed;       // n_head | (n_head_kv << 16)
@@ -47,11 +48,10 @@ vec4 unpack_f16x4(uvec2 p) {
     return vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y));
 }
 
-float eval_rel_bias(uint head, uint n_rel, float sink_h, uint dist) {
+float eval_rel_bias(uint r_base, uint n_rel, float sink_h, uint dist) {
     if (dist >= pc.extent) {
         return -sink_h;
     }
-    const uint r_base = head * n_rel;
     const uint b_base = pc.rel_bias_off + dist * n_rel;
     float acc = 0.0;
     for (uint r = 0u; r < n_rel; ++r) {
@@ -62,10 +62,16 @@ float eval_rel_bias(uint head, uint n_rel, float sink_h, uint dist) {
 
 void main() {
     const uint head = gl_WorkGroupID.x;
+    const uint tok = gl_WorkGroupID.y;
     const uint n_head = pc.nh_packed & 0xFFFFu;
     const uint n_head_kv = pc.nh_packed >> 16u;
     const uint head_dim = pc.hd_nrel_packed & 0xFFFFu;
     const uint n_rel = pc.hd_nrel_packed >> 16u;
+    const bool dyn_pos = (pc.pos == 0xFFFFFFFFu);
+    const uint pos = (dyn_pos ? pos_u32[0] : pc.pos) + tok;
+    const uint kv_start = (!dyn_pos && gl_NumWorkGroups.y == 1u)
+        ? pc.kv_start
+        : ((pc.kv_start == 0u) ? 0u : ((pos + 1u > pc.kv_start) ? (pos + 1u - pc.kv_start) : 0u));
 
     const uint tid = gl_LocalInvocationID.x;
     const uint sg = gl_SubgroupID;
@@ -77,16 +83,18 @@ void main() {
     const uint group = n_head / n_head_kv;
     const uint kv_h = head / group;
     const float scale = inversesqrt(float(head_dim));
-    const float sink_h = sinks[head];
+    const uint head_idx = tok * n_head + head;
+    const float sink_h = sinks[head_idx];
+    const uint r_base = head_idx * n_rel;
 
-    const uint q_base4 = head * hd4;
+    const uint q_base4 = head_idx * hd4;
     for (uint d4 = tid; d4 < hd4; d4 += WG) {
         q_shared[d4] = q4[q_base4 + d4] * scale;
     }
 
     const uint cache_lim = min(pc.extent, MAX_REL_CACHE - 1u);
     for (uint d = tid; d < cache_lim; d += WG) {
-        rel_shared[d] = eval_rel_bias(head, n_rel, sink_h, d);
+        rel_shared[d] = eval_rel_bias(r_base, n_rel, sink_h, d);
     }
     if (tid == 0u) {
         rel_shared[cache_lim] = -sink_h;
@@ -100,7 +108,7 @@ void main() {
         o_local[k] = vec4(0.0);
     }
 
-    for (uint t = pc.kv_start + sg; t <= pc.pos; t += SG) {
+    for (uint t = kv_start + sg; t <= pos; t += SG) {
         const uint kv_off4 = pc.kv_slot_vec4_base + t * kv_dim4 + kv_h * hd4;
         float dot_val = 0.0;
         [[unroll]] for (uint k = 0u; k < N_VEC; ++k) {
@@ -111,10 +119,10 @@ void main() {
         }
         dot_val = subgroupAdd(dot_val);
 
-        const uint dist = pc.pos - t;
+        const uint dist = pos - t;
         const float rel_b = (pc.extent <= MAX_REL_CACHE - 1u)
             ? rel_shared[min(dist, pc.extent)]
-            : eval_rel_bias(head, n_rel, sink_h, dist);
+            : eval_rel_bias(r_base, n_rel, sink_h, dist);
         const float score = dot_val + rel_b;
 
         const float m_new = max(m_local, score);

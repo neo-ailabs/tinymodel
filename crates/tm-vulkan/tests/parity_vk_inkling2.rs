@@ -154,6 +154,11 @@ fn parity_vk_inkling2_pure_gpu_and_3tier_hybrid() {
     )
     .unwrap();
     assert!(host_model.stats.nvme_direct_expert_layers >= 4);
+    for ip in 0..host_model.cfg.n_layers_phys {
+        if let Some((gu_pin, gu_len, dn_pin, dn_len)) = host_model.host_importable_expert_pins(ip) {
+            let _ = hybrid_runner.register_host_moe_layer(ip, gu_pin, gu_len, dn_pin, dn_len);
+        }
+    }
     let mut host_state = Inkling2State::new(&host_model, 64);
     let pool = ThreadPool::new(4);
     let kt = active_kernels();
@@ -311,6 +316,197 @@ fn parity_vk_inkling2_pure_gpu_and_3tier_hybrid() {
     assert!(
         max_diff_rb < 5e-3,
         "post-rollback step 4 max_diff {max_diff_rb} >= 5e-3"
+    );
+
+    // 4. Batched-GEMM prefill window (`W = 10 >= 8`, `save_conv_snapshots = false`):
+    //    Extend the 7-token sequence to 10 tokens (`[5,12,29,41,7,63,18,15,2,3]`, `min_router_margin > 6e-3`),
+    //    verifying `forward_window_hybrid` (2D batched prefill + grouped MoE) matches sequential
+    //    single-token `forward_token_hybrid` across all 10 tokens on both pure-GPU and 3-tier hybrid runners!
+    let toks10 = [5u32, 12, 29, 41, 7, 63, 18, 15, 2, 3];
+    runner.reset_state().unwrap();
+    for (s, &tid) in toks10.iter().enumerate() {
+        let _ = runner.forward_token(tid, s, s + 1 == toks10.len()).unwrap();
+    }
+    let seq_pure_last = runner
+        .forward_batch_hybrid(&[], toks10.len(), false, None)
+        .unwrap()
+        .to_vec();
+
+    runner.reset_state().unwrap();
+    let mut win10_am = [0u32; 10];
+    let win_pure_last = runner
+        .forward_window_hybrid(
+            &toks10,
+            0,
+            true,
+            false,
+            &tap_visits,
+            None,
+            Some(&mut win10_am),
+        )
+        .unwrap()
+        .to_vec();
+    let mut taps10 = vec![0.0f32; 10 * tap_visits.len() * 64];
+    runner
+        .read_dspark_taps(10, tap_visits.len(), &mut taps10)
+        .unwrap();
+    for s in 0..4 {
+        let base_a = s * tap_visits.len() * 64;
+        let base_b = s * tap_visits.len() * 64;
+        for d in 0..(tap_visits.len() * 64) {
+            assert!(
+                (taps10[base_a + d] - taps_read[base_b + d]).abs() < 5e-3,
+                "W=10 batched tap mismatch vs W=4 tap at tok {s} dim {d}"
+            );
+        }
+    }
+    assert_eq!(argmax(&win_pure_last), argmax(&seq_pure_last));
+    let mut max_diff_w10_pure = 0.0f32;
+    for (&a, &b) in win_pure_last.iter().zip(seq_pure_last.iter()) {
+        max_diff_w10_pure = max_diff_w10_pure.max((a - b).abs());
+    }
+    assert!(
+        max_diff_w10_pure < 5e-3,
+        "pure-GPU W=10 batched GEMM max_diff {max_diff_w10_pure} >= 5e-3"
+    );
+    for s in 0..7 {
+        assert_eq!(win10_am[s], argmax(&ref_logits[s]));
+    }
+
+    hybrid_runner.reset_state().unwrap();
+    let mut win10_hyb_am = [0u32; 10];
+    let win_hyb_last = {
+        let mut cb_win = |ip: usize,
+                          w_len: usize,
+                          cur_win: &[f32],
+                          ids_win: &[usize],
+                          w_win: &[f32],
+                          out_win: &mut [f32]| {
+            let (serial_pool, expert_slots, mv_scratch, win_slot_outs) =
+                host_state.host_moe_window_parts_mut();
+            host_model.eval_moe_experts_window_f32(
+                ip,
+                w_len,
+                cur_win,
+                ids_win,
+                w_win,
+                &pool,
+                serial_pool,
+                kt,
+                expert_slots,
+                mv_scratch,
+                win_slot_outs,
+                out_win,
+            );
+        };
+        hybrid_runner
+            .forward_window_hybrid(
+                &toks10,
+                0,
+                true,
+                false,
+                &[],
+                Some(&mut cb_win),
+                Some(&mut win10_hyb_am),
+            )
+            .unwrap()
+            .to_vec()
+    };
+    assert_eq!(win10_hyb_am, win10_am);
+    assert_eq!(argmax(&win_hyb_last), argmax(&seq_pure_last));
+    let mut max_diff_w10_hyb = 0.0f32;
+    for (&a, &b) in win_hyb_last.iter().zip(seq_pure_last.iter()) {
+        max_diff_w10_hyb = max_diff_w10_hyb.max((a - b).abs());
+    }
+    assert!(
+        max_diff_w10_hyb < 5e-3,
+        "3-tier hybrid W=10 batched GEMM max_diff {max_diff_w10_hyb} >= 5e-3"
+    );
+
+    // 5. Concurrent CPU DDR + GPU PCIe split-expert hybrid execution (`set_hybrid_gpu_experts(1)`):
+    //    Verifies baked zero-record decode CBs + parallel split-expert accumulation match both the
+    //    FP64 oracle (`< 5e-3`) AND `W = 4` speculative window evaluation (`0-ULP` / `< 1e-5`)!
+    hybrid_runner.set_hybrid_gpu_experts(1);
+    hybrid_runner.reset_state().unwrap();
+    let mut split_seq_step3 = Vec::new();
+    for (step, &tid) in toks[..4].iter().enumerate() {
+        let mut cb = |ip: usize,
+                      cur_normed: &[f32],
+                      top_ids: &[usize],
+                      top_weights: &[f32],
+                      moe_out: &mut [f32]| {
+            let (serial_pool, expert_slots, mv_scratch) = host_state.host_moe_parts_mut();
+            host_model.eval_moe_experts_f32(
+                ip,
+                cur_normed,
+                top_ids,
+                top_weights,
+                &pool,
+                serial_pool,
+                kt,
+                expert_slots,
+                mv_scratch,
+                moe_out,
+            );
+        };
+        let got = hybrid_runner
+            .forward_token_hybrid(tid, step, true, Some(&mut cb))
+            .unwrap();
+        assert_eq!(argmax(got), argmax(&ref_logits[step]));
+        if step == 3 {
+            split_seq_step3 = got.to_vec();
+        }
+    }
+
+    hybrid_runner.reset_state().unwrap();
+    let mut split_win_am = [0u32; 4];
+    let split_win_step3 = {
+        let mut cb_win = |ip: usize,
+                          w_len: usize,
+                          cur_win: &[f32],
+                          ids_win: &[usize],
+                          w_win: &[f32],
+                          out_win: &mut [f32]| {
+            let (serial_pool, expert_slots, mv_scratch, win_slot_outs) =
+                host_state.host_moe_window_parts_mut();
+            host_model.eval_moe_experts_window_f32(
+                ip,
+                w_len,
+                cur_win,
+                ids_win,
+                w_win,
+                &pool,
+                serial_pool,
+                kt,
+                expert_slots,
+                mv_scratch,
+                win_slot_outs,
+                out_win,
+            );
+        };
+        hybrid_runner
+            .forward_window_hybrid(
+                &toks[..4],
+                0,
+                true,
+                true,
+                &tap_visits,
+                Some(&mut cb_win),
+                Some(&mut split_win_am),
+            )
+            .unwrap()
+            .to_vec()
+    };
+    for s in 0..4 {
+        assert_eq!(split_win_am[s], argmax(&ref_logits[s]));
+    }
+    let mut max_split_consistency = 0.0f32;
+    for (&a, &b) in split_win_step3.iter().zip(split_seq_step3.iter()) {
+        max_split_consistency = max_split_consistency.max((a - b).abs());
+    }
+    assert!(
+        max_split_consistency < 1e-5,
+        "split-expert W=4 vs W=1 consistency drift {max_split_consistency} >= 1e-5"
     );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);

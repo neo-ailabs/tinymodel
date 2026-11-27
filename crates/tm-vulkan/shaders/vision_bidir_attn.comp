@@ -44,7 +44,7 @@ void main() {
     const float scale = inversesqrt(float(pc.head_dim));
 
     const uint q_tok = tile_q0 + sg;
-    const bool valid_q = (q_tok < pc.n_seq);
+    const bool valid_q = (sg < BR) && (q_tok < pc.n_seq);
 
     vec4 q_local[N_VEC];
     vec4 o_local[N_VEC];

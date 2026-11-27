@@ -1,8 +1,9 @@
 #version 450
-// General Sparse MoE Top-K router (`ADR-018`) supporting all 4 gating functions:
+// Workgroup-parallel LDS Sparse MoE Top-K router (`ADR-018` / `ADR-022`) supporting all 4 gating functions:
 //   0 = Softmax, 1 = Sigmoid, 2 = SoftmaxWeight (top-k then softmax), 3 = SqrtSoftplus
 // Plus optional `exp_probs_b` selection bias, `norm_weights` + `norm_eps`, and `weights_scale`.
-// 1 thread per token (`gl_GlobalInvocationID.x < n_tok`) for exact deterministic tie-breaking.
+// 1 workgroup (`WG = 64`) per token (`t = gl_WorkGroupID.x`) with fast LDS reduction for `n_expert <= 512`
+// and exact deterministic tie-breaking (`e_a < e_b` when scores tie).
 
 layout(constant_id = 0) const uint WG = 64;
 layout(local_size_x_id = 0) in;
@@ -25,14 +26,159 @@ layout(push_constant) uniform PC {
     uint weights_scale_bits;
 } pc;
 
+shared float sh_probs[512];
+shared float sh_sel[512];
+shared float sh_red[64];
+shared uint  sh_idx[64];
+
 void main() {
-    const uint t = gl_GlobalInvocationID.x;
+    const uint t = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
     if (t >= pc.n_tok) return;
 
     const uint n_exp = pc.n_expert;
     const uint k = pc.n_expert_used;
     const uint l_off = t * n_exp;
     const uint tk_off = t * k;
+
+    if (n_exp <= 512u) {
+        if (pc.gating_func == 0u) {
+            float local_max = -3.402823466e+38;
+            for (uint e = tid; e < n_exp; e += WG) {
+                const float v = logits[l_off + e];
+                sh_probs[e] = v;
+                local_max = max(local_max, v);
+            }
+            sh_red[tid] = local_max;
+            barrier();
+            for (uint s = WG >> 1u; s > 0u; s >>= 1u) {
+                if (tid < s) {
+                    sh_red[tid] = max(sh_red[tid], sh_red[tid + s]);
+                }
+                barrier();
+            }
+            const float max_l = sh_red[0];
+
+            float local_sum = 0.0;
+            for (uint e = tid; e < n_exp; e += WG) {
+                const float ev = exp(sh_probs[e] - max_l);
+                sh_probs[e] = ev;
+                local_sum += ev;
+            }
+            sh_red[tid] = local_sum;
+            barrier();
+            for (uint s = WG >> 1u; s > 0u; s >>= 1u) {
+                if (tid < s) {
+                    sh_red[tid] += sh_red[tid + s];
+                }
+                barrier();
+            }
+            const float inv = 1.0 / sh_red[0];
+            for (uint e = tid; e < n_exp; e += WG) {
+                sh_probs[e] *= inv;
+            }
+        } else if (pc.gating_func == 1u) {
+            for (uint e = tid; e < n_exp; e += WG) {
+                sh_probs[e] = 1.0 / (1.0 + exp(-logits[l_off + e]));
+            }
+        } else if (pc.gating_func == 2u) {
+            for (uint e = tid; e < n_exp; e += WG) {
+                sh_probs[e] = logits[l_off + e];
+            }
+        } else {
+            for (uint e = tid; e < n_exp; e += WG) {
+                const float lv = logits[l_off + e];
+                const float sp = (lv > 20.0) ? lv : ((lv < -20.0) ? exp(lv) : log(1.0 + exp(lv)));
+                sh_probs[e] = sqrt(sp);
+            }
+        }
+
+        if (pc.has_exp_probs_b != 0u) {
+            for (uint e = tid; e < n_exp; e += WG) {
+                sh_sel[e] = sh_probs[e] + exp_probs_b[e];
+            }
+        } else {
+            for (uint e = tid; e < n_exp; e += WG) {
+                sh_sel[e] = sh_probs[e];
+            }
+        }
+        barrier();
+
+        for (uint slot = 0u; slot < k; ++slot) {
+            float best_val = -3.402823466e+38;
+            uint best_idx = 0xFFFFFFFFu;
+            for (uint e = tid; e < n_exp; e += WG) {
+                const float sv = sh_sel[e];
+                if (sv > best_val || (sv == best_val && e < best_idx)) {
+                    best_val = sv;
+                    best_idx = e;
+                }
+            }
+            sh_red[tid] = best_val;
+            sh_idx[tid] = best_idx;
+            barrier();
+            for (uint s = WG >> 1u; s > 0u; s >>= 1u) {
+                if (tid < s) {
+                    const float rv = sh_red[tid + s];
+                    const uint ri = sh_idx[tid + s];
+                    const float lv = sh_red[tid];
+                    const uint li = sh_idx[tid];
+                    if (rv > lv || (rv == lv && ri < li)) {
+                        sh_red[tid] = rv;
+                        sh_idx[tid] = ri;
+                    }
+                }
+                barrier();
+            }
+            if (tid == 0u) {
+                const uint win = sh_idx[0];
+                top_ids[tk_off + slot] = win;
+                top_weights[tk_off + slot] = sh_probs[win];
+                sh_sel[win] = -3.402823466e+38;
+            }
+            barrier();
+        }
+
+        if (tid == 0u) {
+            if (pc.gating_func == 2u) {
+                float max_w = -3.402823466e+38;
+                for (uint slot = 0u; slot < k; ++slot) {
+                    max_w = max(max_w, top_weights[tk_off + slot]);
+                }
+                float sum = 0.0;
+                for (uint slot = 0u; slot < k; ++slot) {
+                    const float ev = exp(top_weights[tk_off + slot] - max_w);
+                    top_weights[tk_off + slot] = ev;
+                    sum += ev;
+                }
+                const float inv = 1.0 / sum;
+                for (uint slot = 0u; slot < k; ++slot) {
+                    top_weights[tk_off + slot] *= inv;
+                }
+            }
+            if (pc.norm_weights != 0u) {
+                float sum_w = 0.0;
+                for (uint slot = 0u; slot < k; ++slot) {
+                    sum_w += top_weights[tk_off + slot];
+                }
+                const float norm_eps = uintBitsToFloat(pc.norm_eps_bits);
+                const float denom = (norm_eps > 0.0) ? (sum_w + norm_eps) : max(sum_w, 6.103515625e-5);
+                const float inv = 1.0 / denom;
+                for (uint slot = 0u; slot < k; ++slot) {
+                    top_weights[tk_off + slot] *= inv;
+                }
+            }
+            const float w_scale = uintBitsToFloat(pc.weights_scale_bits);
+            if (w_scale != 0.0 && abs(w_scale - 1.0) > 1e-12) {
+                for (uint slot = 0u; slot < k; ++slot) {
+                    top_weights[tk_off + slot] *= w_scale;
+                }
+            }
+        }
+        return;
+    }
+
+    if (tid != 0u) return;
 
     if (pc.gating_func == 0u) {
         float max_l = -3.402823466e+38;

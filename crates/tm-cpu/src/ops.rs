@@ -105,10 +105,7 @@ pub fn matvec_f32_unquant_act(
         };
         let n_thr = pool.num_threads();
         if n_thr <= 1 {
-            for (r, dst) in out.iter_mut().enumerate() {
-                let row = &w[r * cols_blocks..(r + 1) * cols_blocks];
-                *dst = (kt.dot_f32_q8_0)(x, row);
-            }
+            (kt.gemv_f32_q8_0)(w, x, out, rows, cols_blocks);
         } else {
             let chunk = dynamic_row_chunk(rows, n_thr);
             let out_ptr = out.as_mut_ptr() as usize;
@@ -117,11 +114,13 @@ pub fn matvec_f32_unquant_act(
                 // SAFETY: Disjoint `[r0..r1)` output ranges per parallel chunk.
                 let o =
                     unsafe { core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(r0), len) };
-                for (i, dst) in o.iter_mut().enumerate() {
-                    let r = r0 + i;
-                    let row = &w[r * cols_blocks..(r + 1) * cols_blocks];
-                    *dst = (kt.dot_f32_q8_0)(x, row);
-                }
+                (kt.gemv_f32_q8_0)(
+                    &w[r0 * cols_blocks..r1 * cols_blocks],
+                    x,
+                    o,
+                    len,
+                    cols_blocks,
+                );
             });
         }
         return;
@@ -178,27 +177,41 @@ pub fn matvec_batch_f32_unquant_act(
         };
         let n_thr = pool.num_threads();
         if n_thr <= 1 {
-            for r in 0..rows {
-                let row = &w[r * cols_blocks..(r + 1) * cols_blocks];
-                for m in 0..n_vec {
-                    let xm = &x_batch[m * cols..(m + 1) * cols];
-                    out_batch[m * rows + r] = (kt.dot_f32_q8_0)(xm, row);
-                }
-            }
+            (kt.gemm_f32_q8_0)(w, x_batch, out_batch, rows, cols_blocks, n_vec);
         } else {
+            const TILE_TOK: usize = 64;
             let chunk = dynamic_row_chunk(rows, n_thr);
             let out_ptr = out_batch.as_mut_ptr() as usize;
             pool.parallel_for(rows, chunk, |r0, r1| {
-                for r in r0..r1 {
-                    let row = &w[r * cols_blocks..(r + 1) * cols_blocks];
-                    for m in 0..n_vec {
-                        let xm = &x_batch[m * cols..(m + 1) * cols];
-                        let val = (kt.dot_f32_q8_0)(xm, row);
-                        // SAFETY: Each `(m, r)` with `r in r0..r1` writes to a unique element `m * rows + r`.
-                        unsafe {
-                            *(out_ptr as *mut f32).add(m * rows + r) = val;
+                let mut r = r0;
+                let mut tile = [0.0f32; 8 * TILE_TOK];
+                while r < r1 {
+                    let b_rows = (r1 - r).min(8);
+                    let wr = &w[r * cols_blocks..(r + b_rows) * cols_blocks];
+                    let mut m0 = 0usize;
+                    while m0 < n_vec {
+                        let bm = (n_vec - m0).min(TILE_TOK);
+                        (kt.gemm_f32_q8_0)(
+                            wr,
+                            &x_batch[m0 * cols..(m0 + bm) * cols],
+                            &mut tile[..b_rows * bm],
+                            b_rows,
+                            cols_blocks,
+                            bm,
+                        );
+                        for t in 0..bm {
+                            // SAFETY: Disjoint `[(m0 + t) * rows + r .. + b_rows)` per worker.
+                            let dst = unsafe {
+                                core::slice::from_raw_parts_mut(
+                                    (out_ptr as *mut f32).add((m0 + t) * rows + r),
+                                    b_rows,
+                                )
+                            };
+                            dst.copy_from_slice(&tile[t * b_rows..(t + 1) * b_rows]);
                         }
+                        m0 += bm;
                     }
+                    r += b_rows;
                 }
             });
         }

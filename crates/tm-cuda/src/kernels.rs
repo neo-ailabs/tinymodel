@@ -27,6 +27,7 @@ pub fn dtype_cuda_tag(dt: DType) -> Result<i32, CudaError> {
         DType::Q6K => Ok(14),
         DType::BF16 => Ok(30),
         DType::NvFp4 => Ok(40),
+        DType::Q2_0 => Ok(42),
         other => Err(CudaError::UnsupportedDType(other)),
     }
 }
@@ -53,6 +54,8 @@ impl CudaMat {
 pub struct CudaKernels {
     pub quantize_q8_1_f32: CUfunction,
     pub swiglu_quantize_q8_1_f32: CUfunction,
+    pub swiglu_fused_quantize_q8_1_f32: CUfunction,
+    pub mmvq_q2_0_q8_1: CUfunction,
     pub mmvq_q4_0_q8_1: CUfunction,
     pub mmvq_q4_1_q8_1: Option<CUfunction>,
     pub mmvq_q8_0_q8_1: CUfunction,
@@ -70,6 +73,7 @@ pub struct CudaKernels {
     pub swiglu_f32: CUfunction,
     pub swiglu_fused_f32: CUfunction,
     pub sigmoid_gate_mul_f32: CUfunction,
+    pub scale_rows_by_sigmoid_scalar_f32: CUfunction,
     pub split_qwen35_q_gate_f32: CUfunction,
     pub apply_rope_qk_f32: CUfunction,
     pub write_kv_cache_f16: CUfunction,
@@ -82,6 +86,8 @@ pub struct CudaKernels {
     pub gdn_recurrence_step_f32: CUfunction,
     pub gdn_rms_norm_gated_f32: CUfunction,
     pub moe_router_topk_f32: CUfunction,
+    pub moe_indexed_gemv_q8_1: CUfunction,
+    pub moe_reduce_slots_f32: CUfunction,
     pub moe_indexed_gemv_f32: CUfunction,
     pub argmax_f32: CUfunction,
 }
@@ -92,6 +98,8 @@ impl CudaKernels {
         Ok(Self {
             quantize_q8_1_f32: ctx.get_function("quantize_q8_1_f32")?,
             swiglu_quantize_q8_1_f32: ctx.get_function("swiglu_quantize_q8_1_f32")?,
+            swiglu_fused_quantize_q8_1_f32: ctx.get_function("swiglu_fused_quantize_q8_1_f32")?,
+            mmvq_q2_0_q8_1: ctx.get_function("mmvq_q2_0_q8_1")?,
             mmvq_q4_0_q8_1: ctx.get_function("mmvq_q4_0_q8_1")?,
             mmvq_q4_1_q8_1: ctx.get_function("mmvq_q4_1_q8_1").ok(),
             mmvq_q8_0_q8_1: ctx.get_function("mmvq_q8_0_q8_1")?,
@@ -109,6 +117,8 @@ impl CudaKernels {
             swiglu_f32: ctx.get_function("swiglu_f32")?,
             swiglu_fused_f32: ctx.get_function("swiglu_fused_f32")?,
             sigmoid_gate_mul_f32: ctx.get_function("sigmoid_gate_mul_f32")?,
+            scale_rows_by_sigmoid_scalar_f32: ctx
+                .get_function("scale_rows_by_sigmoid_scalar_f32")?,
             split_qwen35_q_gate_f32: ctx.get_function("split_qwen35_q_gate_f32")?,
             apply_rope_qk_f32: ctx.get_function("apply_rope_qk_f32")?,
             write_kv_cache_f16: ctx.get_function("write_kv_cache_f16")?,
@@ -121,6 +131,8 @@ impl CudaKernels {
             gdn_recurrence_step_f32: ctx.get_function("gdn_recurrence_step_f32")?,
             gdn_rms_norm_gated_f32: ctx.get_function("gdn_rms_norm_gated_f32")?,
             moe_router_topk_f32: ctx.get_function("moe_router_topk_f32")?,
+            moe_indexed_gemv_q8_1: ctx.get_function("moe_indexed_gemv_q8_1")?,
+            moe_reduce_slots_f32: ctx.get_function("moe_reduce_slots_f32")?,
             moe_indexed_gemv_f32: ctx.get_function("moe_indexed_gemv_f32")?,
             argmax_f32: ctx.get_function("argmax_f32")?,
         })
@@ -195,6 +207,39 @@ impl CudaKernels {
         }
     }
 
+    /// Fuses `[gate, up]` (`[n_rows, 2 * n_ff]`) SwiGLU + `Q8_1` quantization (`[n_rows, n_ff / 32]`).
+    pub fn launch_swiglu_fused_quantize_q8_1(
+        &self,
+        ctx: &CudaContext,
+        gate_up_ptr: CUdeviceptr,
+        xq_ptr: CUdeviceptr,
+        n_ff: usize,
+        n_rows: usize,
+    ) -> Result<(), CudaError> {
+        let mut p_gu = gate_up_ptr;
+        let mut p_xq = xq_ptr;
+        let mut c_nff = n_ff as i32;
+        let mut c_rows = n_rows as i32;
+        let n_blocks = (n_ff / 32) as u32;
+        let mut args: [*mut c_void; 4] = [
+            (&mut p_gu as *mut CUdeviceptr).cast(),
+            (&mut p_xq as *mut CUdeviceptr).cast(),
+            (&mut c_nff as *mut i32).cast(),
+            (&mut c_rows as *mut i32).cast(),
+        ];
+        // SAFETY: Matches `swiglu_fused_quantize_q8_1_f32`.
+        unsafe {
+            ctx.launch(
+                "swiglu_fused_quantize_q8_1_f32",
+                self.swiglu_fused_quantize_q8_1_f32,
+                (n_blocks.div_ceil(4), n_rows as u32, 1),
+                (32, 4, 1),
+                0,
+                &mut args,
+            )
+        }
+    }
+
     /// Dispatches `out[n_tok, w.rows] = x[n_tok, w.cols] @ w^T`:
     /// - For `n_tok <= MMVQ_MAX_TOK`: uses `__dp4a` MMVQ (`xq_ptr` pre-quantized when `xq_already_quantized` is true);
     /// - For `n_tok > MMVQ_MAX_TOK` and `cc >= 7.0`: uses `wmma` `16×16×16` FP16 Tensor Core GEMM!
@@ -259,7 +304,7 @@ impl CudaKernels {
             let out_sub = out_ptr + (off * w.rows * 4) as u64;
 
             match w.dtype {
-                DType::Q4_0 | DType::Q8_0 | DType::Q5K | DType::Q6K => {
+                DType::Q2_0 | DType::Q4_0 | DType::Q8_0 | DType::Q5K | DType::Q6K => {
                     let xq_sub = if q_ready && off == 0 && n_tok <= MMVQ_MAX_TOK {
                         xq_ptr
                     } else {
@@ -268,6 +313,7 @@ impl CudaKernels {
                         xq_ptr
                     };
                     let (func, kname, coop_4w): (CUfunction, &'static str, bool) = match w.dtype {
+                        DType::Q2_0 => (self.mmvq_q2_0_q8_1, "mmvq_q2_0_q8_1", false),
                         DType::Q4_0 => (
                             self.mmvq_q4_0_q8_1,
                             "mmvq_q4_0_q8_1",
@@ -909,6 +955,188 @@ impl CudaKernels {
                 "argmax_f32",
                 self.argmax_f32,
                 (1, 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            )
+        }
+    }
+
+    pub fn launch_scale_rows_by_sigmoid_scalar(
+        &self,
+        ctx: &CudaContext,
+        dst_ptr: CUdeviceptr,
+        gate_ptr: CUdeviceptr,
+        cols: usize,
+        n_tok: usize,
+    ) -> Result<(), CudaError> {
+        let mut pd = dst_ptr;
+        let mut pg = gate_ptr;
+        let mut c_cols = cols as i32;
+        let mut c_nt = n_tok as i32;
+        let mut args: [*mut c_void; 4] = [
+            (&mut pd as *mut CUdeviceptr).cast(),
+            (&mut pg as *mut CUdeviceptr).cast(),
+            (&mut c_cols as *mut i32).cast(),
+            (&mut c_nt as *mut i32).cast(),
+        ];
+        // SAFETY: Matches `scale_rows_by_sigmoid_scalar_f32`.
+        unsafe {
+            ctx.launch(
+                "scale_rows_by_sigmoid_scalar_f32",
+                self.scale_rows_by_sigmoid_scalar_f32,
+                ((cols as u32).div_ceil(256), n_tok as u32, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_moe_router_topk(
+        &self,
+        ctx: &CudaContext,
+        logits_ptr: CUdeviceptr,
+        probs_bias_ptr: CUdeviceptr,
+        top_ids_ptr: CUdeviceptr,
+        top_weights_ptr: CUdeviceptr,
+        n_expert: usize,
+        k_used: usize,
+        gating_code: i32,
+        norm_weights: bool,
+        norm_eps: f32,
+        weights_scale: f32,
+        n_tok: usize,
+    ) -> Result<(), CudaError> {
+        let mut pl = logits_ptr;
+        let mut pb = probs_bias_ptr;
+        let mut pids = top_ids_ptr;
+        let mut pw = top_weights_ptr;
+        let mut c_ne = n_expert as i32;
+        let mut c_ku = k_used as i32;
+        let mut c_gf = gating_code;
+        let mut c_nw = i32::from(norm_weights);
+        let mut c_eps = norm_eps;
+        let mut c_sc = weights_scale;
+        let mut args: [*mut c_void; 10] = [
+            (&mut pl as *mut CUdeviceptr).cast(),
+            (&mut pb as *mut CUdeviceptr).cast(),
+            (&mut pids as *mut CUdeviceptr).cast(),
+            (&mut pw as *mut CUdeviceptr).cast(),
+            (&mut c_ne as *mut i32).cast(),
+            (&mut c_ku as *mut i32).cast(),
+            (&mut c_gf as *mut i32).cast(),
+            (&mut c_nw as *mut i32).cast(),
+            (&mut c_eps as *mut f32).cast(),
+            (&mut c_sc as *mut f32).cast(),
+        ];
+        // SAFETY: Matches `moe_router_topk_f32` (`Block: (64, 1, 1)`, up to 512 experts).
+        unsafe {
+            ctx.launch(
+                "moe_router_topk_f32",
+                self.moe_router_topk_f32,
+                (n_tok as u32, 1, 1),
+                (64, 1, 1),
+                0,
+                &mut args,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_moe_indexed_gemv_q8_1(
+        &self,
+        ctx: &CudaContext,
+        w_exps_ptr: CUdeviceptr,
+        xq_ptr: CUdeviceptr,
+        x_f32_ptr: CUdeviceptr,
+        top_ids_ptr: CUdeviceptr,
+        top_weights_ptr: CUdeviceptr,
+        exp_scales_ptr: CUdeviceptr,
+        out_ptr: CUdeviceptr,
+        dtype: i32,
+        rows: usize,
+        cols: usize,
+        row_bytes: usize,
+        exp_stride_bytes: usize,
+        slot_count: usize,
+        n_tok: usize,
+        x_mode: i32,
+        out_mode: i32,
+    ) -> Result<(), CudaError> {
+        let mut pw = w_exps_ptr;
+        let mut pxq = xq_ptr;
+        let mut pxf = x_f32_ptr;
+        let mut pids = top_ids_ptr;
+        let mut pws = top_weights_ptr;
+        let mut psc = exp_scales_ptr;
+        let mut pout = out_ptr;
+        let mut dt = dtype;
+        let mut r = rows as i32;
+        let mut c = cols as i32;
+        let mut rb = row_bytes;
+        let mut es = exp_stride_bytes;
+        let mut sc = slot_count as i32;
+        let mut xm = x_mode;
+        let mut om = out_mode;
+        let mut args: [*mut c_void; 15] = [
+            (&mut pw as *mut CUdeviceptr).cast(),
+            (&mut pxq as *mut CUdeviceptr).cast(),
+            (&mut pxf as *mut CUdeviceptr).cast(),
+            (&mut pids as *mut CUdeviceptr).cast(),
+            (&mut pws as *mut CUdeviceptr).cast(),
+            (&mut psc as *mut CUdeviceptr).cast(),
+            (&mut pout as *mut CUdeviceptr).cast(),
+            (&mut dt as *mut i32).cast(),
+            (&mut r as *mut i32).cast(),
+            (&mut c as *mut i32).cast(),
+            (&mut rb as *mut usize).cast(),
+            (&mut es as *mut usize).cast(),
+            (&mut sc as *mut i32).cast(),
+            (&mut xm as *mut i32).cast(),
+            (&mut om as *mut i32).cast(),
+        ];
+        // SAFETY: Matches `moe_indexed_gemv_q8_1`.
+        unsafe {
+            ctx.launch(
+                "moe_indexed_gemv_q8_1",
+                self.moe_indexed_gemv_q8_1,
+                ((rows as u32).div_ceil(4), slot_count as u32, n_tok as u32),
+                (32, 4, 1),
+                0,
+                &mut args,
+            )
+        }
+    }
+
+    pub fn launch_moe_reduce_slots(
+        &self,
+        ctx: &CudaContext,
+        slot_outs_ptr: CUdeviceptr,
+        out_ptr: CUdeviceptr,
+        rows: usize,
+        slot_count: usize,
+        n_tok: usize,
+    ) -> Result<(), CudaError> {
+        let mut ps = slot_outs_ptr;
+        let mut po = out_ptr;
+        let mut r = rows as i32;
+        let mut sc = slot_count as i32;
+        let mut nt = n_tok as i32;
+        let mut args: [*mut c_void; 5] = [
+            (&mut ps as *mut CUdeviceptr).cast(),
+            (&mut po as *mut CUdeviceptr).cast(),
+            (&mut r as *mut i32).cast(),
+            (&mut sc as *mut i32).cast(),
+            (&mut nt as *mut i32).cast(),
+        ];
+        // SAFETY: Matches `moe_reduce_slots_f32`.
+        unsafe {
+            ctx.launch(
+                "moe_reduce_slots_f32",
+                self.moe_reduce_slots_f32,
+                ((rows as u32).div_ceil(256), n_tok as u32, 1),
                 (256, 1, 1),
                 0,
                 &mut args,

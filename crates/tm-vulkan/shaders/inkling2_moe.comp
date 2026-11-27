@@ -5,20 +5,24 @@
 //   op 2 (`moe_situ_glu`): `beta * tanh(g / beta) * sigmoid(g) * lb * tanh(u / lb)`
 //   op 3 (`moe_reduce`): deterministic `0..top_k` weighted expert aggregation
 
+#extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
 layout(constant_id = 0) const uint WG = 128;
-layout(constant_id = 1) const uint NR = 2;
+layout(constant_id = 1) const uint NR = 4;
 layout(local_size_x_id = 0) in;
 
 layout(std430, binding = 0) readonly buffer W16Buf   { uint16_t w16[]; };
+layout(std430, binding = 0) readonly buffer W32Buf   { uint     w32[]; };
 layout(std430, binding = 1) readonly buffer InXBuf   { float x[]; };
+layout(std430, binding = 1) readonly buffer InX4Buf  { vec4  x4[]; };
 layout(std430, binding = 2) readonly buffer BiasBuf  { float bias_or_w[]; };
 layout(std430, binding = 3) buffer          TopIdBuf { uint  top_ids[]; };
 layout(std430, binding = 4) buffer          TopWBuf  { float top_weights[]; };
 layout(std430, binding = 5) buffer          OutYBuf  { float y[]; };
+layout(std430, binding = 5) buffer          OutU32   { uint  y_u32[]; };
 
 layout(push_constant) uniform PC {
     uint op;
@@ -53,55 +57,80 @@ float accurate_tanh(float x) {
 
 shared float s_probs[256];
 shared float s_sel[256];
+shared uint  s_cnt[256];
+shared uint  s_off[256];
 
 void main() {
     const uint tid = gl_LocalInvocationID.x;
     const uint gid = gl_GlobalInvocationID.x;
 
     if (pc.op == 0u) {
-        // Router top-k: `p0 = n_expert (<= 256)`, `p1 = top_k`, `p2 = has_bias`, `p3 = bias_off`, `f0 = w_scale`
-        // `x` = router_logits, `bias_or_w` = exp_probs_b, writes `top_ids` & `top_weights`
+        // Router top-k: `p0 = n_expert (<= 256)`, `p1 = top_k`, `p2 = has_bias`, `p3 = bias_off`, `u6 = w_scale_bits`
+        // `gl_WorkGroupID.y = tok_i` (`0` in single-token mode, `0..w` in batched window mode)
+        const uint tok = gl_WorkGroupID.y;
         const uint n_exp = pc.p0;
         const uint top_k = pc.p1;
+        const uint x_off = tok * n_exp;
+        const uint out_off = tok * top_k;
         for (uint e = tid; e < n_exp; e += WG) {
-            const float p = 1.0 / (1.0 + exp(-x[e]));
+            const float p = 1.0 / (1.0 + exp(-x[x_off + e]));
             s_probs[e] = p;
             s_sel[e] = p + ((pc.p2 != 0u) ? bias_or_w[pc.p3 + e] : 0.0);
         }
         barrier();
 
-        if (tid == 0u) {
+        // Warp-parallel top-k selection across subgroup 0 (`0-ULP` tie-breaking on lowest `e`).
+        if (gl_SubgroupID == 0u) {
+            const uint lane = gl_SubgroupInvocationID;
+            const uint sg = gl_SubgroupSize;
             float sum_w = 0.0;
             for (uint k = 0u; k < top_k; ++k) {
-                uint best_e = 0u;
-                float best_v = -1.0e30;
-                for (uint e = 0u; e < n_exp; ++e) {
-                    if (s_sel[e] > best_v) {
-                        best_v = s_sel[e];
-                        best_e = e;
+                float local_v = -3.0e38;
+                uint local_e = 0xFFFFFFFFu;
+                for (uint e = lane; e < n_exp; e += sg) {
+                    const float v = s_sel[e];
+                    if (v > local_v) {
+                        local_v = v;
+                        local_e = e;
                     }
                 }
-                s_sel[best_e] = -2.0e30;
-                top_ids[k] = best_e;
+                const float best_v = subgroupMax(local_v);
+                const uint cand_e = (local_v == best_v) ? local_e : 0xFFFFFFFFu;
+                const uint best_e = subgroupMin(cand_e);
                 const float pw = s_probs[best_e];
-                top_weights[k] = pw;
                 sum_w += pw;
+                if (lane == 0u) {
+                    s_sel[best_e] = -3.4e38;
+                    top_ids[out_off + k] = best_e;
+                    top_weights[out_off + k] = pw;
+                }
+                subgroupMemoryBarrierShared();
             }
-            const float inv_sum = uintBitsToFloat(pc.u6) / (sum_w + 1.0e-20);
-            for (uint k = 0u; k < top_k; ++k) {
-                top_weights[k] *= inv_sum;
+            if (lane == 0u) {
+                const float inv_sum = uintBitsToFloat(pc.u6) / (sum_w + 1.0e-20);
+                for (uint k = 0u; k < top_k; ++k) {
+                    top_weights[out_off + k] *= inv_sum;
+                }
             }
         }
     } else if (pc.op == 1u) {
-        // Indexed `Q8_0` GEMV (`gl_WorkGroupID.y = k in 0..top_k`):
-        // `p0 = n_in`, `p1 = n_out`, `p2 = row_u16s`, `p3 = expert_u16s`, `p4 = shared_x (1 for gate_up, 0 for down)`
-        const uint k = gl_WorkGroupID.y;
+        // Indexed `Q8_0` GEMV (`gl_WorkGroupID.y = y_slot`):
+        // `p0 = n_in`, `p1 = n_out`, `p2 = row_u16s`, `p3 = expert_u16s`, `p4 = shared_x (top_k for gate_up, 0 for down)`
+        // Optional split-expert slice: `u6 = k_off`, `u7 = (full_top_k << 16) | k_gpu`
+        const uint y_slot = gl_WorkGroupID.y;
         const uint row0 = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * NR;
         if (row0 >= pc.p1) return;
 
-        const uint e_id = top_ids[k];
+        const uint k_gpu = pc.u7 & 0xFFFFu;
+        const uint full_top_k = pc.u7 >> 16u;
+        const uint id_slot = (k_gpu != 0u)
+            ? ((y_slot / k_gpu) * full_top_k + pc.u6 + (y_slot % k_gpu))
+            : (pc.u6 + y_slot);
+        const uint e_id = top_ids[id_slot];
         const uint exp_base = e_id * pc.p3;
-        const uint x_base = (pc.p4 != 0u) ? 0u : (k * pc.p0);
+        const uint x_base = (pc.p4 != 0u)
+            ? (((k_gpu != 0u) ? (y_slot / k_gpu) : (id_slot / pc.p4)) * pc.p0)
+            : (y_slot * pc.p0);
 
         const uint lane = gl_SubgroupInvocationID;
         const uint sg_size = gl_SubgroupSize;
@@ -115,31 +144,32 @@ void main() {
             row_b[r] = exp_base + row * pc.p2;
         }
 
-        if (sg_size <= 32u) {
-            for (uint ib = 0u; ib < nb; ++ib) {
-                float d[NR];
-                for (uint r = 0u; r < NR; ++r) {
-                    d[r] = unpackHalf2x16(uint(w16[row_b[r] + ib * 17u])).x;
-                }
-                for (uint e = lane; e < 32u; e += sg_size) {
-                    const float xv = x[x_base + ib * 32u + e];
-                    for (uint r = 0u; r < NR; ++r) {
-                        const int q = sbyte_at(row_b[r] + ib * 17u + 1u, e);
-                        acc[r] = fma(d[r] * float(q), xv, acc[r]);
-                    }
-                }
-            }
-        } else {
-            const uint sub_blk = lane >> 5u;
-            const uint e = lane & 31u;
-            const uint step_blk = sg_size >> 5u;
-            for (uint ib = sub_blk; ib < nb; ib += step_blk) {
-                const float xv = x[x_base + ib * 32u + e];
-                for (uint r = 0u; r < NR; ++r) {
-                    const uint b = row_b[r] + ib * 17u;
-                    const float d = unpackHalf2x16(uint(w16[b])).x;
-                    acc[r] = fma(d * float(sbyte_at(b + 1u, e)), xv, acc[r]);
-                }
+        // 8 consecutive lanes cover one 32-element Q8_0 block (4 bytes/lane = 32B coalesced line);
+        // `sg_size / 8` blocks run in parallel per subgroup (4 blocks/iter on warp32, 8 on wave64).
+        const uint sub_blk = lane >> 3u;
+        const uint sub_lane = lane & 7u;
+        const uint step_blk = sg_size >> 3u;
+        const uint q_u16_off = 1u + (sub_lane << 1u);
+        const uint x4_base = x_base >> 2u;
+
+        for (uint ib = sub_blk; ib < nb; ib += step_blk) {
+            const vec4 xv = x4[x4_base + ib * 8u + sub_lane];
+            const uint blk_u16 = ib * 17u;
+            for (uint r = 0u; r < NR; ++r) {
+                const uint b = row_b[r] + blk_u16;
+                const uint dw = w32[b >> 1u];
+                const float d = ((b & 1u) == 0u) ? unpackHalf2x16(dw).x : unpackHalf2x16(dw).y;
+                const uint q = b + q_u16_off;
+                const uint q32 = ((q & 1u) == 0u)
+                    ? w32[q >> 1u]
+                    : ((w32[q >> 1u] >> 16u) | (w32[(q >> 1u) + 1u] << 16u));
+                const vec4 q4 = vec4(
+                    float(bitfieldExtract(int(q32), 0, 8)),
+                    float(bitfieldExtract(int(q32), 8, 8)),
+                    float(bitfieldExtract(int(q32), 16, 8)),
+                    float(bitfieldExtract(int(q32), 24, 8))
+                );
+                acc[r] = fma(d, dot(q4, xv), acc[r]);
             }
         }
 
@@ -147,12 +177,12 @@ void main() {
             const float sum = subgroupAdd(acc[r]);
             const uint row = row0 + r;
             if (subgroupElect() && row < pc.p1) {
-                y[k * pc.p1 + row] = sum;
+                y[y_slot * pc.p1 + row] = sum;
             }
         }
     } else if (pc.op == 2u) {
-        // SiTU-GLU across `p0 = top_k * n_ff`, `p1 = n_ff`, `u6 = situ_beta_bits`, `u7 = situ_lb_bits`
-        // `x` = gate_up `[top_k, 2 * n_ff]`, `y` = hidden `[top_k, n_ff]`
+        // SiTU-GLU across `p0 = count * n_ff`, `p1 = n_ff`, `u6 = situ_beta_bits`, `u7 = situ_lb_bits`
+        // `x` = gate_up `[count, 2 * n_ff]`, `y` = hidden `[count, n_ff]`
         if (gid >= pc.p0) return;
         const uint n_ff = pc.p1;
         const uint k = gid / n_ff;
@@ -165,15 +195,160 @@ void main() {
         const float act_u = (lb > 0.0) ? (lb * accurate_tanh(u / lb)) : u;
         y[gid] = act_g * act_u;
     } else if (pc.op == 3u) {
-        // Weighted expert reduction: `p0 = n_embd`, `p1 = top_k`
-        // `x` = exp_down `[top_k, n_embd]`, `top_weights` = weights `[top_k]`, `y` = moe_out `[n_embd]`
+        // Weighted expert reduction: `p0 = n_embd`, `p1 = red_k`, `p2 = add_to_y`,
+        // `u6 = k_off`, `u7 = full_top_k` (`0` -> `red_k`), `gl_WorkGroupID.y = tok (0..w)`
         if (gid >= pc.p0) return;
         const uint n_embd = pc.p0;
-        const uint top_k = pc.p1;
-        float acc = 0.0;
-        for (uint k = 0u; k < top_k; ++k) {
-            acc = fma(top_weights[k], x[k * n_embd + gid], acc);
+        const uint red_k = pc.p1;
+        const uint full_k = (pc.u7 != 0u) ? pc.u7 : red_k;
+        const uint tok = gl_WorkGroupID.y;
+        const uint w_base = tok * full_k + pc.u6;
+        const uint x_base = tok * red_k;
+        float acc = (pc.p2 != 0u) ? y[tok * n_embd + gid] : 0.0;
+        for (uint k = 0u; k < red_k; ++k) {
+            if (pc.p3 == 0u || top_ids[w_base + k] < pc.p3) {
+                acc = fma(top_weights[w_base + k], x[(x_base + k) * n_embd + gid], acc);
+            }
         }
-        y[gid] = acc;
+        y[tok * n_embd + gid] = acc;
+    } else if (pc.op == 4u) {
+        // Build expert-grouped `BM`-row tile descriptors on GPU (`1` workgroup of `WG` threads):
+        //   `p0 = n_exp (<= 256)`, `p1 = total_k (w * top_k <= 1024)`, `p2 = bm (16)`
+        //   `y_u32[0] = num_tiles`
+        //   `y_u32[4 + t*4 + 0..2] = (e_id, start_pos, tile_cnt)`
+        //   `y_u32[2048 + pos] = slot` (`0 .. total_k`)
+        const uint n_exp = pc.p0;
+        const uint total_k = pc.p1;
+        const uint bm = pc.p2;
+        for (uint e = tid; e < n_exp; e += WG) {
+            s_cnt[e] = 0u;
+        }
+        barrier();
+
+        for (uint s = tid; s < total_k; s += WG) {
+            const uint e = top_ids[s];
+            if (e < n_exp) {
+                atomicAdd(s_cnt[e], 1u);
+            }
+        }
+        barrier();
+
+        if (tid == 0u) {
+            uint off = 0u;
+            uint nt = 0u;
+            for (uint e = 0u; e < n_exp; ++e) {
+                const uint c = s_cnt[e];
+                s_off[e] = off;
+                s_cnt[e] = 0u;
+                for (uint m0 = 0u; m0 < c; m0 += bm) {
+                    const uint tc = min(bm, c - m0);
+                    const uint tb = 4u + nt * 4u;
+                    y_u32[tb + 0u] = e;
+                    y_u32[tb + 1u] = off + m0;
+                    y_u32[tb + 2u] = tc;
+                    y_u32[tb + 3u] = 0u;
+                    nt += 1u;
+                }
+                off += c;
+            }
+            y_u32[0] = nt;
+        }
+        barrier();
+
+        for (uint s = tid; s < total_k; s += WG) {
+            const uint e = top_ids[s];
+            if (e < n_exp) {
+                const uint pos = s_off[e] + atomicAdd(s_cnt[e], 1u);
+                y_u32[2048u + pos] = s;
+            }
+        }
+    } else if (pc.op == 5u) {
+        // Exact `0-ULP` expert-deduplicated `Q8_0` GEMV (`tile_cnt <= 8` in registers):
+        // `top_ids` (`binding 3`) holds `moe_tiles_buf`; `gl_WorkGroupID.y = tile_idx`.
+        // `p0 = n_in`, `p1 = n_out`, `p2 = row_u16s`, `p3 = expert_u16s`, `p4 = shared_x_top_k`
+        const uint tile_idx = gl_WorkGroupID.y;
+        if (tile_idx >= top_ids[0]) return;
+        const uint row0 = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * NR;
+        if (row0 >= pc.p1) return;
+
+        const uint tb = 4u + tile_idx * 4u;
+        const uint e_id = top_ids[tb + 0u];
+        const uint start_pos = top_ids[tb + 1u];
+        const uint tile_cnt = top_ids[tb + 2u];
+        const uint exp_base = e_id * pc.p3;
+
+        uint slots[8];
+        uint x4_bases[8];
+        [[unroll]] for (uint m = 0u; m < 8u; ++m) {
+            if (m < tile_cnt) {
+                const uint sl = top_ids[2048u + start_pos + m];
+                slots[m] = sl;
+                const uint xr = (pc.p4 != 0u) ? (sl / pc.p4) : sl;
+                x4_bases[m] = (xr * pc.p0) >> 2u;
+            } else {
+                slots[m] = 0u;
+                x4_bases[m] = 0u;
+            }
+        }
+
+        const uint lane = gl_SubgroupInvocationID;
+        const uint sg_size = gl_SubgroupSize;
+        const uint nb = pc.p0 / 32u;
+        const uint sub_blk = lane >> 3u;
+        const uint sub_lane = lane & 7u;
+        const uint step_blk = sg_size >> 3u;
+        const uint q_u16_off = 1u + (sub_lane << 1u);
+
+        float acc[8][NR];
+        uint row_b[NR];
+        [[unroll]] for (uint r = 0u; r < NR; ++r) {
+            const uint row = min(row0 + r, pc.p1 - 1u);
+            row_b[r] = exp_base + row * pc.p2;
+            [[unroll]] for (uint m = 0u; m < 8u; ++m) {
+                acc[m][r] = 0.0;
+            }
+        }
+
+        for (uint ib = sub_blk; ib < nb; ib += step_blk) {
+            const uint blk_u16 = ib * 17u;
+            float d_arr[NR];
+            vec4 q4_arr[NR];
+            [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                const uint b = row_b[r] + blk_u16;
+                const uint dw = w32[b >> 1u];
+                d_arr[r] = ((b & 1u) == 0u) ? unpackHalf2x16(dw).x : unpackHalf2x16(dw).y;
+                const uint q = b + q_u16_off;
+                const uint q32 = ((q & 1u) == 0u)
+                    ? w32[q >> 1u]
+                    : ((w32[q >> 1u] >> 16u) | (w32[(q >> 1u) + 1u] << 16u));
+                q4_arr[r] = vec4(
+                    float(bitfieldExtract(int(q32), 0, 8)),
+                    float(bitfieldExtract(int(q32), 8, 8)),
+                    float(bitfieldExtract(int(q32), 16, 8)),
+                    float(bitfieldExtract(int(q32), 24, 8))
+                );
+            }
+            [[unroll]] for (uint m = 0u; m < 8u; ++m) {
+                if (m < tile_cnt) {
+                    const vec4 xvm = x4[x4_bases[m] + ib * 8u + sub_lane];
+                    [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                        acc[m][r] = fma(d_arr[r], dot(q4_arr[r], xvm), acc[m][r]);
+                    }
+                }
+            }
+        }
+
+        [[unroll]] for (uint m = 0u; m < 8u; ++m) {
+            if (m < tile_cnt) {
+                const uint y_base = slots[m] * pc.p1;
+                [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                    const float sum = subgroupAdd(acc[m][r]);
+                    const uint row = row0 + r;
+                    if (subgroupElect() && row < pc.p1) {
+                        y[y_base + row] = sum;
+                    }
+                }
+            }
+        }
     }
 }

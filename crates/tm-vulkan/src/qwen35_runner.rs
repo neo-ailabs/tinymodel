@@ -22,15 +22,20 @@ use tm_gguf::{GgufError, GgufFile};
 
 use crate::context::{Pipeline, VkBuffer, VkPrefillMode, VulkanContext};
 use crate::kernels::{dtype_code, normalize_vk_mat_bytes};
-use crate::llama_runner::{VkProfileReport, VkStageStat, kv_cache_bytes_per_layer};
+use crate::llama_runner::{
+    VkProfileReport, VkStageStat, kv_cache_bytes_per_layer, parse_moe_arch_params,
+};
 use crate::lora_gpu::{VkEmbedSlot, VkLinearSlot, VkLoraEngine};
 use crate::{VkResultExt, VulkanError};
 
 const SPV_EMBED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/embed.spv"));
 const SPV_RMS_NORM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm.spv"));
+const SPV_RMS_NORM_Q8_1: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm_q8_1.spv"));
 const SPV_QK_NORM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qk_norm.spv"));
 const SPV_SPLIT_QG_QNORM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/split_qg_qnorm.spv"));
 const SPV_SIGMOID_MUL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sigmoid_mul.spv"));
+const SPV_SIGMOID_MUL_Q8_1: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/sigmoid_mul_q8_1.spv"));
 const SPV_ROPE_KV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_kv.spv"));
 const SPV_ROPE_KV_Q8: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope_kv_q8.spv"));
 const SPV_GQA_ATTN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gqa_attn.spv"));
@@ -39,20 +44,37 @@ const SPV_FA_COOPMAT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_coopm
 const SPV_FA_GQA_TILED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_gqa_tiled.spv"));
 const SPV_FA_GQA_TILED_Q8: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa_gqa_tiled_q8.spv"));
 const SPV_GEMV_RES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_res.spv"));
+const SPV_GEMV_DP4A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_dp4a.spv"));
 const SPV_GEMV_RES_Q4_0_SOA: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemv_res_q4_0_soa.spv"));
+const SPV_GEMV_RES_Q4_0_SOA_DP4A: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemv_res_q4_0_soa_dp4a.spv"));
 const SPV_GEMV_PAIR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_pair.spv"));
+const SPV_GEMV_PAIR_DP4A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_pair_dp4a.spv"));
 const SPV_GEMV_PAIR_Q4_0_SOA: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemv_pair_q4_0_soa.spv"));
+const SPV_GEMV_PAIR_Q4_0_SOA_DP4A: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemv_pair_q4_0_soa_dp4a.spv"));
 const SPV_GEMV_QKV_Q4_0: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemv_qkv_q4_0.spv"));
+const SPV_GEMV_QKV_Q4_0_DP4A: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemv_qkv_q4_0_dp4a.spv"));
 const SPV_GEMV_QKV_Q4_0_SOA: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemv_qkv_q4_0_soa.spv"));
+const SPV_GEMV_QKV_Q4_0_SOA_DP4A: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemv_qkv_q4_0_soa_dp4a.spv"));
 const SPV_GEMV_PAIR_SILU_Q4_0: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemv_pair_silu_q4_0.spv"));
+const SPV_GEMV_PAIR_SILU_Q4_0_DP4A: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemv_pair_silu_q4_0_dp4a.spv"));
 const SPV_GEMV_PAIR_SILU_Q4_0_SOA: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemv_pair_silu_q4_0_soa.spv"));
+const SPV_GEMV_PAIR_SILU_Q4_0_SOA_DP4A: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/gemv_pair_silu_q4_0_soa_dp4a.spv"
+));
 const SPV_SILU_MUL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silu_mul.spv"));
 const SPV_GDN_GATES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gdn_gates.spv"));
+const SPV_GDN_PREP_DECODE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gdn_prep_decode.spv"));
 const SPV_GDN_CONV_SILU_L2: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gdn_conv_silu_l2.spv"));
 const SPV_GDN_RECURRENCE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gdn_recurrence.spv"));
@@ -60,6 +82,8 @@ const SPV_GDN_RECURRENCE_LDS: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gdn_recurrence_lds.spv"));
 const SPV_GDN_NORM_GATED_SILU: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gdn_norm_gated_silu.spv"));
+const SPV_GDN_NORM_GATED_SILU_Q8_1: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gdn_norm_gated_silu_q8_1.spv"));
 const SPV_GEMM_TILED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_tiled.spv"));
 const SPV_GEMM_TILED_DP4A: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_tiled_dp4a.spv"));
 const SPV_GEMM_TILED_DP4A_Q4_SOA: &[u8] =
@@ -72,6 +96,11 @@ const SPV_GEMM_PAIR_SILU_COOPMAT_F16: &[u8] =
 const SPV_QUANTIZE_Q8_1: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quantize_q8_1.spv"));
 const SPV_GEMM_COOPMAT_I8: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_i8.spv"));
 const SPV_ARGMAX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/argmax.spv"));
+const SPV_ADD_BIAS_AXPY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/lora_up_axpy.spv"));
+const SPV_MOE_ROUTER_TOPK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_router_topk.spv"));
+const SPV_MOE_INDEXED_GEMV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/moe_indexed_gemv.spv"));
+const SPV_MOE_REDUCE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_reduce.spv"));
 
 const PREFERRED_MAX_BATCH: usize = 512;
 const TARGET_SLAB_BYTES: u64 = 512 << 20;
@@ -99,6 +128,27 @@ impl ResolvedPrefill {
     }
 }
 
+fn dp4a_decode_enabled(
+    prefill_kind: ResolvedPrefill,
+    int8_accel: bool,
+    n_embd: usize,
+    n_ff: usize,
+    gate_cap: usize,
+) -> bool {
+    if !int8_accel
+        || !n_embd.is_multiple_of(32)
+        || !n_ff.is_multiple_of(32)
+        || !gate_cap.is_multiple_of(32)
+    {
+        return false;
+    }
+    match std::env::var("TM_VK_DP4A").ok().as_deref().map(str::trim) {
+        Some("0" | "false" | "off") => false,
+        Some("force") => true,
+        _ => prefill_kind != ResolvedPrefill::Fallback && n_embd >= 256,
+    }
+}
+
 /// Model hyperparameters for [`Qwen35VkRunner`].
 #[derive(Debug, Clone)]
 pub struct Qwen35VkConfig {
@@ -108,6 +158,8 @@ pub struct Qwen35VkConfig {
     pub n_full_attn_layers: usize,
     pub n_embd: usize,
     pub n_ff: usize,
+    pub n_expert: usize,
+    pub n_expert_used: usize,
     pub n_head: usize,
     pub n_head_kv: usize,
     pub head_dim: usize,
@@ -347,9 +399,13 @@ enum AttnLayerPlan {
         w_beta_batch: BatchGemmEntry,
         gates_set: vk::DescriptorSet,
         conv_set: vk::DescriptorSet,
+        prep_dec_set: vk::DescriptorSet,
         recur_set: vk::DescriptorSet,
         gnorm_set: vk::DescriptorSet,
+        gnorm_dec_set: vk::DescriptorSet,
+        gnorm_dec_fused_q8: bool,
         w_out_dec: GemvCall,
+        w_out_dec_q8: bool,
         w_out_batch: BatchGemmEntry,
         state_slice: VkSlice,
         conv_hist_slice: VkSlice,
@@ -368,7 +424,10 @@ enum AttnLayerPlan {
         attn_dec_set: vk::DescriptorSet,
         attn_batch_set: vk::DescriptorSet,
         sigmoid_set: vk::DescriptorSet,
+        sigmoid_dec_set: vk::DescriptorSet,
+        sigmoid_dec_fused_q8: bool,
         wo_dec: GemvCall,
+        wo_dec_q8: bool,
         wo_batch: BatchGemmEntry,
         k_cache_slice: VkSlice,
         v_cache_slice: VkSlice,
@@ -377,42 +436,104 @@ enum AttnLayerPlan {
     },
 }
 
+struct MoeSharedExpertPlan {
+    n_ff_shexp: usize,
+    gate_dec: GemvCall,
+    up_dec: GemvCall,
+    down_dec: GemvCall,
+    down_dec_q8: bool,
+    gate_batch: BatchGemmEntry,
+    up_batch: BatchGemmEntry,
+    down_batch: BatchGemmEntry,
+    silu_set: vk::DescriptorSet,
+    gate_inp_1d: Option<(GemvCall, BatchGemmEntry, vk::DescriptorSet)>,
+}
+
+struct MoeLayerPlan {
+    n_expert: u32,
+    n_expert_used: u32,
+    n_ff_exp: u32,
+    gating_func: u32,
+    norm_weights: u32,
+    has_exp_probs_b: u32,
+    norm_eps_bits: u32,
+    weights_scale_bits: u32,
+    router_dec: GemvCall,
+    router_batch: BatchGemmEntry,
+    router_bias_set: Option<vk::DescriptorSet>,
+    router_topk_set: vk::DescriptorSet,
+    gate_pipe: Arc<Pipeline>,
+    gate_set: vk::DescriptorSet,
+    gate_gx: u32,
+    gate_push: [u32; 9],
+    up_pipe: Arc<Pipeline>,
+    up_set: vk::DescriptorSet,
+    up_gx: u32,
+    up_push: [u32; 9],
+    silu_set: vk::DescriptorSet,
+    down_pipe: Arc<Pipeline>,
+    down_set: vk::DescriptorSet,
+    down_gx: u32,
+    down_push: [u32; 9],
+    reduce_set: vk::DescriptorSet,
+    shared_expert: Option<Box<MoeSharedExpertPlan>>,
+}
+
+#[allow(clippy::large_enum_variant)]
+enum Qwen35LayerFfnPlan {
+    Dense {
+        ffn_dec: DecodeFfnSets,
+        ffn_dec_sep: (GemvCall, GemvCall, vk::DescriptorSet),
+        ffn_batch: BatchFfnPlan,
+        ffn_batch_sep: (BatchGemmEntry, BatchGemmEntry, vk::DescriptorSet),
+        down_dec: GemvCall,
+        down_dec_q8: bool,
+        down_batch: BatchGemmEntry,
+    },
+    Moe(Box<MoeLayerPlan>),
+}
+
 struct Qwen35LayerPlan {
     idx: usize,
     attn_norm_set: vk::DescriptorSet,
+    attn_norm_dec_set: vk::DescriptorSet,
     attn: AttnLayerPlan,
     post_attn_norm_set: vk::DescriptorSet,
-    ffn_dec: DecodeFfnSets,
-    ffn_dec_sep: (GemvCall, GemvCall, vk::DescriptorSet),
-    ffn_batch: BatchFfnPlan,
-    ffn_batch_sep: (BatchGemmEntry, BatchGemmEntry, vk::DescriptorSet),
-    down_dec: GemvCall,
-    down_batch: BatchGemmEntry,
+    post_attn_norm_dec_set: vk::DescriptorSet,
+    ffn: Qwen35LayerFfnPlan,
     gate_up_weight_bytes: u64,
     down_weight_bytes: u64,
+    active_ff_dim: usize,
 }
 
 struct RunnerPipes {
     embed_dec: Arc<Pipeline>,
     embed_batch: Arc<Pipeline>,
     rms_norm: Arc<Pipeline>,
+    rms_norm_q8_1: Option<Arc<Pipeline>>,
     qk_norm: Arc<Pipeline>,
     split_qg_qnorm: Arc<Pipeline>,
     sigmoid_mul: Arc<Pipeline>,
+    sigmoid_mul_q8_1: Option<Arc<Pipeline>>,
     rope_dec: Arc<Pipeline>,
     rope_batch: Arc<Pipeline>,
     attn_dec: Arc<Pipeline>,
     attn_batch: Arc<Pipeline>,
     attn_batch_kind: BatchAttnKind,
     gdn_gates: Arc<Pipeline>,
+    gdn_prep_decode: Arc<Pipeline>,
     gdn_conv_silu_l2: Arc<Pipeline>,
     gdn_conv_batch: Arc<Pipeline>,
     gdn_conv_state_upd: Arc<Pipeline>,
     gdn_recurrence: Arc<Pipeline>,
     gdn_norm_gated_silu: Arc<Pipeline>,
+    gdn_norm_gated_silu_q8_1: Option<Arc<Pipeline>>,
     silu_mul: Arc<Pipeline>,
     quant_q8_1: Option<Arc<Pipeline>>,
     argmax: Arc<Pipeline>,
+    add_bias: Arc<Pipeline>,
+    moe_router: Arc<Pipeline>,
+    moe_reduce: Arc<Pipeline>,
 }
 
 /// Complete Vulkan GPU inference runner for `qwen35` hybrid GDN + full-attention models.
@@ -439,7 +560,9 @@ pub struct Qwen35VkRunner {
     quant_attn_out_set: Option<vk::DescriptorSet>,
     quant_hb_set: Option<vk::DescriptorSet>,
     output_norm_set: vk::DescriptorSet,
+    output_norm_dec_set: vk::DescriptorSet,
     lm_head_dec: GemvCall,
+    lm_head_dec_q8: bool,
     argmax_set: vk::DescriptorSet,
     layers: Vec<Qwen35LayerPlan>,
     desc_pool: vk::DescriptorPool,
@@ -470,6 +593,16 @@ struct PendingF32 {
     vals: Vec<f32>,
 }
 
+struct PendingMat3D<'a> {
+    slice: VkSlice,
+    bytes: std::borrow::Cow<'a, [u8]>,
+    imported: bool,
+    dtype: DType,
+    cols: usize,
+    row_bytes: usize,
+    exp_stride_bytes: usize,
+}
+
 fn plan_f32_tensor(
     planner: &mut ArenaPlanner,
     gguf: &GgufFile,
@@ -483,6 +616,66 @@ fn plan_f32_tensor(
     dequantize_row_bytes(info.dtype, bytes, &mut vals);
     let slice = planner.reserve((len * 4) as u64)?;
     Ok(PendingF32 { slice, vals })
+}
+
+fn plan_opt_f32_vec(
+    planner: &mut ArenaPlanner,
+    gguf: &GgufFile,
+    name: &str,
+    layer: &str,
+    len: usize,
+) -> Result<Option<PendingF32>, VulkanError> {
+    if gguf.tensor_info(name).is_some() {
+        Ok(Some(plan_f32_tensor(planner, gguf, name, layer, &[len])?))
+    } else {
+        Ok(None)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_mat_3d<'a>(
+    planner: &mut ArenaPlanner,
+    gguf: &'a GgufFile,
+    name: &str,
+    layer: &str,
+    cols: usize,
+    rows: usize,
+    n_expert: usize,
+) -> Result<PendingMat3D<'a>, VulkanError> {
+    let (info, raw_bytes) = gguf.req_tensor(name, layer, &[cols, rows, n_expert])?;
+    let (eff_dtype, bytes) = if info.dtype == DType::Q4_0x4 {
+        let raw_exp_bytes = rows * info.dtype.row_bytes(cols);
+        let out_exp_bytes = rows * DType::Q4_0.row_bytes(cols);
+        let mut out = Vec::with_capacity(n_expert * out_exp_bytes);
+        for e in 0..n_expert {
+            let sub = &raw_bytes[e * raw_exp_bytes..(e + 1) * raw_exp_bytes];
+            let (_, conv) = normalize_vk_mat_bytes(DType::Q4_0x4, sub, rows, cols)?;
+            out.extend_from_slice(&conv);
+        }
+        (DType::Q4_0, std::borrow::Cow::Owned(out))
+    } else {
+        let _ = dtype_code(info.dtype)?;
+        (info.dtype, std::borrow::Cow::Borrowed(raw_bytes))
+    };
+    let row_bytes = eff_dtype.row_bytes(cols);
+    let exp_stride_bytes = rows * row_bytes;
+    let file_off = gguf.tensor_file_offset(info) as u64;
+    let can_import = matches!(&bytes, std::borrow::Cow::Borrowed(_));
+    let (slice, imported) =
+        if can_import && let Some(s) = planner.try_import_slice(file_off, bytes.len() as u64) {
+            (s, true)
+        } else {
+            (planner.reserve(bytes.len() as u64)?, false)
+        };
+    Ok(PendingMat3D {
+        slice,
+        bytes,
+        imported,
+        dtype: eff_dtype,
+        cols,
+        row_bytes,
+        exp_stride_bytes,
+    })
 }
 
 fn repack_q4_0_to_soa(raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
@@ -576,18 +769,60 @@ impl Qwen35VkRunner {
         }
         let gguf_ref: &GgufFile = &gguf;
         let arch = gguf_ref.req_str("general.architecture")?.to_string();
-        if arch != "qwen35" {
+        if !matches!(arch.as_str(), "qwen35" | "qwen35moe") {
             return Err(VulkanError::UnsupportedArch(arch));
         }
 
-        let pfx = "qwen35";
-        let n_layers = gguf_ref.req_usize(&format!("{pfx}.block_count"))?;
+        let pfx = arch.as_str();
+        let raw_blocks = gguf_ref.req_usize(&format!("{pfx}.block_count"))?;
+        let nextn_layers = gguf_ref
+            .get_meta(&format!("{pfx}.nextn_predict_layers"))
+            .and_then(|v| v.as_usize())
+            .unwrap_or(0);
+        let n_layers = raw_blocks.saturating_sub(nextn_layers);
+        if n_layers == 0 {
+            return Err(VulkanError::InvalidDimensions(format!(
+                "{arch}: block_count ({raw_blocks}) <= nextn_predict_layers ({nextn_layers})"
+            )));
+        }
         let n_embd = gguf_ref.req_usize(&format!("{pfx}.embedding_length"))?;
-        let n_ff = gguf_ref.req_usize(&format!("{pfx}.feed_forward_length"))?;
-        let n_head = gguf_ref.req_usize(&format!("{pfx}.attention.head_count"))?;
+        let n_ff_meta = gguf_ref
+            .get_meta(&format!("{pfx}.feed_forward_length"))
+            .and_then(|v| v.as_usize())
+            .unwrap_or(0);
+        let moe_params = parse_moe_arch_params(gguf_ref, pfx, &arch, n_layers, n_ff_meta)?;
+        let n_ff = if n_ff_meta > 0 {
+            n_ff_meta
+        } else if let Some(ref mp) = moe_params {
+            mp.n_ff_exp_per_layer
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(n_embd)
+                .max(1)
+        } else {
+            gguf_ref.req_usize(&format!("{pfx}.feed_forward_length"))?
+        };
+        let n_head = gguf_ref
+            .get_meta(&format!("{pfx}.attention.head_count"))
+            .and_then(|v| {
+                v.as_usize().or_else(|| {
+                    v.as_usize_array()
+                        .and_then(|a| a.iter().copied().find(|&x| x > 0))
+                })
+            })
+            .ok_or_else(|| GgufError::MissingMetadata {
+                path: gguf_ref.path().display().to_string(),
+                key: format!("{pfx}.attention.head_count"),
+            })?;
         let n_head_kv = gguf_ref
             .get_meta(&format!("{pfx}.attention.head_count_kv"))
-            .and_then(|v| v.as_usize())
+            .and_then(|v| {
+                v.as_usize().or_else(|| {
+                    v.as_usize_array()
+                        .and_then(|a| a.iter().copied().find(|&x| x > 0))
+                })
+            })
             .unwrap_or(n_head);
         let head_dim = gguf_ref
             .get_meta(&format!("{pfx}.attention.key_length"))
@@ -774,18 +1009,64 @@ impl Qwen35VkRunner {
             },
         }
 
+        enum PendingMoeExperts<'a> {
+            Separate {
+                gate: PendingMat3D<'a>,
+                up: PendingMat3D<'a>,
+                down: PendingMat3D<'a>,
+            },
+            FusedGateUp {
+                gate_up: PendingMat3D<'a>,
+                down: PendingMat3D<'a>,
+            },
+        }
+
+        struct PendingSharedExpert<'a> {
+            n_ff_shexp: usize,
+            w_gate: PendingMat<'a>,
+            w_up: PendingMat<'a>,
+            w_down: PendingMat<'a>,
+            w_gate_inp_1d: Option<PendingMat<'a>>,
+        }
+
+        struct PendingMoeFfn<'a> {
+            n_expert: usize,
+            n_expert_used: usize,
+            n_ff_exp: usize,
+            gating_func: u32,
+            norm_weights: bool,
+            norm_weights_eps: f32,
+            weights_scale: f32,
+            gate_inp: PendingMat<'a>,
+            gate_inp_bias: Option<PendingF32>,
+            exp_probs_b: Option<PendingF32>,
+            experts: PendingMoeExperts<'a>,
+            shared_expert: Option<Box<PendingSharedExpert<'a>>>,
+        }
+
+        #[allow(clippy::large_enum_variant)]
+        enum PendingLayerFfn<'a> {
+            Dense {
+                w_gate: PendingMat<'a>,
+                w_up: PendingMat<'a>,
+                w_down: PendingMat<'a>,
+            },
+            Moe(Box<PendingMoeFfn<'a>>),
+        }
+
         struct PendingLayer<'a> {
             attn_norm: PendingF32,
             post_attn_norm: PendingF32,
             attn: PendingAttn<'a>,
-            w_gate: PendingMat<'a>,
-            w_up: PendingMat<'a>,
-            w_down: PendingMat<'a>,
+            ffn: PendingLayerFfn<'a>,
         }
 
         let mut p_layers = Vec::with_capacity(n_layers);
         let mut n_gdn_layers = 0usize;
         let mut n_full_attn_layers = 0usize;
+        let mut max_n_ff_exp_seen = 0usize;
+        let mut max_n_ff_shexp_seen = 0usize;
+        let mut any_moe_shexp_1d_gate = false;
         for l in 0..n_layers {
             let ltag = format!("blk.{l}");
             let attn_norm = plan_f32_tensor(
@@ -946,37 +1227,218 @@ impl Qwen35VkRunner {
                 }
             };
 
+            let gate_inp_name = format!("{ltag}.ffn_gate_inp.weight");
+            let ffn = if let Some(ref mp) = moe_params
+                && l >= mp.n_layer_dense_lead
+                && gguf_ref.tensor_info(&gate_inp_name).is_some()
+            {
+                let n_exp = mp.n_expert;
+                let k_used = mp.n_expert_used;
+                let down_exps_name = format!("{ltag}.ffn_down_exps.weight");
+                let down_ti = gguf_ref.tensor_info(&down_exps_name).ok_or_else(|| {
+                    GgufError::MissingTensor {
+                        path: gguf_ref.path().display().to_string(),
+                        tensor: down_exps_name.clone(),
+                        layer: ltag.clone(),
+                    }
+                })?;
+                let n_ff_exp = if mp.n_ff_exp_per_layer[l] > 0 {
+                    mp.n_ff_exp_per_layer[l]
+                } else {
+                    down_ti.dims[0]
+                };
+                max_n_ff_exp_seen = max_n_ff_exp_seen.max(n_ff_exp);
+                let gate_inp = plan_mat(
+                    &mut planner,
+                    gguf_ref,
+                    &gate_inp_name,
+                    &ltag,
+                    n_embd,
+                    n_exp,
+                    false,
+                )?;
+                let gate_inp_bias = plan_opt_f32_vec(
+                    &mut planner,
+                    gguf_ref,
+                    &format!("{ltag}.ffn_gate_inp.bias"),
+                    &ltag,
+                    n_exp,
+                )?;
+                let exp_probs_b = plan_opt_f32_vec(
+                    &mut planner,
+                    gguf_ref,
+                    &format!("{ltag}.exp_probs_b.bias"),
+                    &ltag,
+                    n_exp,
+                )?;
+                let fused_gu_name = format!("{ltag}.ffn_gate_up_exps.weight");
+                let experts = if gguf_ref.tensor_info(&fused_gu_name).is_some() {
+                    let gate_up = plan_mat_3d(
+                        &mut planner,
+                        gguf_ref,
+                        &fused_gu_name,
+                        &ltag,
+                        n_embd,
+                        2 * n_ff_exp,
+                        n_exp,
+                    )?;
+                    let down = plan_mat_3d(
+                        &mut planner,
+                        gguf_ref,
+                        &down_exps_name,
+                        &ltag,
+                        n_ff_exp,
+                        n_embd,
+                        n_exp,
+                    )?;
+                    PendingMoeExperts::FusedGateUp { gate_up, down }
+                } else {
+                    let gate = plan_mat_3d(
+                        &mut planner,
+                        gguf_ref,
+                        &format!("{ltag}.ffn_gate_exps.weight"),
+                        &ltag,
+                        n_embd,
+                        n_ff_exp,
+                        n_exp,
+                    )?;
+                    let up = plan_mat_3d(
+                        &mut planner,
+                        gguf_ref,
+                        &format!("{ltag}.ffn_up_exps.weight"),
+                        &ltag,
+                        n_embd,
+                        n_ff_exp,
+                        n_exp,
+                    )?;
+                    let down = plan_mat_3d(
+                        &mut planner,
+                        gguf_ref,
+                        &down_exps_name,
+                        &ltag,
+                        n_ff_exp,
+                        n_embd,
+                        n_exp,
+                    )?;
+                    PendingMoeExperts::Separate { gate, up, down }
+                };
+                let shexp_gate_name = format!("{ltag}.ffn_gate_shexp.weight");
+                let shared_expert = if let Some(sh_ti) = gguf_ref.tensor_info(&shexp_gate_name) {
+                    let ff_sh = sh_ti.dims[1];
+                    max_n_ff_shexp_seen = max_n_ff_shexp_seen.max(ff_sh);
+                    let w_gate = plan_mat(
+                        &mut planner,
+                        gguf_ref,
+                        &shexp_gate_name,
+                        &ltag,
+                        n_embd,
+                        ff_sh,
+                        use_q4_soa,
+                    )?;
+                    let w_up = plan_mat(
+                        &mut planner,
+                        gguf_ref,
+                        &format!("{ltag}.ffn_up_shexp.weight"),
+                        &ltag,
+                        n_embd,
+                        ff_sh,
+                        use_q4_soa,
+                    )?;
+                    let w_down = plan_mat(
+                        &mut planner,
+                        gguf_ref,
+                        &format!("{ltag}.ffn_down_shexp.weight"),
+                        &ltag,
+                        ff_sh,
+                        n_embd,
+                        use_q4_soa,
+                    )?;
+                    let gi_name = format!("{ltag}.ffn_gate_inp_shexp.weight");
+                    let w_gate_inp_1d = if gguf_ref.tensor_info(&gi_name).is_some() {
+                        any_moe_shexp_1d_gate = true;
+                        let (gi_info, gi_raw) = gguf_ref.req_tensor(&gi_name, &ltag, &[n_embd])?;
+                        let (eff_dt, gi_bytes) =
+                            normalize_vk_mat_bytes(gi_info.dtype, gi_raw, 1, n_embd)?;
+                        let _ = dtype_code(eff_dt)?;
+                        let row_bytes = eff_dt.row_bytes(n_embd);
+                        let slice = planner.reserve(gi_bytes.len() as u64)?;
+                        Some(PendingMat {
+                            slice,
+                            bytes: gi_bytes,
+                            imported: false,
+                            mat: VkMat {
+                                slice,
+                                soa_d: None,
+                                dtype: eff_dt,
+                                rows: 1,
+                                cols: n_embd,
+                                row_bytes,
+                            },
+                        })
+                    } else {
+                        None
+                    };
+                    Some(Box::new(PendingSharedExpert {
+                        n_ff_shexp: ff_sh,
+                        w_gate,
+                        w_up,
+                        w_down,
+                        w_gate_inp_1d,
+                    }))
+                } else {
+                    None
+                };
+                PendingLayerFfn::Moe(Box::new(PendingMoeFfn {
+                    n_expert: n_exp,
+                    n_expert_used: k_used,
+                    n_ff_exp,
+                    gating_func: mp.gating_func,
+                    norm_weights: mp.norm_weights,
+                    norm_weights_eps: mp.norm_weights_eps,
+                    weights_scale: mp.weights_scale,
+                    gate_inp,
+                    gate_inp_bias,
+                    exp_probs_b,
+                    experts,
+                    shared_expert,
+                }))
+            } else {
+                PendingLayerFfn::Dense {
+                    w_gate: plan_mat(
+                        &mut planner,
+                        gguf_ref,
+                        &format!("{ltag}.ffn_gate.weight"),
+                        &ltag,
+                        n_embd,
+                        n_ff,
+                        use_q4_soa,
+                    )?,
+                    w_up: plan_mat(
+                        &mut planner,
+                        gguf_ref,
+                        &format!("{ltag}.ffn_up.weight"),
+                        &ltag,
+                        n_embd,
+                        n_ff,
+                        use_q4_soa,
+                    )?,
+                    w_down: plan_mat(
+                        &mut planner,
+                        gguf_ref,
+                        &format!("{ltag}.ffn_down.weight"),
+                        &ltag,
+                        n_ff,
+                        n_embd,
+                        use_q4_soa,
+                    )?,
+                }
+            };
+
             p_layers.push(PendingLayer {
                 attn_norm,
                 post_attn_norm,
                 attn,
-                w_gate: plan_mat(
-                    &mut planner,
-                    gguf_ref,
-                    &format!("{ltag}.ffn_gate.weight"),
-                    &ltag,
-                    n_embd,
-                    n_ff,
-                    use_q4_soa,
-                )?,
-                w_up: plan_mat(
-                    &mut planner,
-                    gguf_ref,
-                    &format!("{ltag}.ffn_up.weight"),
-                    &ltag,
-                    n_embd,
-                    n_ff,
-                    use_q4_soa,
-                )?,
-                w_down: plan_mat(
-                    &mut planner,
-                    gguf_ref,
-                    &format!("{ltag}.ffn_down.weight"),
-                    &ltag,
-                    n_ff,
-                    n_embd,
-                    use_q4_soa,
-                )?,
+                ffn,
             });
         }
 
@@ -985,16 +1447,26 @@ impl Qwen35VkRunner {
         } else {
             info.device_local_bytes * 97 / 100
         };
+        let hb_dim = n_ff.max(max_n_ff_shexp_seen).max(1);
         let qkv_cap = qg_dim.max(conv_dim);
         let q_cap = q_dim.max(k_gdn_dim);
         let k_cap = kv_dim.max(k_gdn_dim);
         let v_cap = kv_dim.max(v_gdn_dim);
         let gate_cap = q_dim.max(v_gdn_dim);
-        let max_dim = n_ff.max(n_embd).max(qkv_cap);
-        let max_i8_cols = n_embd.max(n_ff).max(gate_cap);
+        let moe_max_single_buf = moe_params.as_ref().map_or(0, |mp| {
+            mp.n_expert_used * n_embd.max(max_n_ff_exp_seen.max(1))
+        });
+        let max_dim = hb_dim.max(n_embd).max(qkv_cap).max(moe_max_single_buf);
+        let max_i8_cols = n_embd.max(hb_dim).max(gate_cap);
         let range_batch_cap =
             ((info.max_storage_buffer_range as usize) / (max_dim * 4 * 2)).max(32);
         let base_bytes = planner.total_bytes();
+        let moe_per_tok = moe_params.as_ref().map_or(0, |mp| {
+            let n_exp = mp.n_expert;
+            let k_used = mp.n_expert_used;
+            let ff_exp = max_n_ff_exp_seen.max(1);
+            3 * n_exp + 2 * k_used + 2 * k_used * ff_exp + k_used * n_embd + n_embd + 2
+        });
         let per_tok_scratch = ((2 * n_embd
             + qkv_cap
             + q_cap
@@ -1002,8 +1474,9 @@ impl Qwen35VkRunner {
             + v_cap
             + 2 * gate_cap
             + 3 * ssm_dt_rank
-            + 2 * n_ff
-            + max_i8_cols)
+            + 2 * hb_dim
+            + max_i8_cols
+            + moe_per_tok)
             * 4) as u64;
         // Cap single-submission batch to 64 on non-CoopMat UMA GPUs (Intel i915, Android Mali,
         // RK3588 Panthor, Pi 5 V3D) so per-submit latency stays well below 500..2000 ms kernel
@@ -1029,9 +1502,62 @@ impl Qwen35VkRunner {
         let s_alpha = planner.reserve((max_batch * ssm_dt_rank * 4) as u64)?;
         let s_beta = planner.reserve((max_batch * ssm_dt_rank * 4) as u64)?;
         let s_g_exp = planner.reserve((max_batch * ssm_dt_rank * 4) as u64)?;
-        let s_hb = planner.reserve((max_batch * n_ff * 4) as u64)?;
-        let s_hb2 = planner.reserve((max_batch * n_ff * 4) as u64)?;
-        let (s_xq, s_xd) = if prefill_kind.uses_q8_1() {
+        let s_hb = planner.reserve((max_batch * hb_dim * 4) as u64)?;
+        let s_hb2 = planner.reserve((max_batch * hb_dim * 4) as u64)?;
+        struct MoeScratchSlices {
+            logits: VkSlice,
+            probs: VkSlice,
+            sel: VkSlice,
+            top_ids: VkSlice,
+            top_w: VkSlice,
+            gate: VkSlice,
+            up: VkSlice,
+            down: VkSlice,
+            shexp_out: Option<VkSlice>,
+            shexp_gate: Option<VkSlice>,
+        }
+        let moe_scratch = if let Some(ref mp) = moe_params {
+            let n_exp = mp.n_expert;
+            let k_used = mp.n_expert_used;
+            let ff_exp = max_n_ff_exp_seen.max(1);
+            Some(MoeScratchSlices {
+                logits: planner.reserve((max_batch * n_exp * 4) as u64)?,
+                probs: planner.reserve((max_batch * n_exp * 4) as u64)?,
+                sel: planner.reserve((max_batch * n_exp * 4) as u64)?,
+                top_ids: planner.reserve((max_batch * k_used * 4) as u64)?,
+                top_w: planner.reserve((max_batch * k_used * 4) as u64)?,
+                gate: planner.reserve((max_batch * k_used * ff_exp * 4) as u64)?,
+                up: planner.reserve((max_batch * k_used * ff_exp * 4) as u64)?,
+                down: planner.reserve((max_batch * k_used * n_embd * 4) as u64)?,
+                shexp_out: if any_moe_shexp_1d_gate {
+                    Some(planner.reserve((max_batch * n_embd * 4) as u64)?)
+                } else {
+                    None
+                },
+                shexp_gate: if any_moe_shexp_1d_gate {
+                    Some(planner.reserve((max_batch * 4) as u64)?)
+                } else {
+                    None
+                },
+            })
+        } else {
+            None
+        };
+        let p_bias_ones = {
+            let slice = planner.reserve((max_batch * 4) as u64)?;
+            PendingF32 {
+                slice,
+                vals: vec![1.0f32; max_batch],
+            }
+        };
+        let use_dp4a_dec = dp4a_decode_enabled(
+            prefill_kind,
+            info.int8_dot_accelerated,
+            n_embd,
+            hb_dim,
+            gate_cap,
+        );
+        let (s_xq, s_xd) = if prefill_kind.uses_q8_1() || use_dp4a_dec {
             let max_blocks = (max_batch * max_i8_cols) / 32;
             (
                 Some(planner.reserve((max_blocks * 32) as u64)?),
@@ -1095,12 +1621,20 @@ impl Qwen35VkRunner {
             }
         };
 
+        let write_mat_3d = |pm: &PendingMat3D<'_>| -> Result<(), VulkanError> {
+            if pm.imported {
+                return Ok(());
+            }
+            ctx.write_bytes(&slabs[pm.slice.slab], pm.slice.offset, &pm.bytes)
+        };
+
         write_mat(&p_token_embd)?;
         if let Some(ref po) = p_output {
             write_mat(po)?;
         }
         write_f32(&p_output_norm)?;
         write_f32(&dummy_rope_freqs)?;
+        write_f32(&p_bias_ones)?;
         for pl in &p_layers {
             write_f32(&pl.attn_norm)?;
             write_f32(&pl.post_attn_norm)?;
@@ -1144,9 +1678,45 @@ impl Qwen35VkRunner {
                     write_mat(wo)?;
                 }
             }
-            write_mat(&pl.w_gate)?;
-            write_mat(&pl.w_up)?;
-            write_mat(&pl.w_down)?;
+            match &pl.ffn {
+                PendingLayerFfn::Dense {
+                    w_gate,
+                    w_up,
+                    w_down,
+                } => {
+                    write_mat(w_gate)?;
+                    write_mat(w_up)?;
+                    write_mat(w_down)?;
+                }
+                PendingLayerFfn::Moe(m) => {
+                    write_mat(&m.gate_inp)?;
+                    if let Some(ref gb) = m.gate_inp_bias {
+                        write_f32(gb)?;
+                    }
+                    if let Some(ref epb) = m.exp_probs_b {
+                        write_f32(epb)?;
+                    }
+                    match &m.experts {
+                        PendingMoeExperts::Separate { gate, up, down } => {
+                            write_mat_3d(gate)?;
+                            write_mat_3d(up)?;
+                            write_mat_3d(down)?;
+                        }
+                        PendingMoeExperts::FusedGateUp { gate_up, down } => {
+                            write_mat_3d(gate_up)?;
+                            write_mat_3d(down)?;
+                        }
+                    }
+                    if let Some(ref sh) = m.shared_expert {
+                        write_mat(&sh.w_gate)?;
+                        write_mat(&sh.w_up)?;
+                        write_mat(&sh.w_down)?;
+                        if let Some(ref gi) = sh.w_gate_inp_1d {
+                            write_mat(gi)?;
+                        }
+                    }
+                }
+            }
         }
 
         let step_buf = ctx.create_host_buffer(32)?;
@@ -1225,11 +1795,34 @@ impl Qwen35VkRunner {
             ),
         };
 
-        let quant_q8_1 = if prefill_kind.uses_q8_1() {
+        let quant_q8_1 = if prefill_kind.uses_q8_1() || use_dp4a_dec {
             Some(ctx.pipeline("quantize_q8_1", 256, SPV_QUANTIZE_Q8_1, 3, 4, &[256])?)
         } else {
             None
         };
+        let rms_norm_q8_1 = if use_dp4a_dec {
+            Some(ctx.pipeline("rms_norm_q8_1", 256, SPV_RMS_NORM_Q8_1, 5, 12, &[256])?)
+        } else {
+            None
+        };
+        let sigmoid_mul_q8_1 = if use_dp4a_dec && (n_head * head_dim).is_multiple_of(32) {
+            Some(ctx.pipeline("sigmoid_mul_q8_1", 256, SPV_SIGMOID_MUL_Q8_1, 4, 4, &[256])?)
+        } else {
+            None
+        };
+        let gdn_norm_gated_silu_q8_1 =
+            if use_dp4a_dec && ssm_state_size.is_multiple_of(32) && ssm_state_size <= 256 {
+                Some(ctx.pipeline(
+                    "gdn_norm_gated_silu_q8_1",
+                    128,
+                    SPV_GDN_NORM_GATED_SILU_Q8_1,
+                    5,
+                    12,
+                    &[128],
+                )?)
+            } else {
+                None
+            };
         let used_lds_recurrence = !info.subgroup_shuffle || ctx.force_lds_recurrence();
         let gdn_recurrence_pipe = if used_lds_recurrence {
             ctx.pipeline(
@@ -1255,9 +1848,11 @@ impl Qwen35VkRunner {
                 &[64, emb_dt, 1],
             )?,
             rms_norm: ctx.pipeline("rms_norm", 0, SPV_RMS_NORM, 3, 12, &[256])?,
+            rms_norm_q8_1,
             qk_norm: ctx.pipeline("qk_norm", 0, SPV_QK_NORM, 2, 8, &[64])?,
             split_qg_qnorm: ctx.pipeline("split_qg_qnorm", 64, SPV_SPLIT_QG_QNORM, 4, 12, &[64])?,
             sigmoid_mul: ctx.pipeline("sigmoid_mul", 256, SPV_SIGMOID_MUL, 2, 4, &[256])?,
+            sigmoid_mul_q8_1,
             rope_dec: ctx.pipeline(rope_dec_name, 0, rope_spv, 7, 32, &[64, 0])?,
             rope_batch: ctx.pipeline(rope_batch_name, 1, rope_spv, 7, 32, &[64, 1])?,
             attn_dec: ctx.pipeline(
@@ -1271,6 +1866,14 @@ impl Qwen35VkRunner {
             attn_batch,
             attn_batch_kind,
             gdn_gates: ctx.pipeline("gdn_gates", 64, SPV_GDN_GATES, 5, 8, &[64])?,
+            gdn_prep_decode: ctx.pipeline(
+                "gdn_prep_decode",
+                128,
+                SPV_GDN_PREP_DECODE,
+                11,
+                24,
+                &[128],
+            )?,
             gdn_conv_silu_l2: ctx.pipeline(
                 "gdn_conv_silu_l2",
                 128,
@@ -1304,9 +1907,13 @@ impl Qwen35VkRunner {
                 12,
                 &[64],
             )?,
+            gdn_norm_gated_silu_q8_1,
             silu_mul: ctx.pipeline("silu_mul", 0, SPV_SILU_MUL, 2, 4, &[256])?,
             quant_q8_1,
             argmax: ctx.pipeline("argmax", 0, SPV_ARGMAX, 2, 4, &[256])?,
+            add_bias: ctx.pipeline("add_bias_axpy", 256, SPV_ADD_BIAS_AXPY, 3, 20, &[256])?,
+            moe_router: ctx.pipeline("moe_router_topk", 64, SPV_MOE_ROUTER_TOPK, 6, 32, &[64])?,
+            moe_reduce: ctx.pipeline("moe_reduce", 256, SPV_MOE_REDUCE, 3, 16, &[256])?,
         };
 
         let gemv_pipe_for = |mat: &VkMat| -> Result<(Arc<Pipeline>, u32, [u32; 4]), VulkanError> {
@@ -1327,8 +1934,8 @@ impl Qwen35VkRunner {
         };
 
         // 4. Allocate static descriptor pool, command pool, pre-bound descriptor sets.
-        let max_sets = (n_layers as u32) * 40 + 32;
-        let max_desc = max_sets * 10;
+        let max_sets = (n_layers as u32) * 64 + 64;
+        let max_desc = max_sets * 12;
         let d = &ctx.inner.device;
         // SAFETY: valid device handle; pools and fence destroyed in `Drop` after `device_wait_idle`.
         let (desc_pool, cmd_pool, cbs, fence) = unsafe {
@@ -1414,11 +2021,90 @@ impl Qwen35VkRunner {
                 }
             };
 
+        let mk_bias_set = |bias_opt: &Option<PendingF32>,
+                           y_slice: VkSlice|
+         -> Result<Option<vk::DescriptorSet>, VulkanError> {
+            if let Some(b) = bias_opt {
+                Ok(Some(alloc_set(
+                    &pipes.add_bias,
+                    &[
+                        Binding::Arena(b.slice),
+                        Binding::Arena(p_bias_ones.slice),
+                        Binding::Arena(y_slice),
+                    ],
+                )?))
+            } else {
+                Ok(None)
+            }
+        };
+
         let alloc_gemv_call = |mat: &VkMat,
                                x_slice: VkSlice,
                                y_slice: VkSlice,
-                               add_residual: bool|
-         -> Result<GemvCall, VulkanError> {
+                               add_residual: bool,
+                               allow_dp4a: bool|
+         -> Result<(GemvCall, bool), VulkanError> {
+            if allow_dp4a
+                && use_dp4a_dec
+                && mat.cols.is_multiple_of(32)
+                && let (Some(xq), Some(xd)) = (s_xq, s_xd)
+            {
+                if let Some(d_slice) = mat.soa_d {
+                    let wg = 128u32;
+                    let nr = 4u32;
+                    let p = ctx.pipeline(
+                        "gemv_res_q4_0_soa_dp4a",
+                        wg | (nr << 16),
+                        SPV_GEMV_RES_Q4_0_SOA_DP4A,
+                        5,
+                        16,
+                        &[wg, nr],
+                    )?;
+                    let set = alloc_set(
+                        &p,
+                        &[
+                            Binding::Arena(mat.slice),
+                            Binding::Arena(d_slice),
+                            Binding::Arena(xq),
+                            Binding::Arena(xd),
+                            Binding::Arena(y_slice),
+                        ],
+                    )?;
+                    let rows_per_wg = (wg / sg).max(1) * nr;
+                    let groups = (mat.rows as u32).div_ceil(rows_per_wg);
+                    let push = [mat.cols as u32, mat.rows as u32, u32::from(add_residual), 0];
+                    return Ok(((p, set, groups, push), true));
+                }
+                if matches!(
+                    mat.dtype,
+                    DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q5K | DType::Q6K
+                ) {
+                    let dt = dtype_code(mat.dtype)?;
+                    let nr = gemv_nr(mat.dtype);
+                    let wg = 128u32;
+                    let key = dt | (nr << 8) | (wg << 16);
+                    let p =
+                        ctx.pipeline("gemv_dp4a", key, SPV_GEMV_DP4A, 4, 16, &[wg, dt, nr, 1])?;
+                    let set = alloc_set(
+                        &p,
+                        &[
+                            Binding::Arena(mat.slice),
+                            Binding::Arena(xq),
+                            Binding::Arena(xd),
+                            Binding::Arena(y_slice),
+                        ],
+                    )?;
+                    let rows_per_wg = (wg / sg).max(1) * nr;
+                    let groups = (mat.rows as u32).div_ceil(rows_per_wg);
+                    let push = [
+                        mat.cols as u32,
+                        mat.rows as u32,
+                        u32::from(add_residual),
+                        (mat.row_bytes / 2) as u32,
+                    ];
+                    return Ok(((p, set, groups, push), true));
+                }
+            }
             if let Some(d_slice) = mat.soa_d {
                 let wg = 128u32;
                 let nr = 4u32;
@@ -1442,7 +2128,7 @@ impl Qwen35VkRunner {
                 let rows_per_wg = (wg / sg).max(1) * nr;
                 let groups = (mat.rows as u32).div_ceil(rows_per_wg);
                 let push = [mat.cols as u32, mat.rows as u32, u32::from(add_residual), 0];
-                Ok((p, set, groups, push))
+                Ok(((p, set, groups, push), false))
             } else {
                 let (p, g, mut push) = gemv_pipe_for(mat)?;
                 push[2] = u32::from(add_residual);
@@ -1454,7 +2140,7 @@ impl Qwen35VkRunner {
                         Binding::Arena(y_slice),
                     ],
                 )?;
-                Ok((p, set, g, push))
+                Ok(((p, set, g, push), false))
             }
         };
 
@@ -1464,6 +2150,95 @@ impl Qwen35VkRunner {
                              ya_slice: VkSlice,
                              yb_slice: VkSlice|
          -> Result<DecodePairSets, VulkanError> {
+            if use_dp4a_dec && let (Some(xq), Some(xd)) = (s_xq, s_xd) {
+                if let (Some(ad), Some(bd)) = (ma.soa_d, mb.soa_d) {
+                    let nr = if ma.rows.is_multiple_of(4) {
+                        4u32
+                    } else {
+                        2u32
+                    };
+                    if ma.rows.is_multiple_of(nr as usize) {
+                        let wg = 128u32;
+                        let pipe = ctx.pipeline(
+                            "gemv_pair_q4_0_soa_dp4a",
+                            wg | (nr << 16),
+                            SPV_GEMV_PAIR_Q4_0_SOA_DP4A,
+                            8,
+                            16,
+                            &[wg, nr],
+                        )?;
+                        let set = alloc_set(
+                            &pipe,
+                            &[
+                                Binding::Arena(ma.slice),
+                                Binding::Arena(ad),
+                                Binding::Arena(mb.slice),
+                                Binding::Arena(bd),
+                                Binding::Arena(xq),
+                                Binding::Arena(xd),
+                                Binding::Arena(ya_slice),
+                                Binding::Arena(yb_slice),
+                            ],
+                        )?;
+                        let rows_per_wg = (wg / sg).max(1) * nr;
+                        let total_rows = (ma.rows + mb.rows) as u32;
+                        return Ok(DecodePairSets::Fused {
+                            pipe,
+                            set,
+                            groups_x: total_rows.div_ceil(rows_per_wg),
+                            push: [ma.cols as u32, ma.rows as u32, mb.rows as u32, 0],
+                        });
+                    }
+                }
+                if ma.dtype == mb.dtype
+                    && matches!(ma.dtype, DType::Q4_0 | DType::Q8_0 | DType::Q6K)
+                {
+                    let dt = dtype_code(ma.dtype)?;
+                    let nr = if ma.rows.is_multiple_of(4) {
+                        4u32
+                    } else if ma.rows.is_multiple_of(2) {
+                        2u32
+                    } else {
+                        1u32
+                    };
+                    if ma.rows.is_multiple_of(nr as usize) {
+                        let wg = 128u32;
+                        let key = dt | (nr << 8) | (wg << 16);
+                        let pipe = ctx.pipeline(
+                            "gemv_pair_dp4a",
+                            key,
+                            SPV_GEMV_PAIR_DP4A,
+                            6,
+                            16,
+                            &[wg, dt, nr],
+                        )?;
+                        let set = alloc_set(
+                            &pipe,
+                            &[
+                                Binding::Arena(ma.slice),
+                                Binding::Arena(mb.slice),
+                                Binding::Arena(xq),
+                                Binding::Arena(xd),
+                                Binding::Arena(ya_slice),
+                                Binding::Arena(yb_slice),
+                            ],
+                        )?;
+                        let rows_per_wg = (wg / sg).max(1) * nr;
+                        let total_rows = (ma.rows + mb.rows) as u32;
+                        return Ok(DecodePairSets::Fused {
+                            pipe,
+                            set,
+                            groups_x: total_rows.div_ceil(rows_per_wg),
+                            push: [
+                                ma.cols as u32,
+                                ma.rows as u32,
+                                mb.rows as u32,
+                                (ma.row_bytes / 2) as u32,
+                            ],
+                        });
+                    }
+                }
+            }
             if let (Some(ad), Some(bd)) = (ma.soa_d, mb.soa_d) {
                 let nr = if ma.rows.is_multiple_of(4) {
                     4u32
@@ -1544,8 +2319,8 @@ impl Qwen35VkRunner {
                 }
             }
             Ok(DecodePairSets::Separate {
-                a: alloc_gemv_call(&ma, x_slice, ya_slice, false)?,
-                b: alloc_gemv_call(&mb, x_slice, yb_slice, false)?,
+                a: alloc_gemv_call(&ma, x_slice, ya_slice, false, true)?.0,
+                b: alloc_gemv_call(&mb, x_slice, yb_slice, false, true)?.0,
             })
         };
 
@@ -1769,7 +2544,23 @@ impl Qwen35VkRunner {
                 Binding::Arena(s_xb),
             ],
         )?;
-        let lm_head_dec = alloc_gemv_call(&out_mat, s_xb, logits_dev, false)?;
+        let output_norm_dec_set =
+            if let (Some(p_nq), Some(xq), Some(xd)) = (&pipes.rms_norm_q8_1, s_xq, s_xd) {
+                alloc_set(
+                    p_nq,
+                    &[
+                        Binding::Arena(s_x),
+                        Binding::Arena(p_output_norm.slice),
+                        Binding::Arena(s_xb),
+                        Binding::Arena(xq),
+                        Binding::Arena(xd),
+                    ],
+                )?
+            } else {
+                output_norm_set
+            };
+        let (lm_head_dec, lm_head_dec_q8) =
+            alloc_gemv_call(&out_mat, s_xb, logits_dev, false, true)?;
         let argmax_set = alloc_set(
             &pipes.argmax,
             &[Binding::Arena(logits_dev), Binding::Raw(&argmax_buf)],
@@ -1831,9 +2622,44 @@ impl Qwen35VkRunner {
                     ));
                 }
             }
-            linear_slots.push(mk_lin_slot(format!("{ltag}.ffn_gate.weight"), s_xb, s_hb));
-            linear_slots.push(mk_lin_slot(format!("{ltag}.ffn_up.weight"), s_xb, s_hb2));
-            linear_slots.push(mk_lin_slot(format!("{ltag}.ffn_down.weight"), s_hb, s_x));
+            match &pl.ffn {
+                PendingLayerFfn::Dense { .. } => {
+                    linear_slots.push(mk_lin_slot(format!("{ltag}.ffn_gate.weight"), s_xb, s_hb));
+                    linear_slots.push(mk_lin_slot(format!("{ltag}.ffn_up.weight"), s_xb, s_hb2));
+                    linear_slots.push(mk_lin_slot(format!("{ltag}.ffn_down.weight"), s_hb, s_x));
+                }
+                PendingLayerFfn::Moe(m) => {
+                    if let Some(ref ms) = moe_scratch {
+                        linear_slots.push(mk_lin_slot(
+                            format!("{ltag}.ffn_gate_inp.weight"),
+                            s_xb,
+                            ms.logits,
+                        ));
+                        if let Some(ref sh) = m.shared_expert {
+                            linear_slots.push(mk_lin_slot(
+                                format!("{ltag}.ffn_gate_shexp.weight"),
+                                s_xb,
+                                s_hb,
+                            ));
+                            linear_slots.push(mk_lin_slot(
+                                format!("{ltag}.ffn_up_shexp.weight"),
+                                s_xb,
+                                s_hb2,
+                            ));
+                            let sh_dst = if sh.w_gate_inp_1d.is_some() {
+                                ms.shexp_out.unwrap_or(s_x)
+                            } else {
+                                s_x
+                            };
+                            linear_slots.push(mk_lin_slot(
+                                format!("{ltag}.ffn_down_shexp.weight"),
+                                s_hb,
+                                sh_dst,
+                            ));
+                        }
+                    }
+                }
+            }
             let attn_norm_set = alloc_set(
                 &pipes.rms_norm,
                 &[
@@ -1842,6 +2668,21 @@ impl Qwen35VkRunner {
                     Binding::Arena(s_xb),
                 ],
             )?;
+            let attn_norm_dec_set =
+                if let (Some(p_nq), Some(xq), Some(xd)) = (&pipes.rms_norm_q8_1, s_xq, s_xd) {
+                    alloc_set(
+                        p_nq,
+                        &[
+                            Binding::Arena(s_x),
+                            Binding::Arena(pl.attn_norm.slice),
+                            Binding::Arena(s_xb),
+                            Binding::Arena(xq),
+                            Binding::Arena(xd),
+                        ],
+                    )?
+                } else {
+                    attn_norm_set
+                };
 
             let attn_plan = match &pl.attn {
                 PendingAttn::Gdn {
@@ -1886,6 +2727,22 @@ impl Qwen35VkRunner {
                             Binding::Arena(s_v),
                         ],
                     )?;
+                    let prep_dec_set = alloc_set(
+                        &pipes.gdn_prep_decode,
+                        &[
+                            Binding::Arena(s_qkv),
+                            Binding::Arena(conv1d.slice),
+                            Binding::Arena(*conv_hist_slice),
+                            Binding::Arena(s_q),
+                            Binding::Arena(s_k),
+                            Binding::Arena(s_v),
+                            Binding::Arena(s_alpha),
+                            Binding::Arena(s_beta),
+                            Binding::Arena(ssm_dt_bias.slice),
+                            Binding::Arena(ssm_a.slice),
+                            Binding::Arena(s_g_exp),
+                        ],
+                    )?;
                     let recur_set = alloc_set(
                         &pipes.gdn_recurrence,
                         &[
@@ -1907,8 +2764,28 @@ impl Qwen35VkRunner {
                         ],
                     )?;
 
-                    let (p_out, s_out, g_out, push_out) =
-                        alloc_gemv_call(&w_out.mat, s_attn_out, s_x, true)?;
+                    let ((p_out, s_out, g_out, push_out), w_out_dec_q8) =
+                        alloc_gemv_call(&w_out.mat, s_attn_out, s_x, true, true)?;
+                    let (gnorm_dec_set, gnorm_dec_fused_q8) = if w_out_dec_q8
+                        && let (Some(p_gnq), Some(xq), Some(xd)) =
+                            (&pipes.gdn_norm_gated_silu_q8_1, s_xq, s_xd)
+                    {
+                        (
+                            alloc_set(
+                                p_gnq,
+                                &[
+                                    Binding::Arena(s_attn_out),
+                                    Binding::Arena(ssm_norm.slice),
+                                    Binding::Arena(s_gate),
+                                    Binding::Arena(xq),
+                                    Binding::Arena(xd),
+                                ],
+                            )?,
+                            true,
+                        )
+                    } else {
+                        (gnorm_set, false)
+                    };
                     let w_out_batch = make_batch_gemm(w_out.mat, s_attn_out, s_x)?;
 
                     AttnLayerPlan::Gdn {
@@ -1920,9 +2797,13 @@ impl Qwen35VkRunner {
                         w_beta_batch,
                         gates_set,
                         conv_set,
+                        prep_dec_set,
                         recur_set,
                         gnorm_set,
+                        gnorm_dec_set,
+                        gnorm_dec_fused_q8,
                         w_out_dec: (p_out, s_out, g_out, push_out),
+                        w_out_dec_q8,
                         w_out_batch,
                         state_slice: *state_slice,
                         conv_hist_slice: *conv_hist_slice,
@@ -1943,7 +2824,107 @@ impl Qwen35VkRunner {
                     k_cache,
                     v_cache,
                 } => {
-                    let qkv_dec = if let (Some(qd), Some(kd), Some(vd)) =
+                    let qkv_dec = if use_dp4a_dec
+                        && let (Some(xq), Some(xd)) = (s_xq, s_xd)
+                        && let (Some(qd), Some(kd), Some(vd)) =
+                            (wqg.mat.soa_d, wk.mat.soa_d, wv.mat.soa_d)
+                        && wqg.mat.rows.is_multiple_of(2)
+                        && wk.mat.rows.is_multiple_of(2)
+                    {
+                        let wg = 128u32;
+                        let nr = if wqg.mat.rows.is_multiple_of(4) && wk.mat.rows.is_multiple_of(4)
+                        {
+                            4u32
+                        } else {
+                            2u32
+                        };
+                        let pipe = ctx.pipeline(
+                            "gemv_qkv_q4_0_soa_dp4a",
+                            wg | (nr << 16),
+                            SPV_GEMV_QKV_Q4_0_SOA_DP4A,
+                            11,
+                            16,
+                            &[wg, nr],
+                        )?;
+                        let set = alloc_set(
+                            &pipe,
+                            &[
+                                Binding::Arena(wqg.slice),
+                                Binding::Arena(qd),
+                                Binding::Arena(wk.slice),
+                                Binding::Arena(kd),
+                                Binding::Arena(wv.slice),
+                                Binding::Arena(vd),
+                                Binding::Arena(xq),
+                                Binding::Arena(xd),
+                                Binding::Arena(s_qkv),
+                                Binding::Arena(s_k),
+                                Binding::Arena(s_v),
+                            ],
+                        )?;
+                        let total_rows = (wqg.mat.rows + wk.mat.rows + wv.mat.rows) as u32;
+                        let rows_per_wg = (wg / sg).max(1) * nr;
+                        DecodeQkvSets::Fused {
+                            pipe,
+                            set,
+                            groups_x: total_rows.div_ceil(rows_per_wg),
+                            push: [
+                                wqg.mat.cols as u32,
+                                wqg.mat.rows as u32,
+                                wk.mat.rows as u32,
+                                wv.mat.rows as u32,
+                            ],
+                        }
+                    } else if use_dp4a_dec
+                        && let (Some(xq), Some(xd)) = (s_xq, s_xd)
+                        && wqg.mat.dtype == DType::Q4_0
+                        && wk.mat.dtype == DType::Q4_0
+                        && wv.mat.dtype == DType::Q4_0
+                        && wqg.mat.rows.is_multiple_of(2)
+                        && wk.mat.rows.is_multiple_of(2)
+                    {
+                        let wg = 128u32;
+                        let nr = if wqg.mat.rows.is_multiple_of(4) && wk.mat.rows.is_multiple_of(4)
+                        {
+                            4u32
+                        } else {
+                            2u32
+                        };
+                        let pipe = ctx.pipeline(
+                            "gemv_qkv_q4_0_dp4a",
+                            wg | (nr << 16),
+                            SPV_GEMV_QKV_Q4_0_DP4A,
+                            8,
+                            16,
+                            &[wg, nr],
+                        )?;
+                        let set = alloc_set(
+                            &pipe,
+                            &[
+                                Binding::Arena(wqg.slice),
+                                Binding::Arena(wk.slice),
+                                Binding::Arena(wv.slice),
+                                Binding::Arena(xq),
+                                Binding::Arena(xd),
+                                Binding::Arena(s_qkv),
+                                Binding::Arena(s_k),
+                                Binding::Arena(s_v),
+                            ],
+                        )?;
+                        let total_rows = (wqg.mat.rows + wk.mat.rows + wv.mat.rows) as u32;
+                        let rows_per_wg = (wg / sg).max(1) * nr;
+                        DecodeQkvSets::Fused {
+                            pipe,
+                            set,
+                            groups_x: total_rows.div_ceil(rows_per_wg),
+                            push: [
+                                wqg.mat.cols as u32,
+                                wqg.mat.rows as u32,
+                                wk.mat.rows as u32,
+                                wv.mat.rows as u32,
+                            ],
+                        }
+                    } else if let (Some(qd), Some(kd), Some(vd)) =
                         (wqg.mat.soa_d, wk.mat.soa_d, wv.mat.soa_d)
                         && wqg.mat.rows.is_multiple_of(2)
                         && wk.mat.rows.is_multiple_of(2)
@@ -2028,9 +3009,9 @@ impl Qwen35VkRunner {
                         }
                     } else {
                         DecodeQkvSets::Separate {
-                            wqg: alloc_gemv_call(&wqg.mat, s_xb, s_qkv, false)?,
-                            wk: alloc_gemv_call(&wk.mat, s_xb, s_k, false)?,
-                            wv: alloc_gemv_call(&wv.mat, s_xb, s_v, false)?,
+                            wqg: alloc_gemv_call(&wqg.mat, s_xb, s_qkv, false, true)?.0,
+                            wk: alloc_gemv_call(&wk.mat, s_xb, s_k, false, true)?.0,
+                            wv: alloc_gemv_call(&wv.mat, s_xb, s_v, false, true)?.0,
                         }
                     };
 
@@ -2101,8 +3082,27 @@ impl Qwen35VkRunner {
                         &[Binding::Arena(s_attn_out), Binding::Arena(s_gate)],
                     )?;
 
-                    let (p_wo, s_wo, g_wo, push_wo) =
-                        alloc_gemv_call(&wo.mat, s_attn_out, s_x, true)?;
+                    let ((p_wo, s_wo, g_wo, push_wo), wo_dec_q8) =
+                        alloc_gemv_call(&wo.mat, s_attn_out, s_x, true, true)?;
+                    let (sigmoid_dec_set, sigmoid_dec_fused_q8) = if wo_dec_q8
+                        && let (Some(p_sq), Some(xq), Some(xd)) =
+                            (&pipes.sigmoid_mul_q8_1, s_xq, s_xd)
+                    {
+                        (
+                            alloc_set(
+                                p_sq,
+                                &[
+                                    Binding::Arena(s_attn_out),
+                                    Binding::Arena(s_gate),
+                                    Binding::Arena(xq),
+                                    Binding::Arena(xd),
+                                ],
+                            )?,
+                            true,
+                        )
+                    } else {
+                        (sigmoid_set, false)
+                    };
                     let wo_batch = make_batch_gemm(wo.mat, s_attn_out, s_x)?;
 
                     AttnLayerPlan::FullAttn {
@@ -2117,7 +3117,10 @@ impl Qwen35VkRunner {
                         attn_dec_set,
                         attn_batch_set,
                         sigmoid_set,
+                        sigmoid_dec_set,
+                        sigmoid_dec_fused_q8,
                         wo_dec: (p_wo, s_wo, g_wo, push_wo),
+                        wo_dec_q8,
                         wo_batch,
                         k_cache_slice: *k_cache,
                         v_cache_slice: *v_cache,
@@ -2135,153 +3138,483 @@ impl Qwen35VkRunner {
                     Binding::Arena(s_xb),
                 ],
             )?;
+            let post_attn_norm_dec_set =
+                if let (Some(p_nq), Some(xq), Some(xd)) = (&pipes.rms_norm_q8_1, s_xq, s_xd) {
+                    alloc_set(
+                        p_nq,
+                        &[
+                            Binding::Arena(s_x),
+                            Binding::Arena(pl.post_attn_norm.slice),
+                            Binding::Arena(s_xb),
+                            Binding::Arena(xq),
+                            Binding::Arena(xd),
+                        ],
+                    )?
+                } else {
+                    post_attn_norm_set
+                };
 
-            let ffn_dec_sep = {
-                let g_call = alloc_gemv_call(&pl.w_gate.mat, s_xb, s_hb, false)?;
-                let u_call = alloc_gemv_call(&pl.w_up.mat, s_xb, s_hb2, false)?;
-                let silu_set = alloc_set(
-                    &pipes.silu_mul,
-                    &[Binding::Arena(s_hb), Binding::Arena(s_hb2)],
-                )?;
-                (g_call, u_call, silu_set)
+            let (ffn_plan, gate_up_weight_bytes, down_weight_bytes, active_ff_dim) = match &pl.ffn {
+                PendingLayerFfn::Dense {
+                    w_gate,
+                    w_up,
+                    w_down,
+                } => {
+                    let ffn_dec_sep = {
+                        let g_call = alloc_gemv_call(&w_gate.mat, s_xb, s_hb, false, true)?.0;
+                        let u_call = alloc_gemv_call(&w_up.mat, s_xb, s_hb2, false, true)?.0;
+                        let silu_set = alloc_set(
+                            &pipes.silu_mul,
+                            &[Binding::Arena(s_hb), Binding::Arena(s_hb2)],
+                        )?;
+                        (g_call, u_call, silu_set)
+                    };
+
+                    let ffn_dec = if use_dp4a_dec
+                        && let (Some(xq), Some(xd)) = (s_xq, s_xd)
+                        && let (Some(gd), Some(ud)) = (w_gate.mat.soa_d, w_up.mat.soa_d)
+                    {
+                        let wg = 128u32;
+                        let nr = 2u32;
+                        let pipe = ctx.pipeline(
+                            "gemv_pair_silu_q4_0_soa_dp4a",
+                            wg | (nr << 16),
+                            SPV_GEMV_PAIR_SILU_Q4_0_SOA_DP4A,
+                            7,
+                            8,
+                            &[wg, nr],
+                        )?;
+                        let set = alloc_set(
+                            &pipe,
+                            &[
+                                Binding::Arena(w_gate.slice),
+                                Binding::Arena(gd),
+                                Binding::Arena(w_up.slice),
+                                Binding::Arena(ud),
+                                Binding::Arena(xq),
+                                Binding::Arena(xd),
+                                Binding::Arena(s_hb),
+                            ],
+                        )?;
+                        let rows_per_wg = (wg / sg).max(1) * nr;
+                        DecodeFfnSets::FusedPairSilu {
+                            pipe,
+                            set,
+                            groups_x: (w_gate.mat.rows as u32).div_ceil(rows_per_wg),
+                            push: [w_gate.mat.cols as u32, w_gate.mat.rows as u32],
+                        }
+                    } else if use_dp4a_dec
+                        && let (Some(xq), Some(xd)) = (s_xq, s_xd)
+                        && w_gate.mat.dtype == DType::Q4_0
+                        && w_up.mat.dtype == DType::Q4_0
+                    {
+                        let wg = 128u32;
+                        let nr = 2u32;
+                        let pipe = ctx.pipeline(
+                            "gemv_pair_silu_q4_0_dp4a",
+                            wg | (nr << 16),
+                            SPV_GEMV_PAIR_SILU_Q4_0_DP4A,
+                            5,
+                            8,
+                            &[wg, nr],
+                        )?;
+                        let set = alloc_set(
+                            &pipe,
+                            &[
+                                Binding::Arena(w_gate.slice),
+                                Binding::Arena(w_up.slice),
+                                Binding::Arena(xq),
+                                Binding::Arena(xd),
+                                Binding::Arena(s_hb),
+                            ],
+                        )?;
+                        let rows_per_wg = (wg / sg).max(1) * nr;
+                        DecodeFfnSets::FusedPairSilu {
+                            pipe,
+                            set,
+                            groups_x: (w_gate.mat.rows as u32).div_ceil(rows_per_wg),
+                            push: [w_gate.mat.cols as u32, w_gate.mat.rows as u32],
+                        }
+                    } else if let (Some(gd), Some(ud)) = (w_gate.mat.soa_d, w_up.mat.soa_d) {
+                        let wg = 128u32;
+                        let nr = 2u32;
+                        let pipe = ctx.pipeline(
+                            "gemv_pair_silu_q4_0_soa",
+                            wg | (nr << 16),
+                            SPV_GEMV_PAIR_SILU_Q4_0_SOA,
+                            6,
+                            8,
+                            &[wg, nr],
+                        )?;
+                        let set = alloc_set(
+                            &pipe,
+                            &[
+                                Binding::Arena(w_gate.slice),
+                                Binding::Arena(gd),
+                                Binding::Arena(w_up.slice),
+                                Binding::Arena(ud),
+                                Binding::Arena(s_xb),
+                                Binding::Arena(s_hb),
+                            ],
+                        )?;
+                        let rows_per_wg = (wg / sg).max(1) * nr;
+                        DecodeFfnSets::FusedPairSilu {
+                            pipe,
+                            set,
+                            groups_x: (w_gate.mat.rows as u32).div_ceil(rows_per_wg),
+                            push: [w_gate.mat.cols as u32, w_gate.mat.rows as u32],
+                        }
+                    } else if w_gate.mat.dtype == DType::Q4_0 && w_up.mat.dtype == DType::Q4_0 {
+                        let wg = 128u32;
+                        let nr = 2u32;
+                        let pipe = ctx.pipeline(
+                            "gemv_pair_silu_q4_0",
+                            wg | (nr << 16),
+                            SPV_GEMV_PAIR_SILU_Q4_0,
+                            4,
+                            8,
+                            &[wg, nr],
+                        )?;
+                        let set = alloc_set(
+                            &pipe,
+                            &[
+                                Binding::Arena(w_gate.slice),
+                                Binding::Arena(w_up.slice),
+                                Binding::Arena(s_xb),
+                                Binding::Arena(s_hb),
+                            ],
+                        )?;
+                        let rows_per_wg = (wg / sg).max(1) * nr;
+                        DecodeFfnSets::FusedPairSilu {
+                            pipe,
+                            set,
+                            groups_x: (w_gate.mat.rows as u32).div_ceil(rows_per_wg),
+                            push: [w_gate.mat.cols as u32, w_gate.mat.rows as u32],
+                        }
+                    } else {
+                        DecodeFfnSets::Separate {
+                            gate: ffn_dec_sep.0.clone(),
+                            up: ffn_dec_sep.1.clone(),
+                            silu_set: ffn_dec_sep.2,
+                        }
+                    };
+
+                    let ffn_batch_sep = {
+                        let gate = make_batch_gemm(w_gate.mat, s_xb, s_hb)?;
+                        let up = make_batch_gemm(w_up.mat, s_xb, s_hb2)?;
+                        let silu_set = alloc_set(
+                            &pipes.silu_mul,
+                            &[Binding::Arena(s_hb), Binding::Arena(s_hb2)],
+                        )?;
+                        (gate, up, silu_set)
+                    };
+
+                    let ffn_batch = if prefill_kind == ResolvedPrefill::CoopMatF16
+                        && w_gate.mat.dtype == w_up.mat.dtype
+                        && matches!(w_gate.mat.dtype, DType::Q4_0 | DType::Q4_1 | DType::Q8_0)
+                        && (8 * sg) <= info.max_workgroup_invocations
+                    {
+                        let dt = dtype_code(w_gate.mat.dtype)?;
+                        let cm_wg = 8 * sg;
+                        let pipe = ctx.pipeline(
+                            "gemm_pair_silu_coopmat_f16",
+                            dt | (cm_wg << 8),
+                            SPV_GEMM_PAIR_SILU_COOPMAT_F16,
+                            4,
+                            16,
+                            &[cm_wg, dt],
+                        )?;
+                        let set = alloc_set(
+                            &pipe,
+                            &[
+                                Binding::Arena(w_gate.slice),
+                                Binding::Arena(w_up.slice),
+                                Binding::Arena(s_xb),
+                                Binding::Arena(s_hb),
+                            ],
+                        )?;
+                        BatchFfnPlan::FusedPairSiluCoopMat {
+                            pipe,
+                            set,
+                            cols: w_gate.mat.cols,
+                            rows: w_gate.mat.rows,
+                            row_bytes: w_gate.mat.row_bytes,
+                        }
+                    } else {
+                        let gate = make_batch_gemm(w_gate.mat, s_xb, s_hb)?;
+                        let up = make_batch_gemm(w_up.mat, s_xb, s_hb2)?;
+                        BatchFfnPlan::Separate {
+                            gate,
+                            up,
+                            silu_set: ffn_batch_sep.2,
+                        }
+                    };
+
+                    let (down_dec, down_dec_q8) =
+                        alloc_gemv_call(&w_down.mat, s_hb, s_x, true, true)?;
+                    let down_batch = make_batch_gemm(w_down.mat, s_hb, s_x)?;
+                    let gu_b = w_gate.mat.byte_len() + w_up.mat.byte_len();
+                    let dn_b = w_down.mat.byte_len();
+                    (
+                        Qwen35LayerFfnPlan::Dense {
+                            ffn_dec,
+                            ffn_dec_sep,
+                            ffn_batch,
+                            ffn_batch_sep,
+                            down_dec,
+                            down_dec_q8,
+                            down_batch,
+                        },
+                        gu_b,
+                        dn_b,
+                        n_ff,
+                    )
+                }
+                PendingLayerFfn::Moe(m) => {
+                    let ms = moe_scratch
+                        .as_ref()
+                        .expect("moe_scratch allocated when MoE layers present");
+                    let router_dec =
+                        alloc_gemv_call(&m.gate_inp.mat, s_xb, ms.logits, false, true)?.0;
+                    let router_batch = make_batch_gemm(m.gate_inp.mat, s_xb, ms.logits)?;
+                    let router_bias_set = mk_bias_set(&m.gate_inp_bias, ms.logits)?;
+                    let epb_slice = m.exp_probs_b.as_ref().map_or(ms.logits, |b| b.slice);
+                    let router_topk_set = alloc_set(
+                        &pipes.moe_router,
+                        &[
+                            Binding::Arena(ms.logits),
+                            Binding::Arena(epb_slice),
+                            Binding::Arena(ms.probs),
+                            Binding::Arena(ms.sel),
+                            Binding::Arena(ms.top_ids),
+                            Binding::Arena(ms.top_w),
+                        ],
+                    )?;
+
+                    let mk_indexed = |pm3: &PendingMat3D<'_>,
+                                      n_out: usize,
+                                      intra_off_bytes: usize,
+                                      x_slice: VkSlice,
+                                      y_slice: VkSlice,
+                                      x_tok_stride: usize,
+                                      x_slot_stride: usize,
+                                      scale_by_router: u32|
+                     -> Result<
+                        (Arc<Pipeline>, vk::DescriptorSet, u32, [u32; 9]),
+                        VulkanError,
+                    > {
+                        let dt = dtype_code(pm3.dtype)?;
+                        let wg = 128u32;
+                        let nr = gemv_nr(pm3.dtype);
+                        let key = dt | (nr << 8) | (wg << 16);
+                        let pipe = ctx.pipeline(
+                            "moe_indexed_gemv",
+                            key,
+                            SPV_MOE_INDEXED_GEMV,
+                            5,
+                            36,
+                            &[wg, dt, nr],
+                        )?;
+                        let set = alloc_set(
+                            &pipe,
+                            &[
+                                Binding::Arena(pm3.slice),
+                                Binding::Arena(x_slice),
+                                Binding::Arena(ms.top_ids),
+                                Binding::Arena(ms.top_w),
+                                Binding::Arena(y_slice),
+                            ],
+                        )?;
+                        let rows_per_wg = (wg / sg).max(1) * nr;
+                        let gx = (n_out as u32).div_ceil(rows_per_wg);
+                        let push = [
+                            pm3.cols as u32,
+                            n_out as u32,
+                            (pm3.row_bytes / 2) as u32,
+                            (pm3.exp_stride_bytes / 2) as u32,
+                            (intra_off_bytes / 2) as u32,
+                            m.n_expert_used as u32,
+                            x_tok_stride as u32,
+                            x_slot_stride as u32,
+                            scale_by_router,
+                        ];
+                        Ok((pipe, set, gx, push))
+                    };
+
+                    let (
+                        (gate_pipe, gate_set, gate_gx, gate_push),
+                        (up_pipe, up_set, up_gx, up_push),
+                        (down_pipe, down_set, down_gx, down_push),
+                        mut gu_bytes,
+                        mut dn_bytes,
+                    ) = match &m.experts {
+                        PendingMoeExperts::Separate { gate, up, down } => {
+                            let g = mk_indexed(gate, m.n_ff_exp, 0, s_xb, ms.gate, n_embd, 0, 0)?;
+                            let u = mk_indexed(up, m.n_ff_exp, 0, s_xb, ms.up, n_embd, 0, 0)?;
+                            let dn = mk_indexed(
+                                down,
+                                n_embd,
+                                0,
+                                ms.gate,
+                                ms.down,
+                                m.n_expert_used * m.n_ff_exp,
+                                m.n_ff_exp,
+                                1,
+                            )?;
+                            let gub = m.gate_inp.mat.byte_len()
+                                + ((gate.exp_stride_bytes + up.exp_stride_bytes) * m.n_expert_used)
+                                    as u64;
+                            let dnb = (down.exp_stride_bytes * m.n_expert_used) as u64;
+                            (g, u, dn, gub, dnb)
+                        }
+                        PendingMoeExperts::FusedGateUp { gate_up, down } => {
+                            let half_off = m.n_ff_exp * gate_up.row_bytes;
+                            let g =
+                                mk_indexed(gate_up, m.n_ff_exp, 0, s_xb, ms.gate, n_embd, 0, 0)?;
+                            let u = mk_indexed(
+                                gate_up, m.n_ff_exp, half_off, s_xb, ms.up, n_embd, 0, 0,
+                            )?;
+                            let dn = mk_indexed(
+                                down,
+                                n_embd,
+                                0,
+                                ms.gate,
+                                ms.down,
+                                m.n_expert_used * m.n_ff_exp,
+                                m.n_ff_exp,
+                                1,
+                            )?;
+                            let gub = m.gate_inp.mat.byte_len()
+                                + (gate_up.exp_stride_bytes * m.n_expert_used) as u64;
+                            let dnb = (down.exp_stride_bytes * m.n_expert_used) as u64;
+                            (g, u, dn, gub, dnb)
+                        }
+                    };
+
+                    let silu_set = alloc_set(
+                        &pipes.silu_mul,
+                        &[Binding::Arena(ms.gate), Binding::Arena(ms.up)],
+                    )?;
+                    let reduce_set = alloc_set(
+                        &pipes.moe_reduce,
+                        &[
+                            Binding::Arena(ms.down),
+                            Binding::Arena(ms.top_w),
+                            Binding::Arena(s_x),
+                        ],
+                    )?;
+
+                    let mut active_ff = m.n_expert_used * m.n_ff_exp;
+                    let shared_expert = if let Some(ref sh) = m.shared_expert {
+                        active_ff += sh.n_ff_shexp;
+                        gu_bytes += sh.w_gate.mat.byte_len() + sh.w_up.mat.byte_len();
+                        dn_bytes += sh.w_down.mat.byte_len();
+                        let gate_dec = alloc_gemv_call(&sh.w_gate.mat, s_xb, s_hb, false, true)?.0;
+                        let up_dec = alloc_gemv_call(&sh.w_up.mat, s_xb, s_hb2, false, true)?.0;
+                        let gate_batch = make_batch_gemm(sh.w_gate.mat, s_xb, s_hb)?;
+                        let up_batch = make_batch_gemm(sh.w_up.mat, s_xb, s_hb2)?;
+                        let sh_silu_set = alloc_set(
+                            &pipes.silu_mul,
+                            &[Binding::Arena(s_hb), Binding::Arena(s_hb2)],
+                        )?;
+                        let ((down_dec, down_dec_q8), down_batch, gate_inp_1d) =
+                            if let Some(ref gi) = sh.w_gate_inp_1d {
+                                gu_bytes += gi.mat.byte_len();
+                                let sh_out = ms.shexp_out.expect("shexp_out allocated");
+                                let sh_gate = ms.shexp_gate.expect("shexp_gate allocated");
+                                let dd =
+                                    alloc_gemv_call(&sh.w_down.mat, s_hb, sh_out, false, true)?;
+                                let db = make_batch_gemm(sh.w_down.mat, s_hb, sh_out)?;
+                                // `s_hb` quantization overwrites `(xq, xd)` before `gi_dec`, so keep 1-row `gi_dec` on `s_xb`!
+                                let gi_dec =
+                                    alloc_gemv_call(&gi.mat, s_xb, sh_gate, false, false)?.0;
+                                let gi_batch = make_batch_gemm(gi.mat, s_xb, sh_gate)?;
+                                let gi_red = alloc_set(
+                                    &pipes.moe_reduce,
+                                    &[
+                                        Binding::Arena(sh_out),
+                                        Binding::Arena(sh_gate),
+                                        Binding::Arena(s_x),
+                                    ],
+                                )?;
+                                (dd, db, Some((gi_dec, gi_batch, gi_red)))
+                            } else {
+                                let dd = alloc_gemv_call(&sh.w_down.mat, s_hb, s_x, true, true)?;
+                                let db = make_batch_gemm(sh.w_down.mat, s_hb, s_x)?;
+                                (dd, db, None)
+                            };
+                        Some(Box::new(MoeSharedExpertPlan {
+                            n_ff_shexp: sh.n_ff_shexp,
+                            gate_dec,
+                            up_dec,
+                            down_dec,
+                            down_dec_q8,
+                            gate_batch,
+                            up_batch,
+                            down_batch,
+                            silu_set: sh_silu_set,
+                            gate_inp_1d,
+                        }))
+                    } else {
+                        None
+                    };
+
+                    (
+                        Qwen35LayerFfnPlan::Moe(Box::new(MoeLayerPlan {
+                            n_expert: m.n_expert as u32,
+                            n_expert_used: m.n_expert_used as u32,
+                            n_ff_exp: m.n_ff_exp as u32,
+                            gating_func: m.gating_func,
+                            norm_weights: u32::from(m.norm_weights),
+                            has_exp_probs_b: u32::from(m.exp_probs_b.is_some()),
+                            norm_eps_bits: m.norm_weights_eps.to_bits(),
+                            weights_scale_bits: m.weights_scale.to_bits(),
+                            router_dec,
+                            router_batch,
+                            router_bias_set,
+                            router_topk_set,
+                            gate_pipe,
+                            gate_set,
+                            gate_gx,
+                            gate_push,
+                            up_pipe,
+                            up_set,
+                            up_gx,
+                            up_push,
+                            silu_set,
+                            down_pipe,
+                            down_set,
+                            down_gx,
+                            down_push,
+                            reduce_set,
+                            shared_expert,
+                        })),
+                        gu_bytes,
+                        dn_bytes,
+                        active_ff,
+                    )
+                }
             };
-
-            let ffn_dec = if let (Some(gd), Some(ud)) = (pl.w_gate.mat.soa_d, pl.w_up.mat.soa_d) {
-                let wg = 128u32;
-                let nr = 2u32;
-                let pipe = ctx.pipeline(
-                    "gemv_pair_silu_q4_0_soa",
-                    wg | (nr << 16),
-                    SPV_GEMV_PAIR_SILU_Q4_0_SOA,
-                    6,
-                    8,
-                    &[wg, nr],
-                )?;
-                let set = alloc_set(
-                    &pipe,
-                    &[
-                        Binding::Arena(pl.w_gate.slice),
-                        Binding::Arena(gd),
-                        Binding::Arena(pl.w_up.slice),
-                        Binding::Arena(ud),
-                        Binding::Arena(s_xb),
-                        Binding::Arena(s_hb),
-                    ],
-                )?;
-                let rows_per_wg = (wg / sg).max(1) * nr;
-                DecodeFfnSets::FusedPairSilu {
-                    pipe,
-                    set,
-                    groups_x: (pl.w_gate.mat.rows as u32).div_ceil(rows_per_wg),
-                    push: [pl.w_gate.mat.cols as u32, pl.w_gate.mat.rows as u32],
-                }
-            } else if pl.w_gate.mat.dtype == DType::Q4_0 && pl.w_up.mat.dtype == DType::Q4_0 {
-                let wg = 128u32;
-                let nr = 2u32;
-                let pipe = ctx.pipeline(
-                    "gemv_pair_silu_q4_0",
-                    wg | (nr << 16),
-                    SPV_GEMV_PAIR_SILU_Q4_0,
-                    4,
-                    8,
-                    &[wg, nr],
-                )?;
-                let set = alloc_set(
-                    &pipe,
-                    &[
-                        Binding::Arena(pl.w_gate.slice),
-                        Binding::Arena(pl.w_up.slice),
-                        Binding::Arena(s_xb),
-                        Binding::Arena(s_hb),
-                    ],
-                )?;
-                let rows_per_wg = (wg / sg).max(1) * nr;
-                DecodeFfnSets::FusedPairSilu {
-                    pipe,
-                    set,
-                    groups_x: (pl.w_gate.mat.rows as u32).div_ceil(rows_per_wg),
-                    push: [pl.w_gate.mat.cols as u32, pl.w_gate.mat.rows as u32],
-                }
-            } else {
-                DecodeFfnSets::Separate {
-                    gate: ffn_dec_sep.0.clone(),
-                    up: ffn_dec_sep.1.clone(),
-                    silu_set: ffn_dec_sep.2,
-                }
-            };
-
-            let ffn_batch_sep = {
-                let gate = make_batch_gemm(pl.w_gate.mat, s_xb, s_hb)?;
-                let up = make_batch_gemm(pl.w_up.mat, s_xb, s_hb2)?;
-                let silu_set = alloc_set(
-                    &pipes.silu_mul,
-                    &[Binding::Arena(s_hb), Binding::Arena(s_hb2)],
-                )?;
-                (gate, up, silu_set)
-            };
-
-            let ffn_batch = if prefill_kind == ResolvedPrefill::CoopMatF16
-                && pl.w_gate.mat.dtype == pl.w_up.mat.dtype
-                && matches!(pl.w_gate.mat.dtype, DType::Q4_0 | DType::Q4_1 | DType::Q8_0)
-                && (8 * sg) <= info.max_workgroup_invocations
-            {
-                let dt = dtype_code(pl.w_gate.mat.dtype)?;
-                let cm_wg = 8 * sg;
-                let pipe = ctx.pipeline(
-                    "gemm_pair_silu_coopmat_f16",
-                    dt | (cm_wg << 8),
-                    SPV_GEMM_PAIR_SILU_COOPMAT_F16,
-                    4,
-                    16,
-                    &[cm_wg, dt],
-                )?;
-                let set = alloc_set(
-                    &pipe,
-                    &[
-                        Binding::Arena(pl.w_gate.slice),
-                        Binding::Arena(pl.w_up.slice),
-                        Binding::Arena(s_xb),
-                        Binding::Arena(s_hb),
-                    ],
-                )?;
-                BatchFfnPlan::FusedPairSiluCoopMat {
-                    pipe,
-                    set,
-                    cols: pl.w_gate.mat.cols,
-                    rows: pl.w_gate.mat.rows,
-                    row_bytes: pl.w_gate.mat.row_bytes,
-                }
-            } else {
-                let gate = make_batch_gemm(pl.w_gate.mat, s_xb, s_hb)?;
-                let up = make_batch_gemm(pl.w_up.mat, s_xb, s_hb2)?;
-                BatchFfnPlan::Separate {
-                    gate,
-                    up,
-                    silu_set: ffn_batch_sep.2,
-                }
-            };
-
-            let (p_dn, s_dn, g_dn, push_dn) = alloc_gemv_call(&pl.w_down.mat, s_hb, s_x, true)?;
-            let down_batch = make_batch_gemm(pl.w_down.mat, s_hb, s_x)?;
 
             layers.push(Qwen35LayerPlan {
                 idx: il,
                 attn_norm_set,
+                attn_norm_dec_set,
                 attn: attn_plan,
                 post_attn_norm_set,
-                ffn_dec,
-                ffn_dec_sep,
-                ffn_batch,
-                ffn_batch_sep,
-                down_dec: (p_dn, s_dn, g_dn, push_dn),
-                down_batch,
-                gate_up_weight_bytes: pl.w_gate.mat.byte_len() + pl.w_up.mat.byte_len(),
-                down_weight_bytes: pl.w_down.mat.byte_len(),
+                post_attn_norm_dec_set,
+                ffn: ffn_plan,
+                gate_up_weight_bytes,
+                down_weight_bytes,
+                active_ff_dim,
             });
         }
 
         let lora = VkLoraEngine::new(&ctx)?;
 
+        let (n_expert, n_expert_used) = moe_params
+            .as_ref()
+            .map_or((0, 0), |mp| (mp.n_expert, mp.n_expert_used));
         let mut runner = Self {
             cfg: Qwen35VkConfig {
                 arch,
@@ -2290,6 +3623,8 @@ impl Qwen35VkRunner {
                 n_full_attn_layers,
                 n_embd,
                 n_ff,
+                n_expert,
+                n_expert_used,
                 n_head,
                 n_head_kv,
                 head_dim,
@@ -2326,7 +3661,9 @@ impl Qwen35VkRunner {
             quant_attn_out_set,
             quant_hb_set,
             output_norm_set,
+            output_norm_dec_set,
             lm_head_dec,
+            lm_head_dec_q8,
             argmax_set,
             layers,
             desc_pool,
@@ -2501,7 +3838,7 @@ impl Qwen35VkRunner {
     ) -> Result<(), VulkanError> {
         self.check_groups(pipe.name, gx, gy)?;
         let d = &self.ctx.inner.device;
-        let mut push_bytes = [0u8; 32];
+        let mut push_bytes = [0u8; 64];
         let byte_len = push_u32.len() * 4;
         for (i, &w) in push_u32.iter().enumerate() {
             push_bytes[i * 4..(i + 1) * 4].copy_from_slice(&w.to_ne_bytes());
@@ -2552,6 +3889,20 @@ impl Qwen35VkRunner {
         }
     }
 
+    fn cmd_decode_norm(
+        &self,
+        cb: vk::CommandBuffer,
+        set: vk::DescriptorSet,
+        push: &[u32],
+    ) -> Result<(), VulkanError> {
+        let pipe = self
+            .pipes
+            .rms_norm_q8_1
+            .as_ref()
+            .unwrap_or(&self.pipes.rms_norm);
+        self.cmd_dispatch_set(cb, pipe, set, push, 1, 1, true)
+    }
+
     fn cmd_decode_pair(
         &self,
         cb: vk::CommandBuffer,
@@ -2570,6 +3921,266 @@ impl Qwen35VkRunner {
                 self.cmd_dispatch_set(cb, &b.0, b.1, &b.3, b.2, 1, barrier_after)
             }
         }
+    }
+
+    fn cmd_add_bias(
+        &self,
+        cb: vk::CommandBuffer,
+        set: vk::DescriptorSet,
+        d_out: usize,
+        n_tok: u32,
+        barrier_after: bool,
+    ) -> Result<(), VulkanError> {
+        let push = [0, d_out as u32, 1, n_tok, 1.0f32.to_bits()];
+        self.cmd_dispatch_set(
+            cb,
+            &self.pipes.add_bias,
+            set,
+            &push,
+            (d_out as u32).div_ceil(256),
+            n_tok,
+            barrier_after,
+        )
+    }
+
+    fn cmd_record_moe_ffn(
+        &self,
+        cb: vk::CommandBuffer,
+        moe: &MoeLayerPlan,
+        ltag: &str,
+        n_tok: u32,
+    ) -> Result<(), VulkanError> {
+        let n_embd = self.cfg.n_embd;
+        // 1. Router logits
+        if n_tok == 1 {
+            self.cmd_dispatch_set(
+                cb,
+                &moe.router_dec.0,
+                moe.router_dec.1,
+                &moe.router_dec.3,
+                moe.router_dec.2,
+                1,
+                true,
+            )?;
+        } else {
+            self.cmd_quant_if_needed(
+                cb,
+                self.quant_xb_set,
+                n_tok,
+                n_embd,
+                moe.router_batch.flavor.uses_i8(),
+            )?;
+            self.cmd_gemm(cb, &moe.router_batch, n_tok, false, true)?;
+        }
+        self.lora.cmd_record_linear(
+            &self.ctx,
+            cb,
+            &format!("{ltag}.ffn_gate_inp.weight"),
+            n_tok,
+        )?;
+        if let Some(bset) = moe.router_bias_set {
+            self.cmd_add_bias(cb, bset, moe.n_expert as usize, n_tok, true)?;
+        }
+
+        // 2. Top-K routing
+        let r_push = [
+            moe.n_expert,
+            moe.n_expert_used,
+            n_tok,
+            moe.gating_func,
+            moe.norm_weights,
+            moe.has_exp_probs_b,
+            moe.norm_eps_bits,
+            moe.weights_scale_bits,
+        ];
+        self.cmd_dispatch_set(
+            cb,
+            &self.pipes.moe_router,
+            moe.router_topk_set,
+            &r_push,
+            n_tok,
+            1,
+            true,
+        )?;
+
+        // 3. Indexed expert gate & up + SwiGLU
+        let gy = n_tok * moe.n_expert_used;
+        self.cmd_dispatch_set(
+            cb,
+            &moe.gate_pipe,
+            moe.gate_set,
+            &moe.gate_push,
+            moe.gate_gx,
+            gy,
+            false,
+        )?;
+        self.cmd_dispatch_set(
+            cb,
+            &moe.up_pipe,
+            moe.up_set,
+            &moe.up_push,
+            moe.up_gx,
+            gy,
+            true,
+        )?;
+        let total_ff = gy * moe.n_ff_exp;
+        self.cmd_dispatch_set(
+            cb,
+            &self.pipes.silu_mul,
+            moe.silu_set,
+            &[total_ff],
+            total_ff.div_ceil(256).min(65535),
+            1,
+            true,
+        )?;
+
+        // 4. Indexed expert down (scaled by router weight) + deterministic 0..k reduction
+        self.cmd_dispatch_set(
+            cb,
+            &moe.down_pipe,
+            moe.down_set,
+            &moe.down_push,
+            moe.down_gx,
+            gy,
+            true,
+        )?;
+        self.cmd_dispatch_set(
+            cb,
+            &self.pipes.moe_reduce,
+            moe.reduce_set,
+            &[n_embd as u32, moe.n_expert_used, n_tok, 0],
+            (n_embd as u32).div_ceil(256),
+            n_tok,
+            true,
+        )?;
+
+        // 5. Optional shared expert (+ optional 1D sigmoid gate `ffn_gate_inp_shexp` for `qwen35moe`)
+        if let Some(ref sh) = moe.shared_expert {
+            let has_1d_gate = sh.gate_inp_1d.is_some();
+            if n_tok == 1 {
+                self.cmd_dispatch_set(
+                    cb,
+                    &sh.gate_dec.0,
+                    sh.gate_dec.1,
+                    &sh.gate_dec.3,
+                    sh.gate_dec.2,
+                    1,
+                    false,
+                )?;
+                self.cmd_dispatch_set(
+                    cb,
+                    &sh.up_dec.0,
+                    sh.up_dec.1,
+                    &sh.up_dec.3,
+                    sh.up_dec.2,
+                    1,
+                    true,
+                )?;
+                self.lora.cmd_record_linear(
+                    &self.ctx,
+                    cb,
+                    &format!("{ltag}.ffn_gate_shexp.weight"),
+                    1,
+                )?;
+                self.lora.cmd_record_linear(
+                    &self.ctx,
+                    cb,
+                    &format!("{ltag}.ffn_up_shexp.weight"),
+                    1,
+                )?;
+                let n_sh = sh.n_ff_shexp as u32;
+                self.cmd_dispatch_set(
+                    cb,
+                    &self.pipes.silu_mul,
+                    sh.silu_set,
+                    &[n_sh],
+                    n_sh.div_ceil(256).min(65535),
+                    1,
+                    true,
+                )?;
+                self.cmd_quant_if_needed(cb, self.quant_hb_set, 1, sh.n_ff_shexp, sh.down_dec_q8)?;
+                self.cmd_dispatch_set(
+                    cb,
+                    &sh.down_dec.0,
+                    sh.down_dec.1,
+                    &sh.down_dec.3,
+                    sh.down_dec.2,
+                    1,
+                    true,
+                )?;
+                self.lora.cmd_record_linear(
+                    &self.ctx,
+                    cb,
+                    &format!("{ltag}.ffn_down_shexp.weight"),
+                    1,
+                )?;
+            } else {
+                let gu_i8 = sh.gate_batch.flavor.uses_i8() || sh.up_batch.flavor.uses_i8();
+                self.cmd_quant_if_needed(cb, self.quant_xb_set, n_tok, n_embd, gu_i8)?;
+                self.cmd_gemm(cb, &sh.gate_batch, n_tok, false, false)?;
+                self.cmd_gemm(cb, &sh.up_batch, n_tok, false, true)?;
+                self.lora.cmd_record_linear(
+                    &self.ctx,
+                    cb,
+                    &format!("{ltag}.ffn_gate_shexp.weight"),
+                    n_tok,
+                )?;
+                self.lora.cmd_record_linear(
+                    &self.ctx,
+                    cb,
+                    &format!("{ltag}.ffn_up_shexp.weight"),
+                    n_tok,
+                )?;
+                let total_sh = n_tok * sh.n_ff_shexp as u32;
+                self.cmd_dispatch_set(
+                    cb,
+                    &self.pipes.silu_mul,
+                    sh.silu_set,
+                    &[total_sh],
+                    total_sh.div_ceil(256).min(65535),
+                    1,
+                    true,
+                )?;
+                self.cmd_quant_if_needed(
+                    cb,
+                    self.quant_hb_set,
+                    n_tok,
+                    sh.n_ff_shexp,
+                    sh.down_batch.flavor.uses_i8(),
+                )?;
+                self.cmd_gemm(cb, &sh.down_batch, n_tok, !has_1d_gate, true)?;
+                self.lora.cmd_record_linear(
+                    &self.ctx,
+                    cb,
+                    &format!("{ltag}.ffn_down_shexp.weight"),
+                    n_tok,
+                )?;
+            }
+            if let Some((ref gi_dec, ref gi_batch, gi_red_set)) = sh.gate_inp_1d {
+                if n_tok == 1 {
+                    self.cmd_dispatch_set(cb, &gi_dec.0, gi_dec.1, &gi_dec.3, gi_dec.2, 1, true)?;
+                } else {
+                    self.cmd_quant_if_needed(
+                        cb,
+                        self.quant_xb_set,
+                        n_tok,
+                        n_embd,
+                        gi_batch.flavor.uses_i8(),
+                    )?;
+                    self.cmd_gemm(cb, gi_batch, n_tok, false, true)?;
+                }
+                self.cmd_dispatch_set(
+                    cb,
+                    &self.pipes.moe_reduce,
+                    gi_red_set,
+                    &[n_embd as u32, 1, n_tok, 1],
+                    (n_embd as u32).div_ceil(256),
+                    n_tok,
+                    true,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn record_decode_into(
@@ -2677,7 +4288,6 @@ impl Qwen35VkRunner {
         let hv = self.cfg.ssm_dt_rank as u32;
         let s_dim = self.cfg.ssm_state_size as u32;
         let d_conv = self.cfg.ssm_conv_kernel as u32;
-        let gates_push = [hv, 1];
         let conv_push = [hk, hv, s_dim, d_conv, 1, eps_bits];
         let recur_push = [hk, hv, s_dim, 1];
         let gnorm_push = [hv, s_dim, eps_bits];
@@ -2688,25 +4298,18 @@ impl Qwen35VkRunner {
             let wu_n = format!("{ltag}.ffn_up.weight");
             let wd_n = format!("{ltag}.ffn_down.weight");
 
-            self.cmd_dispatch_set(
-                cb,
-                &self.pipes.rms_norm,
-                layer.attn_norm_set,
-                &norm_push,
-                1,
-                1,
-                true,
-            )?;
+            self.cmd_decode_norm(cb, layer.attn_norm_dec_set, &norm_push)?;
 
             match &layer.attn {
                 AttnLayerPlan::Gdn {
                     qkv_z_dec,
                     alpha_beta_dec,
-                    gates_set,
-                    conv_set,
+                    prep_dec_set,
                     recur_set,
-                    gnorm_set,
+                    gnorm_dec_set,
+                    gnorm_dec_fused_q8,
                     w_out_dec,
+                    w_out_dec_q8,
                     ..
                 } => {
                     self.cmd_decode_pair(cb, qkv_z_dec, false)?;
@@ -2738,17 +4341,8 @@ impl Qwen35VkRunner {
 
                     self.cmd_dispatch_set(
                         cb,
-                        &self.pipes.gdn_gates,
-                        *gates_set,
-                        &gates_push,
-                        hv.div_ceil(64),
-                        1,
-                        false,
-                    )?;
-                    self.cmd_dispatch_set(
-                        cb,
-                        &self.pipes.gdn_conv_silu_l2,
-                        *conv_set,
+                        &self.pipes.gdn_prep_decode,
+                        *prep_dec_set,
                         &conv_push,
                         2 * hk + hv,
                         1,
@@ -2763,15 +4357,28 @@ impl Qwen35VkRunner {
                         hv,
                         true,
                     )?;
-                    self.cmd_dispatch_set(
-                        cb,
-                        &self.pipes.gdn_norm_gated_silu,
-                        *gnorm_set,
-                        &gnorm_push,
-                        hv,
-                        1,
-                        true,
-                    )?;
+                    if *gnorm_dec_fused_q8
+                        && let Some(ref p_gnq) = self.pipes.gdn_norm_gated_silu_q8_1
+                    {
+                        self.cmd_dispatch_set(cb, p_gnq, *gnorm_dec_set, &gnorm_push, hv, 1, true)?;
+                    } else {
+                        self.cmd_dispatch_set(
+                            cb,
+                            &self.pipes.gdn_norm_gated_silu,
+                            *gnorm_dec_set,
+                            &gnorm_push,
+                            hv,
+                            1,
+                            true,
+                        )?;
+                        self.cmd_quant_if_needed(
+                            cb,
+                            self.quant_attn_out_set,
+                            1,
+                            self.cfg.ssm_d_inner,
+                            *w_out_dec_q8,
+                        )?;
+                    }
                     self.cmd_dispatch_set(
                         cb,
                         &w_out_dec.0,
@@ -2794,8 +4401,10 @@ impl Qwen35VkRunner {
                     k_norm_set,
                     rope_dec_set,
                     attn_dec_set,
-                    sigmoid_set,
+                    sigmoid_dec_set,
+                    sigmoid_dec_fused_q8,
                     wo_dec,
+                    wo_dec_q8,
                     ..
                 } => {
                     match qkv_dec {
@@ -2868,15 +4477,35 @@ impl Qwen35VkRunner {
                         1,
                         true,
                     )?;
-                    self.cmd_dispatch_set(
-                        cb,
-                        &self.pipes.sigmoid_mul,
-                        *sigmoid_set,
-                        &[q_dim as u32],
-                        (q_dim as u32).div_ceil(256),
-                        1,
-                        true,
-                    )?;
+                    if *sigmoid_dec_fused_q8 && let Some(ref p_sq) = self.pipes.sigmoid_mul_q8_1 {
+                        let n_blocks = (q_dim / 32) as u32;
+                        self.cmd_dispatch_set(
+                            cb,
+                            p_sq,
+                            *sigmoid_dec_set,
+                            &[n_blocks],
+                            n_blocks.div_ceil(8),
+                            1,
+                            true,
+                        )?;
+                    } else {
+                        self.cmd_dispatch_set(
+                            cb,
+                            &self.pipes.sigmoid_mul,
+                            *sigmoid_dec_set,
+                            &[q_dim as u32],
+                            (q_dim as u32).div_ceil(256),
+                            1,
+                            true,
+                        )?;
+                        self.cmd_quant_if_needed(
+                            cb,
+                            self.quant_attn_out_set,
+                            1,
+                            q_dim,
+                            *wo_dec_q8,
+                        )?;
+                    }
                     self.cmd_dispatch_set(cb, &wo_dec.0, wo_dec.1, &wo_dec.3, wo_dec.2, 1, true)?;
                     self.lora.cmd_record_linear(
                         &self.ctx,
@@ -2887,82 +4516,88 @@ impl Qwen35VkRunner {
                 }
             }
 
-            self.cmd_dispatch_set(
-                cb,
-                &self.pipes.rms_norm,
-                layer.post_attn_norm_set,
-                &norm_push,
-                1,
-                1,
-                true,
-            )?;
+            self.cmd_decode_norm(cb, layer.post_attn_norm_dec_set, &norm_push)?;
 
-            let force_sep = self.lora.has_linear(&wg_n) || self.lora.has_linear(&wu_n);
-            if force_sep {
-                let (ref gate, ref up, silu_set) = layer.ffn_dec_sep;
-                self.cmd_dispatch_set(cb, &gate.0, gate.1, &gate.3, gate.2, 1, false)?;
-                self.cmd_dispatch_set(cb, &up.0, up.1, &up.3, up.2, 1, true)?;
-                self.lora.cmd_record_linear(&self.ctx, cb, &wg_n, 1)?;
-                self.lora.cmd_record_linear(&self.ctx, cb, &wu_n, 1)?;
-                let gx = (self.cfg.n_ff as u32).div_ceil(256).min(65535);
-                self.cmd_dispatch_set(
-                    cb,
-                    &self.pipes.silu_mul,
-                    silu_set,
-                    &[self.cfg.n_ff as u32],
-                    gx,
-                    1,
-                    true,
-                )?;
-            } else {
-                match &layer.ffn_dec {
-                    DecodeFfnSets::FusedPairSilu {
-                        pipe,
-                        set,
-                        groups_x,
-                        push,
-                    } => {
-                        self.cmd_dispatch_set(cb, pipe, *set, push, *groups_x, 1, true)?;
-                    }
-                    DecodeFfnSets::Separate { gate, up, silu_set } => {
+            match &layer.ffn {
+                Qwen35LayerFfnPlan::Dense {
+                    ffn_dec,
+                    ffn_dec_sep,
+                    down_dec,
+                    down_dec_q8,
+                    ..
+                } => {
+                    let force_sep = self.lora.has_linear(&wg_n) || self.lora.has_linear(&wu_n);
+                    if force_sep {
+                        let (ref gate, ref up, silu_set) = *ffn_dec_sep;
                         self.cmd_dispatch_set(cb, &gate.0, gate.1, &gate.3, gate.2, 1, false)?;
                         self.cmd_dispatch_set(cb, &up.0, up.1, &up.3, up.2, 1, true)?;
+                        self.lora.cmd_record_linear(&self.ctx, cb, &wg_n, 1)?;
+                        self.lora.cmd_record_linear(&self.ctx, cb, &wu_n, 1)?;
                         let gx = (self.cfg.n_ff as u32).div_ceil(256).min(65535);
                         self.cmd_dispatch_set(
                             cb,
                             &self.pipes.silu_mul,
-                            *silu_set,
+                            silu_set,
                             &[self.cfg.n_ff as u32],
                             gx,
                             1,
                             true,
                         )?;
+                    } else {
+                        match ffn_dec {
+                            DecodeFfnSets::FusedPairSilu {
+                                pipe,
+                                set,
+                                groups_x,
+                                push,
+                            } => {
+                                self.cmd_dispatch_set(cb, pipe, *set, push, *groups_x, 1, true)?;
+                            }
+                            DecodeFfnSets::Separate { gate, up, silu_set } => {
+                                self.cmd_dispatch_set(
+                                    cb, &gate.0, gate.1, &gate.3, gate.2, 1, false,
+                                )?;
+                                self.cmd_dispatch_set(cb, &up.0, up.1, &up.3, up.2, 1, true)?;
+                                let gx = (self.cfg.n_ff as u32).div_ceil(256).min(65535);
+                                self.cmd_dispatch_set(
+                                    cb,
+                                    &self.pipes.silu_mul,
+                                    *silu_set,
+                                    &[self.cfg.n_ff as u32],
+                                    gx,
+                                    1,
+                                    true,
+                                )?;
+                            }
+                        }
                     }
+
+                    self.cmd_quant_if_needed(
+                        cb,
+                        self.quant_hb_set,
+                        1,
+                        self.cfg.n_ff,
+                        *down_dec_q8,
+                    )?;
+                    self.cmd_dispatch_set(
+                        cb,
+                        &down_dec.0,
+                        down_dec.1,
+                        &down_dec.3,
+                        down_dec.2,
+                        1,
+                        true,
+                    )?;
+                    self.lora.cmd_record_linear(&self.ctx, cb, &wd_n, 1)?;
+                }
+                Qwen35LayerFfnPlan::Moe(moe) => {
+                    self.cmd_record_moe_ffn(cb, moe, &ltag, 1)?;
                 }
             }
-
-            self.cmd_dispatch_set(
-                cb,
-                &layer.down_dec.0,
-                layer.down_dec.1,
-                &layer.down_dec.3,
-                layer.down_dec.2,
-                1,
-                true,
-            )?;
-            self.lora.cmd_record_linear(&self.ctx, cb, &wd_n, 1)?;
         }
 
         if compute_logits {
-            self.cmd_dispatch_set(
-                cb,
-                &self.pipes.rms_norm,
-                self.output_norm_set,
-                &norm_push,
-                1,
-                1,
-                true,
-            )?;
+            self.cmd_decode_norm(cb, self.output_norm_dec_set, &norm_push)?;
             let lm = &self.lm_head_dec;
             if greedy_argmax {
                 self.cmd_dispatch_set(cb, &lm.0, lm.1, &lm.3, lm.2, 1, true)?;
@@ -3640,47 +5275,16 @@ impl Qwen35VkRunner {
                     true,
                 )?;
 
-                let force_sep = self.lora.has_linear(&wg_n) || self.lora.has_linear(&wu_n);
-                if force_sep {
-                    let (ref gate, ref up, silu_set) = layer.ffn_batch_sep;
-                    let gu_i8 = gate.flavor.uses_i8() || up.flavor.uses_i8();
-                    self.cmd_quant_if_needed(cb, self.quant_xb_set, b_u32, self.cfg.n_embd, gu_i8)?;
-                    self.cmd_gemm(cb, gate, b_u32, false, false)?;
-                    self.cmd_gemm(cb, up, b_u32, false, true)?;
-                    self.lora.cmd_record_linear(&self.ctx, cb, &wg_n, b_u32)?;
-                    self.lora.cmd_record_linear(&self.ctx, cb, &wu_n, b_u32)?;
-                    let total_ff = (b * self.cfg.n_ff) as u32;
-                    let gx = total_ff.div_ceil(256).min(65535);
-                    self.cmd_dispatch_set(
-                        cb,
-                        &self.pipes.silu_mul,
-                        silu_set,
-                        &[total_ff],
-                        gx,
-                        1,
-                        true,
-                    )?;
-                } else {
-                    match &layer.ffn_batch {
-                        BatchFfnPlan::FusedPairSiluCoopMat {
-                            pipe,
-                            set,
-                            cols,
-                            rows,
-                            row_bytes,
-                        } => {
-                            let push = [*cols as u32, *rows as u32, b_u32, (*row_bytes / 2) as u32];
-                            self.cmd_dispatch_set(
-                                cb,
-                                pipe,
-                                *set,
-                                &push,
-                                (*rows as u32).div_ceil(64),
-                                b_u32.div_ceil(128),
-                                true,
-                            )?;
-                        }
-                        BatchFfnPlan::Separate { gate, up, silu_set } => {
+                match &layer.ffn {
+                    Qwen35LayerFfnPlan::Dense {
+                        ffn_batch,
+                        ffn_batch_sep,
+                        down_batch,
+                        ..
+                    } => {
+                        let force_sep = self.lora.has_linear(&wg_n) || self.lora.has_linear(&wu_n);
+                        if force_sep {
+                            let (ref gate, ref up, silu_set) = *ffn_batch_sep;
                             let gu_i8 = gate.flavor.uses_i8() || up.flavor.uses_i8();
                             self.cmd_quant_if_needed(
                                 cb,
@@ -3691,43 +5295,102 @@ impl Qwen35VkRunner {
                             )?;
                             self.cmd_gemm(cb, gate, b_u32, false, false)?;
                             self.cmd_gemm(cb, up, b_u32, false, true)?;
+                            self.lora.cmd_record_linear(&self.ctx, cb, &wg_n, b_u32)?;
+                            self.lora.cmd_record_linear(&self.ctx, cb, &wu_n, b_u32)?;
                             let total_ff = (b * self.cfg.n_ff) as u32;
                             let gx = total_ff.div_ceil(256).min(65535);
                             self.cmd_dispatch_set(
                                 cb,
                                 &self.pipes.silu_mul,
-                                *silu_set,
+                                silu_set,
                                 &[total_ff],
                                 gx,
                                 1,
                                 true,
                             )?;
+                        } else {
+                            match ffn_batch {
+                                BatchFfnPlan::FusedPairSiluCoopMat {
+                                    pipe,
+                                    set,
+                                    cols,
+                                    rows,
+                                    row_bytes,
+                                } => {
+                                    let push = [
+                                        *cols as u32,
+                                        *rows as u32,
+                                        b_u32,
+                                        (*row_bytes / 2) as u32,
+                                    ];
+                                    self.cmd_dispatch_set(
+                                        cb,
+                                        pipe,
+                                        *set,
+                                        &push,
+                                        (*rows as u32).div_ceil(64),
+                                        b_u32.div_ceil(128),
+                                        true,
+                                    )?;
+                                }
+                                BatchFfnPlan::Separate { gate, up, silu_set } => {
+                                    let gu_i8 = gate.flavor.uses_i8() || up.flavor.uses_i8();
+                                    self.cmd_quant_if_needed(
+                                        cb,
+                                        self.quant_xb_set,
+                                        b_u32,
+                                        self.cfg.n_embd,
+                                        gu_i8,
+                                    )?;
+                                    self.cmd_gemm(cb, gate, b_u32, false, false)?;
+                                    self.cmd_gemm(cb, up, b_u32, false, true)?;
+                                    let total_ff = (b * self.cfg.n_ff) as u32;
+                                    let gx = total_ff.div_ceil(256).min(65535);
+                                    self.cmd_dispatch_set(
+                                        cb,
+                                        &self.pipes.silu_mul,
+                                        *silu_set,
+                                        &[total_ff],
+                                        gx,
+                                        1,
+                                        true,
+                                    )?;
+                                }
+                            }
                         }
+
+                        self.cmd_quant_if_needed(
+                            cb,
+                            self.quant_hb_set,
+                            b_u32,
+                            self.cfg.n_ff,
+                            down_batch.flavor.uses_i8(),
+                        )?;
+                        self.cmd_gemm(cb, down_batch, b_u32, true, true)?;
+                        self.lora.cmd_record_linear(&self.ctx, cb, &wd_n, b_u32)?;
+                    }
+                    Qwen35LayerFfnPlan::Moe(moe) => {
+                        self.cmd_record_moe_ffn(cb, moe, &ltag, b_u32)?;
                     }
                 }
-
-                self.cmd_quant_if_needed(
-                    cb,
-                    self.quant_hb_set,
-                    b_u32,
-                    self.cfg.n_ff,
-                    layer.down_batch.flavor.uses_i8(),
-                )?;
-                self.cmd_gemm(cb, &layer.down_batch, b_u32, true, true)?;
-                self.lora.cmd_record_linear(&self.ctx, cb, &wd_n, b_u32)?;
             }
 
             if is_last_chunk && compute_last_logits {
                 let last_x_off = ((b - 1) * self.cfg.n_embd) as u32;
-                self.cmd_dispatch_set(
-                    cb,
-                    &self.pipes.rms_norm,
-                    self.output_norm_set,
-                    &[self.cfg.n_embd as u32, last_x_off, eps_bits],
-                    1,
-                    1,
-                    true,
-                )?;
+                let out_norm_push = [self.cfg.n_embd as u32, last_x_off, eps_bits];
+                if self.lm_head_dec_q8 {
+                    self.cmd_decode_norm(cb, self.output_norm_dec_set, &out_norm_push)?;
+                } else {
+                    self.cmd_dispatch_set(
+                        cb,
+                        &self.pipes.rms_norm,
+                        self.output_norm_set,
+                        &out_norm_push,
+                        1,
+                        1,
+                        true,
+                    )?;
+                }
                 let lm = &self.lm_head_dec;
                 self.cmd_dispatch_set(
                     cb,
@@ -3900,9 +5563,10 @@ impl Qwen35VkRunner {
             }
             stage_bytes[9] += (self.cfg.n_embd * 12) as u64;
             stage_bytes[10] += l.gate_up_weight_bytes;
-            stage_flops[10] += (4 * self.cfg.n_embd * self.cfg.n_ff) as u64;
+            stage_flops[10] += (4 * self.cfg.n_embd * l.active_ff_dim
+                + 2 * self.cfg.n_embd * self.cfg.n_expert) as u64;
             stage_bytes[11] += l.down_weight_bytes;
-            stage_flops[11] += (2 * self.cfg.n_ff * self.cfg.n_embd) as u64;
+            stage_flops[11] += (2 * l.active_ff_dim * self.cfg.n_embd) as u64;
         }
         stage_bytes[12] = self.out_mat.slice.len;
         stage_flops[12] = (2 * self.cfg.n_embd * self.cfg.vocab_size) as u64;
@@ -4014,15 +5678,7 @@ impl Qwen35VkRunner {
                 spans.push((0, q_cb_start, prev));
 
                 for layer in &self.layers {
-                    self.cmd_dispatch_set(
-                        cb,
-                        &self.pipes.rms_norm,
-                        layer.attn_norm_set,
-                        &norm_push,
-                        1,
-                        1,
-                        true,
-                    )?;
+                    self.cmd_decode_norm(cb, layer.attn_norm_dec_set, &norm_push)?;
                     let cur = mark(cb);
                     spans.push((1, prev, cur));
                     prev = cur;
@@ -4031,11 +5687,12 @@ impl Qwen35VkRunner {
                         AttnLayerPlan::Gdn {
                             qkv_z_dec,
                             alpha_beta_dec,
-                            gates_set,
-                            conv_set,
+                            prep_dec_set,
                             recur_set,
-                            gnorm_set,
+                            gnorm_dec_set,
+                            gnorm_dec_fused_q8,
                             w_out_dec,
+                            w_out_dec_q8,
                             ..
                         } => {
                             self.cmd_decode_pair(cb, qkv_z_dec, false)?;
@@ -4046,17 +5703,8 @@ impl Qwen35VkRunner {
 
                             self.cmd_dispatch_set(
                                 cb,
-                                &self.pipes.gdn_gates,
-                                *gates_set,
-                                &[hv_u32, 1],
-                                hv_u32.div_ceil(64),
-                                1,
-                                false,
-                            )?;
-                            self.cmd_dispatch_set(
-                                cb,
-                                &self.pipes.gdn_conv_silu_l2,
-                                *conv_set,
+                                &self.pipes.gdn_prep_decode,
+                                *prep_dec_set,
                                 &[hk_u32, hv_u32, s_u32, dc_u32, 1, eps_bits],
                                 2 * hk_u32 + hv_u32,
                                 1,
@@ -4075,19 +5723,42 @@ impl Qwen35VkRunner {
                                 hv_u32,
                                 true,
                             )?;
-                            self.cmd_dispatch_set(
-                                cb,
-                                &self.pipes.gdn_norm_gated_silu,
-                                *gnorm_set,
-                                &[hv_u32, s_u32, eps_bits],
-                                hv_u32,
-                                1,
-                                true,
-                            )?;
+                            if *gnorm_dec_fused_q8
+                                && let Some(ref p_gnq) = self.pipes.gdn_norm_gated_silu_q8_1
+                            {
+                                self.cmd_dispatch_set(
+                                    cb,
+                                    p_gnq,
+                                    *gnorm_dec_set,
+                                    &[hv_u32, s_u32, eps_bits],
+                                    hv_u32,
+                                    1,
+                                    true,
+                                )?;
+                            } else {
+                                self.cmd_dispatch_set(
+                                    cb,
+                                    &self.pipes.gdn_norm_gated_silu,
+                                    *gnorm_dec_set,
+                                    &[hv_u32, s_u32, eps_bits],
+                                    hv_u32,
+                                    1,
+                                    true,
+                                )?;
+                            }
                             let cur = mark(cb);
                             spans.push((4, prev, cur));
                             prev = cur;
 
+                            if !*gnorm_dec_fused_q8 {
+                                self.cmd_quant_if_needed(
+                                    cb,
+                                    self.quant_attn_out_set,
+                                    1,
+                                    self.cfg.ssm_d_inner,
+                                    *w_out_dec_q8,
+                                )?;
+                            }
                             self.cmd_dispatch_set(
                                 cb,
                                 &w_out_dec.0,
@@ -4107,8 +5778,10 @@ impl Qwen35VkRunner {
                             k_norm_set,
                             rope_dec_set,
                             attn_dec_set,
-                            sigmoid_set,
+                            sigmoid_dec_set,
+                            sigmoid_dec_fused_q8,
                             wo_dec,
+                            wo_dec_q8,
                             ..
                         } => {
                             match qkv_dec {
@@ -4170,19 +5843,43 @@ impl Qwen35VkRunner {
                                 1,
                                 true,
                             )?;
-                            self.cmd_dispatch_set(
-                                cb,
-                                &self.pipes.sigmoid_mul,
-                                *sigmoid_set,
-                                &[q_dim as u32],
-                                (q_dim as u32).div_ceil(256),
-                                1,
-                                true,
-                            )?;
+                            if *sigmoid_dec_fused_q8
+                                && let Some(ref p_sq) = self.pipes.sigmoid_mul_q8_1
+                            {
+                                let n_blocks = (q_dim / 32) as u32;
+                                self.cmd_dispatch_set(
+                                    cb,
+                                    p_sq,
+                                    *sigmoid_dec_set,
+                                    &[n_blocks],
+                                    n_blocks.div_ceil(8),
+                                    1,
+                                    true,
+                                )?;
+                            } else {
+                                self.cmd_dispatch_set(
+                                    cb,
+                                    &self.pipes.sigmoid_mul,
+                                    *sigmoid_dec_set,
+                                    &[q_dim as u32],
+                                    (q_dim as u32).div_ceil(256),
+                                    1,
+                                    true,
+                                )?;
+                            }
                             let cur = mark(cb);
                             spans.push((7, prev, cur));
                             prev = cur;
 
+                            if !*sigmoid_dec_fused_q8 {
+                                self.cmd_quant_if_needed(
+                                    cb,
+                                    self.quant_attn_out_set,
+                                    1,
+                                    q_dim,
+                                    *wo_dec_q8,
+                                )?;
+                            }
                             self.cmd_dispatch_set(
                                 cb, &wo_dec.0, wo_dec.1, &wo_dec.3, wo_dec.2, 1, true,
                             )?;
@@ -4192,70 +5889,81 @@ impl Qwen35VkRunner {
                         }
                     }
 
-                    self.cmd_dispatch_set(
-                        cb,
-                        &self.pipes.rms_norm,
-                        layer.post_attn_norm_set,
-                        &norm_push,
-                        1,
-                        1,
-                        true,
-                    )?;
+                    self.cmd_decode_norm(cb, layer.post_attn_norm_dec_set, &norm_push)?;
                     let cur = mark(cb);
                     spans.push((9, prev, cur));
                     prev = cur;
 
-                    match &layer.ffn_dec {
-                        DecodeFfnSets::FusedPairSilu {
-                            pipe,
-                            set,
-                            groups_x,
-                            push,
+                    match &layer.ffn {
+                        Qwen35LayerFfnPlan::Dense {
+                            ffn_dec,
+                            down_dec,
+                            down_dec_q8,
+                            ..
                         } => {
-                            self.cmd_dispatch_set(cb, pipe, *set, push, *groups_x, 1, true)?;
-                        }
-                        DecodeFfnSets::Separate { gate, up, silu_set } => {
-                            self.cmd_dispatch_set(cb, &gate.0, gate.1, &gate.3, gate.2, 1, false)?;
-                            self.cmd_dispatch_set(cb, &up.0, up.1, &up.3, up.2, 1, true)?;
-                            let gx = (self.cfg.n_ff as u32).div_ceil(256).min(65535);
+                            match ffn_dec {
+                                DecodeFfnSets::FusedPairSilu {
+                                    pipe,
+                                    set,
+                                    groups_x,
+                                    push,
+                                } => {
+                                    self.cmd_dispatch_set(
+                                        cb, pipe, *set, push, *groups_x, 1, true,
+                                    )?;
+                                }
+                                DecodeFfnSets::Separate { gate, up, silu_set } => {
+                                    self.cmd_dispatch_set(
+                                        cb, &gate.0, gate.1, &gate.3, gate.2, 1, false,
+                                    )?;
+                                    self.cmd_dispatch_set(cb, &up.0, up.1, &up.3, up.2, 1, true)?;
+                                    let gx = (self.cfg.n_ff as u32).div_ceil(256).min(65535);
+                                    self.cmd_dispatch_set(
+                                        cb,
+                                        &self.pipes.silu_mul,
+                                        *silu_set,
+                                        &[self.cfg.n_ff as u32],
+                                        gx,
+                                        1,
+                                        true,
+                                    )?;
+                                }
+                            }
+                            let cur = mark(cb);
+                            spans.push((10, prev, cur));
+                            prev = cur;
+
+                            self.cmd_quant_if_needed(
+                                cb,
+                                self.quant_hb_set,
+                                1,
+                                self.cfg.n_ff,
+                                *down_dec_q8,
+                            )?;
                             self.cmd_dispatch_set(
                                 cb,
-                                &self.pipes.silu_mul,
-                                *silu_set,
-                                &[self.cfg.n_ff as u32],
-                                gx,
+                                &down_dec.0,
+                                down_dec.1,
+                                &down_dec.3,
+                                down_dec.2,
                                 1,
                                 true,
                             )?;
+                            let cur = mark(cb);
+                            spans.push((11, prev, cur));
+                            prev = cur;
+                        }
+                        Qwen35LayerFfnPlan::Moe(moe) => {
+                            let ltag = format!("blk.{}", layer.idx);
+                            self.cmd_record_moe_ffn(cb, moe, &ltag, 1)?;
+                            let cur = mark(cb);
+                            spans.push((10, prev, cur));
+                            prev = cur;
                         }
                     }
-                    let cur = mark(cb);
-                    spans.push((10, prev, cur));
-                    prev = cur;
-
-                    self.cmd_dispatch_set(
-                        cb,
-                        &layer.down_dec.0,
-                        layer.down_dec.1,
-                        &layer.down_dec.3,
-                        layer.down_dec.2,
-                        1,
-                        true,
-                    )?;
-                    let cur = mark(cb);
-                    spans.push((11, prev, cur));
-                    prev = cur;
                 }
 
-                self.cmd_dispatch_set(
-                    cb,
-                    &self.pipes.rms_norm,
-                    self.output_norm_set,
-                    &norm_push,
-                    1,
-                    1,
-                    true,
-                )?;
+                self.cmd_decode_norm(cb, self.output_norm_dec_set, &norm_push)?;
                 let lm = &self.lm_head_dec;
                 self.cmd_dispatch_set(cb, &lm.0, lm.1, &lm.3, lm.2, 1, true)?;
                 self.cmd_dispatch_set(
@@ -4566,64 +6274,84 @@ impl Qwen35VkRunner {
                     pp_spans.push((9, prev, cur));
                     prev = cur;
 
-                    match &layer.ffn_batch {
-                        BatchFfnPlan::FusedPairSiluCoopMat {
-                            pipe,
-                            set,
-                            cols,
-                            rows,
-                            row_bytes,
+                    match &layer.ffn {
+                        Qwen35LayerFfnPlan::Dense {
+                            ffn_batch,
+                            down_batch,
+                            ..
                         } => {
-                            let push = [*cols as u32, *rows as u32, b_u32, (*row_bytes / 2) as u32];
-                            self.cmd_dispatch_set(
-                                cb,
-                                pipe,
-                                *set,
-                                &push,
-                                (*rows as u32).div_ceil(64),
-                                b_u32.div_ceil(128),
-                                true,
-                            )?;
-                        }
-                        BatchFfnPlan::Separate { gate, up, silu_set } => {
-                            let gu_i8 = gate.flavor.uses_i8() || up.flavor.uses_i8();
+                            match ffn_batch {
+                                BatchFfnPlan::FusedPairSiluCoopMat {
+                                    pipe,
+                                    set,
+                                    cols,
+                                    rows,
+                                    row_bytes,
+                                } => {
+                                    let push = [
+                                        *cols as u32,
+                                        *rows as u32,
+                                        b_u32,
+                                        (*row_bytes / 2) as u32,
+                                    ];
+                                    self.cmd_dispatch_set(
+                                        cb,
+                                        pipe,
+                                        *set,
+                                        &push,
+                                        (*rows as u32).div_ceil(64),
+                                        b_u32.div_ceil(128),
+                                        true,
+                                    )?;
+                                }
+                                BatchFfnPlan::Separate { gate, up, silu_set } => {
+                                    let gu_i8 = gate.flavor.uses_i8() || up.flavor.uses_i8();
+                                    self.cmd_quant_if_needed(
+                                        cb,
+                                        self.quant_xb_set,
+                                        b_u32,
+                                        self.cfg.n_embd,
+                                        gu_i8,
+                                    )?;
+                                    self.cmd_gemm(cb, gate, b_u32, false, false)?;
+                                    self.cmd_gemm(cb, up, b_u32, false, true)?;
+                                    let total_ff = (b_pp * self.cfg.n_ff) as u32;
+                                    let gx = total_ff.div_ceil(256).min(65535);
+                                    self.cmd_dispatch_set(
+                                        cb,
+                                        &self.pipes.silu_mul,
+                                        *silu_set,
+                                        &[total_ff],
+                                        gx,
+                                        1,
+                                        true,
+                                    )?;
+                                }
+                            }
+                            let cur = mark_pp(cb);
+                            pp_spans.push((10, prev, cur));
+                            prev = cur;
+
                             self.cmd_quant_if_needed(
                                 cb,
-                                self.quant_xb_set,
+                                self.quant_hb_set,
                                 b_u32,
-                                self.cfg.n_embd,
-                                gu_i8,
+                                self.cfg.n_ff,
+                                down_batch.flavor.uses_i8(),
                             )?;
-                            self.cmd_gemm(cb, gate, b_u32, false, false)?;
-                            self.cmd_gemm(cb, up, b_u32, false, true)?;
-                            let total_ff = (b_pp * self.cfg.n_ff) as u32;
-                            let gx = total_ff.div_ceil(256).min(65535);
-                            self.cmd_dispatch_set(
-                                cb,
-                                &self.pipes.silu_mul,
-                                *silu_set,
-                                &[total_ff],
-                                gx,
-                                1,
-                                true,
-                            )?;
+                            self.cmd_gemm(cb, down_batch, b_u32, true, true)?;
+                            let cur = mark_pp(cb);
+                            pp_spans.push((11, prev, cur));
+                            prev = cur;
+                        }
+                        Qwen35LayerFfnPlan::Moe(moe) => {
+                            let ltag = format!("blk.{}", layer.idx);
+                            self.cmd_record_moe_ffn(cb, moe, &ltag, b_u32)?;
+                            let cur = mark_pp(cb);
+                            pp_spans.push((10, prev, cur));
+                            prev = cur;
                         }
                     }
-                    let cur = mark_pp(cb);
-                    pp_spans.push((10, prev, cur));
-                    prev = cur;
-
-                    self.cmd_quant_if_needed(
-                        cb,
-                        self.quant_hb_set,
-                        b_u32,
-                        self.cfg.n_ff,
-                        layer.down_batch.flavor.uses_i8(),
-                    )?;
-                    self.cmd_gemm(cb, &layer.down_batch, b_u32, true, true)?;
-                    let cur = mark_pp(cb);
-                    pp_spans.push((11, prev, cur));
-                    prev = cur;
                 }
 
                 let last_x_off = ((b_pp - 1) * self.cfg.n_embd) as u32;
@@ -4724,11 +6452,14 @@ impl Qwen35VkRunner {
                     }
                     pp_bytes[9] += b_u64 * (self.cfg.n_embd * 8) as u64;
                     pp_bytes[10] += l.gate_up_weight_bytes
-                        + b_u64 * ((self.cfg.n_embd + self.cfg.n_ff) * 4) as u64;
-                    pp_flops[10] += b_u64 * (4 * self.cfg.n_embd * self.cfg.n_ff) as u64;
+                        + b_u64 * ((self.cfg.n_embd + l.active_ff_dim) * 4) as u64;
+                    pp_flops[10] += b_u64
+                        * (4 * self.cfg.n_embd * l.active_ff_dim
+                            + 2 * self.cfg.n_embd * self.cfg.n_expert)
+                            as u64;
                     pp_bytes[11] += l.down_weight_bytes
-                        + b_u64 * ((self.cfg.n_ff + 2 * self.cfg.n_embd) * 4) as u64;
-                    pp_flops[11] += b_u64 * (2 * self.cfg.n_ff * self.cfg.n_embd) as u64;
+                        + b_u64 * ((l.active_ff_dim + 2 * self.cfg.n_embd) * 4) as u64;
+                    pp_flops[11] += b_u64 * (2 * l.active_ff_dim * self.cfg.n_embd) as u64;
                 }
                 pp_bytes[12] = self.out_mat.slice.len;
                 pp_flops[12] = (2 * self.cfg.n_embd * self.cfg.vocab_size) as u64;

@@ -29,16 +29,23 @@ use tm_gguf::{GgufError, GgufFile};
 use tm_lora::{BoundLora, LoraScratch, LoraSet};
 
 use crate::llama::{ModelError, RawMatView};
+use crate::moe::{
+    MoeScratch, SparseMoeFfn, eval_sparse_moe_ffn, load_layer_moe_ffn, parse_moe_arch_params,
+};
 pub use crate::state::LayerState;
 use crate::state::{MAX_SPEC_WINDOW, SpecVerifyBuf, decode_embedding_row};
 
-/// Hyperparameters for `general.architecture == "qwen35"`.
+/// Hyperparameters for `general.architecture == "qwen35" | "qwen35moe"`.
 #[derive(Debug, Clone)]
 pub struct Qwen35Config {
     pub arch: String,
     pub n_layers: usize,
     pub n_embd: usize,
     pub n_ff: usize,
+    pub n_expert: usize,
+    pub n_expert_used: usize,
+    pub max_n_ff_exp: usize,
+    pub max_n_ff_shexp: usize,
     /// Full-attention query heads (`qwen35.attention.head_count`, e.g. 8).
     pub n_head: usize,
     /// Full-attention KV heads (`qwen35.attention.head_count_kv`, e.g. 2).
@@ -108,13 +115,21 @@ pub enum Qwen35AttnWeights<'a> {
 
 type AttnWeights<'a> = Qwen35AttnWeights<'a>;
 
+#[allow(clippy::large_enum_variant)]
+pub enum Qwen35FfnWeights<'a> {
+    Dense {
+        w_gate: RawMatView<'a>,
+        w_up: RawMatView<'a>,
+        w_down: RawMatView<'a>,
+    },
+    Moe(Box<SparseMoeFfn<'a>>),
+}
+
 pub struct Qwen35LayerWeights<'a> {
     pub attn_norm: Vec<f32>,
     pub post_attn_norm: Vec<f32>,
     pub attn: Qwen35AttnWeights<'a>,
-    pub w_gate: RawMatView<'a>,
-    pub w_up: RawMatView<'a>,
-    pub w_down: RawMatView<'a>,
+    pub ffn: Qwen35FfnWeights<'a>,
 }
 
 /// Loaded Qwen3.5 hybrid model borrowing quantized weight slices directly from `GgufFile`.
@@ -159,6 +174,7 @@ pub struct Qwen35State {
     logits: Vec<f32>,
     pub last_hidden: Vec<f32>,
     mv_scratch: MatvecScratch,
+    moe_scratch: MoeScratch,
     pub lora_scratch: LoraScratch,
 }
 
@@ -193,7 +209,13 @@ impl Qwen35State {
             })
             .collect();
 
-        let max_cols = cfg.n_embd.max(cfg.n_ff).max(q_dim).max(v_gdn_dim);
+        let max_cols = cfg
+            .n_embd
+            .max(cfg.n_ff)
+            .max(cfg.max_n_ff_exp)
+            .max(cfg.max_n_ff_shexp)
+            .max(q_dim)
+            .max(v_gdn_dim);
 
         Self {
             max_ctx,
@@ -218,6 +240,13 @@ impl Qwen35State {
             logits: vec![0.0; cfg.vocab_size],
             last_hidden: vec![0.0; cfg.n_embd],
             mv_scratch: MatvecScratch::new(max_cols),
+            moe_scratch: MoeScratch::new(
+                cfg.n_embd,
+                cfg.n_expert,
+                cfg.n_expert_used,
+                cfg.max_n_ff_exp,
+                cfg.max_n_ff_shexp,
+            ),
             lora_scratch: LoraScratch::new(64),
         }
     }
@@ -295,21 +324,58 @@ fn sigmoid_f32(x: f32) -> f32 {
 }
 
 impl<'a> Qwen35Model<'a> {
-    /// Loads and strictly validates a `qwen35` GGUF model (zero-copy weight views).
+    /// Loads and strictly validates a `qwen35` or `qwen35moe` GGUF model (zero-copy weight views).
     pub fn from_gguf(gguf: &'a GgufFile) -> Result<Self, ModelError> {
         let arch = gguf.req_str("general.architecture")?.to_string();
-        if arch != "qwen35" {
+        if !matches!(arch.as_str(), "qwen35" | "qwen35moe") {
             return Err(ModelError::UnsupportedArch(arch));
         }
 
-        let pfx = "qwen35";
-        let n_layers = gguf.req_usize(&format!("{pfx}.block_count"))?;
+        let pfx = arch.as_str();
+        let raw_blocks = gguf.req_usize(&format!("{pfx}.block_count"))?;
+        let nextn_layers = gguf
+            .get_meta(&format!("{pfx}.nextn_predict_layers"))
+            .and_then(|v| v.as_usize())
+            .unwrap_or(0);
+        let n_layers = raw_blocks.saturating_sub(nextn_layers);
+        if n_layers == 0 {
+            return Err(ModelError::InvalidConfig(format!(
+                "{arch}: block_count ({raw_blocks}) <= nextn_predict_layers ({nextn_layers})"
+            )));
+        }
         let n_embd = gguf.req_usize(&format!("{pfx}.embedding_length"))?;
-        let n_ff = gguf.req_usize(&format!("{pfx}.feed_forward_length"))?;
-        let n_head = gguf.req_usize(&format!("{pfx}.attention.head_count"))?;
+        let n_ff_meta = gguf
+            .get_meta(&format!("{pfx}.feed_forward_length"))
+            .and_then(|v| v.as_usize())
+            .unwrap_or(0);
+        let moe_params = parse_moe_arch_params(gguf, pfx, &arch, n_layers, n_ff_meta)?;
+        let n_ff = if n_ff_meta > 0 {
+            n_ff_meta
+        } else if moe_params.is_some() {
+            0
+        } else {
+            gguf.req_usize(&format!("{pfx}.feed_forward_length"))?
+        };
+        let n_head = gguf
+            .get_meta(&format!("{pfx}.attention.head_count"))
+            .and_then(|v| {
+                v.as_usize().or_else(|| {
+                    v.as_usize_array()
+                        .and_then(|a| a.iter().copied().find(|&x| x > 0))
+                })
+            })
+            .ok_or_else(|| GgufError::MissingMetadata {
+                path: gguf.path().display().to_string(),
+                key: format!("{pfx}.attention.head_count"),
+            })?;
         let n_head_kv = gguf
             .get_meta(&format!("{pfx}.attention.head_count_kv"))
-            .and_then(|v| v.as_usize())
+            .and_then(|v| {
+                v.as_usize().or_else(|| {
+                    v.as_usize_array()
+                        .and_then(|a| a.iter().copied().find(|&x| x > 0))
+                })
+            })
             .unwrap_or(n_head);
         let head_dim = gguf
             .get_meta(&format!("{pfx}.attention.key_length"))
@@ -353,11 +419,18 @@ impl<'a> Qwen35Model<'a> {
             .and_then(|v| v.as_usize())
             .unwrap_or_else(|| embd_info.dims.get(1).copied().unwrap_or(0));
 
-        let cfg = Qwen35Config {
-            arch,
+        let (n_expert, n_expert_used) = moe_params
+            .as_ref()
+            .map_or((0, 0), |mp| (mp.n_expert, mp.n_expert_used));
+        let mut cfg = Qwen35Config {
+            arch: arch.clone(),
             n_layers,
             n_embd,
             n_ff,
+            n_expert,
+            n_expert_used,
+            max_n_ff_exp: 0,
+            max_n_ff_shexp: 0,
             n_head,
             n_head_kv,
             head_dim,
@@ -519,25 +592,44 @@ impl<'a> Qwen35Model<'a> {
                 }
             };
 
+            let ffn = if let Some(ref mp) = moe_params
+                && let Some(moe) = load_layer_moe_ffn(gguf, l, &ltag, n_embd, mp)?
+            {
+                cfg.max_n_ff_exp = cfg.max_n_ff_exp.max(moe.cfg.n_ff_exp);
+                cfg.max_n_ff_shexp = cfg.max_n_ff_shexp.max(moe.cfg.n_ff_shexp);
+                Qwen35FfnWeights::Moe(Box::new(moe))
+            } else {
+                if n_ff == 0 {
+                    return Err(GgufError::MissingMetadata {
+                        path: gguf.path().display().to_string(),
+                        key: format!("{pfx}.feed_forward_length"),
+                    }
+                    .into());
+                }
+                Qwen35FfnWeights::Dense {
+                    w_gate: load_mat(
+                        gguf,
+                        &format!("{ltag}.ffn_gate.weight"),
+                        &ltag,
+                        n_embd,
+                        n_ff,
+                    )?,
+                    w_up: load_mat(gguf, &format!("{ltag}.ffn_up.weight"), &ltag, n_embd, n_ff)?,
+                    w_down: load_mat(
+                        gguf,
+                        &format!("{ltag}.ffn_down.weight"),
+                        &ltag,
+                        n_ff,
+                        n_embd,
+                    )?,
+                }
+            };
+
             layers.push(Qwen35LayerWeights {
                 attn_norm,
                 post_attn_norm,
                 attn,
-                w_gate: load_mat(
-                    gguf,
-                    &format!("{ltag}.ffn_gate.weight"),
-                    &ltag,
-                    n_embd,
-                    n_ff,
-                )?,
-                w_up: load_mat(gguf, &format!("{ltag}.ffn_up.weight"), &ltag, n_embd, n_ff)?,
-                w_down: load_mat(
-                    gguf,
-                    &format!("{ltag}.ffn_down.weight"),
-                    &ltag,
-                    n_ff,
-                    n_embd,
-                )?,
+                ffn,
             });
         }
 
@@ -582,9 +674,18 @@ impl<'a> Qwen35Model<'a> {
                     wo.lora_slot = bound.slot_for(wo.name);
                 }
             }
-            l.w_gate.lora_slot = bound.slot_for(l.w_gate.name);
-            l.w_up.lora_slot = bound.slot_for(l.w_up.name);
-            l.w_down.lora_slot = bound.slot_for(l.w_down.name);
+            match &mut l.ffn {
+                Qwen35FfnWeights::Dense {
+                    w_gate,
+                    w_up,
+                    w_down,
+                } => {
+                    w_gate.lora_slot = bound.slot_for(w_gate.name);
+                    w_up.lora_slot = bound.slot_for(w_up.name);
+                    w_down.lora_slot = bound.slot_for(w_down.name);
+                }
+                Qwen35FfnWeights::Moe(moe) => moe.bind_lora(&bound),
+            }
         }
         self.lora = bound;
     }
@@ -1024,69 +1125,92 @@ impl<'a> Qwen35Model<'a> {
                 state.x[i] += state.xb2[i];
             }
 
-            // Post-attention RMSNorm + SwiGLU FFN
+            // Post-attention RMSNorm + SwiGLU / Sparse MoE FFN
             rms_norm(
                 &mut state.xb[..n_embd],
                 &state.x[..n_embd],
                 &layer.post_attn_norm,
                 self.cfg.rms_eps,
             );
-            matvec_pair_f32(
-                pool,
-                kt,
-                layer.w_gate.dtype,
-                layer.w_gate.bytes,
-                layer.w_gate.rows,
-                &mut state.hb[..n_ff],
-                layer.w_up.dtype,
-                layer.w_up.bytes,
-                layer.w_up.rows,
-                &mut state.hb2[..n_ff],
-                &state.xb[..n_embd],
-                &mut state.mv_scratch,
-                n_embd,
-            );
-            if !self.lora.is_empty() {
-                self.lora.apply_linear(
-                    layer.w_gate.lora_slot,
-                    pool,
-                    kt,
-                    &state.xb[..n_embd],
-                    &mut state.hb[..n_ff],
-                    1,
-                    &mut state.lora_scratch,
-                );
-                self.lora.apply_linear(
-                    layer.w_up.lora_slot,
-                    pool,
-                    kt,
-                    &state.xb[..n_embd],
-                    &mut state.hb2[..n_ff],
-                    1,
-                    &mut state.lora_scratch,
-                );
+            match &layer.ffn {
+                Qwen35FfnWeights::Dense {
+                    w_gate,
+                    w_up,
+                    w_down,
+                } => {
+                    matvec_pair_f32(
+                        pool,
+                        kt,
+                        w_gate.dtype,
+                        w_gate.bytes,
+                        w_gate.rows,
+                        &mut state.hb[..n_ff],
+                        w_up.dtype,
+                        w_up.bytes,
+                        w_up.rows,
+                        &mut state.hb2[..n_ff],
+                        &state.xb[..n_embd],
+                        &mut state.mv_scratch,
+                        n_embd,
+                    );
+                    if !self.lora.is_empty() {
+                        self.lora.apply_linear(
+                            w_gate.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.hb[..n_ff],
+                            1,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            w_up.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.hb2[..n_ff],
+                            1,
+                            &mut state.lora_scratch,
+                        );
+                    }
+                    swiglu_inplace_parallel(pool, &mut state.hb[..n_ff], &state.hb2[..n_ff]);
+                    matvec_f32(
+                        pool,
+                        kt,
+                        w_down.dtype,
+                        w_down.bytes,
+                        &state.hb[..n_ff],
+                        &mut state.mv_scratch,
+                        &mut state.xb2[..n_embd],
+                        w_down.rows,
+                        w_down.cols,
+                    );
+                    self.lora.apply_linear(
+                        w_down.lora_slot,
+                        pool,
+                        kt,
+                        &state.hb[..n_ff],
+                        &mut state.xb2[..n_embd],
+                        1,
+                        &mut state.lora_scratch,
+                    );
+                }
+                Qwen35FfnWeights::Moe(moe) => {
+                    eval_sparse_moe_ffn(
+                        moe,
+                        &self.lora,
+                        pool,
+                        kt,
+                        &state.xb[..n_embd],
+                        &mut state.xb2[..n_embd],
+                        n_embd,
+                        1,
+                        &mut state.mv_scratch,
+                        &mut state.lora_scratch,
+                        &mut state.moe_scratch,
+                    );
+                }
             }
-            swiglu_inplace_parallel(pool, &mut state.hb[..n_ff], &state.hb2[..n_ff]);
-            matvec_f32(
-                pool,
-                kt,
-                layer.w_down.dtype,
-                layer.w_down.bytes,
-                &state.hb[..n_ff],
-                &mut state.mv_scratch,
-                &mut state.xb2[..n_embd],
-                layer.w_down.rows,
-                layer.w_down.cols,
-            );
-            self.lora.apply_linear(
-                layer.w_down.lora_slot,
-                pool,
-                kt,
-                &state.hb[..n_ff],
-                &mut state.xb2[..n_embd],
-                1,
-                &mut state.lora_scratch,
-            );
             for i in 0..n_embd {
                 state.x[i] += state.xb2[i];
             }
@@ -1662,74 +1786,105 @@ impl<'a> Qwen35Model<'a> {
             if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t_pn) {
                 p.rms_norm_ns += ts.elapsed().as_nanos() as u64;
             }
-            let t_gu = prof.as_ref().map(|_| Instant::now());
-            matmul_pair_f32(
-                pool,
-                kt,
-                layer.w_gate.dtype,
-                layer.w_gate.bytes,
-                layer.w_gate.rows,
-                &mut state.hb[..b * n_ff],
-                layer.w_up.dtype,
-                layer.w_up.bytes,
-                layer.w_up.rows,
-                &mut state.hb2[..b * n_ff],
-                &state.xb[..b * n_embd],
-                &mut state.mv_scratch,
-                n_embd,
-                b,
-            );
-            if !self.lora.is_empty() {
-                self.lora.apply_linear(
-                    layer.w_gate.lora_slot,
-                    pool,
-                    kt,
-                    &state.xb[..b * n_embd],
-                    &mut state.hb[..b * n_ff],
-                    b,
-                    &mut state.lora_scratch,
-                );
-                self.lora.apply_linear(
-                    layer.w_up.lora_slot,
-                    pool,
-                    kt,
-                    &state.xb[..b * n_embd],
-                    &mut state.hb2[..b * n_ff],
-                    b,
-                    &mut state.lora_scratch,
-                );
+            match &layer.ffn {
+                Qwen35FfnWeights::Dense {
+                    w_gate,
+                    w_up,
+                    w_down,
+                } => {
+                    let t_gu = prof.as_ref().map(|_| Instant::now());
+                    matmul_pair_f32(
+                        pool,
+                        kt,
+                        w_gate.dtype,
+                        w_gate.bytes,
+                        w_gate.rows,
+                        &mut state.hb[..b * n_ff],
+                        w_up.dtype,
+                        w_up.bytes,
+                        w_up.rows,
+                        &mut state.hb2[..b * n_ff],
+                        &state.xb[..b * n_embd],
+                        &mut state.mv_scratch,
+                        n_embd,
+                        b,
+                    );
+                    if !self.lora.is_empty() {
+                        self.lora.apply_linear(
+                            w_gate.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..b * n_embd],
+                            &mut state.hb[..b * n_ff],
+                            b,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            w_up.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..b * n_embd],
+                            &mut state.hb2[..b * n_ff],
+                            b,
+                            &mut state.lora_scratch,
+                        );
+                    }
+                    swiglu_inplace_parallel(
+                        pool,
+                        &mut state.hb[..b * n_ff],
+                        &state.hb2[..b * n_ff],
+                    );
+                    if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t_gu) {
+                        p.ffn_gate_up_ns += ts.elapsed().as_nanos() as u64;
+                    }
+                    let t_fd = prof.as_ref().map(|_| Instant::now());
+                    matmul_f32(
+                        pool,
+                        kt,
+                        w_down.dtype,
+                        w_down.bytes,
+                        &state.hb[..b * n_ff],
+                        &mut state.mv_scratch,
+                        &mut state.xb2[..b * n_embd],
+                        w_down.rows,
+                        w_down.cols,
+                        b,
+                    );
+                    self.lora.apply_linear(
+                        w_down.lora_slot,
+                        pool,
+                        kt,
+                        &state.hb[..b * n_ff],
+                        &mut state.xb2[..b * n_embd],
+                        b,
+                        &mut state.lora_scratch,
+                    );
+                    if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t_fd) {
+                        p.ffn_down_ns += ts.elapsed().as_nanos() as u64;
+                    }
+                }
+                Qwen35FfnWeights::Moe(moe) => {
+                    let t_moe = prof.as_ref().map(|_| Instant::now());
+                    eval_sparse_moe_ffn(
+                        moe,
+                        &self.lora,
+                        pool,
+                        kt,
+                        &state.xb[..b * n_embd],
+                        &mut state.xb2[..b * n_embd],
+                        n_embd,
+                        b,
+                        &mut state.mv_scratch,
+                        &mut state.lora_scratch,
+                        &mut state.moe_scratch,
+                    );
+                    if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t_moe) {
+                        p.ffn_gate_up_ns += ts.elapsed().as_nanos() as u64;
+                    }
+                }
             }
-            swiglu_inplace_parallel(pool, &mut state.hb[..b * n_ff], &state.hb2[..b * n_ff]);
-            if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t_gu) {
-                p.ffn_gate_up_ns += ts.elapsed().as_nanos() as u64;
-            }
-            let t_fd = prof.as_ref().map(|_| Instant::now());
-            matmul_f32(
-                pool,
-                kt,
-                layer.w_down.dtype,
-                layer.w_down.bytes,
-                &state.hb[..b * n_ff],
-                &mut state.mv_scratch,
-                &mut state.xb2[..b * n_embd],
-                layer.w_down.rows,
-                layer.w_down.cols,
-                b,
-            );
-            self.lora.apply_linear(
-                layer.w_down.lora_slot,
-                pool,
-                kt,
-                &state.hb[..b * n_ff],
-                &mut state.xb2[..b * n_embd],
-                b,
-                &mut state.lora_scratch,
-            );
             for i in 0..b * n_embd {
                 state.x[i] += state.xb2[i];
-            }
-            if let (Some(p), Some(ts)) = (prof.as_deref_mut(), t_fd) {
-                p.ffn_down_ns += ts.elapsed().as_nanos() as u64;
             }
         }
 
@@ -2164,70 +2319,95 @@ impl<'a> Qwen35Model<'a> {
             );
             prof.rms_norm_ns += tn2.elapsed().as_nanos() as u64;
 
-            let tf1 = Instant::now();
-            matvec_pair_f32(
-                pool,
-                kt,
-                layer.w_gate.dtype,
-                layer.w_gate.bytes,
-                layer.w_gate.rows,
-                &mut state.hb[..n_ff],
-                layer.w_up.dtype,
-                layer.w_up.bytes,
-                layer.w_up.rows,
-                &mut state.hb2[..n_ff],
-                &state.xb[..n_embd],
-                &mut state.mv_scratch,
-                n_embd,
-            );
-            if !self.lora.is_empty() {
-                self.lora.apply_linear(
-                    layer.w_gate.lora_slot,
-                    pool,
-                    kt,
-                    &state.xb[..n_embd],
-                    &mut state.hb[..n_ff],
-                    1,
-                    &mut state.lora_scratch,
-                );
-                self.lora.apply_linear(
-                    layer.w_up.lora_slot,
-                    pool,
-                    kt,
-                    &state.xb[..n_embd],
-                    &mut state.hb2[..n_ff],
-                    1,
-                    &mut state.lora_scratch,
-                );
-            }
-            swiglu_inplace_parallel(pool, &mut state.hb[..n_ff], &state.hb2[..n_ff]);
-            prof.ffn_gate_up_ns += tf1.elapsed().as_nanos() as u64;
+            match &layer.ffn {
+                Qwen35FfnWeights::Dense {
+                    w_gate,
+                    w_up,
+                    w_down,
+                } => {
+                    let tf1 = Instant::now();
+                    matvec_pair_f32(
+                        pool,
+                        kt,
+                        w_gate.dtype,
+                        w_gate.bytes,
+                        w_gate.rows,
+                        &mut state.hb[..n_ff],
+                        w_up.dtype,
+                        w_up.bytes,
+                        w_up.rows,
+                        &mut state.hb2[..n_ff],
+                        &state.xb[..n_embd],
+                        &mut state.mv_scratch,
+                        n_embd,
+                    );
+                    if !self.lora.is_empty() {
+                        self.lora.apply_linear(
+                            w_gate.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.hb[..n_ff],
+                            1,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            w_up.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..n_embd],
+                            &mut state.hb2[..n_ff],
+                            1,
+                            &mut state.lora_scratch,
+                        );
+                    }
+                    swiglu_inplace_parallel(pool, &mut state.hb[..n_ff], &state.hb2[..n_ff]);
+                    prof.ffn_gate_up_ns += tf1.elapsed().as_nanos() as u64;
 
-            let tf2 = Instant::now();
-            matvec_f32(
-                pool,
-                kt,
-                layer.w_down.dtype,
-                layer.w_down.bytes,
-                &state.hb[..n_ff],
-                &mut state.mv_scratch,
-                &mut state.xb2[..n_embd],
-                layer.w_down.rows,
-                layer.w_down.cols,
-            );
-            self.lora.apply_linear(
-                layer.w_down.lora_slot,
-                pool,
-                kt,
-                &state.hb[..n_ff],
-                &mut state.xb2[..n_embd],
-                1,
-                &mut state.lora_scratch,
-            );
+                    let tf2 = Instant::now();
+                    matvec_f32(
+                        pool,
+                        kt,
+                        w_down.dtype,
+                        w_down.bytes,
+                        &state.hb[..n_ff],
+                        &mut state.mv_scratch,
+                        &mut state.xb2[..n_embd],
+                        w_down.rows,
+                        w_down.cols,
+                    );
+                    self.lora.apply_linear(
+                        w_down.lora_slot,
+                        pool,
+                        kt,
+                        &state.hb[..n_ff],
+                        &mut state.xb2[..n_embd],
+                        1,
+                        &mut state.lora_scratch,
+                    );
+                    prof.ffn_down_ns += tf2.elapsed().as_nanos() as u64;
+                }
+                Qwen35FfnWeights::Moe(moe) => {
+                    let tf = Instant::now();
+                    eval_sparse_moe_ffn(
+                        moe,
+                        &self.lora,
+                        pool,
+                        kt,
+                        &state.xb[..n_embd],
+                        &mut state.xb2[..n_embd],
+                        n_embd,
+                        1,
+                        &mut state.mv_scratch,
+                        &mut state.lora_scratch,
+                        &mut state.moe_scratch,
+                    );
+                    prof.ffn_gate_up_ns += tf.elapsed().as_nanos() as u64;
+                }
+            }
             for i in 0..n_embd {
                 state.x[i] += state.xb2[i];
             }
-            prof.ffn_down_ns += tf2.elapsed().as_nanos() as u64;
         }
 
         state.last_hidden.copy_from_slice(&state.x[..n_embd]);
@@ -2680,64 +2860,91 @@ impl<'a> Qwen35Model<'a> {
                 n_embd,
                 w,
             );
-            matmul_pair_f32(
-                pool,
-                kt,
-                layer.w_gate.dtype,
-                layer.w_gate.bytes,
-                layer.w_gate.rows,
-                &mut state.hb[..w * n_ff],
-                layer.w_up.dtype,
-                layer.w_up.bytes,
-                layer.w_up.rows,
-                &mut state.hb2[..w * n_ff],
-                &state.xb[..w * n_embd],
-                &mut state.mv_scratch,
-                n_embd,
-                w,
-            );
-            if !self.lora.is_empty() {
-                self.lora.apply_linear(
-                    layer.w_gate.lora_slot,
-                    pool,
-                    kt,
-                    &state.xb[..w * n_embd],
-                    &mut state.hb[..w * n_ff],
-                    w,
-                    &mut state.lora_scratch,
-                );
-                self.lora.apply_linear(
-                    layer.w_up.lora_slot,
-                    pool,
-                    kt,
-                    &state.xb[..w * n_embd],
-                    &mut state.hb2[..w * n_ff],
-                    w,
-                    &mut state.lora_scratch,
-                );
+            match &layer.ffn {
+                Qwen35FfnWeights::Dense {
+                    w_gate,
+                    w_up,
+                    w_down,
+                } => {
+                    matmul_pair_f32(
+                        pool,
+                        kt,
+                        w_gate.dtype,
+                        w_gate.bytes,
+                        w_gate.rows,
+                        &mut state.hb[..w * n_ff],
+                        w_up.dtype,
+                        w_up.bytes,
+                        w_up.rows,
+                        &mut state.hb2[..w * n_ff],
+                        &state.xb[..w * n_embd],
+                        &mut state.mv_scratch,
+                        n_embd,
+                        w,
+                    );
+                    if !self.lora.is_empty() {
+                        self.lora.apply_linear(
+                            w_gate.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..w * n_embd],
+                            &mut state.hb[..w * n_ff],
+                            w,
+                            &mut state.lora_scratch,
+                        );
+                        self.lora.apply_linear(
+                            w_up.lora_slot,
+                            pool,
+                            kt,
+                            &state.xb[..w * n_embd],
+                            &mut state.hb2[..w * n_ff],
+                            w,
+                            &mut state.lora_scratch,
+                        );
+                    }
+                    swiglu_inplace_parallel(
+                        pool,
+                        &mut state.hb[..w * n_ff],
+                        &state.hb2[..w * n_ff],
+                    );
+                    matmul_f32(
+                        pool,
+                        kt,
+                        w_down.dtype,
+                        w_down.bytes,
+                        &state.hb[..w * n_ff],
+                        &mut state.mv_scratch,
+                        &mut state.xb2[..w * n_embd],
+                        w_down.rows,
+                        w_down.cols,
+                        w,
+                    );
+                    self.lora.apply_linear(
+                        w_down.lora_slot,
+                        pool,
+                        kt,
+                        &state.hb[..w * n_ff],
+                        &mut state.xb2[..w * n_embd],
+                        w,
+                        &mut state.lora_scratch,
+                    );
+                }
+                Qwen35FfnWeights::Moe(moe) => {
+                    eval_sparse_moe_ffn(
+                        moe,
+                        &self.lora,
+                        pool,
+                        kt,
+                        &state.xb[..w * n_embd],
+                        &mut state.xb2[..w * n_embd],
+                        n_embd,
+                        w,
+                        &mut state.mv_scratch,
+                        &mut state.lora_scratch,
+                        &mut state.moe_scratch,
+                    );
+                }
             }
-            swiglu_inplace_parallel(pool, &mut state.hb[..w * n_ff], &state.hb2[..w * n_ff]);
-            matmul_f32(
-                pool,
-                kt,
-                layer.w_down.dtype,
-                layer.w_down.bytes,
-                &state.hb[..w * n_ff],
-                &mut state.mv_scratch,
-                &mut state.xb2[..w * n_embd],
-                layer.w_down.rows,
-                layer.w_down.cols,
-                w,
-            );
-            self.lora.apply_linear(
-                layer.w_down.lora_slot,
-                pool,
-                kt,
-                &state.hb[..w * n_ff],
-                &mut state.xb2[..w * n_embd],
-                w,
-                &mut state.lora_scratch,
-            );
             for i in 0..w * n_embd {
                 state.x[i] += state.xb2[i];
             }

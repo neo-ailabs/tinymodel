@@ -4,12 +4,15 @@ use std::ffi::c_void;
 
 use tm_core::{DType, KvType};
 use tm_gguf::GgufFile;
-use tm_models::{Qwen35AttnWeights, Qwen35Config, Qwen35Model};
+use tm_models::{Qwen35AttnWeights, Qwen35Config, Qwen35FfnWeights, Qwen35Model};
 
 use crate::CudaError;
 use crate::driver::{CUdeviceptr, CudaBuffer, CudaContext, CudaEvent, CudaGraphExec};
 use crate::kernels::{BLOCK_Q8_1_BYTES, CudaKernels, CudaMat};
-use crate::llama_runner::{CudaProfileReport, CudaStageStat, MAX_CUDA_BATCH, upload_mat};
+use crate::llama_runner::{
+    CudaMoeLayer, CudaMoeScratch, CudaProfileReport, CudaStageStat, MAX_CUDA_BATCH,
+    moe_weight_bytes, upload_mat,
+};
 
 enum CudaQwen35Attn {
     FullAttn {
@@ -37,16 +40,23 @@ enum CudaQwen35Attn {
     },
 }
 
+enum CudaQwen35Ffn {
+    Dense {
+        w_gate: CudaMat,
+        w_up: CudaMat,
+        w_down: CudaMat,
+    },
+    Moe(Box<CudaMoeLayer>),
+}
+
 struct CudaQwen35Layer {
     attn_norm: CudaBuffer,
     post_attn_norm: CudaBuffer,
     attn: CudaQwen35Attn,
-    w_gate: CudaMat,
-    w_up: CudaMat,
-    w_down: CudaMat,
+    ffn: CudaQwen35Ffn,
 }
 
-/// High-throughput CUDA runner for `Qwen3.5` (`qwen35`).
+/// High-throughput CUDA runner for `Qwen3.5` (`qwen35` & `qwen35moe`, e.g. `Qwen3.6-35B-A3B`).
 pub struct Qwen35CudaRunner {
     pub ctx: CudaContext,
     pub kernels: CudaKernels,
@@ -81,6 +91,7 @@ pub struct Qwen35CudaRunner {
     hb: CudaBuffer,
     hb2: CudaBuffer,
     xq_scratch: CudaBuffer,
+    moe_scratch: Option<CudaMoeScratch>,
     logits_dev: CudaBuffer,
     argmax_dev: CudaBuffer,
     logits_host: Vec<f32>,
@@ -133,7 +144,18 @@ impl Qwen35CudaRunner {
             };
         let mut state_bytes = 0usize;
         for l in &cpu_m.layers {
-            weight_bytes += l.w_gate.bytes.len() + l.w_up.bytes.len() + l.w_down.bytes.len();
+            match &l.ffn {
+                Qwen35FfnWeights::Dense {
+                    w_gate,
+                    w_up,
+                    w_down,
+                } => {
+                    weight_bytes += w_gate.bytes.len() + w_up.bytes.len() + w_down.bytes.len();
+                }
+                Qwen35FfnWeights::Moe(moe) => {
+                    weight_bytes += moe_weight_bytes(moe);
+                }
+            }
             match &l.attn {
                 Qwen35AttnWeights::FullAttn {
                     wqg, wk, wv, wo, ..
@@ -224,19 +246,36 @@ impl Qwen35CudaRunner {
                     ssm_state: ctx.alloc_zeroed(hv * s_dim * dv_dim * 4)?,
                 },
             };
+            let ffn = match &l.ffn {
+                Qwen35FfnWeights::Dense {
+                    w_gate,
+                    w_up,
+                    w_down,
+                } => CudaQwen35Ffn::Dense {
+                    w_gate: upload_mat(&ctx, w_gate)?,
+                    w_up: upload_mat(&ctx, w_up)?,
+                    w_down: upload_mat(&ctx, w_down)?,
+                },
+                Qwen35FfnWeights::Moe(moe) => {
+                    CudaQwen35Ffn::Moe(Box::new(CudaMoeLayer::upload(&ctx, moe, cfg.n_embd)?))
+                }
+            };
             layers.push(CudaQwen35Layer {
                 attn_norm: ctx.alloc_from_f32(&l.attn_norm)?,
                 post_attn_norm: ctx.alloc_from_f32(&l.post_attn_norm)?,
                 attn,
-                w_gate: upload_mat(&ctx, &l.w_gate)?,
-                w_up: upload_mat(&ctx, &l.w_up)?,
-                w_down: upload_mat(&ctx, &l.w_down)?,
+                ffn,
             });
         }
 
+        let ff_max = cfg
+            .n_ff
+            .max(cfg.max_n_ff_exp)
+            .max(cfg.max_n_ff_shexp)
+            .max(cfg.n_embd);
         let max_cols = cfg
             .n_embd
-            .max(cfg.n_ff)
+            .max(ff_max)
             .max(q_dim)
             .max(v_gdn_dim)
             .next_multiple_of(32);
@@ -255,9 +294,20 @@ impl Qwen35CudaRunner {
         let beta_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * hv * 4)?;
         let beta_act_buf = ctx.alloc_zeroed(hv * 4)?;
         let g_buf = ctx.alloc_zeroed(hv * 4)?;
-        let hb = ctx.alloc_zeroed(MAX_CUDA_BATCH * cfg.n_ff * 4)?;
-        let hb2 = ctx.alloc_zeroed(MAX_CUDA_BATCH * cfg.n_ff * 4)?;
+        let hb = ctx.alloc_zeroed(MAX_CUDA_BATCH * ff_max.max(1) * 4)?;
+        let hb2 = ctx.alloc_zeroed(MAX_CUDA_BATCH * ff_max.max(1) * 4)?;
         let xq_scratch = ctx.alloc_zeroed(MAX_CUDA_BATCH * (max_cols / 32) * BLOCK_Q8_1_BYTES)?;
+        let moe_scratch = if cfg.n_expert > 0 {
+            Some(CudaMoeScratch::alloc(
+                &ctx,
+                cfg.n_embd,
+                cfg.n_expert,
+                cfg.n_expert_used,
+                cfg.max_n_ff_exp,
+            )?)
+        } else {
+            None
+        };
         let logits_dev = ctx.alloc_zeroed(cfg.vocab_size * 4)?;
         let argmax_dev = ctx.alloc_zeroed(4)?;
         ctx.synchronize()?;
@@ -296,6 +346,7 @@ impl Qwen35CudaRunner {
             hb,
             hb2,
             xq_scratch,
+            moe_scratch,
             logits_dev,
             argmax_dev,
             logits_host: vec![0.0f32; cfg.vocab_size],
@@ -810,7 +861,7 @@ impl Qwen35CudaRunner {
                 n_tok * d,
             )?;
 
-            // Pre-FFN RMSNorm (`post_attn_norm` in Qwen3.5 GGUF naming) + SwiGLU FFN + residual
+            // Pre-FFN RMSNorm (`post_attn_norm` in Qwen3.5 GGUF naming) + Dense/MoE FFN + residual
             self.kernels.launch_rms_norm(
                 &self.ctx,
                 self.x.device_ptr(),
@@ -820,82 +871,119 @@ impl Qwen35CudaRunner {
                 n_tok,
                 self.cfg.rms_eps,
             )?;
-            let ffn_uses_q8 = matches!(
-                layer.w_gate.dtype,
-                DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q5K | DType::Q6K
-            );
-            if can_share_xq && ffn_uses_q8 {
-                self.kernels.launch_quantize_q8_1(
-                    &self.ctx,
-                    self.xb.device_ptr(),
-                    self.xq_scratch.device_ptr(),
-                    d,
-                    n_tok,
-                )?;
-            }
-            self.kernels.launch_linear(
-                &self.ctx,
-                &layer.w_gate,
-                self.xb.device_ptr(),
-                self.xq_scratch.device_ptr(),
-                can_share_xq && ffn_uses_q8,
-                self.hb.device_ptr(),
-                n_tok,
-                false,
-            )?;
-            self.kernels.launch_linear(
-                &self.ctx,
-                &layer.w_up,
-                self.xb.device_ptr(),
-                self.xq_scratch.device_ptr(),
-                can_share_xq && ffn_uses_q8,
-                self.hb2.device_ptr(),
-                n_tok,
-                false,
-            )?;
-            let down_uses_q8 = matches!(
-                layer.w_down.dtype,
-                DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q5K | DType::Q6K
-            );
-            if n_tok <= crate::kernels::MMVQ_MAX_TOK
-                && down_uses_q8
-                && self.cfg.n_ff.is_multiple_of(32)
-            {
-                self.kernels.launch_swiglu_quantize_q8_1(
-                    &self.ctx,
-                    self.hb.device_ptr(),
-                    self.hb2.device_ptr(),
-                    self.xq_scratch.device_ptr(),
-                    self.cfg.n_ff,
-                    n_tok,
-                )?;
-                self.kernels.launch_linear(
-                    &self.ctx,
-                    &layer.w_down,
-                    self.hb.device_ptr(),
-                    self.xq_scratch.device_ptr(),
-                    true,
-                    self.xb2.device_ptr(),
-                    n_tok,
-                    false,
-                )?;
-            } else {
-                self.kernels.launch_swiglu(
-                    &self.ctx,
-                    self.hb.device_ptr(),
-                    self.hb2.device_ptr(),
-                    n_tok * self.cfg.n_ff,
-                )?;
-                self.kernels.launch_linear(
-                    &self.ctx,
-                    &layer.w_down,
-                    self.hb.device_ptr(),
-                    self.xq_scratch.device_ptr(),
-                    false,
-                    self.xb2.device_ptr(),
-                    n_tok,
-                    false,
-                )?;
+            match &layer.ffn {
+                CudaQwen35Ffn::Dense {
+                    w_gate,
+                    w_up,
+                    w_down,
+                } => {
+                    let ffn_uses_q8 = matches!(
+                        w_gate.dtype,
+                        DType::Q2_0
+                            | DType::Q4_0
+                            | DType::Q4_1
+                            | DType::Q8_0
+                            | DType::Q5K
+                            | DType::Q6K
+                    );
+                    if can_share_xq && ffn_uses_q8 {
+                        self.kernels.launch_quantize_q8_1(
+                            &self.ctx,
+                            self.xb.device_ptr(),
+                            self.xq_scratch.device_ptr(),
+                            d,
+                            n_tok,
+                        )?;
+                    }
+                    self.kernels.launch_linear(
+                        &self.ctx,
+                        w_gate,
+                        self.xb.device_ptr(),
+                        self.xq_scratch.device_ptr(),
+                        can_share_xq && ffn_uses_q8,
+                        self.hb.device_ptr(),
+                        n_tok,
+                        false,
+                    )?;
+                    self.kernels.launch_linear(
+                        &self.ctx,
+                        w_up,
+                        self.xb.device_ptr(),
+                        self.xq_scratch.device_ptr(),
+                        can_share_xq && ffn_uses_q8,
+                        self.hb2.device_ptr(),
+                        n_tok,
+                        false,
+                    )?;
+                    let down_uses_q8 = matches!(
+                        w_down.dtype,
+                        DType::Q2_0
+                            | DType::Q4_0
+                            | DType::Q4_1
+                            | DType::Q8_0
+                            | DType::Q5K
+                            | DType::Q6K
+                    );
+                    if n_tok <= crate::kernels::MMVQ_MAX_TOK
+                        && down_uses_q8
+                        && self.cfg.n_ff.is_multiple_of(32)
+                    {
+                        self.kernels.launch_swiglu_quantize_q8_1(
+                            &self.ctx,
+                            self.hb.device_ptr(),
+                            self.hb2.device_ptr(),
+                            self.xq_scratch.device_ptr(),
+                            self.cfg.n_ff,
+                            n_tok,
+                        )?;
+                        self.kernels.launch_linear(
+                            &self.ctx,
+                            w_down,
+                            self.hb.device_ptr(),
+                            self.xq_scratch.device_ptr(),
+                            true,
+                            self.xb2.device_ptr(),
+                            n_tok,
+                            false,
+                        )?;
+                    } else {
+                        self.kernels.launch_swiglu(
+                            &self.ctx,
+                            self.hb.device_ptr(),
+                            self.hb2.device_ptr(),
+                            n_tok * self.cfg.n_ff,
+                        )?;
+                        self.kernels.launch_linear(
+                            &self.ctx,
+                            w_down,
+                            self.hb.device_ptr(),
+                            self.xq_scratch.device_ptr(),
+                            false,
+                            self.xb2.device_ptr(),
+                            n_tok,
+                            false,
+                        )?;
+                    }
+                }
+                CudaQwen35Ffn::Moe(moe) => {
+                    let scratch = self.moe_scratch.as_ref().ok_or_else(|| {
+                        CudaError::InvalidDimensions(
+                            "Qwen3.5 MoE layer present without CudaMoeScratch".to_string(),
+                        )
+                    })?;
+                    moe.encode(
+                        &self.ctx,
+                        &self.kernels,
+                        scratch,
+                        self.xq_scratch.device_ptr(),
+                        self.hb.device_ptr(),
+                        self.hb2.device_ptr(),
+                        self.xb.device_ptr(),
+                        self.xb2.device_ptr(),
+                        d,
+                        n_tok,
+                    )?;
+                }
             }
             self.kernels.launch_add_scaled(
                 &self.ctx,

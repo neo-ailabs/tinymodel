@@ -114,6 +114,7 @@ pub(crate) struct CudaDriver {
     pub cu_memset_d8: FnCuMemsetD8V2,
     #[allow(dead_code)]
     pub cu_memcpy_htod: FnCuMemcpyHtoDV2,
+    #[allow(dead_code)]
     pub cu_memcpy_dtoh: FnCuMemcpyDtoHV2,
     pub cu_memcpy_dtod: FnCuMemcpyDtoDV2,
     pub cu_memcpy_htod_async: FnCuMemcpyHtoDAsyncV2,
@@ -439,9 +440,9 @@ impl CudaContext {
         }
 
         let mut stream: CUstream = ptr::null_mut();
-        // SAFETY: Context is current; `CU_STREAM_NON_BLOCKING = 1`.
+        // SAFETY: Context is current; `CU_STREAM_DEFAULT = 0` guarantees stream ordering with `cuMemsetD8_v2`.
         unsafe {
-            if let Err(e) = drv.check("cuStreamCreate", (drv.cu_stream_create)(&mut stream, 1)) {
+            if let Err(e) = drv.check("cuStreamCreate", (drv.cu_stream_create)(&mut stream, 0)) {
                 let _ = (drv.cu_module_unload)(module);
                 let _ = (drv.cu_device_primary_ctx_release)(dev);
                 return Err(e);
@@ -596,6 +597,7 @@ impl CudaContext {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn copy_dtoh_raw(
         &self,
         src_ptr: CUdeviceptr,
@@ -656,6 +658,7 @@ impl CudaContext {
                 limit: self.inner.info.max_shared_mem_optin,
             });
         }
+        self.bind_current()?;
         // SAFETY: Caller guarantees `params` points to valid kernel argument storage matching `func`'s PTX signature.
         unsafe {
             self.inner.drv.check(

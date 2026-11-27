@@ -1,0 +1,167 @@
+#version 450
+// INT8 DP4A (`OpSDotKHR`) Mixture-of-Experts `Q8_0 * Q8_1` GEMV kernels for `Inkling-2-Mini`:
+//   op 1 (`moe_gemv_q8_0_dp4a`): indexed `mul_mat_id` `Q8_0` GEMV (supports split-expert `k_off`, `k_gpu`)
+//   op 5 (`moe_gemv_q8_0_grouped_dp4a`): `0-ULP` bit-exact expert-deduplicated `Q8_0` GEMV (`tile_cnt <= 8`)
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_spirv_intrinsics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+spirv_instruction(extensions = ["SPV_KHR_integer_dot_product"], capabilities = [6018, 6019], id = 4450)
+int sdot4x8(int a, int b, spirv_literal int packed_fmt);
+
+layout(constant_id = 0) const uint WG = 128;
+layout(constant_id = 1) const uint NR = 4;
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer W32Buf   { uint w32[]; };
+layout(std430, binding = 1) readonly buffer InXQBuf  { int  xq[]; };
+layout(std430, binding = 2) readonly buffer InXDBuf  { vec2 xd[]; };
+layout(std430, binding = 3) readonly buffer TopIdBuf { uint top_ids[]; };
+layout(std430, binding = 4) writeonly buffer OutYBuf { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint op;
+    uint p0;
+    uint p1;
+    uint p2;
+    uint p3;
+    uint p4;
+    uint u6;
+    uint u7;
+} pc;
+
+void main() {
+    const uint row0 = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * NR;
+    if (row0 >= pc.p1) return;
+
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg_size = gl_SubgroupSize;
+    const uint nb = pc.p0 >> 5u;
+    const uint sub_blk = lane >> 3u;
+    const uint sub_lane = lane & 7u;
+    const uint step_blk = sg_size >> 3u;
+    const uint q_u16_off = 1u + (sub_lane << 1u);
+
+    if (pc.op == 1u) {
+        const uint y_slot = gl_WorkGroupID.y;
+        const uint k_gpu = pc.u7 & 0xFFFFu;
+        const uint full_top_k = pc.u7 >> 16u;
+        const uint id_slot = (k_gpu != 0u)
+            ? ((y_slot / k_gpu) * full_top_k + pc.u6 + (y_slot % k_gpu))
+            : (pc.u6 + y_slot);
+        const uint e_id = top_ids[id_slot];
+        const uint exp_base = e_id * pc.p3;
+        const uint xr = (pc.p4 != 0u)
+            ? ((k_gpu != 0u) ? (y_slot / k_gpu) : (id_slot / pc.p4))
+            : y_slot;
+        const uint x_blk_base = xr * nb;
+
+        float acc[NR];
+        uint row_b[NR];
+        [[unroll]] for (uint r = 0u; r < NR; ++r) {
+            acc[r] = 0.0;
+            const uint row = min(row0 + r, pc.p1 - 1u);
+            row_b[r] = exp_base + row * pc.p2;
+        }
+
+        for (uint ib = sub_blk; ib < nb; ib += step_blk) {
+            const uint gblk = x_blk_base + ib;
+            const int xqv = xq[gblk * 8u + sub_lane];
+            const float dx = xd[gblk].x;
+            const uint blk_u16 = ib * 17u;
+            [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                const uint b = row_b[r] + blk_u16;
+                const uint dw = w32[b >> 1u];
+                const float d = ((b & 1u) == 0u) ? unpackHalf2x16(dw).x : unpackHalf2x16(dw).y;
+                const uint q = b + q_u16_off;
+                const uint q32 = ((q & 1u) == 0u)
+                    ? w32[q >> 1u]
+                    : ((w32[q >> 1u] >> 16u) | (w32[(q >> 1u) + 1u] << 16u));
+                acc[r] = fma(d * dx, float(sdot4x8(int(q32), xqv, 0)), acc[r]);
+            }
+        }
+
+        [[unroll]] for (uint r = 0u; r < NR; ++r) {
+            const float sum = subgroupAdd(acc[r]);
+            const uint row = row0 + r;
+            if (subgroupElect() && row < pc.p1) {
+                y[y_slot * pc.p1 + row] = sum;
+            }
+        }
+    } else if (pc.op == 5u) {
+        const uint tile_idx = gl_WorkGroupID.y;
+        if (tile_idx >= top_ids[0]) return;
+
+        const uint tb = 4u + tile_idx * 4u;
+        const uint e_id = top_ids[tb + 0u];
+        const uint start_pos = top_ids[tb + 1u];
+        const uint tile_cnt = top_ids[tb + 2u];
+        const uint exp_base = e_id * pc.p3;
+
+        uint slots[8];
+        uint x_blk_bases[8];
+        [[unroll]] for (uint m = 0u; m < 8u; ++m) {
+            if (m < tile_cnt) {
+                const uint sl = top_ids[2048u + start_pos + m];
+                slots[m] = sl;
+                const uint xr = (pc.p4 != 0u) ? (sl / pc.p4) : sl;
+                x_blk_bases[m] = xr * nb;
+            } else {
+                slots[m] = 0u;
+                x_blk_bases[m] = 0u;
+            }
+        }
+
+        float acc[8][NR];
+        uint row_b[NR];
+        [[unroll]] for (uint r = 0u; r < NR; ++r) {
+            const uint row = min(row0 + r, pc.p1 - 1u);
+            row_b[r] = exp_base + row * pc.p2;
+            [[unroll]] for (uint m = 0u; m < 8u; ++m) {
+                acc[m][r] = 0.0;
+            }
+        }
+
+        for (uint ib = sub_blk; ib < nb; ib += step_blk) {
+            const uint blk_u16 = ib * 17u;
+            float d_arr[NR];
+            int q32_arr[NR];
+            [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                const uint b = row_b[r] + blk_u16;
+                const uint dw = w32[b >> 1u];
+                d_arr[r] = ((b & 1u) == 0u) ? unpackHalf2x16(dw).x : unpackHalf2x16(dw).y;
+                const uint q = b + q_u16_off;
+                const uint q32 = ((q & 1u) == 0u)
+                    ? w32[q >> 1u]
+                    : ((w32[q >> 1u] >> 16u) | (w32[(q >> 1u) + 1u] << 16u));
+                q32_arr[r] = int(q32);
+            }
+            [[unroll]] for (uint m = 0u; m < 8u; ++m) {
+                if (m < tile_cnt) {
+                    const uint gblk = x_blk_bases[m] + ib;
+                    const int xqvm = xq[gblk * 8u + sub_lane];
+                    const float dxm = xd[gblk].x;
+                    [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                        acc[m][r] = fma(d_arr[r] * dxm, float(sdot4x8(q32_arr[r], xqvm, 0)), acc[m][r]);
+                    }
+                }
+            }
+        }
+
+        [[unroll]] for (uint m = 0u; m < 8u; ++m) {
+            if (m < tile_cnt) {
+                const uint y_base = slots[m] * pc.p1;
+                [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                    const float sum = subgroupAdd(acc[m][r]);
+                    const uint row = row0 + r;
+                    if (subgroupElect() && row < pc.p1) {
+                        y[y_base + row] = sum;
+                    }
+                }
+            }
+        }
+    }
+}

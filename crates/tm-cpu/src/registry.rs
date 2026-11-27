@@ -48,6 +48,8 @@ pub type GemmNvFp4Fn = fn(&[BlockNvFp4], &[BlockQ8_0], &mut [f32], usize, usize,
 pub type DotF32F16Fn = fn(&[f32], &[u16]) -> f32;
 pub type DotF32Bf16Fn = fn(&[f32], &[u16]) -> f32;
 pub type DotF32Q8_0Fn = fn(&[f32], &[BlockQ8_0]) -> f32;
+pub type GemvF32Q8_0Fn = fn(&[BlockQ8_0], &[f32], &mut [f32], usize, usize);
+pub type GemmF32Q8_0Fn = fn(&[BlockQ8_0], &[f32], &mut [f32], usize, usize, usize);
 pub type AxpyF32Fn = fn(&mut [f32], f32, &[f32]);
 pub type AxpyF32F16Fn = fn(&mut [f32], f32, &[u16]);
 pub type AxpyF32Q8_0Fn = fn(&mut [f32], f32, &[BlockQ8_0]);
@@ -104,6 +106,8 @@ pub struct KernelTable {
     pub dot_f32_f16: DotF32F16Fn,
     pub dot_f32_bf16: DotF32Bf16Fn,
     pub dot_f32_q8_0: DotF32Q8_0Fn,
+    pub gemv_f32_q8_0: GemvF32Q8_0Fn,
+    pub gemm_f32_q8_0: GemmF32Q8_0Fn,
     pub axpy_f32: AxpyF32Fn,
     pub axpy_f32_f16: AxpyF32F16Fn,
     pub axpy_f32_q8_0: AxpyF32Q8_0Fn,
@@ -156,6 +160,8 @@ const GENERIC_TABLE: KernelTable = KernelTable {
     dot_f32_f16: generic::dot_f32_f16,
     dot_f32_bf16: generic::dot_f32_bf16,
     dot_f32_q8_0: generic::dot_f32_q8_0,
+    gemv_f32_q8_0: generic::gemv_f32_q8_0,
+    gemm_f32_q8_0: generic::gemm_f32_q8_0,
     axpy_f32: generic::axpy_f32,
     axpy_f32_f16: generic::axpy_f32_f16,
     axpy_f32_q8_0: generic::axpy_f32_q8_0,
@@ -984,6 +990,42 @@ mod aarch64_wrappers {
         unsafe { lut::dotprod_gemm_nvfp4_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
     }
 
+    fn neon_gemv_f32_q8_0(
+        w: &[BlockQ8_0],
+        x: &[f32],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        assert_eq!(w.len(), rows * cols_blocks);
+        assert_eq!(out.len(), rows);
+        for (r, dst) in out.iter_mut().enumerate() {
+            *dst = neon_dot_f32_q8_0(x, &w[r * cols_blocks..(r + 1) * cols_blocks]);
+        }
+    }
+
+    fn neon_gemm_f32_q8_0(
+        w: &[BlockQ8_0],
+        x: &[f32],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        let cols = cols_blocks * tm_core::QK8_0;
+        assert_eq!(x.len(), n_tokens * cols);
+        assert_eq!(out.len(), n_tokens * rows);
+        for t in 0..n_tokens {
+            neon_gemv_f32_q8_0(
+                w,
+                &x[t * cols..(t + 1) * cols],
+                &mut out[t * rows..(t + 1) * rows],
+                rows,
+                cols_blocks,
+            );
+        }
+    }
+
     pub const NEON_V80_TABLE: KernelTable = KernelTable {
         isa: Isa::NeonV80,
         vec_dot_q4_0_q8_0: neon_v80_vec_dot,
@@ -1022,6 +1064,8 @@ mod aarch64_wrappers {
         dot_f32_f16: neon_dot_f32_f16,
         dot_f32_bf16: neon_dot_f32_bf16,
         dot_f32_q8_0: neon_dot_f32_q8_0,
+        gemv_f32_q8_0: neon_gemv_f32_q8_0,
+        gemm_f32_q8_0: neon_gemm_f32_q8_0,
         axpy_f32: neon_axpy_f32,
         axpy_f32_f16: neon_axpy_f32_f16,
         axpy_f32_q8_0: neon_axpy_f32_q8_0,
@@ -1075,6 +1119,8 @@ mod aarch64_wrappers {
         dot_f32_f16: neon_dot_f32_f16,
         dot_f32_bf16: neon_dot_f32_bf16,
         dot_f32_q8_0: neon_dot_f32_q8_0,
+        gemv_f32_q8_0: neon_gemv_f32_q8_0,
+        gemm_f32_q8_0: neon_gemm_f32_q8_0,
         axpy_f32: neon_axpy_f32,
         axpy_f32_f16: neon_axpy_f32_f16,
         axpy_f32_q8_0: neon_axpy_f32_q8_0,
@@ -1128,6 +1174,8 @@ mod aarch64_wrappers {
         dot_f32_f16: neon_dot_f32_f16,
         dot_f32_bf16: neon_dot_f32_bf16,
         dot_f32_q8_0: neon_dot_f32_q8_0,
+        gemv_f32_q8_0: neon_gemv_f32_q8_0,
+        gemm_f32_q8_0: neon_gemm_f32_q8_0,
         axpy_f32: neon_axpy_f32,
         axpy_f32_f16: neon_axpy_f32_f16,
         axpy_f32_q8_0: neon_axpy_f32_q8_0,
@@ -1148,7 +1196,79 @@ mod aarch64_wrappers {
 #[cfg(target_arch = "x86_64")]
 mod x86_64_wrappers {
     use super::*;
-    use crate::x86_64::avx2;
+    use crate::x86_64::{avx2, avx512};
+
+    fn avx512_vec_dot_q4_0(x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
+        // SAFETY: `AVX512_TABLE` is only selected after runtime `avx512f+bw+vl+fma` detection.
+        unsafe { avx512::vec_dot_q4_0_q8_0(x, y) }
+    }
+    fn avx512_gemv_q4_0(
+        w: &[BlockQ4_0],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: `AVX512_TABLE` is only selected after runtime `avx512f+bw+vl+fma` detection.
+        unsafe { avx512::gemv_q4_0_q8_0(w, x, out, rows, cols_blocks) }
+    }
+    fn avx512_gemm_q4_0(
+        w: &[BlockQ4_0],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: `AVX512_TABLE` is only selected after runtime `avx512f+bw+vl+fma` detection.
+        unsafe { avx512::gemm_q4_0_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+    fn avx512_vec_dot_q8_0(x: &[BlockQ8_0], y: &[BlockQ8_0]) -> f32 {
+        // SAFETY: `AVX512_TABLE` is only selected after runtime `avx512f+bw+vl` detection.
+        unsafe { avx512::vec_dot_q8_0_q8_0(x, y) }
+    }
+    fn avx512_gemv_q8_0(
+        w: &[BlockQ8_0],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: `AVX512_TABLE` is only selected after runtime `avx512f+bw+vl` detection.
+        unsafe { avx512::gemv_q8_0_q8_0(w, x, out, rows, cols_blocks) }
+    }
+    fn avx512_gemm_q8_0(
+        w: &[BlockQ8_0],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: `AVX512_TABLE` is only selected after runtime `avx512f+bw+vl` detection.
+        unsafe { avx512::gemm_q8_0_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+    fn avx512_gemv_f32_q8_0(
+        w: &[BlockQ8_0],
+        x: &[f32],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: `AVX512_TABLE` is only selected after runtime `avx512f+bw+vl+fma` detection.
+        unsafe { avx512::gemv_f32_q8_0(w, x, out, rows, cols_blocks) }
+    }
+    fn avx512_gemm_f32_q8_0(
+        w: &[BlockQ8_0],
+        x: &[f32],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: `AVX512_TABLE` is only selected after runtime `avx512f+bw+vl+fma` detection.
+        unsafe { avx512::gemm_f32_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
+    }
 
     fn avx2_vec_dot_q4_0(x: &[BlockQ4_0], y: &[BlockQ8_0]) -> f32 {
         // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
@@ -1229,6 +1349,27 @@ mod x86_64_wrappers {
         // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
         unsafe { avx2::dot_f32_q8_0(q, k_q8) }
     }
+    fn avx2_gemv_f32_q8_0(
+        w: &[BlockQ8_0],
+        x: &[f32],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::gemv_f32_q8_0(w, x, out, rows, cols_blocks) }
+    }
+    fn avx2_gemm_f32_q8_0(
+        w: &[BlockQ8_0],
+        x: &[f32],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::gemm_f32_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
+    }
     fn avx2_axpy_f32_q8_0(out: &mut [f32], w: f32, v_q8: &[BlockQ8_0]) {
         // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
         unsafe { avx2::axpy_f32_q8_0(out, w, v_q8) }
@@ -1270,8 +1411,20 @@ mod x86_64_wrappers {
         head_dim: usize,
         d_state: usize,
     ) {
-        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma + f16c` detection.
         unsafe { avx2::mamba2_scan_head(x_h, b_g, c_g, da, dt, d_h, s_h, y_h, head_dim, d_state) }
+    }
+    fn avx2_dot_f32_f16(q: &[f32], k_f16: &[u16]) -> f32 {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma + f16c` detection.
+        unsafe { avx2::dot_f32_f16(q, k_f16) }
+    }
+    fn avx2_axpy_f32_f16(out: &mut [f32], w: f32, v_f16: &[u16]) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma + f16c` detection.
+        unsafe { avx2::axpy_f32_f16(out, w, v_f16) }
+    }
+    fn avx2_f32_to_f16_slice(src: &[f32], dst: &mut [u16]) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma + f16c` detection.
+        unsafe { avx2::f32_to_f16_slice(src, dst) }
     }
 
     pub const AVX2_TABLE: KernelTable = KernelTable {
@@ -1309,14 +1462,16 @@ mod x86_64_wrappers {
         vec_dot_nvfp4_q8_0: generic::vec_dot_nvfp4_q8_0,
         gemv_nvfp4_q8_0: generic::gemv_nvfp4_q8_0,
         gemm_nvfp4_q8_0: generic::gemm_nvfp4_q8_0,
-        dot_f32_f16: generic::dot_f32_f16,
+        dot_f32_f16: avx2_dot_f32_f16,
         dot_f32_bf16: avx2_dot_f32_bf16,
         dot_f32_q8_0: avx2_dot_f32_q8_0,
+        gemv_f32_q8_0: avx2_gemv_f32_q8_0,
+        gemm_f32_q8_0: avx2_gemm_f32_q8_0,
         axpy_f32: generic::axpy_f32,
-        axpy_f32_f16: generic::axpy_f32_f16,
+        axpy_f32_f16: avx2_axpy_f32_f16,
         axpy_f32_q8_0: avx2_axpy_f32_q8_0,
         gemm_q4_0_transposed_tile: generic::gemm_q4_0_transposed_tile,
-        f32_to_f16_slice: generic::f32_to_f16_slice,
+        f32_to_f16_slice: avx2_f32_to_f16_slice,
         quantize_q8_0: generic::quantize_q8_0,
         quantize_q8_1: generic::quantize_q8_1,
         quantize_q8_k: generic::quantize_q8_k,
@@ -1324,6 +1479,19 @@ mod x86_64_wrappers {
         l2_norm_f32: avx2_l2_norm_f32,
         gdn_recurrence_head: avx2_gdn_recurrence_head,
         mamba2_scan_head: avx2_mamba2_scan_head,
+    };
+
+    pub const AVX512_TABLE: KernelTable = KernelTable {
+        isa: Isa::Avx512,
+        vec_dot_q4_0_q8_0: avx512_vec_dot_q4_0,
+        gemv_q4_0_q8_0: avx512_gemv_q4_0,
+        gemm_q4_0_q8_0: avx512_gemm_q4_0,
+        vec_dot_q8_0_q8_0: avx512_vec_dot_q8_0,
+        gemv_q8_0_q8_0: avx512_gemv_q8_0,
+        gemm_q8_0_q8_0: avx512_gemm_q8_0,
+        gemv_f32_q8_0: avx512_gemv_f32_q8_0,
+        gemm_f32_q8_0: avx512_gemm_f32_q8_0,
+        ..AVX2_TABLE
     };
 }
 
@@ -1352,7 +1520,9 @@ pub fn select_kernels(isa: Isa) -> &'static KernelTable {
         ))]
         Isa::NeonI8mm => &aarch64_wrappers::NEON_V80_TABLE,
         #[cfg(target_arch = "x86_64")]
-        Isa::Avx2 | Isa::Avx512 => &x86_64_wrappers::AVX2_TABLE,
+        Isa::Avx2 => &x86_64_wrappers::AVX2_TABLE,
+        #[cfg(target_arch = "x86_64")]
+        Isa::Avx512 => &x86_64_wrappers::AVX512_TABLE,
         _ => &GENERIC_TABLE,
     }
 }

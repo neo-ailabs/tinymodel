@@ -105,31 +105,29 @@ void main() {
         }
     } else if (DTYPE == 2u) {
         const uint nb = pc.n_in / 32u;
-        if (sg_size <= 32u) {
-            for (uint ib = 0u; ib < nb; ++ib) {
-                float d[NR];
-                for (uint r = 0u; r < NR; ++r) {
-                    d[r] = unpackHalf2x16(uint(w16[row_b[r] + ib * 17u])).x;
-                }
-                for (uint e = lane; e < 32u; e += sg_size) {
-                    const float xv = x[x_base + ib * 32u + e];
-                    for (uint r = 0u; r < NR; ++r) {
-                        const int q = sbyte_at(row_b[r] + ib * 17u + 1u, e);
-                        acc[r] = fma(d[r] * float(q), xv, acc[r]);
-                    }
-                }
-            }
-        } else {
-            const uint sub_blk = lane >> 5u;
-            const uint e = lane & 31u;
-            const uint step_blk = sg_size >> 5u;
-            for (uint ib = sub_blk; ib < nb; ib += step_blk) {
-                const float xv = x[x_base + ib * 32u + e];
-                for (uint r = 0u; r < NR; ++r) {
-                    const uint b = row_b[r] + ib * 17u;
-                    const float d = unpackHalf2x16(uint(w16[b])).x;
-                    acc[r] = fma(d * float(sbyte_at(b + 1u, e)), xv, acc[r]);
-                }
+        const uint sub_blk = lane >> 3u;
+        const uint sub_lane = lane & 7u;
+        const uint step_blk = max(sg_size >> 3u, 1u);
+        const uint q_u16_off = 1u + (sub_lane << 1u);
+        for (uint ib = sub_blk; ib < nb; ib += step_blk) {
+            const uint x0 = x_base + ib * 32u + sub_lane * 4u;
+            const vec4 xv = vec4(x[x0], x[x0 + 1u], x[x0 + 2u], x[x0 + 3u]);
+            const uint blk_u16 = ib * 17u;
+            for (uint r = 0u; r < NR; ++r) {
+                const uint b = row_b[r] + blk_u16;
+                const uint dw = w32[b >> 1u];
+                const float d = ((b & 1u) == 0u) ? unpackHalf2x16(dw).x : unpackHalf2x16(dw).y;
+                const uint q = b + q_u16_off;
+                const uint q32 = ((q & 1u) == 0u)
+                    ? w32[q >> 1u]
+                    : ((w32[q >> 1u] >> 16u) | (w32[(q >> 1u) + 1u] << 16u));
+                const vec4 q4 = vec4(
+                    float(bitfieldExtract(int(q32), 0, 8)),
+                    float(bitfieldExtract(int(q32), 8, 8)),
+                    float(bitfieldExtract(int(q32), 16, 8)),
+                    float(bitfieldExtract(int(q32), 24, 8))
+                );
+                acc[r] = fma(d, dot(q4, xv), acc[r]);
             }
         }
     } else if (DTYPE == 3u) {

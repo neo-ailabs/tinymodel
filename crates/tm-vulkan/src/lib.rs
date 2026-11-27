@@ -8,6 +8,7 @@
 //! instead of silently dropping work.
 
 mod context;
+pub mod dflash_runner;
 pub mod inkling2_runner;
 mod kernels;
 pub mod llama_runner;
@@ -17,6 +18,7 @@ pub mod train_accel;
 pub mod vision_runner;
 
 pub use context::{DeviceInfo, VkBuffer, VkPrefillMode, VulkanContext};
+pub use dflash_runner::{DFlashVkConfig, DFlashVkRunner};
 pub use inkling2_runner::{
     HostMoeFn, HostMoeWindowFn, Inkling2VkConfig, Inkling2VkRunner, MAX_INKLING2_SPEC_WINDOW,
     MAX_INKLING2_VK_WINDOW,

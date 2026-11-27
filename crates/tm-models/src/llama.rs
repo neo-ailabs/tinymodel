@@ -27,7 +27,7 @@ pub enum ModelError {
     #[error(transparent)]
     Gguf(#[from] GgufError),
     #[error(
-        "unsupported model architecture '{0}' (supports 'llama', 'qwen2', 'qwen3', 'smollm3', 'phi3', 'mistral', 'mistral3', 'olmo2', 'olmo3', 'granite', 'exaone', 'olmoe', 'granitemoe', 'qwen2moe', 'qwen3moe', 'bailingmoe2', 'qwen35', 'gemma2', 'gemma3', 'gemma4', 'lfm2', 'lfm3', 'mamba2', 'nemotron_h', 'falcon-h1', 'granitehybrid', 'granitemoehybrid', 'inkling2', and 'inkling2_loop')"
+        "unsupported model architecture '{0}' (supports 'llama', 'qwen2', 'qwen3', 'smollm3', 'phi3', 'mistral', 'mistral3', 'olmo2', 'olmo3', 'granite', 'exaone', 'olmoe', 'granitemoe', 'qwen2moe', 'qwen3moe', 'bailingmoe2', 'qwen35', 'qwen35moe', 'gemma2', 'gemma3', 'gemma4', 'lfm2', 'lfm3', 'mamba2', 'nemotron_h', 'falcon-h1', 'granitehybrid', 'granitemoehybrid', 'inkling2', and 'inkling2_loop')"
     )]
     UnsupportedArch(String),
     #[error("invalid model configuration: {0}")]
