@@ -16,3 +16,6 @@ tm-cpu = { path = "../tm-cpu", default-features = false }
 tm-gguf = { path = "../tm-gguf" }
 tm-lora = { path = "../tm-lora" }
 tm-models = { path = "../tm-models" }
+
+[dev-dependencies]
+tm-tokenizer = { path = "../tm-tokenizer" }

@@ -168,9 +168,9 @@ impl CudaMoeScratch {
 #[inline]
 pub(crate) fn is_q8_1_moe_dtype(dtype_tag: i32, cols: usize) -> bool {
     match dtype_tag {
-        2 | 3 | 8 => cols.is_multiple_of(32),
+        2 | 3 | 6 | 8 | 20 => cols.is_multiple_of(32),
         42 => cols.is_multiple_of(64),
-        12..=14 => cols.is_multiple_of(256),
+        11..=14 | 23 => cols.is_multiple_of(256),
         _ => false,
     }
 }
@@ -551,11 +551,9 @@ impl CudaMoeLayer {
         // 4. Optional shared expert (100% stream-ordered, CUDA-Graph safe!)
         if let Some(ref sh) = self.shared_expert {
             let can_share_xq = n_tok <= crate::kernels::MMVQ_MAX_TOK && d.is_multiple_of(32);
-            let sh_uses_q8 = matches!(
-                sh.w_gate.dtype,
-                DType::Q2_0 | DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q5K | DType::Q6K
-            );
-            if can_share_xq && sh_uses_q8 {
+            let sh_uses_q8 = crate::kernels::is_q8_1_mmvq_dtype(sh.w_gate.dtype);
+            let up_uses_q8 = crate::kernels::is_q8_1_mmvq_dtype(sh.w_up.dtype);
+            if can_share_xq && (sh_uses_q8 || up_uses_q8) {
                 kernels.launch_quantize_q8_1(ctx, ffn_in_ptr, xq_scratch_ptr, d, n_tok)?;
             }
             kernels.launch_linear(
@@ -573,7 +571,7 @@ impl CudaMoeLayer {
                 &sh.w_up,
                 ffn_in_ptr,
                 xq_scratch_ptr,
-                can_share_xq && sh_uses_q8,
+                can_share_xq && up_uses_q8,
                 hb2_ptr,
                 n_tok,
                 false,
@@ -585,25 +583,14 @@ impl CudaMoeLayer {
                     ffn_in_ptr,
                     xq_scratch_ptr,
                     can_share_xq
-                        && sh_uses_q8
-                        && matches!(
-                            w_gi.dtype,
-                            DType::Q2_0
-                                | DType::Q4_0
-                                | DType::Q4_1
-                                | DType::Q8_0
-                                | DType::Q5K
-                                | DType::Q6K
-                        ),
+                        && (sh_uses_q8 || up_uses_q8)
+                        && crate::kernels::is_q8_1_mmvq_dtype(w_gi.dtype),
                     scratch.shexp_gate.device_ptr(),
                     n_tok,
                     true,
                 )?;
             }
-            let down_uses_q8 = matches!(
-                sh.w_down.dtype,
-                DType::Q2_0 | DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q5K | DType::Q6K
-            );
+            let down_uses_q8 = crate::kernels::is_q8_1_mmvq_dtype(sh.w_down.dtype);
             if n_tok <= crate::kernels::MMVQ_MAX_TOK
                 && down_uses_q8
                 && sh.n_ff_shexp.is_multiple_of(32)

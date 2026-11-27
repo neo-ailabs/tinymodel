@@ -222,6 +222,10 @@ pub fn init_lora_adapter_for_cpu_model(
             "QLoRA fine-tuning is not yet supported on architecture '{}'",
             m.cfg.arch
         ))),
+        CpuModel::Qwen4Exp(m) => Err(TrainError::InvalidConfig(format!(
+            "QLoRA fine-tuning is not yet supported on architecture '{}'",
+            m.cfg.arch
+        ))),
     }
 }
 

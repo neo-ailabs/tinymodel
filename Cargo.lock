@@ -215,6 +215,7 @@ dependencies = [
  "tm-gguf",
  "tm-lora",
  "tm-models",
+ "tm-tokenizer",
 ]
 
 [[package]]

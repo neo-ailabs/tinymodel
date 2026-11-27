@@ -5,13 +5,19 @@
 //! memory against the device's hardware limits before calling `cuLaunchKernel`.
 
 pub mod driver;
+pub mod hy4_runner;
+pub mod inkling2_runner;
 pub mod kernels;
 pub mod llama_runner;
 pub mod qwen35_runner;
+pub mod qwen4exp_runner;
 
 pub use driver::{CUdeviceptr, CudaBuffer, CudaContext, CudaDeviceInfo, CudaEvent};
+pub use hy4_runner::Hy4CudaRunner;
+pub use inkling2_runner::{DFlashCudaRunner, Inkling2CudaRunner, MAX_INKLING2_CUDA_SPEC_WINDOW};
 pub use kernels::{BLOCK_Q8_1_BYTES, CudaKernels, CudaMat, MMVQ_MAX_TOK, dtype_cuda_tag};
 pub use llama_runner::{CudaProfileReport, CudaStageStat, LlamaCudaRunner};
+pub use qwen4exp_runner::Qwen4ExpCudaRunner;
 pub use qwen35_runner::Qwen35CudaRunner;
 
 use thiserror::Error;
@@ -68,11 +74,23 @@ pub enum CudaError {
 pub enum CudaRunner {
     Llama(LlamaCudaRunner),
     Qwen35(Qwen35CudaRunner),
+    Qwen4Exp(Qwen4ExpCudaRunner),
+    Inkling2(Inkling2CudaRunner),
+    Hy4(Box<Hy4CudaRunner>),
 }
 
 impl CudaRunner {
     pub fn from_gguf(gguf: &tm_gguf::GgufFile, max_ctx: usize) -> Result<Self, CudaError> {
         Self::from_gguf_with_kv_type(gguf, max_ctx, KvType::F16)
+    }
+
+    pub fn from_strata(
+        model_path: &std::path::Path,
+        engram_path: Option<&std::path::Path>,
+        max_ctx: usize,
+    ) -> Result<(Self, String), CudaError> {
+        let (r, tok_json) = Hy4CudaRunner::from_strata(model_path, engram_path, max_ctx)?;
+        Ok((CudaRunner::Hy4(Box::new(r)), tok_json))
     }
 
     pub fn from_gguf_with_kv_type(
@@ -90,6 +108,12 @@ impl CudaRunner {
             "qwen35" | "qwen35moe" => Ok(CudaRunner::Qwen35(
                 Qwen35CudaRunner::from_gguf_with_kv_type(gguf, max_ctx, kv_type)?,
             )),
+            "qwen4exp" => Ok(CudaRunner::Qwen4Exp(
+                Qwen4ExpCudaRunner::from_gguf_with_kv_type(gguf, max_ctx, kv_type)?,
+            )),
+            "inkling2" | "inkling2_loop" => Ok(CudaRunner::Inkling2(
+                Inkling2CudaRunner::from_gguf_with_kv_type(gguf, max_ctx, kv_type)?,
+            )),
             other => Err(CudaError::UnsupportedArch(other.to_string())),
         }
     }
@@ -98,6 +122,9 @@ impl CudaRunner {
         match self {
             CudaRunner::Llama(r) => &r.cfg.arch,
             CudaRunner::Qwen35(r) => &r.cfg.arch,
+            CudaRunner::Qwen4Exp(r) => &r.cfg.arch,
+            CudaRunner::Inkling2(r) => &r.cfg.arch,
+            CudaRunner::Hy4(r) => &r.cfg.arch,
         }
     }
 
@@ -105,6 +132,9 @@ impl CudaRunner {
         match self {
             CudaRunner::Llama(r) => r.ctx.info(),
             CudaRunner::Qwen35(r) => r.ctx.info(),
+            CudaRunner::Qwen4Exp(r) => r.ctx.info(),
+            CudaRunner::Inkling2(r) => r.ctx.info(),
+            CudaRunner::Hy4(r) => r.ctx.info(),
         }
     }
 
@@ -116,6 +146,9 @@ impl CudaRunner {
         match self {
             CudaRunner::Llama(r) => r.cfg.vocab_size,
             CudaRunner::Qwen35(r) => r.cfg.vocab_size,
+            CudaRunner::Qwen4Exp(r) => r.cfg.vocab_size,
+            CudaRunner::Inkling2(r) => r.cfg.vocab_size,
+            CudaRunner::Hy4(r) => r.cfg.vocab_size,
         }
     }
 
@@ -123,6 +156,9 @@ impl CudaRunner {
         match self {
             CudaRunner::Llama(r) => r.cfg.n_layers,
             CudaRunner::Qwen35(r) => r.cfg.n_layers,
+            CudaRunner::Qwen4Exp(r) => r.cfg.n_layers,
+            CudaRunner::Inkling2(r) => r.cfg.n_layers,
+            CudaRunner::Hy4(r) => r.cfg.n_layers,
         }
     }
 
@@ -130,6 +166,23 @@ impl CudaRunner {
         match self {
             CudaRunner::Llama(r) => r.vram_bytes,
             CudaRunner::Qwen35(r) => r.vram_bytes,
+            CudaRunner::Qwen4Exp(r) => r.vram_bytes,
+            CudaRunner::Inkling2(r) => r.vram_bytes,
+            CudaRunner::Hy4(r) => r.vram_bytes,
+        }
+    }
+
+    pub fn active_decode_bytes_override(&self) -> Option<u64> {
+        match self {
+            CudaRunner::Hy4(r) => Some(r.active_decode_bytes as u64),
+            _ => None,
+        }
+    }
+
+    pub fn bos_eos_ids(&self) -> Option<(u32, u32)> {
+        match self {
+            CudaRunner::Hy4(r) => Some((r.cfg.bos_id, r.cfg.eos_id)),
+            _ => None,
         }
     }
 
@@ -137,6 +190,9 @@ impl CudaRunner {
         match self {
             CudaRunner::Llama(r) => r.reset_state(),
             CudaRunner::Qwen35(r) => r.reset_state(),
+            CudaRunner::Qwen4Exp(r) => r.reset_state(),
+            CudaRunner::Inkling2(r) => r.reset_state(),
+            CudaRunner::Hy4(r) => r.reset_state(),
         }
     }
 
@@ -149,6 +205,9 @@ impl CudaRunner {
         match self {
             CudaRunner::Llama(r) => r.forward_token(token_id, pos, compute_logits),
             CudaRunner::Qwen35(r) => r.forward_token(token_id, pos, compute_logits),
+            CudaRunner::Qwen4Exp(r) => r.forward_token(token_id, pos, compute_logits),
+            CudaRunner::Inkling2(r) => r.forward_token(token_id, pos, compute_logits),
+            CudaRunner::Hy4(r) => r.forward_token(token_id, pos, compute_logits),
         }
     }
 
@@ -156,6 +215,9 @@ impl CudaRunner {
         match self {
             CudaRunner::Llama(r) => r.forward_token_greedy(token_id, pos),
             CudaRunner::Qwen35(r) => r.forward_token_greedy(token_id, pos),
+            CudaRunner::Qwen4Exp(r) => r.forward_token_greedy(token_id, pos),
+            CudaRunner::Inkling2(r) => r.forward_token_greedy(token_id, pos),
+            CudaRunner::Hy4(r) => r.forward_token_greedy(token_id, pos),
         }
     }
 
@@ -168,6 +230,9 @@ impl CudaRunner {
         match self {
             CudaRunner::Llama(r) => r.forward_batch(token_ids, start_pos, compute_last_logits),
             CudaRunner::Qwen35(r) => r.forward_batch(token_ids, start_pos, compute_last_logits),
+            CudaRunner::Qwen4Exp(r) => r.forward_batch(token_ids, start_pos, compute_last_logits),
+            CudaRunner::Inkling2(r) => r.forward_batch(token_ids, start_pos, compute_last_logits),
+            CudaRunner::Hy4(r) => r.forward_batch(token_ids, start_pos, compute_last_logits),
         }
     }
 
@@ -180,6 +245,9 @@ impl CudaRunner {
         match self {
             CudaRunner::Llama(r) => r.forward_embed(embed, pos, compute_logits),
             CudaRunner::Qwen35(r) => r.forward_embed(embed, pos, compute_logits),
+            CudaRunner::Qwen4Exp(r) => r.forward_embed(embed, pos, compute_logits),
+            CudaRunner::Inkling2(r) => r.forward_embed(embed, pos, compute_logits),
+            CudaRunner::Hy4(r) => r.forward_embed(embed, pos, compute_logits),
         }
     }
 
@@ -191,6 +259,9 @@ impl CudaRunner {
         match self {
             CudaRunner::Llama(r) => r.profile(n_runs, ctx_pos),
             CudaRunner::Qwen35(r) => r.profile(n_runs, ctx_pos),
+            CudaRunner::Qwen4Exp(r) => r.profile(n_runs, ctx_pos),
+            CudaRunner::Inkling2(r) => r.profile(n_runs, ctx_pos),
+            CudaRunner::Hy4(r) => r.profile(n_runs, ctx_pos),
         }
     }
 }

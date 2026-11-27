@@ -18,6 +18,8 @@ pub enum TokenizerError {
     MissingKey(&'static str),
     #[error("unsupported tokenizer model '{0}' (currently supported: 'gpt2', 'llama', 'gemma4')")]
     UnsupportedModel(String),
+    #[error("invalid HuggingFace tokenizer.json: {0}")]
+    InvalidJson(String),
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -25,6 +27,7 @@ pub enum TokenizerError {
 enum TokenizerMode {
     Gpt2ByteBpe,
     Gpt4oByteBpe,
+    DeepSeek3ByteBpe,
     Gemma4SpmBpe,
     LlamaSpm,
 }
@@ -254,6 +257,123 @@ impl Tokenizer {
         })
     }
 
+    /// Loads a GPT-2 / DeepSeek-3 `ByteLevel` BPE tokenizer from a HuggingFace `tokenizer.json` string
+    /// (e.g. `Section 0` `tokenizer_json` in `.strata` v1.0 artifacts for `Tencent Hy4-Flash`).
+    pub fn from_hf_tokenizer_json(
+        json_str: &str,
+        bos_id: Option<u32>,
+        eos_id: Option<u32>,
+    ) -> Result<Self, TokenizerError> {
+        let parsed = parse_hf_bpe_json(json_str)?;
+        let real_vocab_size = parsed.tokens.len();
+        let total_bytes: usize = parsed.tokens.iter().map(|s| s.len()).sum();
+
+        let mut vocab_pool = String::with_capacity(total_bytes + 4096);
+        let mut vocab_offsets = Vec::with_capacity(real_vocab_size + 256);
+        vocab_offsets.push(0u32);
+
+        let table_cap = ((real_vocab_size + 4096) * 2).next_power_of_two().max(64);
+        let vocab_mask = table_cap - 1;
+        let mut vocab_table = vec![EMPTY_SLOT; table_cap];
+
+        for (id, s) in parsed.tokens.iter().enumerate() {
+            vocab_pool.push_str(s);
+            vocab_offsets.push(vocab_pool.len() as u32);
+            if !s.is_empty() {
+                table_upsert(
+                    &mut vocab_table,
+                    vocab_mask,
+                    &vocab_pool,
+                    &vocab_offsets,
+                    s,
+                    id as u32,
+                );
+            }
+        }
+
+        let mut merges = HashMap::with_capacity(parsed.merges.len());
+        let mut merged_scratch = String::with_capacity(64);
+        for (rank, (a, b)) in parsed.merges.iter().enumerate() {
+            let id_a = intern_or_lookup(
+                &mut vocab_table,
+                vocab_mask,
+                &mut vocab_pool,
+                &mut vocab_offsets,
+                a,
+            );
+            let id_b = intern_or_lookup(
+                &mut vocab_table,
+                vocab_mask,
+                &mut vocab_pool,
+                &mut vocab_offsets,
+                b,
+            );
+            merged_scratch.clear();
+            merged_scratch.push_str(a);
+            merged_scratch.push_str(b);
+            let id_ab = intern_or_lookup(
+                &mut vocab_table,
+                vocab_mask,
+                &mut vocab_pool,
+                &mut vocab_offsets,
+                &merged_scratch,
+            );
+            let pair_key = ((id_a as u64) << 32) | (id_b as u64);
+            merges.entry(pair_key).or_insert((rank as u32, id_ab));
+        }
+
+        let mut special_tokens = parsed.special_tokens;
+        special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.1.cmp(&b.1)));
+
+        let mut eot_id = None;
+        for eog_str in [
+            "<|eos|>",
+            "<｜end▁of▁sentence｜>",
+            "<|im_end|>",
+            "<|eot_id|>",
+            "<end_of_turn>",
+        ] {
+            if let Some(id) = table_lookup(
+                &vocab_table,
+                vocab_mask,
+                &vocab_pool,
+                &vocab_offsets,
+                eog_str,
+            ) && (id as usize) < real_vocab_size
+            {
+                eot_id = Some(id);
+                break;
+            }
+        }
+
+        let (byte_to_char, char_to_byte) = build_gpt2_byte_maps();
+        let mode = if parsed.is_deepseek3 {
+            TokenizerMode::DeepSeek3ByteBpe
+        } else {
+            TokenizerMode::Gpt2ByteBpe
+        };
+
+        Ok(Self {
+            mode,
+            real_vocab_size,
+            vocab_pool,
+            vocab_offsets,
+            vocab_table,
+            vocab_mask,
+            merges,
+            scores: Vec::new(),
+            add_space_prefix: false,
+            byte_to_char,
+            char_to_byte,
+            bos_id,
+            eos_id,
+            eot_id: eot_id.or(eos_id),
+            add_bos: bos_id.is_some(),
+            max_digits: 3,
+            special_tokens,
+        })
+    }
+
     #[inline]
     pub fn is_stop_token(&self, id: u32) -> bool {
         self.eos_id == Some(id) || self.eot_id == Some(id)
@@ -365,10 +485,10 @@ impl Tokenizer {
         let mut sym_ids: Vec<u32> = Vec::with_capacity(64);
         let mut char_buf = [0u8; 4];
 
-        let chunks = if self.mode == TokenizerMode::Gpt4oByteBpe {
-            pretokenize_gpt4o(text)
-        } else {
-            pretokenize_bpe(text, self.max_digits)
+        let chunks = match self.mode {
+            TokenizerMode::Gpt4oByteBpe => pretokenize_gpt4o(text),
+            TokenizerMode::DeepSeek3ByteBpe => pretokenize_deepseek3(text),
+            _ => pretokenize_bpe(text, self.max_digits),
         };
 
         for chunk in chunks {
@@ -868,6 +988,537 @@ fn pretokenize_bpe(text: &str, max_digits: usize) -> Vec<&str> {
     }
 
     chunks
+}
+
+#[inline]
+fn is_cjk_or_kana(c: char) -> bool {
+    let u = c as u32;
+    (0x4E00..=0x9FA5).contains(&u)
+        || (0x3040..=0x309F).contains(&u)
+        || (0x30A0..=0x30FF).contains(&u)
+}
+
+/// Pre-tokenizer matching `Hy4-Flash` / `DeepSeek-V3` three-stage isolated splits:
+/// 1. `\p{N}{1,3}`
+/// 2. `[一-龥぀-ゟ゠-ヿ]+`
+/// 3. `[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
+fn pretokenize_deepseek3(text: &str) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let len = text.len();
+    let mut i = 0usize;
+
+    let is_ascii_punct = |c: char| c.is_ascii_punctuation();
+    let is_punct_or_sym =
+        |c: char| !c.is_whitespace() && !c.is_alphabetic() && !c.is_numeric() && !is_cjk_or_kana(c);
+    let is_non_cjk_letter = |c: char| c.is_alphabetic() && !is_cjk_or_kana(c);
+
+    while i < len {
+        let rest = &text[i..];
+        let mut chars = rest.char_indices();
+        let Some((_, c0)) = chars.next() else {
+            break;
+        };
+
+        // Stage 1: `\p{N}{1,3}`
+        if c0.is_numeric() {
+            let mut end = c0.len_utf8();
+            let mut cnt = 1usize;
+            for (idx, c) in chars {
+                if c.is_numeric() && cnt < 3 {
+                    end = idx + c.len_utf8();
+                    cnt += 1;
+                } else {
+                    break;
+                }
+            }
+            chunks.push(&text[i..i + end]);
+            i += end;
+            continue;
+        }
+
+        // Stage 2: `[一-龥぀-ゟ゠-ヿ]+`
+        if is_cjk_or_kana(c0) {
+            let mut end = c0.len_utf8();
+            for (idx, c) in chars {
+                if is_cjk_or_kana(c) {
+                    end = idx + c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            chunks.push(&text[i..i + end]);
+            i += end;
+            continue;
+        }
+
+        // Stage 3a: `[ascii_punct][A-Za-z]+`
+        if is_ascii_punct(c0)
+            && let Some((idx1, c1)) = chars.clone().next()
+            && c1.is_ascii_alphabetic()
+        {
+            let mut end = idx1 + c1.len_utf8();
+            for (idx, c) in chars.skip(1) {
+                if c.is_ascii_alphabetic() {
+                    end = idx + c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            chunks.push(&text[i..i + end]);
+            i += end;
+            continue;
+        }
+
+        // Stage 3b: `[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+` (excluding CJK/Kana isolated in Stage 2)
+        if is_non_cjk_letter(c0) {
+            let mut end = c0.len_utf8();
+            for (idx, c) in chars {
+                if is_non_cjk_letter(c) {
+                    end = idx + c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            chunks.push(&text[i..i + end]);
+            i += end;
+            continue;
+        }
+        if c0 != '\r'
+            && c0 != '\n'
+            && !is_punct_or_sym(c0)
+            && !c0.is_numeric()
+            && let Some((idx1, c1)) = chars.clone().next()
+            && is_non_cjk_letter(c1)
+        {
+            let mut end = idx1 + c1.len_utf8();
+            for (idx, c) in chars.skip(1) {
+                if is_non_cjk_letter(c) {
+                    end = idx + c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            chunks.push(&text[i..i + end]);
+            i += end;
+            continue;
+        }
+
+        // Stage 3c: ` ?[\p{P}\p{S}]+[\r\n]*`
+        if is_punct_or_sym(c0)
+            || (c0 == ' '
+                && chars
+                    .clone()
+                    .next()
+                    .is_some_and(|(_, c1)| is_punct_or_sym(c1)))
+        {
+            let mut end = c0.len_utf8();
+            let mut iter = chars;
+            if c0 == ' '
+                && let Some((idx1, c1)) = iter.next()
+            {
+                end = idx1 + c1.len_utf8();
+            }
+            let mut in_nl = false;
+            for (idx, c) in iter {
+                if !in_nl && is_punct_or_sym(c) {
+                    end = idx + c.len_utf8();
+                } else if c == '\r' || c == '\n' {
+                    in_nl = true;
+                    end = idx + c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            chunks.push(&text[i..i + end]);
+            i += end;
+            continue;
+        }
+
+        // Stage 3d: `\s*[\r\n]+ | \s+(?!\S) | \s+`
+        if c0.is_whitespace() {
+            let mut end = c0.len_utf8();
+            let mut last_nl_end = if c0 == '\r' || c0 == '\n' {
+                Some(end)
+            } else {
+                None
+            };
+            let mut last_ws_start = 0usize;
+            let mut hit_non_ws = false;
+            for (idx, c) in chars {
+                if c.is_whitespace() {
+                    last_ws_start = idx;
+                    end = idx + c.len_utf8();
+                    if c == '\r' || c == '\n' {
+                        last_nl_end = Some(end);
+                    }
+                } else {
+                    hit_non_ws = true;
+                    break;
+                }
+            }
+            if let Some(nl_end) = last_nl_end {
+                chunks.push(&text[i..i + nl_end]);
+                i += nl_end;
+            } else if hit_non_ws && last_ws_start > 0 {
+                chunks.push(&text[i..i + last_ws_start]);
+                i += last_ws_start;
+            } else {
+                chunks.push(&text[i..i + end]);
+                i += end;
+            }
+            continue;
+        }
+
+        chunks.push(&text[i..i + c0.len_utf8()]);
+        i += c0.len_utf8();
+    }
+
+    chunks
+}
+
+struct ParsedHfBpe {
+    tokens: Vec<String>,
+    merges: Vec<(String, String)>,
+    special_tokens: Vec<(String, u32)>,
+    is_deepseek3: bool,
+}
+
+struct JsonCursor<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl<'a> JsonCursor<'a> {
+    fn skip_ws(&mut self) {
+        while self.i < self.b.len() && matches!(self.b[self.i], b' ' | b'\t' | b'\r' | b'\n') {
+            self.i += 1;
+        }
+    }
+
+    fn peek(&mut self) -> Option<u8> {
+        self.skip_ws();
+        self.b.get(self.i).copied()
+    }
+
+    fn expect(&mut self, ch: u8) -> Result<(), TokenizerError> {
+        self.skip_ws();
+        if self.b.get(self.i).copied() == Some(ch) {
+            self.i += 1;
+            Ok(())
+        } else {
+            Err(TokenizerError::InvalidJson(format!(
+                "expected '{}' at byte {}",
+                ch as char, self.i
+            )))
+        }
+    }
+
+    fn parse_str(&mut self) -> Result<String, TokenizerError> {
+        self.expect(b'"')?;
+        let mut out = String::new();
+        while self.i < self.b.len() {
+            let c = self.b[self.i];
+            if c == b'"' {
+                self.i += 1;
+                return Ok(out);
+            }
+            if c != b'\\' {
+                let start = self.i;
+                self.i += 1;
+                while self.i < self.b.len() && self.b[self.i] != b'"' && self.b[self.i] != b'\\' {
+                    self.i += 1;
+                }
+                let s = core::str::from_utf8(&self.b[start..self.i])
+                    .map_err(|e| TokenizerError::InvalidJson(e.to_string()))?;
+                out.push_str(s);
+                continue;
+            }
+            self.i += 1;
+            let esc = *self
+                .b
+                .get(self.i)
+                .ok_or_else(|| TokenizerError::InvalidJson("EOF in string escape".to_string()))?;
+            self.i += 1;
+            match esc {
+                b'"' => out.push('"'),
+                b'\\' => out.push('\\'),
+                b'/' => out.push('/'),
+                b'b' => out.push('\u{0008}'),
+                b'f' => out.push('\u{000C}'),
+                b'n' => out.push('\n'),
+                b'r' => out.push('\r'),
+                b't' => out.push('\t'),
+                b'u' => {
+                    let u1 = self.parse_hex4()?;
+                    if (0xD800..=0xDBFF).contains(&u1)
+                        && self.b.get(self.i..self.i + 2) == Some(b"\\u")
+                    {
+                        self.i += 2;
+                        let u2 = self.parse_hex4()?;
+                        let cp = 0x10000 + (((u1 as u32 - 0xD800) << 10) | (u2 as u32 - 0xDC00));
+                        if let Some(ch) = char::from_u32(cp) {
+                            out.push(ch);
+                        }
+                    } else if let Some(ch) = char::from_u32(u1 as u32) {
+                        out.push(ch);
+                    }
+                }
+                other => {
+                    return Err(TokenizerError::InvalidJson(format!(
+                        "bad escape \\{}",
+                        other as char
+                    )));
+                }
+            }
+        }
+        Err(TokenizerError::InvalidJson(
+            "unterminated string".to_string(),
+        ))
+    }
+
+    fn parse_hex4(&mut self) -> Result<u16, TokenizerError> {
+        let slice = self
+            .b
+            .get(self.i..self.i + 4)
+            .ok_or_else(|| TokenizerError::InvalidJson("short \\u escape".to_string()))?;
+        self.i += 4;
+        let s =
+            core::str::from_utf8(slice).map_err(|e| TokenizerError::InvalidJson(e.to_string()))?;
+        u16::from_str_radix(s, 16).map_err(|e| TokenizerError::InvalidJson(e.to_string()))
+    }
+
+    fn parse_u32(&mut self) -> Result<u32, TokenizerError> {
+        self.skip_ws();
+        let start = self.i;
+        while self.i < self.b.len() && self.b[self.i].is_ascii_digit() {
+            self.i += 1;
+        }
+        let s = core::str::from_utf8(&self.b[start..self.i])
+            .map_err(|e| TokenizerError::InvalidJson(e.to_string()))?;
+        s.parse::<u32>()
+            .map_err(|e| TokenizerError::InvalidJson(e.to_string()))
+    }
+
+    fn skip_value(&mut self) -> Result<(), TokenizerError> {
+        let Some(c) = self.peek() else {
+            return Err(TokenizerError::InvalidJson("unexpected EOF".to_string()));
+        };
+        match c {
+            b'"' => {
+                let _ = self.parse_str()?;
+                Ok(())
+            }
+            b'{' => {
+                self.i += 1;
+                if self.peek() == Some(b'}') {
+                    self.i += 1;
+                    return Ok(());
+                }
+                loop {
+                    let _ = self.parse_str()?;
+                    self.expect(b':')?;
+                    self.skip_value()?;
+                    if self.peek() == Some(b',') {
+                        self.i += 1;
+                    } else {
+                        self.expect(b'}')?;
+                        return Ok(());
+                    }
+                }
+            }
+            b'[' => {
+                self.i += 1;
+                if self.peek() == Some(b']') {
+                    self.i += 1;
+                    return Ok(());
+                }
+                loop {
+                    self.skip_value()?;
+                    if self.peek() == Some(b',') {
+                        self.i += 1;
+                    } else {
+                        self.expect(b']')?;
+                        return Ok(());
+                    }
+                }
+            }
+            _ => {
+                while self.i < self.b.len()
+                    && !matches!(
+                        self.b[self.i],
+                        b',' | b'}' | b']' | b' ' | b'\t' | b'\r' | b'\n'
+                    )
+                {
+                    self.i += 1;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn parse_hf_bpe_json(json_str: &str) -> Result<ParsedHfBpe, TokenizerError> {
+    let mut cur = JsonCursor {
+        b: json_str.as_bytes(),
+        i: 0,
+    };
+    let is_deepseek3 = json_str.contains("一-龥");
+    let mut vocab_pairs: Vec<(u32, String)> = Vec::new();
+    let mut added_list: Vec<(u32, String)> = Vec::new();
+    let mut merges: Vec<(String, String)> = Vec::new();
+
+    cur.expect(b'{')?;
+    if cur.peek() != Some(b'}') {
+        loop {
+            let key = cur.parse_str()?;
+            cur.expect(b':')?;
+            match key.as_str() {
+                "added_tokens" => {
+                    if cur.peek() == Some(b'[') {
+                        cur.i += 1;
+                        if cur.peek() != Some(b']') {
+                            loop {
+                                cur.expect(b'{')?;
+                                let mut id = None;
+                                let mut content = None;
+                                if cur.peek() != Some(b'}') {
+                                    loop {
+                                        let fk = cur.parse_str()?;
+                                        cur.expect(b':')?;
+                                        match fk.as_str() {
+                                            "id" => id = Some(cur.parse_u32()?),
+                                            "content" => content = Some(cur.parse_str()?),
+                                            _ => cur.skip_value()?,
+                                        }
+                                        if cur.peek() == Some(b',') {
+                                            cur.i += 1;
+                                        } else {
+                                            cur.expect(b'}')?;
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    cur.i += 1;
+                                }
+                                if let (Some(tid), Some(tok_s)) = (id, content) {
+                                    added_list.push((tid, tok_s));
+                                }
+                                if cur.peek() == Some(b',') {
+                                    cur.i += 1;
+                                } else {
+                                    cur.expect(b']')?;
+                                    break;
+                                }
+                            }
+                        } else {
+                            cur.i += 1;
+                        }
+                    } else {
+                        cur.skip_value()?;
+                    }
+                }
+                "model" => {
+                    cur.expect(b'{')?;
+                    if cur.peek() != Some(b'}') {
+                        loop {
+                            let mk = cur.parse_str()?;
+                            cur.expect(b':')?;
+                            match mk.as_str() {
+                                "vocab" => {
+                                    cur.expect(b'{')?;
+                                    if cur.peek() != Some(b'}') {
+                                        loop {
+                                            let ts = cur.parse_str()?;
+                                            cur.expect(b':')?;
+                                            let tid = cur.parse_u32()?;
+                                            vocab_pairs.push((tid, ts));
+                                            if cur.peek() == Some(b',') {
+                                                cur.i += 1;
+                                            } else {
+                                                cur.expect(b'}')?;
+                                                break;
+                                            }
+                                        }
+                                    } else {
+                                        cur.i += 1;
+                                    }
+                                }
+                                "merges" => {
+                                    cur.expect(b'[')?;
+                                    if cur.peek() != Some(b']') {
+                                        loop {
+                                            if cur.peek() == Some(b'[') {
+                                                cur.i += 1;
+                                                let a = cur.parse_str()?;
+                                                cur.expect(b',')?;
+                                                let b = cur.parse_str()?;
+                                                cur.expect(b']')?;
+                                                merges.push((a, b));
+                                            } else {
+                                                let line = cur.parse_str()?;
+                                                if let Some((a, b)) = line.split_once(' ') {
+                                                    merges.push((a.to_string(), b.to_string()));
+                                                }
+                                            }
+                                            if cur.peek() == Some(b',') {
+                                                cur.i += 1;
+                                            } else {
+                                                cur.expect(b']')?;
+                                                break;
+                                            }
+                                        }
+                                    } else {
+                                        cur.i += 1;
+                                    }
+                                }
+                                _ => cur.skip_value()?,
+                            }
+                            if cur.peek() == Some(b',') {
+                                cur.i += 1;
+                            } else {
+                                cur.expect(b'}')?;
+                                break;
+                            }
+                        }
+                    } else {
+                        cur.i += 1;
+                    }
+                }
+                _ => cur.skip_value()?,
+            }
+            if cur.peek() == Some(b',') {
+                cur.i += 1;
+            } else {
+                cur.expect(b'}')?;
+                break;
+            }
+        }
+    }
+
+    let max_id = vocab_pairs
+        .iter()
+        .map(|(i, _)| *i)
+        .chain(added_list.iter().map(|(i, _)| *i))
+        .max()
+        .ok_or_else(|| TokenizerError::InvalidJson("empty vocabulary".to_string()))?;
+    let mut tokens = vec![String::new(); (max_id as usize) + 1];
+    for (id, s) in vocab_pairs {
+        tokens[id as usize] = s;
+    }
+    let mut special_tokens = Vec::new();
+    for (id, s) in added_list {
+        if s.len() >= 2 {
+            special_tokens.push((s.clone(), id));
+        }
+        tokens[id as usize] = s;
+    }
+
+    Ok(ParsedHfBpe {
+        tokens,
+        merges,
+        special_tokens,
+        is_deepseek3,
+    })
 }
 
 fn match_contraction_suffix(s: &str) -> usize {

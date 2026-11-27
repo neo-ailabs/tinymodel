@@ -74,13 +74,17 @@ pub enum DType {
     Iq2Xxs,
     Iq3Xxs,
     Iq4Nl,
+    Iq4Xs,
     NvFp4,
     Q4_0,
     /// Offline 4-row x 32-col interleaved `Q4_0` layout (`72` bytes = `4 * 18` bytes, zero overhead).
     Q4_0x4,
     Q4_1,
+    Q5_0,
     Q8_0,
     Q8_1,
+    Q3K,
+    Q4K,
     Q5K,
     Q6K,
     Q8K,
@@ -94,14 +98,18 @@ impl DType {
             1 => Some(DType::F16),
             2 => Some(DType::Q4_0),
             3 => Some(DType::Q4_1),
+            6 => Some(DType::Q5_0),
             8 => Some(DType::Q8_0),
             9 => Some(DType::Q8_1),
+            11 => Some(DType::Q3K),
+            12 => Some(DType::Q4K),
             13 => Some(DType::Q5K),
             14 => Some(DType::Q6K),
             15 => Some(DType::Q8K),
             16 => Some(DType::Iq2Xxs),
             18 => Some(DType::Iq3Xxs),
             20 => Some(DType::Iq4Nl),
+            23 => Some(DType::Iq4Xs),
             30 => Some(DType::BF16),
             35 => Some(DType::TQ2_0),
             40 => Some(DType::NvFp4),
@@ -118,14 +126,18 @@ impl DType {
             DType::F16 => 1,
             DType::Q4_0 => 2,
             DType::Q4_1 => 3,
+            DType::Q5_0 => 6,
             DType::Q8_0 => 8,
             DType::Q8_1 => 9,
+            DType::Q3K => 11,
+            DType::Q4K => 12,
             DType::Q5K => 13,
             DType::Q6K => 14,
             DType::Q8K => 15,
             DType::Iq2Xxs => 16,
             DType::Iq3Xxs => 18,
             DType::Iq4Nl => 20,
+            DType::Iq4Xs => 23,
             DType::BF16 => 30,
             DType::TQ2_0 => 35,
             DType::NvFp4 => 40,
@@ -145,12 +157,16 @@ impl DType {
             DType::Iq2Xxs => "iq2_xxs",
             DType::Iq3Xxs => "iq3_xxs",
             DType::Iq4Nl => "iq4_nl",
+            DType::Iq4Xs => "iq4_xs",
             DType::NvFp4 => "nvfp4",
             DType::Q4_0 => "q4_0",
             DType::Q4_0x4 => "q4_0x4",
             DType::Q4_1 => "q4_1",
+            DType::Q5_0 => "q5_0",
             DType::Q8_0 => "q8_0",
             DType::Q8_1 => "q8_1",
+            DType::Q3K => "q3_k",
+            DType::Q4K => "q4_k",
             DType::Q5K => "q5_k",
             DType::Q6K => "q6_k",
             DType::Q8K => "q8_k",
@@ -168,11 +184,15 @@ impl DType {
             "iq2_xxs" | "iq2" => Some(DType::Iq2Xxs),
             "iq3_xxs" | "iq3" => Some(DType::Iq3Xxs),
             "iq4_nl" | "iq4" => Some(DType::Iq4Nl),
+            "iq4_xs" => Some(DType::Iq4Xs),
             "nvfp4" | "fp4" => Some(DType::NvFp4),
             "q4_0" => Some(DType::Q4_0),
             "q4_0x4" | "q4_0_4x8" => Some(DType::Q4_0x4),
             "q4_1" => Some(DType::Q4_1),
+            "q5_0" => Some(DType::Q5_0),
             "q8_0" | "q8" => Some(DType::Q8_0),
+            "q3_k" => Some(DType::Q3K),
+            "q4_k" => Some(DType::Q4K),
             "q5_k" => Some(DType::Q5K),
             "q6_k" => Some(DType::Q6K),
             _ => None,
@@ -185,15 +205,21 @@ impl DType {
             DType::F32 | DType::F16 | DType::BF16 => 1,
             DType::Q2_0 => QK2_0,
             DType::NvFp4 => QK_NVFP4,
-            DType::Q4_0 => QK4_0,
+            DType::Q4_0 | DType::Q5_0 => QK4_0,
             DType::Iq4Nl => QK4_NL,
             DType::Q4_0x4 => QK4_0X4,
             DType::Q4_1 => QK4_1,
             DType::Q8_0 => QK8_0,
             DType::Q8_1 => QK8_1,
-            DType::TQ2_0 | DType::Iq2Xxs | DType::Iq3Xxs | DType::Q5K | DType::Q6K | DType::Q8K => {
-                QK_K
-            }
+            DType::TQ2_0
+            | DType::Iq2Xxs
+            | DType::Iq3Xxs
+            | DType::Iq4Xs
+            | DType::Q3K
+            | DType::Q4K
+            | DType::Q5K
+            | DType::Q6K
+            | DType::Q8K => QK_K,
         }
     }
 
@@ -207,12 +233,16 @@ impl DType {
             DType::Iq2Xxs => core::mem::size_of::<BlockIQ2XXS>(),
             DType::Iq3Xxs => core::mem::size_of::<BlockIQ3XXS>(),
             DType::Iq4Nl => core::mem::size_of::<BlockIQ4NL>(),
+            DType::Iq4Xs => 136,
             DType::NvFp4 => core::mem::size_of::<BlockNvFp4>(),
             DType::Q4_0 => core::mem::size_of::<BlockQ4_0>(),
             DType::Q4_0x4 => core::mem::size_of::<BlockQ4_0x4>(),
             DType::Q4_1 => core::mem::size_of::<BlockQ4_1>(),
+            DType::Q5_0 => 22,
             DType::Q8_0 => core::mem::size_of::<BlockQ8_0>(),
             DType::Q8_1 => core::mem::size_of::<BlockQ8_1>(),
+            DType::Q3K => 110,
+            DType::Q4K => 144,
             DType::Q5K => core::mem::size_of::<BlockQ5K>(),
             DType::Q6K => core::mem::size_of::<BlockQ6K>(),
             DType::Q8K => core::mem::size_of::<BlockQ8K>(),
@@ -793,6 +823,116 @@ pub fn dequantize_row_bytes(dtype: DType, src: &[u8], dst: &mut [f32]) {
                 let base = ib * QK8_1;
                 for j in 0..32 {
                     dst[base + j] = (blk[4 + j] as i8) as f32 * d;
+                }
+            }
+        }
+        DType::Q5_0 => {
+            for (ib, blk) in src.as_chunks::<22>().0.iter().enumerate() {
+                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                let qh = u32::from_le_bytes([blk[2], blk[3], blk[4], blk[5]]);
+                let base = ib * QK4_0;
+                for j in 0..16 {
+                    let xh0 = (((qh >> j) & 1) << 4) as u8;
+                    let xh1 = (((qh >> (j + 16)) & 1) << 4) as u8;
+                    let qs = blk[6 + j];
+                    dst[base + j] = ((((qs & 0x0F) | xh0) as i32) - 16) as f32 * d;
+                    dst[base + j + 16] = ((((qs >> 4) | xh1) as i32) - 16) as f32 * d;
+                }
+            }
+        }
+        DType::Q3K => {
+            const KMASK1: u32 = 0x0303_0303;
+            const KMASK2: u32 = 0x0F0F_0F0F;
+            for (ib, blk) in src.as_chunks::<110>().0.iter().enumerate() {
+                let hm = &blk[0..32];
+                let qs = &blk[32..96];
+                let sc_raw = &blk[96..108];
+                let d_all = f16_to_f32(u16::from_le_bytes([blk[108], blk[109]]));
+                let a0 = u32::from_le_bytes([sc_raw[0], sc_raw[1], sc_raw[2], sc_raw[3]]);
+                let a1 = u32::from_le_bytes([sc_raw[4], sc_raw[5], sc_raw[6], sc_raw[7]]);
+                let tmp = u32::from_le_bytes([sc_raw[8], sc_raw[9], sc_raw[10], sc_raw[11]]);
+                let aux = [
+                    (a0 & KMASK2) | ((tmp & KMASK1) << 4),
+                    (a1 & KMASK2) | (((tmp >> 2) & KMASK1) << 4),
+                    ((a0 >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4),
+                    ((a1 >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4),
+                ];
+                let mut scales = [0i8; 16];
+                for (w, &u) in aux.iter().enumerate() {
+                    let b = u.to_le_bytes();
+                    for k in 0..4 {
+                        scales[w * 4 + k] = b[k] as i8;
+                    }
+                }
+                let mut out_idx = ib * QK_K;
+                let mut is = 0usize;
+                let mut m = 1u8;
+                for half128 in 0..2 {
+                    let q = &qs[half128 * 32..(half128 + 1) * 32];
+                    let mut shift = 0u32;
+                    for _ in 0..4 {
+                        let dl0 = d_all * ((scales[is] as i32 - 32) as f32);
+                        is += 1;
+                        for l in 0..16 {
+                            let qv = (((q[l] >> shift) & 3) as i32)
+                                - if (hm[l] & m) != 0 { 0 } else { 4 };
+                            dst[out_idx] = dl0 * (qv as f32);
+                            out_idx += 1;
+                        }
+                        let dl1 = d_all * ((scales[is] as i32 - 32) as f32);
+                        is += 1;
+                        for l in 0..16 {
+                            let qv = (((q[l + 16] >> shift) & 3) as i32)
+                                - if (hm[l + 16] & m) != 0 { 0 } else { 4 };
+                            dst[out_idx] = dl1 * (qv as f32);
+                            out_idx += 1;
+                        }
+                        shift += 2;
+                        m = m.wrapping_shl(1);
+                    }
+                }
+            }
+        }
+        DType::Q4K => {
+            for (ib, blk) in src.as_chunks::<144>().0.iter().enumerate() {
+                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                let dmin = f16_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
+                let mut scales_12 = [0u8; 12];
+                scales_12.copy_from_slice(&blk[4..16]);
+                let (sc, m) = unpack_q5k_scales_mins(&scales_12);
+                let qs = &blk[16..144];
+                let base = ib * QK_K;
+                for chunk in 0..4 {
+                    let d1 = d * (sc[2 * chunk] as f32);
+                    let m1 = dmin * (m[2 * chunk] as f32);
+                    let d2 = d * (sc[2 * chunk + 1] as f32);
+                    let m2 = dmin * (m[2 * chunk + 1] as f32);
+                    let ql = &qs[chunk * 32..(chunk + 1) * 32];
+                    let out = &mut dst[base + chunk * 64..base + (chunk + 1) * 64];
+                    for l in 0..32 {
+                        out[l] = d1 * ((ql[l] & 0x0F) as f32) - m1;
+                        out[l + 32] = d2 * ((ql[l] >> 4) as f32) - m2;
+                    }
+                }
+            }
+        }
+        DType::Iq4Xs => {
+            for (ib, blk) in src.as_chunks::<136>().0.iter().enumerate() {
+                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                let scales_h = u16::from_le_bytes([blk[2], blk[3]]) as u32;
+                let scales_l = &blk[4..8];
+                let qs_all = &blk[8..136];
+                let base = ib * QK_K;
+                for ib32 in 0..8 {
+                    let ls = (((scales_l[ib32 / 2] >> (4 * (ib32 % 2))) & 0x0F) as u32)
+                        | (((scales_h >> (2 * ib32)) & 3) << 4);
+                    let dl = d * ((ls as i32 - 32) as f32);
+                    let qs = &qs_all[ib32 * 16..(ib32 + 1) * 16];
+                    let out = &mut dst[base + ib32 * 32..base + (ib32 + 1) * 32];
+                    for j in 0..16 {
+                        out[j] = dl * (KVALUES_IQ4NL[(qs[j] & 0x0F) as usize] as f32);
+                        out[j + 16] = dl * (KVALUES_IQ4NL[(qs[j] >> 4) as usize] as f32);
+                    }
                 }
             }
         }

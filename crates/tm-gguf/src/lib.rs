@@ -195,6 +195,24 @@ impl MetadataValue {
         }
     }
 
+    pub fn as_u64_array(&self) -> Option<Vec<u64>> {
+        match self {
+            MetadataValue::U32Array(v) => Some(v.iter().map(|&x| x as u64).collect()),
+            MetadataValue::I32Array(v) => v.iter().map(|&x| u64::try_from(x).ok()).collect(),
+            MetadataValue::Array(items) => items
+                .iter()
+                .map(|v| match *v {
+                    MetadataValue::U64(x) => Some(x),
+                    MetadataValue::I64(x) => u64::try_from(x).ok(),
+                    MetadataValue::U32(x) => Some(x as u64),
+                    MetadataValue::I32(x) => u64::try_from(x).ok(),
+                    _ => None,
+                })
+                .collect(),
+            _ => None,
+        }
+    }
+
     pub fn as_bool_array(&self) -> Option<Vec<bool>> {
         match self {
             MetadataValue::Array(items) => items.iter().map(|v| v.as_bool()).collect(),
@@ -253,7 +271,9 @@ pub struct TensorInfo {
     /// `dims[1]` is rows (`ne1`), etc.
     pub dims: Vec<usize>,
     pub dtype: DType,
-    /// Byte offset relative to the start of the GGUF tensor data section.
+    /// Shard index (`0` for single-file GGUFs or shard `00001-of-MMMMM`, `1..` for subsequent shards).
+    pub shard_idx: usize,
+    /// Byte offset relative to the start of that shard's GGUF tensor data section.
     pub offset: usize,
     /// Total size in bytes of this tensor's raw data.
     pub byte_len: usize,
@@ -277,7 +297,7 @@ impl Backing {
     }
 }
 
-/// Memory-mapped GGUF file with parsed metadata and tensor directory.
+/// Memory-mapped GGUF file (single-file or multi-shard `-NNNNN-of-MMMMM.gguf`) with parsed metadata and tensor directory.
 pub struct GgufFile {
     path: PathBuf,
     version: u32,
@@ -287,12 +307,45 @@ pub struct GgufFile {
     tensors: HashMap<String, TensorInfo>,
     tensor_order: Vec<String>,
     backing: Backing,
+    extra_shards: Vec<(PathBuf, usize, Backing)>,
+}
+
+/// Detects `-NNNNN-of-MMMMM.gguf` split filenames and returns `(shard_paths_1_to_m)` when `MMMMM > 1`.
+fn resolve_split_gguf_paths(path: &Path) -> Option<Vec<PathBuf>> {
+    let fname = path.file_name()?.to_str()?;
+    let stem = fname.strip_suffix(".gguf")?;
+    // Pattern: `<prefix>-NNNNN-of-MMMMM` (`15` chars suffix: `-00001-of-00002`)
+    if stem.len() < 16 {
+        return None;
+    }
+    let split_at = stem.len() - 15;
+    let suffix = &stem[split_at..];
+    let bytes = suffix.as_bytes();
+    if bytes[0] != b'-' || &bytes[6..10] != b"-of-" {
+        return None;
+    }
+    let idx_str = &suffix[1..6];
+    let cnt_str = &suffix[10..15];
+    if !idx_str.bytes().all(|b| b.is_ascii_digit()) || !cnt_str.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let idx: usize = idx_str.parse().ok()?;
+    let cnt: usize = cnt_str.parse().ok()?;
+    if cnt <= 1 || idx == 0 || idx > cnt {
+        return None;
+    }
+    let prefix = &stem[..split_at];
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut out = Vec::with_capacity(cnt);
+    for s in 1..=cnt {
+        out.push(parent.join(format!("{prefix}-{s:05}-of-{cnt:05}.gguf")));
+    }
+    Some(out)
 }
 
 impl GgufFile {
-    /// Opens and memory-maps a GGUF file from disk, validating its header and tensor table.
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, GgufError> {
-        let path_buf = path.as_ref().to_path_buf();
+    fn open_single_mmap(path_buf: PathBuf) -> Result<Self, GgufError> {
         let path_str = path_buf.display().to_string();
         let file = File::open(&path_buf).map_err(|source| GgufError::Io {
             path: path_str.clone(),
@@ -311,6 +364,36 @@ impl GgufFile {
             let _ = mmap.advise(memmap2::Advice::Sequential);
         }
         Self::parse(path_buf, Backing::Mmap(mmap))
+    }
+
+    /// Opens and memory-maps a GGUF file (or all `-NNNNN-of-MMMMM.gguf` shards automatically) from disk.
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, GgufError> {
+        let path_buf = path.as_ref().to_path_buf();
+        if let Some(shard_paths) = resolve_split_gguf_paths(&path_buf) {
+            let mut primary = Self::open_single_mmap(shard_paths[0].clone())?;
+            primary.extra_shards.reserve(shard_paths.len() - 1);
+            for (extra_i, sp) in shard_paths.into_iter().skip(1).enumerate() {
+                let shard_idx = extra_i + 1;
+                let parsed = Self::open_single_mmap(sp.clone())?;
+                for (k, v) in parsed.metadata {
+                    primary.metadata.entry(k).or_insert(v);
+                }
+                for name in parsed.tensor_order {
+                    if let Some(mut info) = parsed.tensors.get(&name).cloned() {
+                        info.shard_idx = shard_idx;
+                        if !primary.tensors.contains_key(&name) {
+                            primary.tensor_order.push(name.clone());
+                        }
+                        primary.tensors.insert(name, info);
+                    }
+                }
+                primary
+                    .extra_shards
+                    .push((sp, parsed.data_offset, parsed.backing));
+            }
+            return Ok(primary);
+        }
+        Self::open_single_mmap(path_buf)
     }
 
     #[cfg(test)]
@@ -428,6 +511,7 @@ impl GgufFile {
                 name,
                 dims,
                 dtype,
+                shard_idx: 0,
                 offset,
                 byte_len,
                 header_type_offset,
@@ -490,11 +574,24 @@ impl GgufFile {
             tensors,
             tensor_order,
             backing,
+            extra_shards: Vec::new(),
         })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn shard_count(&self) -> usize {
+        1 + self.extra_shards.len()
+    }
+
+    pub fn shard_path(&self, shard_idx: usize) -> &Path {
+        if shard_idx == 0 {
+            &self.path
+        } else {
+            &self.extra_shards[shard_idx - 1].0
+        }
     }
 
     pub fn version(&self) -> u32 {
@@ -505,31 +602,36 @@ impl GgufFile {
         self.alignment
     }
 
-    /// Byte offset where the tensor data section begins in the file.
+    /// Byte offset where the tensor data section begins in shard 0.
     pub fn data_offset(&self) -> usize {
         self.data_offset
     }
 
-    /// Raw read-only view of the entire memory-mapped GGUF file.
+    /// Raw read-only view of shard 0's memory-mapped GGUF file.
     pub fn as_bytes(&self) -> &[u8] {
         self.backing.as_slice()
     }
 
-    /// Returns `true` when backed by an OS page-aligned read-only `mmap` (vs in-memory test buffer).
+    /// Returns `true` when backed by a single-file OS page-aligned read-only `mmap`.
     pub fn is_mmap(&self) -> bool {
         #[cfg(test)]
         {
-            matches!(self.backing, Backing::Mmap(_))
+            self.extra_shards.is_empty() && matches!(self.backing, Backing::Mmap(_))
         }
         #[cfg(not(test))]
         {
-            true
+            self.extra_shards.is_empty()
         }
     }
 
-    /// Absolute byte offset of a tensor from the start of the GGUF file.
+    /// Absolute byte offset of a tensor from the start of its owning GGUF shard file.
     pub fn tensor_file_offset(&self, info: &TensorInfo) -> usize {
-        self.data_offset + info.offset
+        let d_off = if info.shard_idx == 0 {
+            self.data_offset
+        } else {
+            self.extra_shards[info.shard_idx - 1].1
+        };
+        d_off + info.offset
     }
 
     pub fn metadata(&self) -> &HashMap<String, MetadataValue> {
@@ -640,11 +742,11 @@ impl GgufFile {
                 actual: info.dims.clone(),
             });
         }
-        let abs_offset = (self.data_offset + info.offset) as u64;
+        let abs_offset = self.tensor_file_offset(info) as u64;
         Ok((info, abs_offset, info.byte_len))
     }
 
-    /// Borrows the raw mmap bytes for tensor `name` (zero copy).
+    /// Borrows the raw mmap bytes for tensor `name` from its owning shard (zero copy).
     pub fn tensor_bytes(&self, name: &str, layer: &str) -> Result<(&TensorInfo, &[u8]), GgufError> {
         let info = self
             .tensors
@@ -654,9 +756,15 @@ impl GgufFile {
                 tensor: name.to_string(),
                 layer: layer.to_string(),
             })?;
-        let start = self.data_offset + info.offset;
+        let (d_off, slice) = if info.shard_idx == 0 {
+            (self.data_offset, self.backing.as_slice())
+        } else {
+            let s = &self.extra_shards[info.shard_idx - 1];
+            (s.1, s.2.as_slice())
+        };
+        let start = d_off + info.offset;
         let end = start + info.byte_len;
-        Ok((info, &self.backing.as_slice()[start..end]))
+        Ok((info, &slice[start..end]))
     }
 
     /// Borrows a tensor and strictly validates its expected dimensions.

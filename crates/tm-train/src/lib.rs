@@ -126,6 +126,10 @@ pub fn estimate_cpu_qlora_dirty_bytes(
             let c = &m.cfg;
             ((max_seq * c.n_embd * 16 + c.vocab_padded * 2) * 4) as u64
         }
+        CpuModel::Qwen4Exp(m) => {
+            let c = &m.cfg;
+            ((max_seq * c.hc_dim() * 16 + c.vocab_size * 2) * 4) as u64
+        }
     }
 }
 
@@ -161,6 +165,10 @@ impl<'a> PolyTrainer<'a> {
                 m, max_seq, max_rank, ckpt_mode,
             )))),
             CpuModel::Inkling2(m) => Err(TrainError::InvalidConfig(format!(
+                "QLoRA fine-tuning is not yet supported on architecture '{}'",
+                m.cfg.arch
+            ))),
+            CpuModel::Qwen4Exp(m) => Err(TrainError::InvalidConfig(format!(
                 "QLoRA fine-tuning is not yet supported on architecture '{}'",
                 m.cfg.arch
             ))),

@@ -5,12 +5,14 @@
 
 pub mod dflash;
 pub mod gemma4;
+pub mod hy4;
 pub mod inkling2;
 pub mod lfm2;
 pub mod llama;
 pub mod mamba2;
 pub mod moe;
 pub mod qwen35;
+pub mod qwen4exp;
 pub mod sampler;
 pub mod state;
 pub mod vision;
@@ -19,6 +21,11 @@ pub use dflash::{DFlashConfig, DFlashModel, DFlashState, MAX_DFLASH_BLOCK_SIZE};
 pub use gemma4::{
     Gemma4Config, Gemma4LayerWeights, Gemma4Model, Gemma4State, KvLayerWeights, PleGlobalWeights,
     PleLayerWeights,
+};
+pub use hy4::{
+    HY4_MAGIC, Hy4Config, Hy4EngramCfg, Hy4EngramReader, Hy4Manifest, Hy4Model, Hy4State,
+    Hy4TensorInfo, StrataExpertEntry, StrataHeader, StrataProfile, StrataSectionEntry,
+    dequant_hy4_row, discover_sibling_engram_strata, is_strata_file,
 };
 pub use inkling2::{
     BytesBacking, ExpertLayerStore, ExpertWorkSlot, Inkling2Config, Inkling2DecodeProfile,
@@ -41,6 +48,10 @@ pub use moe::{
     ExpertGatingFunc, MOE_NORM_CLAMP_F16_MIN, MoeArchParams, MoeScratch, PackedExperts,
     SharedExpertWeights, SparseMoeConfig, SparseMoeFfn, compute_moe_routing_row,
     eval_sparse_moe_ffn, load_layer_moe_ffn, parse_moe_arch_params,
+};
+pub use qwen4exp::{
+    Qwen4ExpAttnWeights, Qwen4ExpConfig, Qwen4ExpHcWeights, Qwen4ExpLayerWeights, Qwen4ExpModel,
+    Qwen4ExpPleWeights, Qwen4ExpState,
 };
 pub use qwen35::{
     Qwen35AttnWeights, Qwen35Config, Qwen35DecodeProfile, Qwen35FfnWeights, Qwen35LayerWeights,

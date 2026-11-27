@@ -29,13 +29,13 @@ fn print_usage() {
     eprintln!(
         "Usage:
   tinymodel probe [-t <threads>] [--stream-mib <mib>] [--no-stream] [--vulkan] [--cuda] [--json]
-  tinymodel inspect <model.gguf>
+  tinymodel inspect <model.gguf|model.strata>
   tinymodel convert -i <in.gguf> -o <out.gguf> [--quant q4_0x4|q4_0|q8_0|iq4_nl|iq3_xxs|q2_0|iq2_xxs|tq2_0] [--lm-head-quant <fmt>] [--prune-vocab <N>] [--vocab-corpus <file>]
   tinymodel lora-merge -m <base.gguf> --lora <adapter.gguf>[:scale] -o <out.gguf> [--quant <fmt>] [--lm-head-quant <fmt>]
-  tinymodel run -m <model.gguf> [--mmproj <mmproj.gguf> --image <img.ppm|bmp>] [-md <dspark.gguf>] [--draft-max <k>] [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--spec off|auto|suffix|mtp] [--mtp <mtp.gguf>] [--lora <adapter.gguf>[:scale]] [--cuda | --vulkan | --metal | --gpu <cuda|vulkan|metal|cpu>]
-  tinymodel bench -m <model.gguf> [-md <dspark.gguf>] [--draft-max <k>] [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--spec off|auto|suffix|mtp] [--mtp <mtp.gguf>] [--lora <adapter.gguf>[:scale]] [--cuda | --vulkan | --metal | --gpu <cuda|vulkan|metal|cpu>] [--json]
-  tinymodel profile -m <model.gguf> [-n <tokens>] [-t <threads>] [-c <ctx>] [--lora <adapter.gguf>[:scale]] [--cuda | --vulkan | --metal | --gpu <cuda|vulkan|metal|cpu>]
-  tinymodel logits -m <model.gguf> -o <out.bin> [-p <prompt> | --tokens 1,2,3] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--lora <adapter.gguf>[:scale]] [--cuda | --vulkan | --metal | --gpu <cuda|vulkan|metal|cpu>]
+  tinymodel run -m <model.gguf|model.strata> [--engram <engram.strata>] [--mmproj <mmproj.gguf> --image <img.ppm|bmp>] [-md <dspark.gguf>] [--draft-max <k>] [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--spec off|auto|suffix|mtp] [--mtp <mtp.gguf>] [--lora <adapter.gguf>[:scale]] [--cuda | --vulkan | --metal | --gpu <cuda|vulkan|metal|cpu>]
+  tinymodel bench -m <model.gguf|model.strata> [--engram <engram.strata>] [-md <dspark.gguf>] [--draft-max <k>] [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--spec off|auto|suffix|mtp] [--mtp <mtp.gguf>] [--lora <adapter.gguf>[:scale]] [--cuda | --vulkan | --metal | --gpu <cuda|vulkan|metal|cpu>] [--json]
+  tinymodel profile -m <model.gguf|model.strata> [--engram <engram.strata>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--lora <adapter.gguf>[:scale]] [--cuda | --vulkan | --metal | --gpu <cuda|vulkan|metal|cpu>]
+  tinymodel logits -m <model.gguf|model.strata> [--engram <engram.strata>] -o <out.bin> [-p <prompt> | --tokens 1,2,3] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--lora <adapter.gguf>[:scale]] [--cuda | --vulkan | --metal | --gpu <cuda|vulkan|metal|cpu>]
   tinymodel train-mtp -m <base.gguf> --data <path> -o <mtp.gguf> [--steps <N>] [--seq-len <T>] [--lr <LR>] [--quant f16|q8_0|q4_0|f32] [-t <threads>] [--max-temp-c <C>] [--json]
   tinymodel finetune -m <base.gguf> --data <path> -o <adapter.gguf> [--rank <R>] [--alpha <A>] [--targets q,k,v,o,gate,up,down] [--steps <N>] [--seq-len <T>] [--grad-accum <M>] [--lr <LR>] [--lora-plus-ratio <K>] [--save-every <S>] [--ckpt <ckpt.gguf>] [--resume <ckpt.gguf>] [--f16] [--vulkan | --metal | --gpu <vulkan|metal|cpu>] [--gpu-min-macs <N>] [-t <threads>] [--max-temp-c <C>] [--json]"
     );
@@ -157,6 +157,46 @@ fn cmd_convert(args: &[String]) -> Result<()> {
 }
 
 fn cmd_inspect(path: PathBuf) -> Result<()> {
+    if tm_models::is_strata_file(&path) {
+        let (hdr, man) = tm_models::Hy4Manifest::from_strata_path(&path, false)?;
+        println!("File: {}", path.display());
+        println!(
+            "Container: .strata v1 (profile={:?}, flags=0x{:x})",
+            hdr.profile, hdr.flags
+        );
+        println!("Architecture: {}", man.cfg.arch);
+        println!(
+            "Layers: {} (hidden={}, hc={}, vocab={}, experts={}, top_k={}, lat_dim={})",
+            man.cfg.n_layers,
+            man.cfg.n_embd,
+            man.cfg.hc_count,
+            man.cfg.vocab_size,
+            man.cfg.n_experts,
+            man.cfg.top_k,
+            man.cfg.lat_dim
+        );
+        println!("Trunk tensors: {}", man.tensors.len());
+        for (i, sec) in hdr.sections.iter().enumerate() {
+            println!(
+                "  Section {i}: offset={} bytes={} ({:.2} MiB) flags=0x{:x}",
+                sec.file_offset,
+                sec.byte_length,
+                sec.byte_length as f64 / (1024.0 * 1024.0),
+                sec.flags
+            );
+        }
+        let mut names: Vec<&String> = man.tensors.keys().collect();
+        names.sort();
+        for name in names.into_iter().take(16) {
+            if let Some(ti) = man.tensors.get(name) {
+                println!(
+                    "  {:<44} {:?} fmt={} ({} bytes)",
+                    ti.name, ti.shape, ti.fmt, ti.bytes
+                );
+            }
+        }
+        return Ok(());
+    }
     let gguf = GgufFile::open(&path)?;
     println!("File: {}", gguf.path().display());
     println!(
@@ -273,6 +313,7 @@ fn cmd_lora_merge(args: &[String]) -> Result<()> {
 
 struct RunOpts {
     model: PathBuf,
+    engram_path: Option<PathBuf>,
     draft_model: Option<PathBuf>,
     draft_max: usize,
     prompt: Option<String>,
@@ -298,6 +339,7 @@ struct RunOpts {
 
 fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
     let mut model: Option<PathBuf> = None;
+    let mut engram_path: Option<PathBuf> = None;
     let mut draft_model: Option<PathBuf> = None;
     let mut draft_max = 3usize;
     let mut prompt: Option<String> = None;
@@ -327,6 +369,12 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
                 i += 1;
                 model = Some(PathBuf::from(
                     args.get(i).context("missing value for -m/--model")?,
+                ));
+            }
+            "--engram" => {
+                i += 1;
+                engram_path = Some(PathBuf::from(
+                    args.get(i).context("missing value for --engram")?,
                 ));
             }
             "-md" | "--draft" | "--model-draft" => {
@@ -548,6 +596,7 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
     let model = model.context("missing required -m <model.gguf>")?;
     Ok(RunOpts {
         model,
+        engram_path,
         draft_model,
         draft_max,
         prompt,
@@ -1485,7 +1534,7 @@ impl<'a> VkDSparkCtx<'a> {
     }
 }
 
-#[cfg(feature = "vulkan")]
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
 struct DSparkAdaptiveCtrl {
     max_k: usize,
     active_k: usize,
@@ -1497,7 +1546,7 @@ struct DSparkAdaptiveCtrl {
     cooldown: usize,
 }
 
-#[cfg(feature = "vulkan")]
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
 impl DSparkAdaptiveCtrl {
     fn new(max_k: usize, single_step_s: f64) -> Self {
         Self {
@@ -2842,24 +2891,50 @@ fn cmd_profile_vulkan(opts: RunOpts) -> Result<()> {
 #[cfg(feature = "cuda")]
 fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
     let t_load = Instant::now();
-    let gguf = GgufFile::open(&opts.model)?;
-    let tok = Tokenizer::from_gguf(&gguf)?;
-    let prompt_ids = resolve_prompt_ids(&opts, &tok)?;
     let is_pure_greedy =
         opts.sampler.temperature <= 0.0 && (opts.sampler.repeat_penalty - 1.0).abs() < 1e-6;
 
-    let mut runner =
-        tm_cuda::CudaRunner::from_gguf_with_kv_type(&gguf, opts.max_ctx, opts.kv_type)?;
+    let (mut runner, tok, prompt_ids, mut dspark_cuda) = if tm_models::is_strata_file(&opts.model) {
+        let (r, tok_json) = tm_cuda::CudaRunner::from_strata(
+            &opts.model,
+            opts.engram_path.as_deref(),
+            opts.max_ctx,
+        )?;
+        let (bos_id, eos_id) = r.bos_eos_ids().unwrap_or((120_000, 120_025));
+        let tok = Tokenizer::from_hf_tokenizer_json(&tok_json, Some(bos_id), Some(eos_id))?;
+        let prompt_ids = resolve_prompt_ids(&opts, &tok)?;
+        (r, tok, prompt_ids, None)
+    } else {
+        let gguf = GgufFile::open(&opts.model)?;
+        let tok = Tokenizer::from_gguf(&gguf)?;
+        let prompt_ids = resolve_prompt_ids(&opts, &tok)?;
+        let runner =
+            tm_cuda::CudaRunner::from_gguf_with_kv_type(&gguf, opts.max_ctx, opts.kv_type)?;
+        let draft_gguf = match &opts.draft_model {
+            Some(p) => Some(GgufFile::open(p)?),
+            None => None,
+        };
+        let dspark_cuda = match (&runner, &draft_gguf) {
+            (tm_cuda::CudaRunner::Inkling2(ik), Some(dg))
+                if is_pure_greedy && dg.req_str("general.architecture").ok() == Some("dflash") =>
+            {
+                Some(tm_cuda::DFlashCudaRunner::from_gguf(ik, dg, opts.max_ctx)?)
+            }
+            _ => None,
+        };
+        (runner, tok, prompt_ids, dspark_cuda)
+    };
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
     let info = runner.device_info().clone();
     eprintln!(
-        "[tinymodel] arch={} backend=cuda ({}, sm_{}{}) vram={:.1}MiB kv={} load={:.1}ms prompt_tokens={} vocab={} layers={}",
+        "[tinymodel] arch={} backend=cuda ({}, sm_{}{}) vram={:.1}MiB kv={} dspark={} load={:.1}ms prompt_tokens={} vocab={} layers={}",
         runner.arch(),
         info.name,
         info.cc_major,
         info.cc_minor,
         runner.vram_allocated_bytes() as f64 / (1024.0 * 1024.0),
         opts.kv_type.as_str(),
+        if dspark_cuda.is_some() { "gpu" } else { "off" },
         load_ms,
         prompt_ids.len(),
         runner.vocab_size(),
@@ -2884,9 +2959,30 @@ fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
         }
     }
     let logits = if !prompt_ids.is_empty() {
-        let l = runner.forward_batch(&prompt_ids, pos, true)?;
-        pos += prompt_ids.len();
-        l
+        if let (tm_cuda::CudaRunner::Inkling2(ik), Some(ds)) = (&mut runner, &mut dspark_cuda) {
+            let visits = ds.cfg.target_layers.clone();
+            let mut off = 0usize;
+            while off < prompt_ids.len() {
+                let b = (prompt_ids.len() - off).min(tm_cuda::llama_runner::MAX_CUDA_BATCH);
+                let is_last = off + b == prompt_ids.len();
+                let _ = ik.forward_window_with_taps(
+                    &prompt_ids[off..off + b],
+                    pos + off,
+                    is_last,
+                    false,
+                    &visits,
+                    None,
+                )?;
+                ds.inject_batch(ik, pos + off, b)?;
+                off += b;
+            }
+            pos += prompt_ids.len();
+            ik.forward_window_with_taps(&[], pos, false, false, &[], None)?
+        } else {
+            let l = runner.forward_batch(&prompt_ids, pos, true)?;
+            pos += prompt_ids.len();
+            l
+        }
     } else {
         bail!("prompt must contain at least 1 text token");
     };
@@ -2895,25 +2991,124 @@ fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
 
     let mut stdout = io::stdout().lock();
     let mut generated = 0usize;
+    let mut dspark_drafted = 0usize;
+    let mut dspark_accepted = 0usize;
     let t_gen = Instant::now();
-    while generated < opts.n_predict {
-        if tok.is_stop_token(next_id) {
-            break;
+
+    if let (tm_cuda::CudaRunner::Inkling2(ik), Some(ds)) = (&mut runner, &mut dspark_cuda) {
+        let visits = ds.cfg.target_layers.clone();
+        let max_k = opts.draft_max.min(ds.cfg.block_size.saturating_sub(1));
+        let mut ctrl = DSparkAdaptiveCtrl::new(max_k, 0.0);
+        let mut drafts = [0u32; tm_cuda::MAX_INKLING2_CUDA_SPEC_WINDOW];
+        let mut probs = [0.0f32; tm_cuda::MAX_INKLING2_CUDA_SPEC_WINDOW];
+        let mut win_toks = [0u32; tm_cuda::MAX_INKLING2_CUDA_SPEC_WINDOW];
+        let mut win_argmax = [0u32; tm_cuda::MAX_INKLING2_CUDA_SPEC_WINDOW];
+        let mut pending_inj: Option<(usize, usize)> = None;
+
+        if !tok.is_stop_token(next_id) && opts.n_predict > 0 {
+            stdout.write_all(&tok.decode_token_bytes(next_id))?;
+            stdout.flush()?;
+            history.push(next_id);
+            generated += 1;
         }
-        stdout.write_all(&tok.decode_token_bytes(next_id))?;
-        stdout.flush()?;
-        history.push(next_id);
-        generated += 1;
-        if generated >= opts.n_predict {
-            break;
+        while generated < opts.n_predict && !tok.is_stop_token(next_id) {
+            let t_step = Instant::now();
+            let rem_gen = opts.n_predict - generated;
+            let rem_ctx = opts.max_ctx.saturating_sub(pos + 1);
+            let cap_k = max_k.min(rem_gen.saturating_sub(1)).min(rem_ctx);
+            let ask_k = ctrl.choose_k(cap_k);
+            let (inj_pos, inj_cnt) = pending_inj.take().unwrap_or((0, 0));
+            let raw_d = ds.inject_and_draft_greedy_with_probs(
+                ik,
+                inj_pos,
+                inj_cnt,
+                pos,
+                next_id,
+                ask_k,
+                &mut drafts,
+                &mut probs,
+            )?;
+            let drafted = DSparkAdaptiveCtrl::gate_drafts(raw_d, &probs);
+            let w = 1 + drafted;
+            win_toks[0] = next_id;
+            win_toks[1..w].copy_from_slice(&drafts[..drafted]);
+
+            ik.set_dspark_tap_slot(0);
+            let _ = ik.forward_window_with_taps(
+                &win_toks[..w],
+                pos,
+                false,
+                drafted > 0,
+                &visits,
+                Some(&mut win_argmax[..w]),
+            )?;
+
+            let mut accepted = 0usize;
+            let mut committed = 1usize;
+            for j in 0..=drafted {
+                let target_tok = win_argmax[j];
+                if j < drafted && target_tok == win_toks[j + 1] {
+                    if tok.is_stop_token(target_tok) {
+                        next_id = target_tok;
+                        committed = j + 1;
+                        break;
+                    }
+                    accepted += 1;
+                    stdout.write_all(&tok.decode_token_bytes(target_tok))?;
+                    stdout.flush()?;
+                    history.push(target_tok);
+                    generated += 1;
+                    next_id = target_tok;
+                    if generated >= opts.n_predict {
+                        committed = j + 1;
+                        break;
+                    }
+                } else {
+                    committed = j + 1;
+                    next_id = target_tok;
+                    if !tok.is_stop_token(target_tok) && generated < opts.n_predict {
+                        stdout.write_all(&tok.decode_token_bytes(target_tok))?;
+                        stdout.flush()?;
+                        history.push(target_tok);
+                        generated += 1;
+                    }
+                    break;
+                }
+            }
+            if drafted > 0 {
+                ik.commit_speculative_window(committed)?;
+                dspark_drafted += drafted;
+                dspark_accepted += accepted;
+            }
+            let step_s = t_step.elapsed().as_secs_f64();
+            if drafted > 0 {
+                ctrl.observe(drafted, accepted, committed, step_s);
+            } else if ask_k == 0 {
+                ctrl.observe(0, 0, 1, step_s);
+            }
+            pending_inj = Some((pos, committed));
+            pos += committed;
         }
-        if is_pure_greedy {
-            next_id = runner.forward_token_greedy(next_id, pos)?;
-        } else {
-            let logits = runner.forward_token(next_id, pos, true)?;
-            next_id = sampler.sample(logits, &history);
+    } else {
+        while generated < opts.n_predict {
+            if tok.is_stop_token(next_id) {
+                break;
+            }
+            stdout.write_all(&tok.decode_token_bytes(next_id))?;
+            stdout.flush()?;
+            history.push(next_id);
+            generated += 1;
+            if generated >= opts.n_predict {
+                break;
+            }
+            if is_pure_greedy {
+                next_id = runner.forward_token_greedy(next_id, pos)?;
+            } else {
+                let logits = runner.forward_token(next_id, pos, true)?;
+                next_id = sampler.sample(logits, &history);
+            }
+            pos += 1;
         }
-        pos += 1;
     }
     let gen_sec = t_gen.elapsed().as_secs_f64();
     writeln!(stdout)?;
@@ -2924,6 +3119,14 @@ fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
     } else {
         0.0
     };
+    if dspark_drafted > 0 {
+        eprintln!(
+            "[tinymodel] dspark (cuda): accepted={}/{} ({:.1}%)",
+            dspark_accepted,
+            dspark_drafted,
+            100.0 * (dspark_accepted as f64) / (dspark_drafted as f64)
+        );
+    }
     eprintln!(
         "[tinymodel] timings (cuda): prefill {:.1}ms ({} tok, {:.2} tok/s) | decode {:.1}ms ({} tok, {:.2} tok/s)",
         pp_sec * 1e3,
@@ -2940,11 +3143,6 @@ fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
 fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
     let tel_before = probe::collect_telemetry();
     let t_load = Instant::now();
-    let gguf = GgufFile::open(&opts.model)?;
-    let arch = gguf.req_str("general.architecture")?.to_string();
-    let active_decode_bytes = compute_active_decode_bytes(&gguf);
-    let (pp_ids, corpus_mode) = resolve_bench_pp_ids(&opts, &gguf)?;
-    let n_pp = pp_ids.len();
     let model_name = opts
         .model
         .file_name()
@@ -2952,43 +3150,230 @@ fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
         .unwrap_or("?")
         .to_string();
 
-    let mut runner =
-        tm_cuda::CudaRunner::from_gguf_with_kv_type(&gguf, opts.max_ctx, opts.kv_type)?;
+    let (mut runner, arch, active_decode_bytes, pp_ids, corpus_mode, mut dspark_cuda) =
+        if tm_models::is_strata_file(&opts.model) {
+            let (r, tok_json) = tm_cuda::CudaRunner::from_strata(
+                &opts.model,
+                opts.engram_path.as_deref(),
+                opts.max_ctx,
+            )?;
+            let arch = r.arch().to_string();
+            let active_decode_bytes = r.active_decode_bytes_override().unwrap_or(0);
+            let has_custom = opts.prompt.is_some()
+                || opts.prompt_file.is_some()
+                || opts.explicit_tokens.is_some();
+            let (pp_ids, corpus_mode) = if has_custom {
+                let (bos_id, eos_id) = r.bos_eos_ids().unwrap_or((120_000, 120_025));
+                let tok = Tokenizer::from_hf_tokenizer_json(&tok_json, Some(bos_id), Some(eos_id))?;
+                let ids = resolve_prompt_ids(&opts, &tok)?;
+                if ids.len() + opts.n_predict + 2 > opts.max_ctx {
+                    bail!(
+                        "prompt ({} tokens) + n_predict ({}) exceeds max_ctx ({})",
+                        ids.len(),
+                        opts.n_predict,
+                        opts.max_ctx
+                    );
+                }
+                (ids, true)
+            } else {
+                let vocab_cap = r.vocab_size().saturating_sub(1).clamp(1, 1000);
+                let n_pp = 512usize.min(opts.max_ctx.saturating_sub(opts.n_predict + 2));
+                let ids: Vec<u32> = (0..n_pp).map(|i| ((i % vocab_cap) + 1) as u32).collect();
+                (ids, false)
+            };
+            (r, arch, active_decode_bytes, pp_ids, corpus_mode, None)
+        } else {
+            let gguf = GgufFile::open(&opts.model)?;
+            let arch = gguf.req_str("general.architecture")?.to_string();
+            let active_decode_bytes = compute_active_decode_bytes(&gguf);
+            let (pp_ids, corpus_mode) = resolve_bench_pp_ids(&opts, &gguf)?;
+            let runner =
+                tm_cuda::CudaRunner::from_gguf_with_kv_type(&gguf, opts.max_ctx, opts.kv_type)?;
+            let draft_gguf = match &opts.draft_model {
+                Some(p) => Some(GgufFile::open(p)?),
+                None => None,
+            };
+            let dspark_cuda = match (&runner, &draft_gguf) {
+                (tm_cuda::CudaRunner::Inkling2(ik), Some(dg))
+                    if dg.req_str("general.architecture").ok() == Some("dflash") =>
+                {
+                    Some(tm_cuda::DFlashCudaRunner::from_gguf(ik, dg, opts.max_ctx)?)
+                }
+                _ => None,
+            };
+            (
+                runner,
+                arch,
+                active_decode_bytes,
+                pp_ids,
+                corpus_mode,
+                dspark_cuda,
+            )
+        };
+    let n_pp = pp_ids.len();
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
-    // Warmup both MMVQ decode and WMMA Tensor Core prefill paths
+    // Warmup both MMVQ decode and WMMA Tensor Core prefill paths + measure single-step baseline
     let _ = runner.forward_token_greedy(1, 0)?;
+    let t_s1 = Instant::now();
     let _ = runner.forward_token_greedy(2, 1)?;
+    let single_step_s = t_s1.elapsed().as_secs_f64();
     runner.reset_state()?;
     let warmup_ids = [1u32; 16];
     let _ = runner.forward_batch(&warmup_ids, 0, true)?;
     runner.reset_state()?;
 
     let t_pp = Instant::now();
-    let pp_logits = runner.forward_batch(&pp_ids, 0, corpus_mode)?;
-    let first_tok = if corpus_mode { argmax(pp_logits) } else { 0 };
+    let first_tok =
+        if let (tm_cuda::CudaRunner::Inkling2(ik), Some(ds)) = (&mut runner, &mut dspark_cuda) {
+            ds.reset_state(ik)?;
+            let visits = ds.cfg.target_layers.clone();
+            let mut off = 0usize;
+            while off < pp_ids.len() {
+                let b = (pp_ids.len() - off).min(tm_cuda::llama_runner::MAX_CUDA_BATCH);
+                let is_last = off + b == pp_ids.len();
+                let _ = ik.forward_window_with_taps(
+                    &pp_ids[off..off + b],
+                    off,
+                    is_last && corpus_mode,
+                    false,
+                    &visits,
+                    None,
+                )?;
+                ds.inject_batch(ik, off, b)?;
+                off += b;
+            }
+            if corpus_mode {
+                argmax(ik.forward_window_with_taps(&[], n_pp, false, false, &[], None)?)
+            } else {
+                0
+            }
+        } else {
+            let pp_logits = runner.forward_batch(&pp_ids, 0, corpus_mode)?;
+            if corpus_mode { argmax(pp_logits) } else { 0 }
+        };
     let pp_sec = t_pp.elapsed().as_secs_f64();
     let pp_tps = (n_pp as f64) / pp_sec.max(1e-9);
 
     let n_gen = opts.n_predict;
     let mut gen_tokens = Vec::with_capacity(n_gen + 1);
-    let (mut tok, base_pos) = if corpus_mode {
+    let mut dspark_drafted = 0usize;
+    let mut dspark_accepted = 0usize;
+
+    let (mut tok, mut cur_pos) = if corpus_mode {
         (first_tok, n_pp)
     } else {
         runner.reset_state()?;
-        (runner.forward_token_greedy(1, 0)?, 1)
+        if let (tm_cuda::CudaRunner::Inkling2(ik), Some(ds)) = (&mut runner, &mut dspark_cuda) {
+            ds.reset_state(ik)?;
+            let visits = ds.cfg.target_layers.clone();
+            let mut a0 = [0u32; 1];
+            let _ = ik.forward_window_with_taps(&[1], 0, false, false, &visits, Some(&mut a0))?;
+            ds.inject_batch(ik, 0, 1)?;
+            (a0[0], 1)
+        } else {
+            (runner.forward_token_greedy(1, 0)?, 1)
+        }
     };
     gen_tokens.push(tok);
+
     let t0 = Instant::now();
-    for step in 0..n_gen {
-        tok = runner.forward_token_greedy(tok, base_pos + step)?;
-        gen_tokens.push(tok);
+    if let (tm_cuda::CudaRunner::Inkling2(ik), Some(ds)) = (&mut runner, &mut dspark_cuda) {
+        let visits = ds.cfg.target_layers.clone();
+        let max_k = opts.draft_max.min(ds.cfg.block_size.saturating_sub(1));
+        let mut ctrl = DSparkAdaptiveCtrl::new(max_k, single_step_s);
+        let mut drafts = [0u32; tm_cuda::MAX_INKLING2_CUDA_SPEC_WINDOW];
+        let mut probs = [0.0f32; tm_cuda::MAX_INKLING2_CUDA_SPEC_WINDOW];
+        let mut win_toks = [0u32; tm_cuda::MAX_INKLING2_CUDA_SPEC_WINDOW];
+        let mut win_argmax = [0u32; tm_cuda::MAX_INKLING2_CUDA_SPEC_WINDOW];
+        let mut pending_inj: Option<(usize, usize)> = None;
+
+        while gen_tokens.len() <= n_gen {
+            let t_step = Instant::now();
+            let rem_gen = (n_gen + 1) - gen_tokens.len();
+            let rem_ctx = opts.max_ctx.saturating_sub(cur_pos + 1);
+            let cap_k = max_k.min(rem_gen.saturating_sub(1)).min(rem_ctx);
+            let ask_k = ctrl.choose_k(cap_k);
+            let (inj_pos, inj_cnt) = pending_inj.take().unwrap_or((0, 0));
+            let raw_d = ds.inject_and_draft_greedy_with_probs(
+                ik,
+                inj_pos,
+                inj_cnt,
+                cur_pos,
+                tok,
+                ask_k,
+                &mut drafts,
+                &mut probs,
+            )?;
+            let drafted = DSparkAdaptiveCtrl::gate_drafts(raw_d, &probs);
+            let w = 1 + drafted;
+            win_toks[0] = tok;
+            win_toks[1..w].copy_from_slice(&drafts[..drafted]);
+
+            ik.set_dspark_tap_slot(0);
+            let _ = ik.forward_window_with_taps(
+                &win_toks[..w],
+                cur_pos,
+                false,
+                drafted > 0,
+                &visits,
+                Some(&mut win_argmax[..w]),
+            )?;
+
+            let mut accepted = 0usize;
+            let mut committed = 1usize;
+            for j in 0..=drafted {
+                let target_tok = win_argmax[j];
+                if j < drafted && target_tok == win_toks[j + 1] {
+                    accepted += 1;
+                    gen_tokens.push(target_tok);
+                    tok = target_tok;
+                    if gen_tokens.len() > n_gen {
+                        committed = j + 1;
+                        break;
+                    }
+                } else {
+                    committed = j + 1;
+                    tok = target_tok;
+                    if gen_tokens.len() <= n_gen {
+                        gen_tokens.push(target_tok);
+                    }
+                    break;
+                }
+            }
+            if drafted > 0 {
+                ik.commit_speculative_window(committed)?;
+                dspark_drafted += drafted;
+                dspark_accepted += accepted;
+            }
+            let step_s = t_step.elapsed().as_secs_f64();
+            if drafted > 0 {
+                ctrl.observe(drafted, accepted, committed, step_s);
+            } else if ask_k == 0 {
+                ctrl.observe(0, 0, 1, step_s);
+            }
+            pending_inj = Some((cur_pos, committed));
+            cur_pos += committed;
+        }
+    } else {
+        for step in 0..n_gen {
+            tok = runner.forward_token_greedy(tok, cur_pos + step)?;
+            gen_tokens.push(tok);
+        }
     }
     let sec = t0.elapsed().as_secs_f64();
     let tps = (n_gen as f64) / sec.max(1e-9);
     let tel_after = probe::collect_telemetry();
     let info = runner.device_info().clone();
     let dev_name = format!("{} (sm_{}{})", info.name, info.cc_major, info.cc_minor);
+    let wmode = if dspark_cuda.is_some() {
+        format!(
+            "device-vram+dspark_gpu_k{}({}/{})",
+            opts.draft_max, dspark_accepted, dspark_drafted
+        )
+    } else {
+        "device-vram".to_string()
+    };
 
     if opts.json {
         BenchMetrics {
@@ -2997,7 +3382,7 @@ fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
             backend: "cuda",
             isa: "cuda",
             device_name: &dev_name,
-            weights_mode: "device-vram",
+            weights_mode: &wmode,
             threads: 1,
             max_ctx: opts.max_ctx,
             corpus_mode,
@@ -3017,10 +3402,11 @@ fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
     } else {
         let eff_bw = (active_decode_bytes as f64 / 1e9) * tps;
         println!(
-            "bench: model={} arch={} backend=cuda ({}) vram={:.1}MiB load={:.1}ms pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, bw={:.1}/{:.1} GB/s = {:.1}%, last_tok={})",
+            "bench: model={} arch={} backend=cuda ({}) weights={} vram={:.1}MiB load={:.1}ms pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, bw={:.1}/{:.1} GB/s = {:.1}%, last_tok={})",
             model_name,
             arch,
             dev_name,
+            wmode,
             runner.vram_allocated_bytes() as f64 / (1024.0 * 1024.0),
             load_ms,
             n_pp,
@@ -3045,10 +3431,13 @@ fn cmd_profile_cuda(opts: RunOpts) -> Result<()> {
         .and_then(|s| s.to_str())
         .unwrap_or("?")
         .to_string();
-    let gguf = GgufFile::open(&opts.model)?;
     let n_runs = opts.n_predict.max(32);
-    let mut runner =
-        tm_cuda::CudaRunner::from_gguf_with_kv_type(&gguf, opts.max_ctx, opts.kv_type)?;
+    let mut runner = if tm_models::is_strata_file(&opts.model) {
+        tm_cuda::CudaRunner::from_strata(&opts.model, opts.engram_path.as_deref(), opts.max_ctx)?.0
+    } else {
+        let gguf = GgufFile::open(&opts.model)?;
+        tm_cuda::CudaRunner::from_gguf_with_kv_type(&gguf, opts.max_ctx, opts.kv_type)?
+    };
     let rep = runner.profile(n_runs, 512)?;
     println!(
         "=== CUDA GPU Decode Profile: {} ({}, arch={}) ===",
@@ -3814,6 +4203,97 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
         .out_path
         .clone()
         .context("logits requires -o <out.bin>")?;
+    if tm_models::is_strata_file(&opts.model) {
+        let file = File::create(&out_path)
+            .with_context(|| format!("failed to create '{}'", out_path.display()))?;
+        let mut writer = BufWriter::new(file);
+        if opts.use_cuda {
+            #[cfg(feature = "cuda")]
+            {
+                let (mut runner, tok_json) = tm_cuda::CudaRunner::from_strata(
+                    &opts.model,
+                    opts.engram_path.as_deref(),
+                    opts.max_ctx,
+                )?;
+                let (bos_id, eos_id) = runner.bos_eos_ids().unwrap_or((120_000, 120_025));
+                let tok = if opts.explicit_tokens.is_some() && tok_json.is_empty() {
+                    None
+                } else {
+                    Some(Tokenizer::from_hf_tokenizer_json(
+                        &tok_json,
+                        Some(bos_id),
+                        Some(eos_id),
+                    )?)
+                };
+                let input_ids = if let Some(ref ids) = opts.explicit_tokens {
+                    ids.clone()
+                } else {
+                    resolve_prompt_ids(&opts, tok.as_ref().context("missing tokenizer")?)?
+                };
+                let n_steps = input_ids.len();
+                let vocab = runner.vocab_size() as u32;
+                writer.write_all(b"TMLG")?;
+                writer.write_all(&1u32.to_le_bytes())?;
+                writer.write_all(&(n_steps as u32).to_le_bytes())?;
+                writer.write_all(&vocab.to_le_bytes())?;
+                for &id in &input_ids {
+                    writer.write_all(&id.to_le_bytes())?;
+                }
+                for (pos, &id) in input_ids.iter().enumerate() {
+                    let logits = runner.forward_token(id, pos, true)?;
+                    write_f32_le(&mut writer, logits)?;
+                }
+                writer.flush()?;
+                eprintln!(
+                    "[tinymodel logits] wrote {} steps x {} vocab (cuda {}) -> {}",
+                    n_steps,
+                    vocab,
+                    runner.arch(),
+                    out_path.display()
+                );
+                return Ok(());
+            }
+            #[cfg(not(feature = "cuda"))]
+            bail!("--cuda requires compiling with feature 'cuda'");
+        }
+        let pool = ThreadPool::new(opts.threads);
+        let kt = active_kernels();
+        let (model, reader) = tm_models::Hy4Model::open(&opts.model, opts.engram_path.as_deref())?;
+        let input_ids = if let Some(ref ids) = opts.explicit_tokens {
+            ids.clone()
+        } else {
+            let tok = Tokenizer::from_hf_tokenizer_json(
+                &model.man.tokenizer_json,
+                Some(model.man.cfg.bos_id),
+                Some(model.man.cfg.eos_id),
+            )?;
+            resolve_prompt_ids(&opts, &tok)?
+        };
+        let n_steps = input_ids.len();
+        let mut state = model.new_state(reader, opts.max_ctx);
+        let vocab = model.man.cfg.vocab_size as u32;
+        writer.write_all(b"TMLG")?;
+        writer.write_all(&1u32.to_le_bytes())?;
+        writer.write_all(&(n_steps as u32).to_le_bytes())?;
+        writer.write_all(&vocab.to_le_bytes())?;
+        for &id in &input_ids {
+            writer.write_all(&id.to_le_bytes())?;
+        }
+        for (pos, &id) in input_ids.iter().enumerate() {
+            model.forward_tokens(&mut state, &pool, kt, &[id], pos, true)?;
+            write_f32_le(&mut writer, state.logits())?;
+        }
+        writer.flush()?;
+        eprintln!(
+            "[tinymodel logits] wrote {} steps x {} vocab (cpu/{} {}) -> {}",
+            n_steps,
+            vocab,
+            kt.isa.name(),
+            model.man.cfg.arch,
+            out_path.display()
+        );
+        return Ok(());
+    }
     let gguf = std::sync::Arc::new(GgufFile::open(&opts.model)?);
     let arch = gguf.req_str("general.architecture")?.to_string();
     let tok = Tokenizer::from_gguf(&gguf)?;

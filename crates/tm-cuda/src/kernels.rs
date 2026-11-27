@@ -22,14 +22,38 @@ pub fn dtype_cuda_tag(dt: DType) -> Result<i32, CudaError> {
         DType::F16 => Ok(1),
         DType::Q4_0 => Ok(2),
         DType::Q4_1 => Ok(3),
+        DType::Q5_0 => Ok(6),
         DType::Q8_0 => Ok(8),
+        DType::Q3K => Ok(11),
+        DType::Q4K => Ok(12),
         DType::Q5K => Ok(13),
         DType::Q6K => Ok(14),
+        DType::Iq4Nl => Ok(20),
+        DType::Iq4Xs => Ok(23),
         DType::BF16 => Ok(30),
         DType::NvFp4 => Ok(40),
         DType::Q2_0 => Ok(42),
         other => Err(CudaError::UnsupportedDType(other)),
     }
+}
+
+/// Returns `true` when `dt` uses the `Q8_1` (`__dp4a`) MMVQ path in `launch_linear`.
+#[inline]
+pub fn is_q8_1_mmvq_dtype(dt: DType) -> bool {
+    matches!(
+        dt,
+        DType::Q2_0
+            | DType::Q4_0
+            | DType::Q4_1
+            | DType::Q5_0
+            | DType::Q8_0
+            | DType::Q3K
+            | DType::Q4K
+            | DType::Q5K
+            | DType::Q6K
+            | DType::Iq4Nl
+            | DType::Iq4Xs
+    )
 }
 
 /// Device weight matrix handle carrying its own `DType` (`AGENTS.md` Rule #5).
@@ -58,10 +82,14 @@ pub struct CudaKernels {
     pub mmvq_q2_0_q8_1: CUfunction,
     pub mmvq_q4_0_q8_1: CUfunction,
     pub mmvq_q4_1_q8_1: Option<CUfunction>,
+    pub mmvq_q5_0_q8_1: CUfunction,
     pub mmvq_q8_0_q8_1: CUfunction,
+    pub mmvq_q3_k_q8_1: CUfunction,
     pub mmvq_q4_k_q8_1: CUfunction,
     pub mmvq_q5_k_q8_1: CUfunction,
     pub mmvq_q6_k_q8_1: CUfunction,
+    pub mmvq_iq4_nl_q8_1: CUfunction,
+    pub mmvq_iq4_xs_q8_1: CUfunction,
     pub mmvq_float_f32: CUfunction,
     pub wmma_gemm_mixed_f32: CUfunction,
     pub embed_tokens_f32: CUfunction,
@@ -70,6 +98,7 @@ pub struct CudaKernels {
     pub add_bias_rows_f32: CUfunction,
     pub add_scaled_inplace_f32: CUfunction,
     pub scale_inplace_f32: CUfunction,
+    pub copy_2d_rows_f32: CUfunction,
     pub swiglu_f32: CUfunction,
     pub swiglu_fused_f32: CUfunction,
     pub sigmoid_gate_mul_f32: CUfunction,
@@ -102,10 +131,14 @@ impl CudaKernels {
             mmvq_q2_0_q8_1: ctx.get_function("mmvq_q2_0_q8_1")?,
             mmvq_q4_0_q8_1: ctx.get_function("mmvq_q4_0_q8_1")?,
             mmvq_q4_1_q8_1: ctx.get_function("mmvq_q4_1_q8_1").ok(),
+            mmvq_q5_0_q8_1: ctx.get_function("mmvq_q5_0_q8_1")?,
             mmvq_q8_0_q8_1: ctx.get_function("mmvq_q8_0_q8_1")?,
+            mmvq_q3_k_q8_1: ctx.get_function("mmvq_q3_k_q8_1")?,
             mmvq_q4_k_q8_1: ctx.get_function("mmvq_q4_k_q8_1")?,
             mmvq_q5_k_q8_1: ctx.get_function("mmvq_q5_k_q8_1")?,
             mmvq_q6_k_q8_1: ctx.get_function("mmvq_q6_k_q8_1")?,
+            mmvq_iq4_nl_q8_1: ctx.get_function("mmvq_iq4_nl_q8_1")?,
+            mmvq_iq4_xs_q8_1: ctx.get_function("mmvq_iq4_xs_q8_1")?,
             mmvq_float_f32: ctx.get_function("mmvq_float_f32")?,
             wmma_gemm_mixed_f32: ctx.get_function("wmma_gemm_mixed_f32")?,
             embed_tokens_f32: ctx.get_function("embed_tokens_f32")?,
@@ -114,6 +147,7 @@ impl CudaKernels {
             add_bias_rows_f32: ctx.get_function("add_bias_rows_f32")?,
             add_scaled_inplace_f32: ctx.get_function("add_scaled_inplace_f32")?,
             scale_inplace_f32: ctx.get_function("scale_inplace_f32")?,
+            copy_2d_rows_f32: ctx.get_function("copy_2d_rows_f32")?,
             swiglu_f32: ctx.get_function("swiglu_f32")?,
             swiglu_fused_f32: ctx.get_function("swiglu_fused_f32")?,
             sigmoid_gate_mul_f32: ctx.get_function("sigmoid_gate_mul_f32")?,
@@ -304,7 +338,16 @@ impl CudaKernels {
             let out_sub = out_ptr + (off * w.rows * 4) as u64;
 
             match w.dtype {
-                DType::Q2_0 | DType::Q4_0 | DType::Q8_0 | DType::Q5K | DType::Q6K => {
+                DType::Q2_0
+                | DType::Q4_0
+                | DType::Q5_0
+                | DType::Q8_0
+                | DType::Q3K
+                | DType::Q4K
+                | DType::Q5K
+                | DType::Q6K
+                | DType::Iq4Nl
+                | DType::Iq4Xs => {
                     let xq_sub = if q_ready && off == 0 && n_tok <= MMVQ_MAX_TOK {
                         xq_ptr
                     } else {
@@ -319,9 +362,16 @@ impl CudaKernels {
                             "mmvq_q4_0_q8_1",
                             b == 1 && w.cols >= 2048,
                         ),
+                        DType::Q5_0 => (self.mmvq_q5_0_q8_1, "mmvq_q5_0_q8_1", false),
                         DType::Q8_0 => (
                             self.mmvq_q8_0_q8_1,
                             "mmvq_q8_0_q8_1",
+                            b == 1 && w.cols >= 1024,
+                        ),
+                        DType::Q3K => (self.mmvq_q3_k_q8_1, "mmvq_q3_k_q8_1", false),
+                        DType::Q4K => (
+                            self.mmvq_q4_k_q8_1,
+                            "mmvq_q4_k_q8_1",
                             b == 1 && w.cols >= 1024,
                         ),
                         DType::Q5K => (
@@ -333,6 +383,12 @@ impl CudaKernels {
                             self.mmvq_q6_k_q8_1,
                             "mmvq_q6_k_q8_1",
                             b == 1 && w.cols >= 2048,
+                        ),
+                        DType::Iq4Nl => (self.mmvq_iq4_nl_q8_1, "mmvq_iq4_nl_q8_1", false),
+                        DType::Iq4Xs => (
+                            self.mmvq_iq4_xs_q8_1,
+                            "mmvq_iq4_xs_q8_1",
+                            b == 1 && w.cols >= 1024,
                         ),
                         _ => unreachable!(),
                     };
@@ -402,6 +458,16 @@ impl CudaKernels {
                     }
                 }
                 DType::F16 | DType::BF16 | DType::F32 | DType::Q4_1 | DType::NvFp4 => {
+                    let coop_4w = b == 1
+                        && w.cols >= 1024
+                        && matches!(w.dtype, DType::BF16 | DType::F16 | DType::F32)
+                        && w.cols.is_multiple_of(8)
+                        && ((w.ptr() as usize) | w.row_bytes) & 15 == 0;
+                    let grid_x = if coop_4w {
+                        w.rows as u32
+                    } else {
+                        (w.rows as u32).div_ceil(4)
+                    };
                     let mut p_w = w.ptr();
                     let mut p_x = x_sub;
                     let mut p_out = out_sub;
@@ -425,7 +491,7 @@ impl CudaKernels {
                         ctx.launch(
                             "mmvq_float_f32",
                             self.mmvq_float_f32,
-                            ((w.rows as u32).div_ceil(4), 1, 1),
+                            (grid_x, 1, 1),
                             (32, 4, 1),
                             0,
                             &mut args,
@@ -634,6 +700,44 @@ impl CudaKernels {
                 "scale_inplace_f32",
                 self.scale_inplace_f32,
                 ((n as u32).div_ceil(256), 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            )
+        }
+    }
+
+    pub fn launch_copy_2d_rows(
+        &self,
+        ctx: &CudaContext,
+        dst_ptr: CUdeviceptr,
+        src_ptr: CUdeviceptr,
+        cols: usize,
+        dst_stride: usize,
+        src_stride: usize,
+        n_tok: usize,
+    ) -> Result<(), CudaError> {
+        if cols == 0 || n_tok == 0 {
+            return Ok(());
+        }
+        let mut pd = dst_ptr;
+        let mut ps = src_ptr;
+        let mut c_cols = cols as i32;
+        let mut ds = dst_stride;
+        let mut ss = src_stride;
+        let mut args: [*mut c_void; 5] = [
+            (&mut pd as *mut CUdeviceptr).cast(),
+            (&mut ps as *mut CUdeviceptr).cast(),
+            (&mut c_cols as *mut i32).cast(),
+            (&mut ds as *mut usize).cast(),
+            (&mut ss as *mut usize).cast(),
+        ];
+        // SAFETY: Matches `copy_2d_rows_f32`.
+        unsafe {
+            ctx.launch(
+                "copy_2d_rows_f32",
+                self.copy_2d_rows_f32,
+                ((cols as u32).div_ceil(256), n_tok as u32, 1),
                 (256, 1, 1),
                 0,
                 &mut args,

@@ -680,6 +680,35 @@ pub fn matvec_f32(
                 }
             });
         }
+        DType::Q5_0 | DType::Q3K | DType::Q4K | DType::Iq4Xs => {
+            let blk_elems = dtype.block_elements();
+            let blk_bytes = dtype.block_bytes();
+            let row_bytes = dtype.row_bytes(cols);
+            let n_blks = cols / blk_elems;
+            pool.parallel_for(rows, chunk, |r0, r1| {
+                let len = r1 - r0;
+                // SAFETY: Disjoint `[r0..r1)` output ranges per parallel chunk.
+                let o =
+                    unsafe { core::slice::from_raw_parts_mut((out_ptr as *mut f32).add(r0), len) };
+                let mut deq_blk = [0.0f32; QK_K];
+                for i in 0..len {
+                    let rb = &w_bytes[(r0 + i) * row_bytes..(r0 + i + 1) * row_bytes];
+                    let mut acc = 0.0f32;
+                    for b in 0..n_blks {
+                        dequantize_row_bytes(
+                            dtype,
+                            &rb[b * blk_bytes..(b + 1) * blk_bytes],
+                            &mut deq_blk[..blk_elems],
+                        );
+                        acc += generic::vec_dot_f32(
+                            &deq_blk[..blk_elems],
+                            &x[b * blk_elems..(b + 1) * blk_elems],
+                        );
+                    }
+                    o[i] = acc;
+                }
+            });
+        }
         other => panic!("matvec_f32: unsupported weight dtype {other:?}"),
     }
 }

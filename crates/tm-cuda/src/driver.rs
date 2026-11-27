@@ -545,6 +545,24 @@ impl CudaContext {
         }
     }
 
+    pub fn alloc_uninit(&self, bytes: usize) -> Result<CudaBuffer, CudaError> {
+        let alloc_bytes = bytes.max(16);
+        self.bind_current()?;
+        let mut ptr_dev: CUdeviceptr = 0;
+        // SAFETY: Context is current; allocates `alloc_bytes` in GPU global memory.
+        unsafe {
+            self.inner.drv.check(
+                "cuMemAlloc_v2",
+                (self.inner.drv.cu_mem_alloc)(&mut ptr_dev, alloc_bytes),
+            )?;
+        }
+        Ok(CudaBuffer {
+            ctx: self.clone(),
+            ptr: ptr_dev,
+            bytes: alloc_bytes,
+        })
+    }
+
     pub fn alloc_zeroed(&self, bytes: usize) -> Result<CudaBuffer, CudaError> {
         let alloc_bytes = bytes.max(16);
         self.bind_current()?;
@@ -571,10 +589,11 @@ impl CudaContext {
     }
 
     pub fn alloc_from_bytes(&self, data: &[u8]) -> Result<CudaBuffer, CudaError> {
-        let buf = self.alloc_zeroed(data.len().max(16))?;
-        if !data.is_empty() {
-            buf.copy_from_bytes(data)?;
+        if data.is_empty() {
+            return self.alloc_zeroed(16);
         }
+        let buf = self.alloc_uninit(data.len())?;
+        buf.copy_from_bytes(data)?;
         Ok(buf)
     }
 
@@ -728,9 +747,8 @@ impl CudaBuffer {
             )));
         }
         self.ctx.bind_current()?;
-        // SAFETY: `src` and `self.ptr` are valid for `src.len()` bytes; async on `stream` followed by sync if unpinned,
-        // so we use synchronous `cuMemcpyHtoD_v2` after stream sync or async on stream. Note: `cuMemcpyHtoDAsync_v2`
-        // is stream-ordered with `self.ctx.stream()` even for pageable host memory in CUDA!
+        // SAFETY: `src` and `self.ptr` are valid for `src.len()` bytes; `cuMemcpyHtoDAsync_v2`
+        // is stream-ordered with `self.ctx.stream()` even for pageable host memory in CUDA.
         unsafe {
             self.ctx.inner.drv.check(
                 "cuMemcpyHtoDAsync_v2",
@@ -739,6 +757,34 @@ impl CudaBuffer {
                     src.as_ptr().cast::<c_void>(),
                     src.len(),
                     self.ctx.inner.stream,
+                ),
+            )
+        }
+    }
+
+    /// Synchronously copies `src` to `self.ptr + dst_offset` (ideal for chunked streaming from disk).
+    pub fn copy_from_bytes_at(&self, dst_offset: usize, src: &[u8]) -> Result<(), CudaError> {
+        if src.is_empty() {
+            return Ok(());
+        }
+        if dst_offset.saturating_add(src.len()) > self.bytes {
+            return Err(CudaError::InvalidDimensions(format!(
+                "H2D copy {} + {} bytes exceeds buffer size {}",
+                dst_offset,
+                src.len(),
+                self.bytes
+            )));
+        }
+        self.ctx.bind_current()?;
+        // SAFETY: `src` and `self.ptr + dst_offset` are valid for `src.len()` bytes; synchronous `cuMemcpyHtoD_v2`
+        // completes before returning so the caller can immediately reuse its host staging buffer.
+        unsafe {
+            self.ctx.inner.drv.check(
+                "cuMemcpyHtoD_v2",
+                (self.ctx.inner.drv.cu_memcpy_htod)(
+                    self.ptr + dst_offset as u64,
+                    src.as_ptr().cast::<c_void>(),
+                    src.len(),
                 ),
             )
         }
