@@ -12,9 +12,10 @@ name = "tinymodel"
 path = "src/main.rs"
 
 [features]
-default = ["edge", "metal", "vulkan", "train"]
+default = ["edge", "cuda", "metal", "vulkan", "train"]
 micro = ["tm-cpu/micro"]
 edge = ["tm-cpu/edge"]
+cuda = ["dep:tm-cuda"]
 metal = ["dep:tm-metal"]
 vulkan = ["dep:tm-vulkan"]
 train = ["dep:tm-train"]
@@ -23,6 +24,7 @@ train = ["dep:tm-train"]
 anyhow = "1"
 tm-core = { path = "../tm-core" }
 tm-cpu = { path = "../tm-cpu", default-features = false }
+tm-cuda = { path = "../tm-cuda", optional = true }
 tm-gguf = { path = "../tm-gguf" }
 tm-lora = { path = "../tm-lora" }
 tm-metal = { path = "../tm-metal", optional = true }

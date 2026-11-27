@@ -143,4 +143,14 @@
 - **决策**：
   1. 在 `crates/tm-models/src/vision.rs`（`#![forbid(unsafe_code)]`，零新增外部 crate）实现兼容 `llama.cpp` / `mtmd` `mmproj` GGUF 规范的零拷贝 `VisionModel`，统一覆盖四大视觉编码器与投影族：**SigLIP / Gemma 3 & 4**（2D Patch Conv + 可学习位置编码 + Pre-LN + 空间平均池化 + `mm.soft_emb_norm` + 线性投影）、**Qwen2-VL / Qwen2.5-VL / Qwen3-VL / Qwen3.5**（3D 时序-2 卷积 `v.patch_embd.weight` + `.weight.1` + 2D Vision RoPE + 融合 QKV + SwiGLU + 2×2 空间合并 MLP + 3D M-RoPE 坐标）、**Pixtral / Mistral-3**（2D Vision RoPE + Pre-RMSNorm + SwiGLU + `mm.patch_merger`）及 **SmolVLM / LFM2-VL**（双线性位置编码插值 + Pixel-Shuffle MLP），并内置纯 Rust PPM/PGM/BMP 解码、Keys 双三次缩放与 Qwen-VL `smart_resize_dims`。
   2. 在全部五大主干（`LlamaModel`、`Qwen35Model`、`Gemma4Model`、`Lfm2Model`、`Mamba2Model`）及对应的 Apple Metal GPU Runner（`MetalRunner::forward_embed`）补齐零堆分配 `forward_embed` 视觉嵌入注入接口，在 `tm-runtime` 提供 `Session::prefill_multimodal` 与**阶段加载（Staged Load）**`encode_image_staged`（编码完成后立即释放 `mmproj` mmap，稳态解码零额外内存占用），并在 `tm-cli` `run` 接入 `--mmproj <file> --image <file>`。
-- **后果**：零外部依赖一次打通全栈原生多模态推理（CPU + Apple Metal），全部 4 大视觉族通过独立 FP64 Python Oracle（`tools/oracle/p2_vision_oracle.py`）对齐与 CPU/Metal `forward_embed` 0-ULP/精确一致验收，且不影响 `micro` 档纯文本静态二进制体积。
+- **后果**：零外部依赖一次打通全栈原生多模态推理（CPU + Apple Metal），全部 4 大视觉族通过独立 FP64 Python Oracle（`tools/oracle/p2_vision_oracle.py`）对齐与 CPU/Metal `forward_embed` 0-ULP/精确一致验收，且不影响 `micro` 档静态二进制体积。
+
+## ADR-020：NVIDIA CUDA 后端（`tm-cuda` 动态 Driver API + CUDA Graph）与原生 `NVFP4` (`ggml_type = 40`) 支持（2026-11-27）
+
+- **状态**：已接受
+- **背景**：按 `ROADMAP.md` M5 GPU 后端顺序（Metal → Vulkan → CUDA）及 Unsloth Dynamic 混合精度 GGUF（如 `Inkling-2-Mini-UD-Q8_K_XL.gguf` 采用 `GGML_TYPE_NVFP4 = 40` + 逐专家 `F32` `.scale`），需要为 `tinymodel` 落地零编译期 CUDA SDK 硬依赖的 `tm-cuda` 后端，并在全栈补齐 `DType::NvFp4` 内核三件套及 macOS 16GB 统一内存零 Swap 调度。
+- **决策**：
+  1. **动态 `libcuda` Driver API + 双路径 PTX 构建（`crates/tm-cuda`）**：通过 `libloading` 在运行时动态加载 `libcuda.so.1`（macOS / 无 GPU 宿主机可无痛编译检查）；`build.rs` 自动检测 `nvcc` 编译 `kernels/cuda_ops.cu`（无 `nvcc` 时回退到随仓预编译 `ptx/cuda_ops.ptx`）。每次 `cuLaunchKernel` 前显式校验线程块与动态共享内存上限。
+  2. **双模态 `__dp4a` MMVQ + `wmma` Tensor Core GEMM + 单次 `cuGraphLaunch` 解码**：移植并扩展 `Strata`（MIT）风格 4-warp 协同 `__dp4a` MMVQ（覆盖 `Q4_0`/`Q4_1`/`Q8_0`/`Q5_K`/`Q6_K`/`F16`/`BF16`/`F32`/`NVFP4`）与 `16×16×16` FP16 Tensor Core 预填充 GEMM；`LlamaCudaRunner`（覆盖稠密与 `SparseMoe` 架构群）与 `Qwen35CudaRunner`（严格遵循 `GDN_CONTRACT` 五大不变量）共享绑定词表 `Arc<CudaBuffer>`，并将整步 Decode 捕获为可参数化更新 `(token_id, pos)` 的 `CUDA Graph`，消除百余次内核发射开销。
+  3. **原生 `DType::NvFp4` (`ggml_type = 40`, `4.50 bpw`) 与 macOS 统一内存分层增强**：在 `tm-core` / `tm-cpu` 实现 `BlockNvFp4`（4×`UE4M3` 子块缩放 + 64×`E2M1` 码本）及 `generic` / `neon` / `dotprod` 4 行 `vqtbl1q_s8 + vdotq_s32` 内核（全四档 ISA **0-ULP** 逐位一致）；在 `Inkling2Model` 支持逐专家 `.scale`、macOS `F_NOCACHE` 无缓存 8 路并发 SSD 流式直读、稠密 `BF16` 权重 `mlock` 防压缩与 32-token 锁步批处理 Prefill。
+- **后果**：`tinymodel --cuda` 在 NVIDIA Tesla T4 (`sm_75`) 上通过 L1/L3 对齐校验并在核心 MMVQ/GDN 微基准上达到 `Strata` 的 `100%–112%`；Apple M4 (16 GB) 可无 Swap 流畅运行 21.30 GiB `Inkling-2-Mini-UD-Q8_K_XL`（RAM MoE 有效带宽 `63.2 GB/s`，`lm_head` `66.2 GB/s`）。

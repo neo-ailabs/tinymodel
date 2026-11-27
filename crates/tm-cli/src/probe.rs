@@ -776,6 +776,7 @@ pub struct ProbeOpts {
     pub stream_mib: Option<usize>,
     pub skip_stream: bool,
     pub use_vulkan: bool,
+    pub use_cuda: bool,
     pub json: bool,
 }
 
@@ -784,6 +785,7 @@ pub fn parse_probe_opts(args: &[String]) -> Result<ProbeOpts> {
     let mut stream_mib: Option<usize> = None;
     let mut skip_stream = false;
     let mut use_vulkan = false;
+    let mut use_cuda = false;
     let mut json = false;
 
     let mut i = 0;
@@ -812,6 +814,9 @@ pub fn parse_probe_opts(args: &[String]) -> Result<ProbeOpts> {
             "--vulkan" => {
                 use_vulkan = true;
             }
+            "--cuda" => {
+                use_cuda = true;
+            }
             "--json" => {
                 json = true;
             }
@@ -825,8 +830,112 @@ pub fn parse_probe_opts(args: &[String]) -> Result<ProbeOpts> {
         stream_mib,
         skip_stream,
         use_vulkan,
+        use_cuda,
         json,
     })
+}
+
+#[cfg(feature = "cuda")]
+fn run_cuda_probe_and_self_check() -> Result<(String, String)> {
+    let ctx = tm_cuda::CudaContext::new(None)?;
+    let kernels = tm_cuda::CudaKernels::load(&ctx)?;
+    let info = ctx.info();
+
+    // L1 self-check: 8 rows x 64 cols Q4_0 x Q8_1 MMVQ vs `generic` scalar reference
+    let rows = 8usize;
+    let cols = 64usize;
+    let n_blks = cols / 32;
+    let mut w_blks = Vec::with_capacity(rows * n_blks);
+    let mut w_bytes = Vec::with_capacity(rows * n_blks * 18);
+    for r in 0..rows {
+        for b in 0..n_blks {
+            let d = f32_to_f16(0.25 * ((r % 3) + 1) as f32);
+            let mut qs = [0u8; 16];
+            for (j, slot) in qs.iter_mut().enumerate() {
+                let lo = ((r * 7 + b * 3 + j) % 16) as u8;
+                let hi = ((r * 5 + b * 11 + j + 3) % 16) as u8;
+                *slot = lo | (hi << 4);
+            }
+            w_bytes.extend_from_slice(&d.to_le_bytes());
+            w_bytes.extend_from_slice(&qs);
+            w_blks.push(BlockQ4_0 { d, qs });
+        }
+    }
+    let x: Vec<f32> = (0..cols).map(|i| ((i as f32) - 31.5) * 0.125).collect();
+    let mut xq_cpu = vec![
+        BlockQ8_1 {
+            d: 0,
+            s: 0,
+            qs: [0; 32]
+        };
+        n_blks
+    ];
+    generic::quantize_q8_1(&x, &mut xq_cpu);
+    let mut ref_out = vec![0.0f32; rows];
+    // Convert `BlockQ8_1` to `BlockQ8_0` for `generic::gemv_q4_0_q8_0` reference
+    let mut xq8_0 = vec![BlockQ8_0 { d: 0, qs: [0; 32] }; n_blks];
+    generic::quantize_q8_0(&x, &mut xq8_0);
+    generic::gemv_q4_0_q8_0(&w_blks, &xq8_0, &mut ref_out, rows, n_blks);
+
+    let w_mat = tm_cuda::CudaMat {
+        buf: std::sync::Arc::new(ctx.alloc_from_bytes(&w_bytes)?),
+        offset: 0,
+        dtype: tm_core::DType::Q4_0,
+        rows,
+        cols,
+        row_bytes: n_blks * 18,
+    };
+    let x_dev = ctx.alloc_from_f32(&x)?;
+    let xq_dev = ctx.alloc_zeroed(n_blks * tm_cuda::BLOCK_Q8_1_BYTES)?;
+    let out_dev = ctx.alloc_zeroed(rows * 4)?;
+    kernels.launch_linear(
+        &ctx,
+        &w_mat,
+        x_dev.device_ptr(),
+        xq_dev.device_ptr(),
+        false,
+        out_dev.device_ptr(),
+        1,
+        true,
+    )?;
+    let mut got = vec![0.0f32; rows];
+    out_dev.copy_to_f32(&mut got)?;
+    for i in 0..rows {
+        let err = (got[i] - ref_out[i]).abs();
+        if err > 5e-3 {
+            bail!(
+                "CUDA L1 mmvq_q4_0_q8_1 mismatch at {i}: got={} ref={}",
+                got[i],
+                ref_out[i]
+            );
+        }
+    }
+
+    let cuda_json = format!(
+        "{{\"device_name\":\"{}\",\"driver_version\":{},\"cc\":\"{}.{}\",\"sm_count\":{},\"dp4a\":{},\"fp16_wmma\":{},\"vram_bytes\":{},\"peak_bw_gbps\":{:.2},\"self_check_passed\":true}}",
+        json_escape(&info.name),
+        info.driver_version,
+        info.cc_major,
+        info.cc_minor,
+        info.sm_count,
+        info.has_dp4a(),
+        info.has_fp16_wmma(),
+        info.total_vram_bytes,
+        info.peak_mem_bw_gbps,
+    );
+    let summary = format!(
+        "{} (sm_{}{}, driver={}, SMs={}, dp4a={}, wmma={}, VRAM={:.1} MiB, peak_bw={:.1} GB/s) — L1 GPU Self-Check PASSED",
+        info.name,
+        info.cc_major,
+        info.cc_minor,
+        info.driver_version,
+        info.sm_count,
+        info.has_dp4a(),
+        info.has_fp16_wmma(),
+        info.total_vram_bytes as f64 / 1048576.0,
+        info.peak_mem_bw_gbps,
+    );
+    Ok((cuda_json, summary))
 }
 
 #[cfg(feature = "vulkan")]
@@ -947,6 +1056,19 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
         None
     };
 
+    let cuda_probe: Option<(String, String)> = if opts.use_cuda {
+        #[cfg(feature = "cuda")]
+        {
+            Some(run_cuda_probe_and_self_check()?)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            bail!("--cuda requires compiling with feature 'cuda'");
+        }
+    } else {
+        None
+    };
+
     if opts.json {
         let isas_json: Vec<String> = tested_isas.iter().map(|s| format!("\"{s}\"")).collect();
         let clusters_json: Vec<String> = clusters
@@ -990,6 +1112,10 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
             Some((j, _)) => j.as_str(),
             None => "null",
         };
+        let cuda_self_json = match &cuda_probe {
+            Some((j, _)) => j.as_str(),
+            None => "null",
+        };
 
         #[cfg(feature = "vulkan")]
         let vk_devs_json = match tm_vulkan::VulkanContext::list_devices() {
@@ -1029,7 +1155,7 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
             \"process_rss_bytes\":{},\"process_peak_rss_bytes\":{},\
             \"process_private_dirty_bytes\":{},\"process_pss_anon_bytes\":{},\
             \"kernel_self_check\":{{\"passed\":{},\"error\":{}}},\
-            \"vulkan\":{},\"vulkan_devices\":{},\
+            \"vulkan\":{},\"vulkan_devices\":{},\"cuda\":{},\
             \"stream_bw\":{},\"telemetry\":{}}}",
             json_escape(&model_name),
             std::env::consts::OS,
@@ -1052,6 +1178,7 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
             err_json,
             vk_self_json,
             vk_devs_json,
+            cuda_self_json,
             stream_json,
             telemetry.to_json()
         );
@@ -1118,6 +1245,9 @@ pub fn cmd_probe(opts: ProbeOpts) -> Result<()> {
         }
         if let Some((_, ref vk_sum)) = vk_probe {
             println!("Vulkan GPU: {vk_sum}");
+        }
+        if let Some((_, ref cu_sum)) = cuda_probe {
+            println!("CUDA GPU: {cu_sum}");
         }
         if let Some((mib, rgbs, cgbs)) = stream {
             println!(

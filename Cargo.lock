@@ -182,6 +182,7 @@ dependencies = [
  "anyhow",
  "tm-core",
  "tm-cpu",
+ "tm-cuda",
  "tm-gguf",
  "tm-lora",
  "tm-metal",
@@ -201,6 +202,19 @@ name = "tm-cpu"
 version = "0.1.0"
 dependencies = [
  "tm-core",
+]
+
+[[package]]
+name = "tm-cuda"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "thiserror",
+ "tm-core",
+ "tm-cpu",
+ "tm-gguf",
+ "tm-lora",
+ "tm-models",
 ]
 
 [[package]]

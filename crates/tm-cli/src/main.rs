@@ -16,8 +16,8 @@ use tm_cpu::{ThreadPool, active_kernels};
 use tm_gguf::{ConvertOptions, GgufFile};
 use tm_lora::{LoraAdapter, LoraMergeOptions, LoraSet, merge_lora_gguf, parse_lora_spec};
 use tm_models::{
-    CpuDecodeProfile, LlamaModel, LlamaState, Qwen35DecodeProfile, Qwen35Model, Qwen35State,
-    Sampler, SamplerConfig, argmax,
+    CpuDecodeProfile, Inkling2DecodeProfile, Inkling2Model, Inkling2State, LlamaModel, LlamaState,
+    Qwen35DecodeProfile, Qwen35Model, Qwen35State, Sampler, SamplerConfig, argmax,
 };
 use tm_runtime::{
     CpuModel, LinearMtpHead, MtpDrafter, MultimodalChunk, RgbImage, Session, SpecController,
@@ -28,14 +28,14 @@ use tm_tokenizer::Tokenizer;
 fn print_usage() {
     eprintln!(
         "Usage:
-  tinymodel probe [-t <threads>] [--stream-mib <mib>] [--no-stream] [--vulkan] [--json]
+  tinymodel probe [-t <threads>] [--stream-mib <mib>] [--no-stream] [--vulkan] [--cuda] [--json]
   tinymodel inspect <model.gguf>
   tinymodel convert -i <in.gguf> -o <out.gguf> [--quant q4_0x4|q4_0|q8_0|iq4_nl|iq3_xxs|q2_0|iq2_xxs|tq2_0] [--lm-head-quant <fmt>] [--prune-vocab <N>] [--vocab-corpus <file>]
   tinymodel lora-merge -m <base.gguf> --lora <adapter.gguf>[:scale] -o <out.gguf> [--quant <fmt>] [--lm-head-quant <fmt>]
-  tinymodel run -m <model.gguf> [--mmproj <mmproj.gguf> --image <img.ppm|bmp>] [-md <dspark.gguf>] [--draft-max <k>] [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--spec off|auto|suffix|mtp] [--mtp <mtp.gguf>] [--lora <adapter.gguf>[:scale]] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]
-  tinymodel bench -m <model.gguf> [-md <dspark.gguf>] [--draft-max <k>] [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--spec off|auto|suffix|mtp] [--mtp <mtp.gguf>] [--lora <adapter.gguf>[:scale]] [--vulkan | --metal | --gpu <vulkan|metal|cpu>] [--json]
-  tinymodel profile -m <model.gguf> [-n <tokens>] [-t <threads>] [-c <ctx>] [--lora <adapter.gguf>[:scale]] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]
-  tinymodel logits -m <model.gguf> -o <out.bin> [-p <prompt> | --tokens 1,2,3] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--lora <adapter.gguf>[:scale]] [--vulkan | --metal | --gpu <vulkan|metal|cpu>]
+  tinymodel run -m <model.gguf> [--mmproj <mmproj.gguf> --image <img.ppm|bmp>] [-md <dspark.gguf>] [--draft-max <k>] [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--spec off|auto|suffix|mtp] [--mtp <mtp.gguf>] [--lora <adapter.gguf>[:scale]] [--cuda | --vulkan | --metal | --gpu <cuda|vulkan|metal|cpu>]
+  tinymodel bench -m <model.gguf> [-md <dspark.gguf>] [--draft-max <k>] [-p <prompt> | -f <file>] [-n <tokens>] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--spec off|auto|suffix|mtp] [--mtp <mtp.gguf>] [--lora <adapter.gguf>[:scale]] [--cuda | --vulkan | --metal | --gpu <cuda|vulkan|metal|cpu>] [--json]
+  tinymodel profile -m <model.gguf> [-n <tokens>] [-t <threads>] [-c <ctx>] [--lora <adapter.gguf>[:scale]] [--cuda | --vulkan | --metal | --gpu <cuda|vulkan|metal|cpu>]
+  tinymodel logits -m <model.gguf> -o <out.bin> [-p <prompt> | --tokens 1,2,3] [-t <threads>] [-c <ctx>] [--kv-type f16|q8_0] [--lora <adapter.gguf>[:scale]] [--cuda | --vulkan | --metal | --gpu <cuda|vulkan|metal|cpu>]
   tinymodel train-mtp -m <base.gguf> --data <path> -o <mtp.gguf> [--steps <N>] [--seq-len <T>] [--lr <LR>] [--quant f16|q8_0|q4_0|f32] [-t <threads>] [--max-temp-c <C>] [--json]
   tinymodel finetune -m <base.gguf> --data <path> -o <adapter.gguf> [--rank <R>] [--alpha <A>] [--targets q,k,v,o,gate,up,down] [--steps <N>] [--seq-len <T>] [--grad-accum <M>] [--lr <LR>] [--lora-plus-ratio <K>] [--save-every <S>] [--ckpt <ckpt.gguf>] [--resume <ckpt.gguf>] [--f16] [--vulkan | --metal | --gpu <vulkan|metal|cpu>] [--gpu-min-macs <N>] [-t <threads>] [--max-temp-c <C>] [--json]"
     );
@@ -289,6 +289,7 @@ struct RunOpts {
     lora_specs: Vec<(PathBuf, f32)>,
     use_metal: bool,
     use_vulkan: bool,
+    use_cuda: bool,
     json: bool,
     sampler: SamplerConfig,
     mmproj_path: Option<PathBuf>,
@@ -313,6 +314,7 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
     let mut lora_specs: Vec<(PathBuf, f32)> = Vec::new();
     let mut use_metal = false;
     let mut use_vulkan = false;
+    let mut use_cuda = false;
     let mut json = false;
     let mut sampler = SamplerConfig::default();
     let mut mmproj_path: Option<PathBuf> = None;
@@ -445,28 +447,45 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
             "--metal" => {
                 use_metal = true;
                 use_vulkan = false;
+                use_cuda = false;
             }
             "--vulkan" => {
                 use_vulkan = true;
                 use_metal = false;
+                use_cuda = false;
+            }
+            "--cuda" => {
+                use_cuda = true;
+                use_metal = false;
+                use_vulkan = false;
             }
             "--gpu" => {
                 i += 1;
                 let bk = args.get(i).context("missing value for --gpu")?;
                 match bk.as_str() {
+                    "cuda" | "nv" => {
+                        use_cuda = true;
+                        use_vulkan = false;
+                        use_metal = false;
+                    }
                     "vulkan" | "vk" => {
                         use_vulkan = true;
                         use_metal = false;
+                        use_cuda = false;
                     }
                     "metal" | "mtl" => {
                         use_metal = true;
                         use_vulkan = false;
+                        use_cuda = false;
                     }
                     "cpu" | "none" => {
                         use_vulkan = false;
                         use_metal = false;
+                        use_cuda = false;
                     }
-                    other => bail!("unknown --gpu backend '{other}' (expected vulkan, metal, cpu)"),
+                    other => {
+                        bail!("unknown --gpu backend '{other}' (expected cuda, vulkan, metal, cpu)")
+                    }
                 }
             }
             "--kv-type" => {
@@ -519,8 +538,8 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
         i += 1;
     }
 
-    if use_metal && use_vulkan {
-        bail!("cannot specify both --metal and --vulkan");
+    if usize::from(use_metal) + usize::from(use_vulkan) + usize::from(use_cuda) > 1 {
+        bail!("cannot specify more than one GPU backend (--cuda, --vulkan, --metal)");
     }
     if !image_paths.is_empty() && mmproj_path.is_none() {
         bail!("--image requires --mmproj <mmproj.gguf>");
@@ -545,6 +564,7 @@ fn parse_run_opts(args: &[String]) -> Result<RunOpts> {
         lora_specs,
         use_metal,
         use_vulkan,
+        use_cuda,
         json,
         sampler,
         mmproj_path,
@@ -917,7 +937,7 @@ fn compute_active_decode_bytes(gguf: &GgufFile) -> u64 {
                 } else {
                     1
                 };
-                if suffix.ends_with("_exps.weight") {
+                if suffix.ends_with("_exps.weight") || suffix.ends_with("_exps.scale") {
                     let per_exp = (info.byte_len / n_exp) as u64;
                     total += mult * (n_exp_used as u64) * per_exp;
                 } else {
@@ -1150,22 +1170,29 @@ fn cmd_bench_metal(opts: RunOpts) -> Result<()> {
 /// buffers (KV cache + GDN recurrent state + scratch) fit comfortably inside `available_bytes`
 /// before allocating, preventing SD-swap thrashing or container OOM kills.
 fn check_linux_dirty_budget(required_bytes: u64, max_ctx: usize) -> Result<()> {
-    const OS_HEADROOM_BYTES: u64 = 32 * 1024 * 1024;
-    if let Ok(budget) = tm_core::probe_system_memory() {
-        let safe_limit = budget.available_bytes.saturating_sub(OS_HEADROOM_BYTES);
-        if required_bytes > safe_limit {
-            let cg_note = budget
-                .cgroup_max_bytes
-                .map(|m| format!(" (cgroup memory.max={:.1} MiB)", m as f64 / 1048576.0))
-                .unwrap_or_default();
-            bail!(
-                "insufficient memory for runtime state (-c {max_ctx}): need {:.1} MiB dirty RAM, \
-                 only {:.1} MiB safely available{}; reduce -c <ctx> or free system memory",
-                required_bytes as f64 / 1048576.0,
-                safe_limit as f64 / 1048576.0,
-                cg_note,
-            );
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        const OS_HEADROOM_BYTES: u64 = 32 * 1024 * 1024;
+        if let Ok(budget) = tm_core::probe_system_memory() {
+            let safe_limit = budget.available_bytes.saturating_sub(OS_HEADROOM_BYTES);
+            if required_bytes > safe_limit {
+                let cg_note = budget
+                    .cgroup_max_bytes
+                    .map(|m| format!(" (cgroup memory.max={:.1} MiB)", m as f64 / 1048576.0))
+                    .unwrap_or_default();
+                bail!(
+                    "insufficient memory for runtime state (-c {max_ctx}): need {:.1} MiB dirty RAM, \
+                     only {:.1} MiB safely available{}; reduce -c <ctx> or free system memory",
+                    required_bytes as f64 / 1048576.0,
+                    safe_limit as f64 / 1048576.0,
+                    cg_note,
+                );
+            }
         }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = (required_bytes, max_ctx);
     }
     Ok(())
 }
@@ -2427,7 +2454,240 @@ fn cmd_profile_vulkan(opts: RunOpts) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
+fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
+    let t_load = Instant::now();
+    let gguf = GgufFile::open(&opts.model)?;
+    let tok = Tokenizer::from_gguf(&gguf)?;
+    let prompt_ids = resolve_prompt_ids(&opts, &tok)?;
+    let is_pure_greedy =
+        opts.sampler.temperature <= 0.0 && (opts.sampler.repeat_penalty - 1.0).abs() < 1e-6;
+
+    let mut runner =
+        tm_cuda::CudaRunner::from_gguf_with_kv_type(&gguf, opts.max_ctx, opts.kv_type)?;
+    let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
+    let info = runner.device_info().clone();
+    eprintln!(
+        "[tinymodel] arch={} backend=cuda ({}, sm_{}{}) vram={:.1}MiB kv={} load={:.1}ms prompt_tokens={} vocab={} layers={}",
+        runner.arch(),
+        info.name,
+        info.cc_major,
+        info.cc_minor,
+        runner.vram_allocated_bytes() as f64 / (1024.0 * 1024.0),
+        opts.kv_type.as_str(),
+        load_ms,
+        prompt_ids.len(),
+        runner.vocab_size(),
+        runner.n_layers()
+    );
+
+    let pool = ThreadPool::new(opts.threads);
+    let vision_embeds = encode_cli_images(&opts, &pool)?;
+
+    let mut sampler = Sampler::new(opts.sampler, runner.vocab_size());
+    let mut history = prompt_ids.clone();
+
+    let t_pp = Instant::now();
+    let mut pos = 0usize;
+    let total_vis: usize = vision_embeds.iter().map(|v| v.n_tokens).sum();
+    let total_pp = total_vis + prompt_ids.len();
+    for vis in &vision_embeds {
+        for idx in 0..vis.n_tokens {
+            let is_last = pos + 1 == total_pp;
+            let _ = runner.forward_embed(vis.token_embed(idx), pos, is_last)?;
+            pos += 1;
+        }
+    }
+    let logits = if !prompt_ids.is_empty() {
+        let l = runner.forward_batch(&prompt_ids, pos, true)?;
+        pos += prompt_ids.len();
+        l
+    } else {
+        bail!("prompt must contain at least 1 text token");
+    };
+    let mut next_id = sampler.sample(logits, &history);
+    let pp_sec = t_pp.elapsed().as_secs_f64();
+
+    let mut stdout = io::stdout().lock();
+    let mut generated = 0usize;
+    let t_gen = Instant::now();
+    while generated < opts.n_predict {
+        if tok.is_stop_token(next_id) {
+            break;
+        }
+        stdout.write_all(&tok.decode_token_bytes(next_id))?;
+        stdout.flush()?;
+        history.push(next_id);
+        generated += 1;
+        if generated >= opts.n_predict {
+            break;
+        }
+        if is_pure_greedy {
+            next_id = runner.forward_token_greedy(next_id, pos)?;
+        } else {
+            let logits = runner.forward_token(next_id, pos, true)?;
+            next_id = sampler.sample(logits, &history);
+        }
+        pos += 1;
+    }
+    let gen_sec = t_gen.elapsed().as_secs_f64();
+    writeln!(stdout)?;
+    let tg_runs = generated.saturating_sub(1);
+    let pp_tps = (total_pp as f64) / pp_sec.max(1e-9);
+    let tg_tps = if tg_runs > 0 {
+        (tg_runs as f64) / gen_sec.max(1e-9)
+    } else {
+        0.0
+    };
+    eprintln!(
+        "[tinymodel] timings (cuda): prefill {:.1}ms ({} tok, {:.2} tok/s) | decode {:.1}ms ({} tok, {:.2} tok/s)",
+        pp_sec * 1e3,
+        total_pp,
+        pp_tps,
+        gen_sec * 1e3,
+        tg_runs,
+        tg_tps
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
+    let tel_before = probe::collect_telemetry();
+    let t_load = Instant::now();
+    let gguf = GgufFile::open(&opts.model)?;
+    let arch = gguf.req_str("general.architecture")?.to_string();
+    let active_decode_bytes = compute_active_decode_bytes(&gguf);
+    let (pp_ids, corpus_mode) = resolve_bench_pp_ids(&opts, &gguf)?;
+    let n_pp = pp_ids.len();
+    let model_name = opts
+        .model
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("?")
+        .to_string();
+
+    let mut runner =
+        tm_cuda::CudaRunner::from_gguf_with_kv_type(&gguf, opts.max_ctx, opts.kv_type)?;
+    let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
+
+    // Warmup both MMVQ decode and WMMA Tensor Core prefill paths
+    let _ = runner.forward_token_greedy(1, 0)?;
+    let _ = runner.forward_token_greedy(2, 1)?;
+    runner.reset_state()?;
+    let warmup_ids = [1u32; 16];
+    let _ = runner.forward_batch(&warmup_ids, 0, true)?;
+    runner.reset_state()?;
+
+    let t_pp = Instant::now();
+    let pp_logits = runner.forward_batch(&pp_ids, 0, corpus_mode)?;
+    let first_tok = if corpus_mode { argmax(pp_logits) } else { 0 };
+    let pp_sec = t_pp.elapsed().as_secs_f64();
+    let pp_tps = (n_pp as f64) / pp_sec.max(1e-9);
+
+    let n_gen = opts.n_predict;
+    let mut gen_tokens = Vec::with_capacity(n_gen + 1);
+    let (mut tok, base_pos) = if corpus_mode {
+        (first_tok, n_pp)
+    } else {
+        runner.reset_state()?;
+        (runner.forward_token_greedy(1, 0)?, 1)
+    };
+    gen_tokens.push(tok);
+    let t0 = Instant::now();
+    for step in 0..n_gen {
+        tok = runner.forward_token_greedy(tok, base_pos + step)?;
+        gen_tokens.push(tok);
+    }
+    let sec = t0.elapsed().as_secs_f64();
+    let tps = (n_gen as f64) / sec.max(1e-9);
+    let tel_after = probe::collect_telemetry();
+    let info = runner.device_info().clone();
+    let dev_name = format!("{} (sm_{}{})", info.name, info.cc_major, info.cc_minor);
+
+    if opts.json {
+        BenchMetrics {
+            model_name: &model_name,
+            arch: &arch,
+            backend: "cuda",
+            isa: "cuda",
+            device_name: &dev_name,
+            weights_mode: "device-vram",
+            threads: 1,
+            max_ctx: opts.max_ctx,
+            corpus_mode,
+            active_decode_bytes,
+            load_ms,
+            ttft_ms: pp_sec * 1e3,
+            n_pp,
+            pp_ms: pp_sec * 1e3,
+            n_gen,
+            tg_ms: sec * 1e3,
+            last_tok: tok,
+            greedy_hash: probe::hash_token_sequence(&gen_tokens),
+            tel_before,
+            tel_after,
+        }
+        .print_json();
+    } else {
+        let eff_bw = (active_decode_bytes as f64 / 1e9) * tps;
+        println!(
+            "bench: model={} arch={} backend=cuda ({}) vram={:.1}MiB load={:.1}ms pp{}={:.2} tok/s tg{}={:.2} tok/s ({:.2} ms/tok, bw={:.1}/{:.1} GB/s = {:.1}%, last_tok={})",
+            model_name,
+            arch,
+            dev_name,
+            runner.vram_allocated_bytes() as f64 / (1024.0 * 1024.0),
+            load_ms,
+            n_pp,
+            pp_tps,
+            n_gen,
+            tps,
+            (sec * 1e3) / (n_gen as f64),
+            eff_bw,
+            info.peak_mem_bw_gbps,
+            100.0 * eff_bw / info.peak_mem_bw_gbps.max(1.0),
+            tok
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn cmd_profile_cuda(opts: RunOpts) -> Result<()> {
+    let model_name = opts
+        .model
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("?")
+        .to_string();
+    let gguf = GgufFile::open(&opts.model)?;
+    let n_runs = opts.n_predict.max(32);
+    let mut runner =
+        tm_cuda::CudaRunner::from_gguf_with_kv_type(&gguf, opts.max_ctx, opts.kv_type)?;
+    let rep = runner.profile(n_runs, 512)?;
+    println!(
+        "=== CUDA GPU Decode Profile: {} ({}, arch={}) ===",
+        model_name, rep.device_name, rep.arch
+    );
+    println!(
+        "Decode: {:.3} ms/tok ({:.2} tok/s) | Weights: {:.1} MiB | Effective BW: {:.2} / {:.1} GB/s ({:.1}%)",
+        rep.total_ms_per_tok,
+        rep.tok_per_sec,
+        rep.model_weight_bytes as f64 / (1024.0 * 1024.0),
+        rep.effective_bw_gbps,
+        rep.peak_bw_gbps,
+        rep.bw_utilization_pct
+    );
+    Ok(())
+}
+
 fn cmd_run(opts: RunOpts) -> Result<()> {
+    if opts.use_cuda {
+        #[cfg(feature = "cuda")]
+        return cmd_run_cuda(opts);
+        #[cfg(not(feature = "cuda"))]
+        bail!("--cuda requires compiling with feature 'cuda'");
+    }
     if opts.use_metal {
         #[cfg(all(feature = "metal", target_vendor = "apple"))]
         return cmd_run_metal(opts);
@@ -2489,6 +2749,19 @@ fn cmd_run(opts: RunOpts) -> Result<()> {
         model.n_layers(),
         opts.prefix_cache_mib
     );
+    if let CpuModel::Inkling2(ref m) = model {
+        let st = &m.stats;
+        eprintln!(
+            "[tinymodel] inkling2 placement: dense={:.1}MiB | ram_mmap_layers={} | ram_owned_layers={} ({:.1}MiB, core_in_fast={}/12) | ssd_stream_layers={} ({:.1}MiB/tok)",
+            st.dense_bytes as f64 / 1048576.0,
+            st.ram_mmap_expert_layers,
+            st.ram_owned_expert_layers,
+            st.ram_owned_bytes as f64 / 1048576.0,
+            st.core_layers_in_fast_tiers,
+            st.nvme_direct_expert_layers,
+            st.nvme_bytes_per_decode_tok as f64 / 1048576.0,
+        );
+    }
 
     let vision_embeds = encode_cli_images(&opts, &pool)?;
     let t_pp = Instant::now();
@@ -2601,6 +2874,12 @@ fn cmd_run(opts: RunOpts) -> Result<()> {
 }
 
 fn cmd_bench(opts: RunOpts) -> Result<()> {
+    if opts.use_cuda {
+        #[cfg(feature = "cuda")]
+        return cmd_bench_cuda(opts);
+        #[cfg(not(feature = "cuda"))]
+        bail!("--cuda requires compiling with feature 'cuda'");
+    }
     if opts.use_vulkan {
         #[cfg(feature = "vulkan")]
         return cmd_bench_vulkan(opts);
@@ -2649,6 +2928,19 @@ fn cmd_bench(opts: RunOpts) -> Result<()> {
         session.enable_speculation();
     }
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
+    if let CpuModel::Inkling2(ref m) = model {
+        let st = &m.stats;
+        eprintln!(
+            "[tinymodel] inkling2 placement: dense={:.1}MiB | ram_mmap_layers={} | ram_owned_layers={} ({:.1}MiB, core_in_fast={}/12) | ssd_stream_layers={} ({:.1}MiB/tok)",
+            st.dense_bytes as f64 / 1048576.0,
+            st.ram_mmap_expert_layers,
+            st.ram_owned_expert_layers,
+            st.ram_owned_bytes as f64 / 1048576.0,
+            st.core_layers_in_fast_tiers,
+            st.nvme_direct_expert_layers,
+            st.nvme_bytes_per_decode_tok as f64 / 1048576.0,
+        );
+    }
 
     // Warm up mmap pages & thread pool
     model.forward_token(&mut session.state, &pool, kt, 1, 0, true)?;
@@ -2798,6 +3090,12 @@ fn cmd_profile_metal(opts: RunOpts) -> Result<()> {
 }
 
 fn cmd_profile(opts: RunOpts) -> Result<()> {
+    if opts.use_cuda {
+        #[cfg(feature = "cuda")]
+        return cmd_profile_cuda(opts);
+        #[cfg(not(feature = "cuda"))]
+        bail!("--cuda requires compiling with feature 'cuda'");
+    }
     if opts.use_vulkan {
         #[cfg(feature = "vulkan")]
         return cmd_profile_vulkan(opts);
@@ -2820,6 +3118,98 @@ fn cmd_profile(opts: RunOpts) -> Result<()> {
     let arch = gguf.req_str("general.architecture")?.to_string();
     let pool = ThreadPool::new(opts.threads);
     let kt = active_kernels();
+
+    if arch == "inkling2" || arch == "inkling2_loop" {
+        let model = Inkling2Model::from_gguf(&gguf)?;
+        let st = &model.stats;
+        eprintln!(
+            "[tinymodel] inkling2 placement: dense={:.1}MiB | ram_mmap_layers={} | ram_owned_layers={} ({:.1}MiB, core_in_fast={}/12) | ssd_stream_layers={} ({:.1}MiB/tok, uncached={})",
+            st.dense_bytes as f64 / 1048576.0,
+            st.ram_mmap_expert_layers,
+            st.ram_owned_expert_layers,
+            st.ram_owned_bytes as f64 / 1048576.0,
+            st.core_layers_in_fast_tiers,
+            st.nvme_direct_expert_layers,
+            st.nvme_bytes_per_decode_tok as f64 / 1048576.0,
+            st.direct_io_active,
+        );
+        let mut state = Inkling2State::new_with_kv_type(&model, opts.max_ctx, opts.kv_type);
+        model.forward_token(&mut state, &pool, kt, 1, 0, true)?;
+        state.reset();
+
+        let n_pp = 32usize.min(opts.max_ctx / 2);
+        let pp_ids: Vec<u32> = (0..n_pp).map(|i| ((i % 1000) + 1) as u32).collect();
+        let t_pp = Instant::now();
+        model.forward_batch(&mut state, &pool, kt, &pp_ids, 0, true)?;
+        let pp_ms = t_pp.elapsed().as_secs_f64() * 1e3;
+        let pp_tps = (n_pp as f64) / (pp_ms * 1e-3).max(1e-9);
+
+        let n_runs = opts.n_predict.max(4);
+        let mut prof = Inkling2DecodeProfile::default();
+        let mut tok = argmax(state.logits());
+        let t_dec = Instant::now();
+        for step in 0..n_runs {
+            model.forward_token_profiled(&mut state, &pool, kt, tok, n_pp + step, &mut prof)?;
+            tok = argmax(state.logits());
+        }
+        let wall_ns = t_dec.elapsed().as_nanos() as u64;
+        let runs_f = prof.n_steps.max(1) as f64;
+        let wall_ms = (wall_ns as f64 / 1e6) / runs_f;
+        let dec_tps = 1e3 / wall_ms.max(1e-6);
+        let total_b =
+            (prof.dense_attn_bytes + prof.moe_ram_bytes + prof.moe_ssd_bytes + prof.lm_head_bytes)
+                as f64
+                / runs_f;
+        let e2e_gbs = (total_b / 1e9) / (wall_ms * 1e-3);
+
+        println!(
+            "=== CPU Profile (Inkling-2 Looped MoE): {} (isa={}, threads={}, kv={}) ===",
+            model_name,
+            kt.isa.name(),
+            pool.num_threads(),
+            opts.kv_type.as_str()
+        );
+        println!(
+            "Prefill pp{}: {:.2} ms ({:.2} tok/s) | Decode tg{}: {:.2} ms/tok ({:.2} tok/s, eff_bw={:.2} GB/s)",
+            n_pp, pp_ms, pp_tps, n_runs, wall_ms, dec_tps, e2e_gbs
+        );
+        println!();
+        println!(
+            "{:<26} {:>10} {:>8} {:>10} {:>12}",
+            "Decode Stage", "ms/tok", "Share%", "MiB/tok", "Eff GB/s"
+        );
+        println!("{}", "-".repeat(70));
+        let rows = [
+            ("embed+depth_mix", prof.embed_mix_ns, 0u64),
+            ("loop_controllers (24v)", prof.loop_ctrl_ns, 0u64),
+            (
+                "dense_attn_proj+conv",
+                prof.dense_attn_proj_ns,
+                prof.dense_attn_bytes,
+            ),
+            ("gqa_rel_sink_kv", prof.gqa_kv_ns, 0u64),
+            ("moe_router+post_conv", prof.moe_route_ns, 0u64),
+            ("moe_experts_ram", prof.moe_ram_ns, prof.moe_ram_bytes),
+            ("moe_experts_ssd", prof.moe_ssd_ns, prof.moe_ssd_bytes),
+            ("lm_head (200K BF16)", prof.lm_head_ns, prof.lm_head_bytes),
+        ];
+        for (name, ns, bytes) in rows {
+            let ms = (ns as f64 / 1e6) / runs_f;
+            let pct = 100.0 * (ns as f64) / (wall_ns as f64).max(1.0);
+            let b_tok = bytes as f64 / runs_f;
+            let mib = b_tok / (1024.0 * 1024.0);
+            let gbs = if b_tok > 0.0 && ms > 0.0 {
+                (b_tok / 1e9) / (ms * 1e-3)
+            } else {
+                0.0
+            };
+            println!(
+                "{:<26} {:>10.2} {:>7.1}% {:>10.1} {:>12.2}",
+                name, ms, pct, mib, gbs
+            );
+        }
+        return Ok(());
+    }
 
     if arch == "qwen35" {
         let model = Qwen35Model::from_gguf(&gguf)?;
@@ -3165,6 +3555,37 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
         }
         #[cfg(not(feature = "vulkan"))]
         bail!("--vulkan requires compiling with feature 'vulkan'");
+    }
+
+    if opts.use_cuda {
+        #[cfg(feature = "cuda")]
+        {
+            let mut runner =
+                tm_cuda::CudaRunner::from_gguf_with_kv_type(&gguf, opts.max_ctx, opts.kv_type)?;
+            let vocab = runner.vocab_size() as u32;
+            writer.write_all(b"TMLG")?;
+            writer.write_all(&1u32.to_le_bytes())?;
+            writer.write_all(&(n_steps as u32).to_le_bytes())?;
+            writer.write_all(&vocab.to_le_bytes())?;
+            for &id in &input_ids {
+                writer.write_all(&id.to_le_bytes())?;
+            }
+            for (pos, &id) in input_ids.iter().enumerate() {
+                let logits = runner.forward_token(id, pos, true)?;
+                write_f32_le(&mut writer, logits)?;
+            }
+            writer.flush()?;
+            eprintln!(
+                "[tinymodel logits] wrote {} steps x {} vocab (cuda {}) -> {}",
+                n_steps,
+                vocab,
+                arch,
+                out_path.display()
+            );
+            return Ok(());
+        }
+        #[cfg(not(feature = "cuda"))]
+        bail!("--cuda requires compiling with feature 'cuda'");
     }
 
     if opts.use_metal {
@@ -3546,6 +3967,7 @@ fn cmd_finetune(args: &[String]) -> Result<()> {
     let mut alpha_explicit = false;
     let mut use_metal = false;
     let mut use_vulkan = false;
+    let mut use_cuda = false;
     let mut gpu_min_macs: Option<usize> = None;
 
     let mut i = 0;
@@ -3709,28 +4131,45 @@ fn cmd_finetune(args: &[String]) -> Result<()> {
             "--metal" => {
                 use_metal = true;
                 use_vulkan = false;
+                use_cuda = false;
             }
             "--vulkan" => {
                 use_vulkan = true;
                 use_metal = false;
+                use_cuda = false;
+            }
+            "--cuda" => {
+                use_cuda = true;
+                use_metal = false;
+                use_vulkan = false;
             }
             "--gpu" => {
                 i += 1;
                 let bk = args.get(i).context("missing value for --gpu")?;
                 match bk.as_str() {
+                    "cuda" | "nv" => {
+                        use_cuda = true;
+                        use_vulkan = false;
+                        use_metal = false;
+                    }
                     "vulkan" | "vk" => {
                         use_vulkan = true;
                         use_metal = false;
+                        use_cuda = false;
                     }
                     "metal" | "mtl" => {
                         use_metal = true;
                         use_vulkan = false;
+                        use_cuda = false;
                     }
                     "cpu" | "none" => {
                         use_vulkan = false;
                         use_metal = false;
+                        use_cuda = false;
                     }
-                    other => bail!("unknown --gpu backend '{other}' (expected vulkan, metal, cpu)"),
+                    other => {
+                        bail!("unknown --gpu backend '{other}' (expected cuda, vulkan, metal, cpu)")
+                    }
                 }
             }
             "--gpu-min-macs" => {
@@ -3748,6 +4187,9 @@ fn cmd_finetune(args: &[String]) -> Result<()> {
         i += 1;
     }
 
+    if use_cuda {
+        bail!("finetune --cuda is not yet wired (use --metal, --vulkan, or CPU)");
+    }
     if use_metal && use_vulkan {
         bail!("cannot specify both --metal and --vulkan");
     }
