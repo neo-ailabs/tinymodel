@@ -27,7 +27,6 @@ struct Inkling2CudaKernels {
     shortconv: CUfunction,
     clip_heads: CUfunction,
     situ_glu_fused: CUfunction,
-    situ_glu_fused_q8_1: CUfunction,
     rel_attn_f16: CUfunction,
     softcap_inplace: CUfunction,
     softcap_argmax: CUfunction,
@@ -43,7 +42,6 @@ impl Inkling2CudaKernels {
             shortconv: ctx.get_function("inkling2_shortconv_f32")?,
             clip_heads: ctx.get_function("inkling2_clip_heads_f32")?,
             situ_glu_fused: ctx.get_function("inkling2_situ_glu_fused_f32")?,
-            situ_glu_fused_q8_1: ctx.get_function("inkling2_situ_glu_fused_quantize_q8_1_f32")?,
             rel_attn_f16: ctx.get_function("inkling2_rel_attn_f16_kv")?,
             softcap_inplace: ctx.get_function("softcap_inplace_f32")?,
             softcap_argmax: ctx.get_function("softcap_argmax_f32")?,
@@ -186,6 +184,8 @@ pub struct Inkling2CudaRunner {
     shortconv_snap: CudaBuffer,
 
     // Pre-allocated Arena scratch on GPU (`0` allocations on forward/decode/verify!)
+    pinned_ids: crate::driver::CudaPinnedBuffer,
+    pinned_pos: crate::driver::CudaPinnedBuffer,
     pub(crate) token_ids_buf: CudaBuffer,
     pos_buf: CudaBuffer,
     decode_graphs: [Option<CudaGraphExec>; 3],
@@ -217,6 +217,9 @@ pub struct Inkling2CudaRunner {
     moe_logits: CudaBuffer,
     moe_top_ids: CudaBuffer,
     moe_top_weights: CudaBuffer,
+    moe_exp_offs: CudaBuffer,
+    moe_tile_offs: CudaBuffer,
+    moe_sorted_ts: CudaBuffer,
     moe_exp_gu: CudaBuffer,
     moe_exp_hid: CudaBuffer,
     moe_slot_outs: CudaBuffer,
@@ -771,6 +774,8 @@ impl Inkling2CudaRunner {
         let ku = cfg.n_expert_used;
         let max_cols = (2 * d).max(max_q_dim).max(n_ff).next_multiple_of(32);
 
+        let pinned_ids = ctx.alloc_pinned(MAX_CUDA_BATCH * 4)?;
+        let pinned_pos = ctx.alloc_pinned(4)?;
         let token_ids_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * 4)?;
         let pos_buf = ctx.alloc_zeroed(4)?;
         let cur_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * d * 4)?;
@@ -801,6 +806,9 @@ impl Inkling2CudaRunner {
         let moe_logits = ctx.alloc_zeroed(MAX_CUDA_BATCH * n_exp * 4)?;
         let moe_top_ids = ctx.alloc_zeroed(MAX_CUDA_BATCH * ku * 4)?;
         let moe_top_weights = ctx.alloc_zeroed(MAX_CUDA_BATCH * ku * 4)?;
+        let moe_exp_offs = ctx.alloc_zeroed((n_exp.max(1) + 2) * 4)?;
+        let moe_tile_offs = ctx.alloc_zeroed((n_exp.max(1) + 2) * 4)?;
+        let moe_sorted_ts = ctx.alloc_zeroed(MAX_CUDA_BATCH * ku * 4)?;
         let moe_exp_gu = ctx.alloc_zeroed(MAX_CUDA_BATCH * ku * 2 * n_ff * 4)?;
         let moe_exp_hid = ctx.alloc_zeroed(MAX_CUDA_BATCH * ku * n_ff * 4)?;
         let moe_slot_outs = ctx.alloc_zeroed(MAX_CUDA_BATCH * ku * d * 4)?;
@@ -838,6 +846,8 @@ impl Inkling2CudaRunner {
             slot_hist_offs,
             total_hist_floats,
             shortconv_snap,
+            pinned_ids,
+            pinned_pos,
             token_ids_buf,
             pos_buf,
             decode_graphs: [None, None, None],
@@ -869,6 +879,9 @@ impl Inkling2CudaRunner {
             moe_logits,
             moe_top_ids,
             moe_top_weights,
+            moe_exp_offs,
+            moe_tile_offs,
+            moe_sorted_ts,
             moe_exp_gu,
             moe_exp_hid,
             moe_slot_outs,
@@ -1725,8 +1738,9 @@ impl Inkling2CudaRunner {
             false,
             self.moe_logits.device_ptr(),
             n_tok,
-            true,
+            false,
         )?;
+        let ne = self.cfg.n_expert;
         let ku = self.cfg.n_expert_used;
         let n_ff = self.cfg.n_ff_exp;
         let rows_slots = n_tok * ku;
@@ -1736,7 +1750,7 @@ impl Inkling2CudaRunner {
             layer.exp_probs_b.as_ref().map_or(0, |b| b.device_ptr()),
             self.moe_top_ids.device_ptr(),
             self.moe_top_weights.device_ptr(),
-            self.cfg.n_expert,
+            ne,
             ku,
             2, // Sigmoid
             true,
@@ -1745,68 +1759,47 @@ impl Inkling2CudaRunner {
             n_tok,
         )?;
 
-        let in_xq_ptr = if is_q8_1_moe_dtype(layer.gate_up_dtype, d) {
-            self.kernels.launch_quantize_q8_1(
+        let gu_scales_ptr = layer.gate_up_scales.as_ref().map_or(0, |b| b.device_ptr());
+        let dn_scales_ptr = layer.down_scales.as_ref().map_or(0, |b| b.device_ptr());
+
+        if n_tok >= 16
+            && ne <= 512
+            && self.ctx.info().has_fp16_wmma()
+            && d.is_multiple_of(32)
+            && n_ff.is_multiple_of(32)
+        {
+            // `P0-2`: Grouped `wmma` Tensor Core prefill GEMM across 3 passes!
+            self.kernels.launch_moe_build_expert_buckets(
                 &self.ctx,
-                self.wo_out_buf.device_ptr(),
-                self.moe_exp_xq.device_ptr(),
-                d,
-                n_tok,
+                self.moe_top_ids.device_ptr(),
+                self.moe_exp_offs.device_ptr(),
+                self.moe_tile_offs.device_ptr(),
+                self.moe_sorted_ts.device_ptr(),
+                rows_slots,
+                ne,
             )?;
-            self.moe_exp_xq.device_ptr()
-        } else {
-            0
-        };
-
-        self.kernels.launch_moe_indexed_gemv_q8_1(
-            &self.ctx,
-            layer.gate_up_exps.device_ptr(),
-            in_xq_ptr,
-            self.wo_out_buf.device_ptr(),
-            self.moe_top_ids.device_ptr(),
-            self.moe_top_weights.device_ptr(),
-            layer.gate_up_scales.as_ref().map_or(0, |b| b.device_ptr()),
-            self.moe_exp_gu.device_ptr(),
-            layer.gate_up_dtype,
-            2 * n_ff,
-            d,
-            layer.gate_up_row_bytes,
-            layer.gate_up_exp_bytes,
-            ku,
-            n_tok,
-            0,
-            0,
-        )?;
-
-        let dn_uses_q8 = is_q8_1_moe_dtype(layer.down_dtype, n_ff);
-        let (dn_xq_ptr, dn_f32_ptr) = if dn_uses_q8 {
-            let mut pgu = self.moe_exp_gu.device_ptr();
-            let mut pxq = self.moe_exp_xq.device_ptr();
-            let mut c_nff = n_ff as i32;
-            let mut c_nr = rows_slots as i32;
-            let mut beta = self.cfg.situ_beta;
-            let mut lb = self.cfg.situ_linear_beta;
-            let mut args: [*mut c_void; 6] = [
-                (&mut pgu as *mut CUdeviceptr).cast(),
-                (&mut pxq as *mut CUdeviceptr).cast(),
-                (&mut c_nff as *mut i32).cast(),
-                (&mut c_nr as *mut i32).cast(),
-                (&mut beta as *mut f32).cast(),
-                (&mut lb as *mut f32).cast(),
-            ];
-            // SAFETY: Matches `inkling2_situ_glu_fused_quantize_q8_1_f32`.
-            unsafe {
-                self.ctx.launch(
-                    "inkling2_situ_glu_fused_quantize_q8_1_f32",
-                    self.ik.situ_glu_fused_q8_1,
-                    (((n_ff / 32) as u32).div_ceil(4), rows_slots as u32, 1),
-                    (32, 4, 1),
-                    0,
-                    &mut args,
-                )?;
-            }
-            (self.moe_exp_xq.device_ptr(), self.moe_exp_hid.device_ptr())
-        } else {
+            self.kernels.launch_wmma_moe_grouped(
+                &self.ctx,
+                layer.gate_up_exps.device_ptr(),
+                self.wo_out_buf.device_ptr(),
+                self.moe_exp_offs.device_ptr(),
+                self.moe_tile_offs.device_ptr(),
+                self.moe_sorted_ts.device_ptr(),
+                self.moe_top_weights.device_ptr(),
+                gu_scales_ptr,
+                self.moe_exp_gu.device_ptr(),
+                layer.gate_up_dtype,
+                2 * n_ff,
+                d,
+                layer.gate_up_row_bytes,
+                layer.gate_up_exp_bytes,
+                0,
+                ne,
+                ku,
+                n_tok,
+                0,
+                0,
+            )?;
             let total = (rows_slots * n_ff) as u32;
             let mut pgu = self.moe_exp_gu.device_ptr();
             let mut po = self.moe_exp_hid.device_ptr();
@@ -1833,28 +1826,101 @@ impl Inkling2CudaRunner {
                     &mut args,
                 )?;
             }
-            (0, self.moe_exp_hid.device_ptr())
-        };
+            self.kernels.launch_wmma_moe_grouped(
+                &self.ctx,
+                layer.down_exps.device_ptr(),
+                self.moe_exp_hid.device_ptr(),
+                self.moe_exp_offs.device_ptr(),
+                self.moe_tile_offs.device_ptr(),
+                self.moe_sorted_ts.device_ptr(),
+                self.moe_top_weights.device_ptr(),
+                dn_scales_ptr,
+                self.moe_slot_outs.device_ptr(),
+                layer.down_dtype,
+                d,
+                n_ff,
+                layer.down_row_bytes,
+                layer.down_exp_bytes,
+                0,
+                ne,
+                ku,
+                n_tok,
+                1,
+                1,
+            )?;
+        } else {
+            // `P0-3`: Fused dual `Gate + Up + SiTU` `__dp4a` decode/DSpark-verify path!
+            let in_xq_ptr = if is_q8_1_moe_dtype(layer.gate_up_dtype, d) {
+                self.kernels.launch_quantize_q8_1(
+                    &self.ctx,
+                    self.wo_out_buf.device_ptr(),
+                    self.moe_exp_xq.device_ptr(),
+                    d,
+                    n_tok,
+                )?;
+                self.moe_exp_xq.device_ptr()
+            } else {
+                0
+            };
 
-        self.kernels.launch_moe_indexed_gemv_q8_1(
-            &self.ctx,
-            layer.down_exps.device_ptr(),
-            dn_xq_ptr,
-            dn_f32_ptr,
-            self.moe_top_ids.device_ptr(),
-            self.moe_top_weights.device_ptr(),
-            layer.down_scales.as_ref().map_or(0, |b| b.device_ptr()),
-            self.moe_slot_outs.device_ptr(),
-            layer.down_dtype,
-            d,
-            n_ff,
-            layer.down_row_bytes,
-            layer.down_exp_bytes,
-            ku,
-            n_tok,
-            1,
-            1,
-        )?;
+            self.kernels.launch_moe_indexed_dual_gu_act(
+                &self.ctx,
+                layer.gate_up_exps.device_ptr(),
+                layer.gate_up_exps.device_ptr(),
+                in_xq_ptr,
+                self.wo_out_buf.device_ptr(),
+                self.moe_top_ids.device_ptr(),
+                gu_scales_ptr,
+                gu_scales_ptr,
+                self.moe_exp_hid.device_ptr(),
+                layer.gate_up_dtype,
+                n_ff,
+                d,
+                layer.gate_up_row_bytes,
+                layer.gate_up_exp_bytes,
+                layer.gate_up_exp_bytes,
+                n_ff * layer.gate_up_row_bytes,
+                ku,
+                n_tok,
+                1,
+                self.cfg.situ_beta,
+                self.cfg.situ_linear_beta,
+            )?;
+
+            let dn_uses_q8 = is_q8_1_moe_dtype(layer.down_dtype, n_ff);
+            let dn_xq_ptr = if dn_uses_q8 {
+                self.kernels.launch_quantize_q8_1(
+                    &self.ctx,
+                    self.moe_exp_hid.device_ptr(),
+                    self.moe_exp_xq.device_ptr(),
+                    n_ff,
+                    rows_slots,
+                )?;
+                self.moe_exp_xq.device_ptr()
+            } else {
+                0
+            };
+
+            self.kernels.launch_moe_indexed_gemv_q8_1(
+                &self.ctx,
+                layer.down_exps.device_ptr(),
+                dn_xq_ptr,
+                self.moe_exp_hid.device_ptr(),
+                self.moe_top_ids.device_ptr(),
+                self.moe_top_weights.device_ptr(),
+                dn_scales_ptr,
+                self.moe_slot_outs.device_ptr(),
+                layer.down_dtype,
+                d,
+                n_ff,
+                layer.down_row_bytes,
+                layer.down_exp_bytes,
+                ku,
+                n_tok,
+                1,
+                1,
+            )?;
+        }
         self.kernels.launch_moe_reduce_slots(
             &self.ctx,
             self.moe_slot_outs.device_ptr(),
@@ -2253,8 +2319,12 @@ impl Inkling2CudaRunner {
         compute_logits: bool,
         compute_argmax: bool,
     ) -> Result<(), CudaError> {
-        self.token_ids_buf.copy_from_u32(&[token_id])?;
-        self.pos_buf.copy_from_u32(&[pos as u32])?;
+        self.pinned_ids.write_u32_at(0, &[token_id]);
+        self.pinned_pos.write_u32_at(0, &[pos as u32]);
+        self.token_ids_buf
+            .copy_from_pinned_async(0, &self.pinned_ids, 0, 4)?;
+        self.pos_buf
+            .copy_from_pinned_async(0, &self.pinned_pos, 0, 4)?;
         let slot = if !compute_logits && !compute_argmax {
             0
         } else if !compute_argmax {
@@ -2346,7 +2416,9 @@ impl Inkling2CudaRunner {
             }
         }
         let want_all_argmax = out_argmax.is_some();
-        self.token_ids_buf.copy_from_u32(window_tokens)?;
+        self.pinned_ids.write_u32_at(0, window_tokens);
+        self.token_ids_buf
+            .copy_from_pinned_async(0, &self.pinned_ids, 0, w * 4)?;
         self.encode_chunk(
             w,
             start_pos,

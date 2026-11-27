@@ -254,9 +254,44 @@ fn bench_f16_kv_ops() {
     );
 }
 
+fn bench_q2_0_gemv() {
+    let rows = 2048usize;
+    let cols = 2048usize;
+    let cols_blocks = cols / 64;
+    let iters = 200usize;
+
+    let w_f32: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i as f32) * 0.011).sin())
+        .collect();
+    let mut w = vec![tm_core::BlockQ2_0 { d: 0, qs: [0; 16] }; rows * cols_blocks];
+    tm_core::quantize_row_q2_0(&w_f32, &mut w);
+
+    let x_f32: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.019).cos()).collect();
+    let mut x_q8 = vec![tm_core::BlockQ8_0 { d: 0, qs: [0; 32] }; cols / 32];
+    tm_core::quantize_row_q8_0(&x_f32, &mut x_q8);
+    let mut out = vec![0.0f32; rows];
+    let kt = active_kernels();
+
+    for _ in 0..10 {
+        (kt.gemv_q2_0_q8_0)(black_box(&w), black_box(&x_q8), &mut out, rows, cols_blocks);
+    }
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        (kt.gemv_q2_0_q8_0)(black_box(&w), black_box(&x_q8), &mut out, rows, cols_blocks);
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    let gflops = (2.0 * (rows * cols * iters) as f64) / secs / 1e9;
+    println!(
+        "gemv_q2_0_q8_0 2048x2048 (isa={}): {gflops:.1} GFLOP/s (out[0]={:.3})",
+        kt.isa.name(),
+        out[0]
+    );
+}
+
 fn main() {
     bench_mamba2_scan();
     bench_q4_0_gemv();
+    bench_q2_0_gemv();
     bench_nvfp4_gemv();
     bench_f32_q8_0_gemv_gemm();
     bench_f16_kv_ops();

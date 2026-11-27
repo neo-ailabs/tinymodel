@@ -411,6 +411,8 @@ pub struct Hy4Config {
     pub eos_id: u32,
     pub dense_ff: usize,
     pub lat_dim: usize,
+    pub dfly_mask_id: u32,
+    pub dfly_layers: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -586,6 +588,42 @@ impl Hy4Manifest {
             })
             .map_or(1536, |t| t.cols());
         let row_dim = engram_dim.checked_div(n_cols).unwrap_or(96);
+        let dfly_mask_id = tc
+            .get_key("dfly_mask_id")
+            .and_then(|v| v.as_usize().ok())
+            .map(|x| x as u32)
+            .unwrap_or_else(|| {
+                if vocab_size > 120_009 {
+                    120_009
+                } else {
+                    vocab_size.saturating_sub(1) as u32
+                }
+            });
+        let dfly_layers = if tensors.contains_key("model.dfly_layers.0.input_layernorm.weight") {
+            let mut n_dfly = 0usize;
+            while tensors.contains_key(&format!(
+                "model.dfly_layers.{n_dfly}.input_layernorm.weight"
+            )) {
+                n_dfly += 1;
+            }
+            if let Some(arr) = tc.get_key("dfly_layers").and_then(|v| v.as_array().ok()) {
+                arr.iter()
+                    .take(n_dfly)
+                    .filter_map(|v| v.as_usize().ok())
+                    .collect()
+            } else if n_layers >= 42 && n_dfly == 5 {
+                vec![25, 29, 33, 37, 41]
+            } else {
+                let mut sparse: Vec<usize> = (0..n_layers).filter(|&l| !is_swa[l]).collect();
+                if sparse.len() >= n_dfly {
+                    sparse.split_off(sparse.len() - n_dfly)
+                } else {
+                    (0..n_dfly).map(|d| d % n_layers.max(1)).collect()
+                }
+            }
+        } else {
+            Vec::new()
+        };
 
         let tokenizer_json = if keep_tokenizer {
             root.get_key("tokenizer_json")
@@ -638,6 +676,8 @@ impl Hy4Manifest {
                 eos_id,
                 dense_ff,
                 lat_dim,
+                dfly_mask_id,
+                dfly_layers,
             },
             engram: Hy4EngramCfg {
                 n_mod,
@@ -1192,8 +1232,8 @@ pub struct Hy4State {
     pub max_ctx: usize,
     pub engram: Hy4EngramReader,
     pub seq_tokens: Vec<u32>,
-    pub k_caches: Vec<Vec<u16>>,
-    pub v_caches: Vec<Vec<u16>>,
+    /// Matrix-Absorbed MLA compressed latent cache per layer: `[cap, kv_lora + qk_rope]` in FP16 (`28x` smaller than expanded KV!).
+    pub latent_kv_caches: Vec<Vec<u16>>,
     logits: Vec<f32>,
 }
 
@@ -1262,28 +1302,21 @@ impl Hy4Model {
 
     pub fn new_state(&self, reader: Hy4EngramReader, max_ctx: usize) -> Hy4State {
         let c = &self.man.cfg;
-        let mut k_caches = Vec::with_capacity(c.n_layers);
-        let mut v_caches = Vec::with_capacity(c.n_layers);
+        let kv_lat = c.kv_lora + c.qk_rope;
+        let mut latent_kv_caches = Vec::with_capacity(c.n_layers);
         for il in 0..c.n_layers {
-            let nh = if c.is_swa[il] {
-                c.heads_swa
-            } else {
-                c.heads_sparse
-            };
             let cap = if c.is_swa[il] && c.window > 0 {
                 c.window.min(max_ctx)
             } else {
                 max_ctx
             };
-            k_caches.push(vec![0u16; cap * nh * c.qk_head]);
-            v_caches.push(vec![0u16; cap * nh * c.v_head]);
+            latent_kv_caches.push(vec![0u16; cap * kv_lat]);
         }
         Hy4State {
             max_ctx,
             engram: reader,
             seq_tokens: vec![self.man.engram.pad_id as u32; max_ctx.max(1)],
-            k_caches,
-            v_caches,
+            latent_kv_caches,
             logits: vec![0.0; c.vocab_size],
         }
     }
@@ -1712,62 +1745,75 @@ impl Hy4Model {
             );
         }
 
-        let ex = c.qk_nope + c.v_head;
-        let mut kvx = vec![0.0f32; n_tok * nh * ex];
-        self.linear_trunk(
-            pool,
-            &format!("{p}.kv_b_proj.weight"),
-            &kvc,
-            &mut kvx,
-            n_tok,
-        )?;
-
         let ring_cap = if swa && c.window > 0 {
             c.window.min(state.max_ctx)
         } else {
             0
         };
+        let kv_lat = c.kv_lora + c.qk_rope;
+        // Matrix-Absorbed MLA: dequantize `kv_b_proj` (`[nh * (qk_nope + v_head), kv_lora]`) once per layer call
+        let kvb_ti = self.man.req_tensor(&format!("{p}.kv_b_proj.weight"))?;
+        let kvb_tb = &self.trunk[kvb_ti.offset as usize..(kvb_ti.offset + kvb_ti.bytes) as usize];
+        let ex = c.qk_nope + c.v_head;
+        let total_rows = nh * ex;
+        let mut w_kvb = vec![0.0f32; total_rows * c.kv_lora];
+        for r in 0..total_rows {
+            dequant_hy4_row(
+                kvb_ti.fmt,
+                kvb_tb,
+                total_rows,
+                c.kv_lora,
+                r,
+                &mut w_kvb[r * c.kv_lora..(r + 1) * c.kv_lora],
+            );
+        }
+
         let sinks = self.load_vec(&format!("{p}.learnable_sink_param"))?;
         let scale = 1.0f32 / (c.qk_head as f32).sqrt();
         let vd = nh * c.v_head;
         let mut attn = vec![0.0f32; n_tok * vd];
+        let mut qa_t = vec![0.0f32; kv_lat];
+        let mut ctx_t = vec![0.0f32; c.kv_lora];
 
+        // Causal token-by-token latent KV write + absorbed MQA so `n_tok > ring_cap` SWA wrap never clobbers earlier slots!
         for t in 0..n_tok {
             let pos = start_pos + t;
             let slot = if ring_cap > 0 { pos % ring_cap } else { pos };
-            for h_i in 0..nh {
-                let src_ex = &kvx[(t * nh + h_i) * ex..(t * nh + h_i + 1) * ex];
-                let kc = &mut state.k_caches[il]
-                    [(slot * nh + h_i) * c.qk_head..(slot * nh + h_i + 1) * c.qk_head];
-                let vc = &mut state.v_caches[il]
-                    [(slot * nh + h_i) * c.v_head..(slot * nh + h_i + 1) * c.v_head];
-                for d in 0..c.qk_nope {
-                    kc[d] = f32_to_f16(src_ex[d]);
+            {
+                let dst_lat = &mut state.latent_kv_caches[il][slot * kv_lat..(slot + 1) * kv_lat];
+                for d in 0..c.kv_lora {
+                    dst_lat[d] = f32_to_f16(kvc[t * c.kv_lora + d]);
                 }
                 for d in 0..c.qk_rope {
-                    kc[c.qk_nope + d] = f32_to_f16(kpe[t * c.qk_rope + d]);
-                }
-                for d in 0..c.v_head {
-                    vc[d] = f32_to_f16(src_ex[c.qk_nope + d]);
+                    dst_lat[c.kv_lora + d] = f32_to_f16(kpe[t * c.qk_rope + d]);
                 }
             }
-
             let kv_start = if swa && c.window > 0 && (pos + 1) > c.window {
                 pos + 1 - c.window
             } else {
                 0
             };
+
             for h_i in 0..nh {
+                qa_t.fill(0.0);
                 let qh = &q[(t * nh + h_i) * c.qk_head..(t * nh + h_i + 1) * c.qk_head];
+                qa_t[c.kv_lora..kv_lat].copy_from_slice(&qh[c.qk_nope..c.qk_head]);
+                for i in 0..c.qk_nope {
+                    let qv = qh[i];
+                    let wr = &w_kvb[(h_i * ex + i) * c.kv_lora..(h_i * ex + i + 1) * c.kv_lora];
+                    for l in 0..c.kv_lora {
+                        qa_t[l] += qv * wr[l];
+                    }
+                }
+
                 let mut mx = sinks[h_i];
                 let mut scores = Vec::with_capacity(pos - kv_start + 1);
                 for p_t in kv_start..=pos {
                     let s_slot = if ring_cap > 0 { p_t % ring_cap } else { p_t };
-                    let kh = &state.k_caches[il]
-                        [(s_slot * nh + h_i) * c.qk_head..(s_slot * nh + h_i + 1) * c.qk_head];
+                    let lat_s = &state.latent_kv_caches[il][s_slot * kv_lat..(s_slot + 1) * kv_lat];
                     let mut dot = 0.0f32;
-                    for d in 0..c.qk_head {
-                        dot += qh[d] * f16_to_f32(kh[d]);
+                    for d in 0..kv_lat {
+                        dot += qa_t[d] * f16_to_f32(lat_s[d]);
                     }
                     let sc = dot * scale;
                     mx = mx.max(sc);
@@ -1778,17 +1824,26 @@ impl Hy4Model {
                     *sc = (*sc - mx).exp();
                     denom += *sc as f64;
                 }
-                let oh = &mut attn[(t * nh + h_i) * c.v_head..(t * nh + h_i + 1) * c.v_head];
-                oh.fill(0.0);
+                ctx_t.fill(0.0);
                 for (idx_p, &sc) in scores.iter().enumerate() {
                     let p_t = kv_start + idx_p;
                     let s_slot = if ring_cap > 0 { p_t % ring_cap } else { p_t };
-                    let vh = &state.v_caches[il]
-                        [(s_slot * nh + h_i) * c.v_head..(s_slot * nh + h_i + 1) * c.v_head];
+                    let lat_s =
+                        &state.latent_kv_caches[il][s_slot * kv_lat..s_slot * kv_lat + c.kv_lora];
                     let wt = (sc as f64 / denom) as f32;
-                    for d in 0..c.v_head {
-                        oh[d] += wt * f16_to_f32(vh[d]);
+                    for d in 0..c.kv_lora {
+                        ctx_t[d] += wt * f16_to_f32(lat_s[d]);
                     }
+                }
+
+                for j in 0..c.v_head {
+                    let wr = &w_kvb[(h_i * ex + c.qk_nope + j) * c.kv_lora
+                        ..(h_i * ex + c.qk_nope + j + 1) * c.kv_lora];
+                    let mut acc = 0.0f32;
+                    for l in 0..c.kv_lora {
+                        acc += wr[l] * ctx_t[l];
+                    }
+                    attn[(t * nh + h_i) * c.v_head + j] = acc;
                 }
             }
         }
@@ -2002,11 +2057,8 @@ impl Hy4Model {
 
 impl Hy4State {
     pub fn reset(&mut self) {
-        for kc in &mut self.k_caches {
-            kc.fill(0);
-        }
-        for vc in &mut self.v_caches {
-            vc.fill(0);
+        for lc in &mut self.latent_kv_caches {
+            lc.fill(0);
         }
     }
 

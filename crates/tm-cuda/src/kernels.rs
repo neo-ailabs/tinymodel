@@ -116,8 +116,14 @@ pub struct CudaKernels {
     pub gdn_rms_norm_gated_f32: CUfunction,
     pub moe_router_topk_f32: CUfunction,
     pub moe_indexed_gemv_q8_1: CUfunction,
+    pub moe_indexed_dual_gu_act_f32: CUfunction,
+    pub moe_build_expert_buckets_u32: CUfunction,
+    pub wmma_moe_grouped_f32: CUfunction,
     pub moe_reduce_slots_f32: CUfunction,
     pub moe_indexed_gemv_f32: CUfunction,
+    pub mtp_rms_norm_cat2_f32: CUfunction,
+    pub elemwise_mul_add_f32: CUfunction,
+    pub dfly_bias_sigmoid_slot_f32: CUfunction,
     pub argmax_f32: CUfunction,
 }
 
@@ -166,8 +172,14 @@ impl CudaKernels {
             gdn_rms_norm_gated_f32: ctx.get_function("gdn_rms_norm_gated_f32")?,
             moe_router_topk_f32: ctx.get_function("moe_router_topk_f32")?,
             moe_indexed_gemv_q8_1: ctx.get_function("moe_indexed_gemv_q8_1")?,
+            moe_indexed_dual_gu_act_f32: ctx.get_function("moe_indexed_dual_gu_act_f32")?,
+            moe_build_expert_buckets_u32: ctx.get_function("moe_build_expert_buckets_u32")?,
+            wmma_moe_grouped_f32: ctx.get_function("wmma_moe_grouped_f32")?,
             moe_reduce_slots_f32: ctx.get_function("moe_reduce_slots_f32")?,
             moe_indexed_gemv_f32: ctx.get_function("moe_indexed_gemv_f32")?,
+            mtp_rms_norm_cat2_f32: ctx.get_function("mtp_rms_norm_cat2_f32")?,
+            elemwise_mul_add_f32: ctx.get_function("elemwise_mul_add_f32")?,
+            dfly_bias_sigmoid_slot_f32: ctx.get_function("dfly_bias_sigmoid_slot_f32")?,
             argmax_f32: ctx.get_function("argmax_f32")?,
         })
     }
@@ -1045,6 +1057,20 @@ impl CudaKernels {
         out_id_ptr: CUdeviceptr,
         vocab_size: usize,
     ) -> Result<(), CudaError> {
+        self.launch_argmax_rows(ctx, logits_ptr, out_id_ptr, vocab_size, 1)
+    }
+
+    pub fn launch_argmax_rows(
+        &self,
+        ctx: &CudaContext,
+        logits_ptr: CUdeviceptr,
+        out_id_ptr: CUdeviceptr,
+        vocab_size: usize,
+        n_rows: usize,
+    ) -> Result<(), CudaError> {
+        if n_rows == 0 {
+            return Ok(());
+        }
         let mut pl = logits_ptr;
         let mut pid = out_id_ptr;
         let mut vs = vocab_size as i32;
@@ -1053,13 +1079,123 @@ impl CudaKernels {
             (&mut pid as *mut CUdeviceptr).cast(),
             (&mut vs as *mut i32).cast(),
         ];
-        // SAFETY: Matches `argmax_f32`.
+        // SAFETY: Matches `argmax_f32` (`Grid: (1, n_rows, 1)`).
         unsafe {
             ctx.launch(
                 "argmax_f32",
                 self.argmax_f32,
-                (1, 1, 1),
+                (1, n_rows as u32, 1),
                 (256, 1, 1),
+                0,
+                &mut args,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mtp_rms_norm_cat2(
+        &self,
+        ctx: &CudaContext,
+        a_ptr: CUdeviceptr,
+        wa_ptr: CUdeviceptr,
+        b_ptr: CUdeviceptr,
+        wb_ptr: CUdeviceptr,
+        out_ptr: CUdeviceptr,
+        dim: usize,
+        eps: f32,
+        n_rows: usize,
+    ) -> Result<(), CudaError> {
+        if n_rows == 0 {
+            return Ok(());
+        }
+        let mut pa = a_ptr;
+        let mut pwa = wa_ptr;
+        let mut pb = b_ptr;
+        let mut pwb = wb_ptr;
+        let mut pout = out_ptr;
+        let mut d = dim as i32;
+        let mut e = eps;
+        let mut args: [*mut c_void; 7] = [
+            (&mut pa as *mut CUdeviceptr).cast(),
+            (&mut pwa as *mut CUdeviceptr).cast(),
+            (&mut pb as *mut CUdeviceptr).cast(),
+            (&mut pwb as *mut CUdeviceptr).cast(),
+            (&mut pout as *mut CUdeviceptr).cast(),
+            (&mut d as *mut i32).cast(),
+            (&mut e as *mut f32).cast(),
+        ];
+        // SAFETY: Matches `mtp_rms_norm_cat2_f32`.
+        unsafe {
+            ctx.launch(
+                "mtp_rms_norm_cat2_f32",
+                self.mtp_rms_norm_cat2_f32,
+                (2, n_rows as u32, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            )
+        }
+    }
+
+    pub fn launch_elemwise_mul_add(
+        &self,
+        ctx: &CudaContext,
+        dst_ptr: CUdeviceptr,
+        a_ptr: CUdeviceptr,
+        b_ptr: CUdeviceptr,
+        n: usize,
+    ) -> Result<(), CudaError> {
+        if n == 0 {
+            return Ok(());
+        }
+        let mut pd = dst_ptr;
+        let mut pa = a_ptr;
+        let mut pb = b_ptr;
+        let mut cn = n;
+        let mut args: [*mut c_void; 4] = [
+            (&mut pd as *mut CUdeviceptr).cast(),
+            (&mut pa as *mut CUdeviceptr).cast(),
+            (&mut pb as *mut CUdeviceptr).cast(),
+            (&mut cn as *mut usize).cast(),
+        ];
+        // SAFETY: Matches `elemwise_mul_add_f32`.
+        unsafe {
+            ctx.launch(
+                "elemwise_mul_add_f32",
+                self.elemwise_mul_add_f32,
+                ((n as u32).div_ceil(256), 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            )
+        }
+    }
+
+    pub fn launch_dfly_bias_sigmoid_slot(
+        &self,
+        ctx: &CudaContext,
+        logit_ptr: CUdeviceptr,
+        bias_ptr: CUdeviceptr,
+        probs_out_ptr: CUdeviceptr,
+        slot: usize,
+    ) -> Result<(), CudaError> {
+        let mut pl = logit_ptr;
+        let mut pb = bias_ptr;
+        let mut pp = probs_out_ptr;
+        let mut cs = slot as i32;
+        let mut args: [*mut c_void; 4] = [
+            (&mut pl as *mut CUdeviceptr).cast(),
+            (&mut pb as *mut CUdeviceptr).cast(),
+            (&mut pp as *mut CUdeviceptr).cast(),
+            (&mut cs as *mut i32).cast(),
+        ];
+        // SAFETY: Matches `dfly_bias_sigmoid_slot_f32`.
+        unsafe {
+            ctx.launch(
+                "dfly_bias_sigmoid_slot_f32",
+                self.dfly_bias_sigmoid_slot_f32,
+                (1, 1, 1),
+                (1, 1, 1),
                 0,
                 &mut args,
             )
@@ -1242,6 +1378,202 @@ impl CudaKernels {
                 self.moe_reduce_slots_f32,
                 ((rows as u32).div_ceil(256), n_tok as u32, 1),
                 (256, 1, 1),
+                0,
+                &mut args,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_moe_indexed_dual_gu_act(
+        &self,
+        ctx: &CudaContext,
+        w_gate_ptr: CUdeviceptr,
+        w_up_ptr: CUdeviceptr,
+        xq_ptr: CUdeviceptr,
+        x_f32_ptr: CUdeviceptr,
+        top_ids_ptr: CUdeviceptr,
+        gate_scales_ptr: CUdeviceptr,
+        up_scales_ptr: CUdeviceptr,
+        out_act_ptr: CUdeviceptr,
+        dtype: i32,
+        n_ff_exp: usize,
+        cols: usize,
+        row_bytes: usize,
+        gate_exp_stride: usize,
+        up_exp_stride: usize,
+        up_sub_offset_bytes: usize,
+        slot_count: usize,
+        n_tok: usize,
+        act_mode: i32,
+        situ_beta: f32,
+        situ_lb: f32,
+    ) -> Result<(), CudaError> {
+        let mut pwg = w_gate_ptr;
+        let mut pwu = w_up_ptr;
+        let mut pxq = xq_ptr;
+        let mut pxf = x_f32_ptr;
+        let mut pids = top_ids_ptr;
+        let mut pgs = gate_scales_ptr;
+        let mut pus = up_scales_ptr;
+        let mut pout = out_act_ptr;
+        let mut dt = dtype;
+        let mut r = n_ff_exp as i32;
+        let mut c = cols as i32;
+        let mut rb = row_bytes;
+        let mut ges = gate_exp_stride;
+        let mut ues = up_exp_stride;
+        let mut uso = up_sub_offset_bytes;
+        let mut sc = slot_count as i32;
+        let mut am = act_mode;
+        let mut sb = situ_beta;
+        let mut sl = situ_lb;
+        let mut args: [*mut c_void; 19] = [
+            (&mut pwg as *mut CUdeviceptr).cast(),
+            (&mut pwu as *mut CUdeviceptr).cast(),
+            (&mut pxq as *mut CUdeviceptr).cast(),
+            (&mut pxf as *mut CUdeviceptr).cast(),
+            (&mut pids as *mut CUdeviceptr).cast(),
+            (&mut pgs as *mut CUdeviceptr).cast(),
+            (&mut pus as *mut CUdeviceptr).cast(),
+            (&mut pout as *mut CUdeviceptr).cast(),
+            (&mut dt as *mut i32).cast(),
+            (&mut r as *mut i32).cast(),
+            (&mut c as *mut i32).cast(),
+            (&mut rb as *mut usize).cast(),
+            (&mut ges as *mut usize).cast(),
+            (&mut ues as *mut usize).cast(),
+            (&mut uso as *mut usize).cast(),
+            (&mut sc as *mut i32).cast(),
+            (&mut am as *mut i32).cast(),
+            (&mut sb as *mut f32).cast(),
+            (&mut sl as *mut f32).cast(),
+        ];
+        // SAFETY: Matches `moe_indexed_dual_gu_act_f32`.
+        unsafe {
+            ctx.launch(
+                "moe_indexed_dual_gu_act_f32",
+                self.moe_indexed_dual_gu_act_f32,
+                (
+                    (n_ff_exp as u32).div_ceil(4),
+                    slot_count as u32,
+                    n_tok as u32,
+                ),
+                (32, 4, 1),
+                0,
+                &mut args,
+            )
+        }
+    }
+
+    pub fn launch_moe_build_expert_buckets(
+        &self,
+        ctx: &CudaContext,
+        top_ids_ptr: CUdeviceptr,
+        exp_offs_ptr: CUdeviceptr,
+        tile_offs_ptr: CUdeviceptr,
+        sorted_ts_ptr: CUdeviceptr,
+        n_ent: usize,
+        n_expert: usize,
+    ) -> Result<(), CudaError> {
+        let mut pids = top_ids_ptr;
+        let mut peo = exp_offs_ptr;
+        let mut pto = tile_offs_ptr;
+        let mut pst = sorted_ts_ptr;
+        let mut c_ne = n_ent as i32;
+        let mut c_nx = n_expert as i32;
+        let mut args: [*mut c_void; 6] = [
+            (&mut pids as *mut CUdeviceptr).cast(),
+            (&mut peo as *mut CUdeviceptr).cast(),
+            (&mut pto as *mut CUdeviceptr).cast(),
+            (&mut pst as *mut CUdeviceptr).cast(),
+            (&mut c_ne as *mut i32).cast(),
+            (&mut c_nx as *mut i32).cast(),
+        ];
+        // SAFETY: Matches `moe_build_expert_buckets_u32`.
+        unsafe {
+            ctx.launch(
+                "moe_build_expert_buckets_u32",
+                self.moe_build_expert_buckets_u32,
+                (1, 1, 1),
+                (256, 1, 1),
+                0,
+                &mut args,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_wmma_moe_grouped(
+        &self,
+        ctx: &CudaContext,
+        w_exps_ptr: CUdeviceptr,
+        x_f32_ptr: CUdeviceptr,
+        exp_offs_ptr: CUdeviceptr,
+        tile_offs_ptr: CUdeviceptr,
+        sorted_ts_ptr: CUdeviceptr,
+        top_weights_ptr: CUdeviceptr,
+        exp_scales_ptr: CUdeviceptr,
+        out_ptr: CUdeviceptr,
+        dtype: i32,
+        rows: usize,
+        cols: usize,
+        row_bytes: usize,
+        exp_stride_bytes: usize,
+        sub_offset_bytes: usize,
+        n_expert: usize,
+        slot_count: usize,
+        n_tok: usize,
+        x_mode: i32,
+        out_mode: i32,
+    ) -> Result<(), CudaError> {
+        let n_ent = n_tok * slot_count;
+        let max_tiles = (n_ent.div_ceil(16) + n_ent.min(n_expert)).max(1) as u32;
+        let mut pw = w_exps_ptr;
+        let mut px = x_f32_ptr;
+        let mut peo = exp_offs_ptr;
+        let mut pto = tile_offs_ptr;
+        let mut pst = sorted_ts_ptr;
+        let mut pws = top_weights_ptr;
+        let mut psc = exp_scales_ptr;
+        let mut pout = out_ptr;
+        let mut dt = dtype;
+        let mut r = rows as i32;
+        let mut c = cols as i32;
+        let mut rb = row_bytes;
+        let mut es = exp_stride_bytes;
+        let mut so = sub_offset_bytes;
+        let mut nx = n_expert as i32;
+        let mut sc = slot_count as i32;
+        let mut xm = x_mode;
+        let mut om = out_mode;
+        let mut args: [*mut c_void; 18] = [
+            (&mut pw as *mut CUdeviceptr).cast(),
+            (&mut px as *mut CUdeviceptr).cast(),
+            (&mut peo as *mut CUdeviceptr).cast(),
+            (&mut pto as *mut CUdeviceptr).cast(),
+            (&mut pst as *mut CUdeviceptr).cast(),
+            (&mut pws as *mut CUdeviceptr).cast(),
+            (&mut psc as *mut CUdeviceptr).cast(),
+            (&mut pout as *mut CUdeviceptr).cast(),
+            (&mut dt as *mut i32).cast(),
+            (&mut r as *mut i32).cast(),
+            (&mut c as *mut i32).cast(),
+            (&mut rb as *mut usize).cast(),
+            (&mut es as *mut usize).cast(),
+            (&mut so as *mut usize).cast(),
+            (&mut nx as *mut i32).cast(),
+            (&mut sc as *mut i32).cast(),
+            (&mut xm as *mut i32).cast(),
+            (&mut om as *mut i32).cast(),
+        ];
+        // SAFETY: Matches `wmma_moe_grouped_f32`.
+        unsafe {
+            ctx.launch(
+                "wmma_moe_grouped_f32",
+                self.wmma_moe_grouped_f32,
+                ((rows as u32).div_ceil(64), max_tiles, 1),
+                (32, 4, 1),
                 0,
                 &mut args,
             )

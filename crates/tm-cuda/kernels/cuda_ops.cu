@@ -1599,6 +1599,35 @@ __global__ void __launch_bounds__(128) wmma_gemm_mixed_f32(
 // 4. Token Embedding, Norms, Activations & Elementwise Ops
 // ============================================================================
 
+__device__ __forceinline__ float accurate_tanh_f32(float x) {
+    const float ax = fabsf(x);
+    if (ax < 0.0625f) {
+        const float x2 = x * x;
+        return x * fmaf(x2, fmaf(x2, 2.0f / 15.0f, -1.0f / 3.0f), 1.0f);
+    }
+    if (ax > 10.0f) {
+        return (x >= 0.0f) ? 1.0f : -1.0f;
+    }
+    const float e = expf(-2.0f * ax);
+    const float t = (1.0f - e) / (1.0f + e);
+    return (x >= 0.0f) ? t : -t;
+}
+
+__device__ __forceinline__ float block256_reduce_sum(float v, int tid, float warp_sums[8]) {
+    v = warp_reduce_sum(v);
+    if ((tid & 31) == 0) warp_sums[tid >> 5] = v;
+    __syncthreads();
+    if (tid < 32) {
+        const float s = (tid < 8) ? warp_sums[tid] : 0.0f;
+        const float tot = warp_reduce_sum(s);
+        if (tid == 0) warp_sums[0] = tot;
+    }
+    __syncthreads();
+    const float res = warp_sums[0];
+    __syncthreads();
+    return res;
+}
+
 // Grid: (ceil(n_embd / 256), n_tok, 1), Block: (256, 1, 1)
 __global__ void embed_tokens_f32(
     const uint8_t* __restrict__ emb_bytes,
@@ -1757,6 +1786,59 @@ __global__ void sigmoid_gate_mul_f32(
     if (idx >= n) return;
     const float g = gate[idx];
     dst[idx] *= 1.0f / (1.0f + expf(-g));
+}
+
+// MTP / DFly2 dual RMSNorm + concat: `out[t, 0..dim] = rms_norm(a[t], wa, eps)`, `out[t, dim..2*dim] = rms_norm(b[t], wb, eps)`
+// Grid: (2, n_rows, 1), Block: (256, 1, 1)
+__global__ void mtp_rms_norm_cat2_f32(
+    const float* __restrict__ a,
+    const float* __restrict__ wa,
+    const float* __restrict__ b,
+    const float* __restrict__ wb,
+    float* __restrict__ out,
+    int dim,
+    float eps
+) {
+    const int part = int(blockIdx.x);
+    const int row = int(blockIdx.y);
+    const int tid = int(threadIdx.x);
+    __shared__ float warp_sums[8];
+
+    const float* src = (part == 0) ? (a + size_t(row) * dim) : (b + size_t(row) * dim);
+    const float* w = (part == 0) ? wa : wb;
+    float* dst = out + size_t(row) * (2 * dim) + size_t(part) * dim;
+
+    float ss = 0.0f;
+    for (int i = tid; i < dim; i += 256) {
+        const float v = src[i];
+        ss = fmaf(v, v, ss);
+    }
+    const float inv = rsqrtf(block256_reduce_sum(ss, tid, warp_sums) / float(dim) + eps);
+    for (int i = tid; i < dim; i += 256) {
+        dst[i] = src[i] * inv * w[i];
+    }
+}
+
+// Elementwise fused multiply-add: `dst[i] += a[i] * b[i]`
+__global__ void elemwise_mul_add_f32(
+    float* __restrict__ dst,
+    const float* __restrict__ a,
+    const float* __restrict__ b,
+    size_t n
+) {
+    const size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = fmaf(a[idx], b[idx], dst[idx]);
+}
+
+// Single-scalar bias + sigmoid store into `probs_out[slot]` (for DFly2 confidence head):
+// Grid: (1, 1, 1), Block: (1, 1, 1)
+__global__ void dfly_bias_sigmoid_slot_f32(
+    const float* __restrict__ logit,
+    const float* __restrict__ bias,
+    float* __restrict__ probs_out,
+    int slot
+) {
+    probs_out[slot] = 1.0f / (1.0f + expf(-(logit[0] + bias[0])));
 }
 
 // Per-row scalar sigmoid gate multiply (`dst[t * cols + c] *= sigmoid(gate[t])`) — stream-ordered, CUDA-Graph safe!
@@ -2484,40 +2566,20 @@ __global__ void moe_router_topk_f32(
 // - `x_mode == 1`: `xq` is `[n_tok * slot_count, cols/32]`, `x_f32` is `[n_tok * slot_count, cols]` (per-slot input, e.g. `down`)
 // - `out_mode == 0`: writes `out[(t * slot_count + slot) * rows + row] = acc`
 // - `out_mode == 1`: writes `out[(t * slot_count + slot) * rows + row] = top_weights[t * slot_count + slot] * acc`
-__global__ void __launch_bounds__(128, 2) moe_indexed_gemv_q8_1(
-    const uint8_t* __restrict__ w_exps,
-    const BlockQ8_1* __restrict__ xq,
-    const float* __restrict__ x_f32,
-    const uint32_t* __restrict__ top_ids,
-    const float* __restrict__ top_weights,
-    const float* __restrict__ exp_scales,
-    float* __restrict__ out,
+// Shared `__dp4a` MoE expert row dot-product helper:
+__device__ __forceinline__ float dot_moe_row_q8_1(
+    const uint8_t* __restrict__ w_row,
+    const BlockQ8_1* __restrict__ xr,
+    const float* __restrict__ xt,
     int dtype,
-    int rows,
     int cols,
-    size_t row_bytes,
-    size_t expert_stride_bytes,
-    int slot_count,
-    int x_mode,
-    int out_mode
+    int lane
 ) {
-    const int row = int(blockIdx.x) * 4 + int(threadIdx.y);
-    const int slot = int(blockIdx.y);
-    const int tok = int(blockIdx.z);
-    const int lane = int(threadIdx.x);
-    if (row >= rows) return;
-
-    const size_t ts_idx = size_t(tok) * slot_count + slot;
-    const uint32_t exp_id = top_ids[ts_idx];
-    const uint8_t* w_row = w_exps + size_t(exp_id) * expert_stride_bytes + size_t(row) * row_bytes;
-    const size_t x_row_idx = (x_mode == 0) ? size_t(tok) : ts_idx;
     const int n_q8 = cols >> 5;
-
     float acc = 0.0f;
 
-    if (dtype == DTYPE_Q8_0 && xq != nullptr && (cols & 31) == 0) {
+    if (dtype == DTYPE_Q8_0 && xr != nullptr && (cols & 31) == 0) {
         const BlockQ8_0* wr = reinterpret_cast<const BlockQ8_0*>(w_row);
-        const BlockQ8_1* xr = xq + x_row_idx * n_q8;
         const int iqs = 2 * (lane & 3);
         for (int kbx = lane >> 2; kbx < n_q8; kbx += 8) {
             const BlockQ8_0& wb = wr[kbx];
@@ -2528,16 +2590,14 @@ __global__ void __launch_bounds__(128, 2) moe_indexed_gemv_q8_1(
             sumi = dp4a_i8(load_i32_2b(wb.qs + 4 * (iqs + 1)), xqs[iqs + 1], sumi);
             acc += __half2float(wb.d) * __low2float(xb.ds) * float(sumi);
         }
-    } else if (dtype == DTYPE_Q4_0 && xq != nullptr && (cols & 31) == 0) {
+    } else if (dtype == DTYPE_Q4_0 && xr != nullptr && (cols & 31) == 0) {
         const BlockQ4_0* wr = reinterpret_cast<const BlockQ4_0*>(w_row);
-        const BlockQ8_1* xr = xq + x_row_idx * n_q8;
         const int iqs = 2 * (lane & 1);
         for (int kbx = lane >> 1; kbx < n_q8; kbx += 16) {
             acc += dot_q4_0_q8_1_half(wr[kbx], xr[kbx], iqs);
         }
-    } else if (dtype == DTYPE_Q4_1 && xq != nullptr && (cols & 31) == 0) {
+    } else if (dtype == DTYPE_Q4_1 && xr != nullptr && (cols & 31) == 0) {
         const BlockQ4_1* wr = reinterpret_cast<const BlockQ4_1*>(w_row);
-        const BlockQ8_1* xr = xq + x_row_idx * n_q8;
         const int iqs = 2 * (lane & 1);
         for (int kbx = lane >> 1; kbx < n_q8; kbx += 16) {
             const BlockQ4_1& wb = wr[kbx];
@@ -2555,9 +2615,8 @@ __global__ void __launch_bounds__(128, 2) moe_indexed_gemv_q8_1(
             const float2 ds = __half22float2(xb.ds);
             acc += dm.x * ds.x * float(sumi) + 0.5f * dm.y * ds.y;
         }
-    } else if (dtype == DTYPE_Q2_0 && xq != nullptr && (cols & 63) == 0) {
+    } else if (dtype == DTYPE_Q2_0 && xr != nullptr && (cols & 63) == 0) {
         const BlockQ2_0* wr = reinterpret_cast<const BlockQ2_0*>(w_row);
-        const BlockQ8_1* xr = xq + x_row_idx * n_q8;
         const int n_b64 = cols >> 6;
         const int sub = lane & 3;
         const int q8_half = sub >> 1;
@@ -2574,9 +2633,8 @@ __global__ void __launch_bounds__(128, 2) moe_indexed_gemv_q8_1(
             sumi = dp4a_i8(unpack_q2_0_byte_s8x4(uint8_t((raw4 >> 24) & 0xFFu)), xqs[3], sumi);
             acc += __half2float(wb.d) * __low2float(xb.ds) * float(sumi);
         }
-    } else if (dtype == DTYPE_Q4_K && xq != nullptr && (cols & 255) == 0) {
+    } else if (dtype == DTYPE_Q4_K && xr != nullptr && (cols & 255) == 0) {
         const BlockQ4K* wr = reinterpret_cast<const BlockQ4K*>(w_row);
-        const BlockQ8_1* xr = xq + x_row_idx * n_q8;
         const int n_sb = cols >> 8;
         const int chunk64 = lane >> 3;
         const int q_idx = lane & 7;
@@ -2597,9 +2655,8 @@ __global__ void __launch_bounds__(128, 2) moe_indexed_gemv_q8_1(
             if (q_idx == 0) term -= dm.y * (float(m0) * ds0.y + float(m1) * ds1.y);
             acc += term;
         }
-    } else if (dtype == DTYPE_Q5_K && xq != nullptr && (cols & 255) == 0) {
+    } else if (dtype == DTYPE_Q5_K && xr != nullptr && (cols & 255) == 0) {
         const BlockQ5K* wr = reinterpret_cast<const BlockQ5K*>(w_row);
-        const BlockQ8_1* xr = xq + x_row_idx * n_q8;
         const int n_sb = cols >> 8;
         const int chunk64 = lane >> 3;
         const int q_idx = lane & 7;
@@ -2623,9 +2680,8 @@ __global__ void __launch_bounds__(128, 2) moe_indexed_gemv_q8_1(
             if (q_idx == 0) term -= dm.y * (float(m0) * ds0.y + float(m1) * ds1.y);
             acc += term;
         }
-    } else if (dtype == DTYPE_Q6_K && xq != nullptr && (cols & 255) == 0) {
+    } else if (dtype == DTYPE_Q6_K && xr != nullptr && (cols & 255) == 0) {
         const BlockQ6K* wr = reinterpret_cast<const BlockQ6K*>(w_row);
-        const BlockQ8_1* xr = xq + x_row_idx * n_q8;
         const int n_sb = cols >> 8;
         const int half128 = lane >> 4;
         const int sub_pair = (lane >> 3) & 1;
@@ -2648,9 +2704,8 @@ __global__ void __launch_bounds__(128, 2) moe_indexed_gemv_q8_1(
             acc += d * (float(sc_ptr[sc_half + 2 * quad_a]) * __low2float(xba.ds) * float(dota)
                       + float(sc_ptr[sc_half + 2 * quad_b]) * __low2float(xbb.ds) * float(dotb));
         }
-    } else if (dtype == DTYPE_Q5_0 && xq != nullptr && (cols & 31) == 0) {
+    } else if (dtype == DTYPE_Q5_0 && xr != nullptr && (cols & 31) == 0) {
         const BlockQ5_0* wr = reinterpret_cast<const BlockQ5_0*>(w_row);
-        const BlockQ8_1* xr = xq + x_row_idx * n_q8;
         const int sub = lane & 3;
         const int j0 = sub * 4;
         for (int kbx = lane >> 2; kbx < n_q8; kbx += 8) {
@@ -2672,9 +2727,8 @@ __global__ void __launch_bounds__(128, 2) moe_indexed_gemv_q8_1(
             sumi = dp4a_i8(int(w_hi), xqs[4 + sub], sumi);
             acc += __half2float(wb.d) * __low2float(xb.ds) * float(sumi);
         }
-    } else if (dtype == DTYPE_IQ4_NL && xq != nullptr && (cols & 31) == 0) {
+    } else if (dtype == DTYPE_IQ4_NL && xr != nullptr && (cols & 31) == 0) {
         const BlockIQ4NL* wr = reinterpret_cast<const BlockIQ4NL*>(w_row);
-        const BlockQ8_1* xr = xq + x_row_idx * n_q8;
         const int sub = lane & 3;
         for (int kbx = lane >> 2; kbx < n_q8; kbx += 8) {
             const BlockIQ4NL& wb = wr[kbx];
@@ -2692,9 +2746,8 @@ __global__ void __launch_bounds__(128, 2) moe_indexed_gemv_q8_1(
             sumi = dp4a_i8(int(w_hi), xqs[4 + sub], sumi);
             acc += __half2float(wb.d) * __low2float(xb.ds) * float(sumi);
         }
-    } else if (dtype == DTYPE_Q3_K && xq != nullptr && (cols & 255) == 0) {
+    } else if (dtype == DTYPE_Q3_K && xr != nullptr && (cols & 255) == 0) {
         const BlockQ3K* wr = reinterpret_cast<const BlockQ3K*>(w_row);
-        const BlockQ8_1* xr = xq + x_row_idx * n_q8;
         const int n_sb = cols >> 8;
         const int is = lane >> 1;
         const int part = lane & 1;
@@ -2734,9 +2787,8 @@ __global__ void __launch_bounds__(128, 2) moe_indexed_gemv_q8_1(
             sumi = dp4a_i8(int(w1), xqs[1], sumi);
             acc += dl * __low2float(xb.ds) * float(sumi);
         }
-    } else if (dtype == DTYPE_IQ4_XS && xq != nullptr && (cols & 255) == 0) {
+    } else if (dtype == DTYPE_IQ4_XS && xr != nullptr && (cols & 255) == 0) {
         const BlockIQ4XS* wr = reinterpret_cast<const BlockIQ4XS*>(w_row);
-        const BlockQ8_1* xr = xq + x_row_idx * n_q8;
         const int n_sb = cols >> 8;
         const int ib = lane >> 2;
         const int quad = lane & 3;
@@ -2760,12 +2812,45 @@ __global__ void __launch_bounds__(128, 2) moe_indexed_gemv_q8_1(
             acc += dl * __low2float(xb.ds) * float(sumi);
         }
     } else {
-        const float* xt = x_f32 + x_row_idx * cols;
         for (int c = lane; c < cols; c += 32) {
             acc += dequant_elem(dtype, w_row, c) * xt[c];
         }
     }
+    return acc;
+}
 
+__global__ void __launch_bounds__(128, 4) moe_indexed_gemv_q8_1(
+    const uint8_t* __restrict__ w_exps,
+    const BlockQ8_1* __restrict__ xq,
+    const float* __restrict__ x_f32,
+    const uint32_t* __restrict__ top_ids,
+    const float* __restrict__ top_weights,
+    const float* __restrict__ exp_scales,
+    float* __restrict__ out,
+    int dtype,
+    int rows,
+    int cols,
+    size_t row_bytes,
+    size_t expert_stride_bytes,
+    int slot_count,
+    int x_mode,
+    int out_mode
+) {
+    const int row = int(blockIdx.x) * 4 + int(threadIdx.y);
+    const int slot = int(blockIdx.y);
+    const int tok = int(blockIdx.z);
+    const int lane = int(threadIdx.x);
+    if (row >= rows) return;
+
+    const size_t ts_idx = size_t(tok) * slot_count + slot;
+    const uint32_t exp_id = top_ids[ts_idx];
+    const uint8_t* w_row = w_exps + size_t(exp_id) * expert_stride_bytes + size_t(row) * row_bytes;
+    const size_t x_row_idx = (x_mode == 0) ? size_t(tok) : ts_idx;
+    const int n_q8 = cols >> 5;
+    const BlockQ8_1* xr = (xq != nullptr) ? (xq + x_row_idx * n_q8) : nullptr;
+    const float* xt = (x_f32 != nullptr) ? (x_f32 + x_row_idx * cols) : nullptr;
+
+    float acc = dot_moe_row_q8_1(w_row, xr, xt, dtype, cols, lane);
     acc = warp_reduce_sum(acc);
     if (lane == 0) {
         if (exp_scales != nullptr) {
@@ -2773,6 +2858,322 @@ __global__ void __launch_bounds__(128, 2) moe_indexed_gemv_q8_1(
         }
         const float w_slot = (out_mode == 1) ? top_weights[ts_idx] : 1.0f;
         out[ts_idx * rows + row] = w_slot * acc;
+    }
+}
+
+// `P0-3`: Fused dual `Gate + Up + SwiGLU / SiTU` decode/small-batch MoE kernel!
+// Reads `xq` ONCE per warp for `Q8_0`/`Q4_0`/`Q2_0`/`Q4_K` and eliminates intermediate `gate` & `up` global buffers!
+// `act_mode`: `0` = SwiGLU (`silu(g) * u`), `1` = `Inkling-2` `SiTU` GLU (`situ_beta`, `situ_lb`).
+// Grid: (ceil(n_ff_exp / 4), slot_count, n_tok), Block: (32, 4, 1)
+__global__ void __launch_bounds__(128, 4) moe_indexed_dual_gu_act_f32(
+    const uint8_t* __restrict__ w_gate_exps,
+    const uint8_t* __restrict__ w_up_exps,
+    const BlockQ8_1* __restrict__ xq,
+    const float* __restrict__ x_f32,
+    const uint32_t* __restrict__ top_ids,
+    const float* __restrict__ gate_scales,
+    const float* __restrict__ up_scales,
+    float* __restrict__ out_act,
+    int dtype,
+    int n_ff_exp,
+    int cols,
+    size_t row_bytes,
+    size_t gate_exp_stride,
+    size_t up_exp_stride,
+    size_t up_sub_offset_bytes,
+    int slot_count,
+    int act_mode,
+    float situ_beta,
+    float situ_lb
+) {
+    const int row = int(blockIdx.x) * 4 + int(threadIdx.y);
+    const int slot = int(blockIdx.y);
+    const int tok = int(blockIdx.z);
+    const int lane = int(threadIdx.x);
+    if (row >= n_ff_exp) return;
+
+    const size_t ts_idx = size_t(tok) * slot_count + slot;
+    const uint32_t exp_id = top_ids[ts_idx];
+    const uint8_t* wg_row = w_gate_exps + size_t(exp_id) * gate_exp_stride + size_t(row) * row_bytes;
+    const uint8_t* wu_row = w_up_exps + size_t(exp_id) * up_exp_stride + up_sub_offset_bytes + size_t(row) * row_bytes;
+    const int n_q8 = cols >> 5;
+    const BlockQ8_1* xr = (xq != nullptr) ? (xq + size_t(tok) * n_q8) : nullptr;
+    const float* xt = (x_f32 != nullptr) ? (x_f32 + size_t(tok) * cols) : nullptr;
+
+    float acc_g = 0.0f;
+    float acc_u = 0.0f;
+
+    if (dtype == DTYPE_Q8_0 && xr != nullptr && (cols & 31) == 0) {
+        const BlockQ8_0* wgr = reinterpret_cast<const BlockQ8_0*>(wg_row);
+        const BlockQ8_0* wur = reinterpret_cast<const BlockQ8_0*>(wu_row);
+        const int iqs = 2 * (lane & 3);
+        for (int kbx = lane >> 2; kbx < n_q8; kbx += 8) {
+            const BlockQ8_1& xb = xr[kbx];
+            const float x_d = __low2float(xb.ds);
+            const int x0 = reinterpret_cast<const int*>(xb.qs)[iqs];
+            const int x1 = reinterpret_cast<const int*>(xb.qs)[iqs + 1];
+
+            const BlockQ8_0& wgb = wgr[kbx];
+            int sg = dp4a_i8(load_i32_2b(wgb.qs + 4 * iqs), x0, 0);
+            sg = dp4a_i8(load_i32_2b(wgb.qs + 4 * (iqs + 1)), x1, sg);
+            acc_g += __half2float(wgb.d) * x_d * float(sg);
+
+            const BlockQ8_0& wub = wur[kbx];
+            int su = dp4a_i8(load_i32_2b(wub.qs + 4 * iqs), x0, 0);
+            su = dp4a_i8(load_i32_2b(wub.qs + 4 * (iqs + 1)), x1, su);
+            acc_u += __half2float(wub.d) * x_d * float(su);
+        }
+    } else if (dtype == DTYPE_Q2_0 && xr != nullptr && (cols & 63) == 0) {
+        const BlockQ2_0* wgr = reinterpret_cast<const BlockQ2_0*>(wg_row);
+        const BlockQ2_0* wur = reinterpret_cast<const BlockQ2_0*>(wu_row);
+        const int n_b64 = cols >> 6;
+        const int sub = lane & 3;
+        const int q8_half = sub >> 1;
+        const int q8_quad = (sub & 1) * 4;
+        for (int b64 = lane >> 2; b64 < n_b64; b64 += 8) {
+            const BlockQ8_1& xb = xr[2 * b64 + q8_half];
+            const float x_d = __low2float(xb.ds);
+            const int* xqs = reinterpret_cast<const int*>(xb.qs) + q8_quad;
+            const int x0 = xqs[0], x1 = xqs[1], x2 = xqs[2], x3 = xqs[3];
+
+            const BlockQ2_0& wgb = wgr[b64];
+            const uint32_t rg = uint32_t(load_i32_2b(wgb.qs + 4 * sub));
+            int sg = dp4a_i8(unpack_q2_0_byte_s8x4(uint8_t(rg & 0xFFu)), x0, 0);
+            sg = dp4a_i8(unpack_q2_0_byte_s8x4(uint8_t((rg >> 8) & 0xFFu)), x1, sg);
+            sg = dp4a_i8(unpack_q2_0_byte_s8x4(uint8_t((rg >> 16) & 0xFFu)), x2, sg);
+            sg = dp4a_i8(unpack_q2_0_byte_s8x4(uint8_t((rg >> 24) & 0xFFu)), x3, sg);
+            acc_g += __half2float(wgb.d) * x_d * float(sg);
+
+            const BlockQ2_0& wub = wur[b64];
+            const uint32_t ru = uint32_t(load_i32_2b(wub.qs + 4 * sub));
+            int su = dp4a_i8(unpack_q2_0_byte_s8x4(uint8_t(ru & 0xFFu)), x0, 0);
+            su = dp4a_i8(unpack_q2_0_byte_s8x4(uint8_t((ru >> 8) & 0xFFu)), x1, su);
+            su = dp4a_i8(unpack_q2_0_byte_s8x4(uint8_t((ru >> 16) & 0xFFu)), x2, su);
+            su = dp4a_i8(unpack_q2_0_byte_s8x4(uint8_t((ru >> 24) & 0xFFu)), x3, su);
+            acc_u += __half2float(wub.d) * x_d * float(su);
+        }
+    } else {
+        acc_g = dot_moe_row_q8_1(wg_row, xr, xt, dtype, cols, lane);
+        acc_u = dot_moe_row_q8_1(wu_row, xr, xt, dtype, cols, lane);
+    }
+
+    acc_g = warp_reduce_sum(acc_g);
+    acc_u = warp_reduce_sum(acc_u);
+    if (lane == 0) {
+        if (gate_scales != nullptr) acc_g *= gate_scales[exp_id];
+        if (up_scales != nullptr) acc_u *= up_scales[exp_id];
+        float act;
+        if (act_mode == 1) {
+            const float ag = situ_beta * accurate_tanh_f32(acc_g / situ_beta) / (1.0f + expf(-acc_g));
+            const float au = (situ_lb > 0.0f) ? (situ_lb * accurate_tanh_f32(acc_u / situ_lb)) : acc_u;
+            act = ag * au;
+        } else {
+            act = (acc_g / (1.0f + expf(-acc_g))) * acc_u;
+        }
+        out_act[ts_idx * n_ff_exp + row] = act;
+    }
+}
+
+// `P0-2`: Deterministic on-GPU expert bucket builder (`n_expert <= 512`):
+// Produces `exp_offs[0..=n_expert]`, `tile_offs[0..=n_expert]` (16-token tiles), and `sorted_ts[0..n_ent]`!
+// Grid: (1, 1, 1), Block: (256, 1, 1)
+__global__ void moe_build_expert_buckets_u32(
+    const uint32_t* __restrict__ top_ids,
+    uint32_t* __restrict__ exp_offs,
+    uint32_t* __restrict__ tile_offs,
+    uint32_t* __restrict__ sorted_ts,
+    int n_ent,
+    int n_expert
+) {
+    const int tid = int(threadIdx.x);
+    __shared__ uint32_t s_counts[513];
+    __shared__ uint32_t s_cursor[512];
+
+    for (int e = tid; e <= n_expert; e += 256) {
+        s_counts[e] = 0u;
+    }
+    __syncthreads();
+
+    for (int i = tid; i < n_ent; i += 256) {
+        const uint32_t e = top_ids[i];
+        if (e < uint32_t(n_expert)) {
+            atomicAdd(&s_counts[e], 1u);
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        uint32_t cur_off = 0u;
+        uint32_t cur_tile = 0u;
+        for (int e = 0; e < n_expert; ++e) {
+            const uint32_t cnt = s_counts[e];
+            exp_offs[e] = cur_off;
+            tile_offs[e] = cur_tile;
+            s_cursor[e] = cur_off;
+            cur_off += cnt;
+            cur_tile += (cnt + 15u) >> 4;
+        }
+        exp_offs[n_expert] = cur_off;
+        tile_offs[n_expert] = cur_tile;
+
+        // Deterministic `0..n_ent` scatter (preserves exact `(tok, slot)` ordering inside every expert bucket)
+        for (int i = 0; i < n_ent; ++i) {
+            const uint32_t e = top_ids[i];
+            if (e < uint32_t(n_expert)) {
+                sorted_ts[s_cursor[e]++] = uint32_t(i);
+            }
+        }
+    }
+}
+
+// `P0-2`: Grouped MoE `wmma` 16x16x16 Tensor Core GEMM (`BM = 64 rows, BN = 16 token-slots, BK = 32 cols`)!
+// Grid: (ceil(rows / 64), max_tiles, 1), Block: (32, 4, 1) — excess `blockIdx.y >= tile_offs[n_expert]` exit in 1 instruction (zero host sync!).
+__global__ void __launch_bounds__(128) wmma_moe_grouped_f32(
+    const uint8_t* __restrict__ w_exps,
+    const float* __restrict__ x_f32,
+    const uint32_t* __restrict__ exp_offs,
+    const uint32_t* __restrict__ tile_offs,
+    const uint32_t* __restrict__ sorted_ts,
+    const float* __restrict__ top_weights,
+    const float* __restrict__ exp_scales,
+    float* __restrict__ out,
+    int dtype,
+    int rows,
+    int cols,
+    size_t row_bytes,
+    size_t expert_stride_bytes,
+    size_t sub_offset_bytes,
+    int n_expert,
+    int slot_count,
+    int x_mode,
+    int out_mode
+) {
+    const int tile_id = int(blockIdx.y);
+    if (uint32_t(tile_id) >= tile_offs[n_expert]) return;
+
+    const int lane = int(threadIdx.x);
+    const int warp_id = int(threadIdx.y);
+    const int tid = warp_id * 32 + lane;
+    const int row_base = int(blockIdx.x) * 64;
+
+    __shared__ __align__(16) half smem_w[64 * 32];
+    __shared__ __align__(16) half smem_x[16 * 32];
+    __shared__ __align__(16) float smem_c[4 * 256];
+    __shared__ uint32_t s_ts[16];
+    __shared__ uint32_t s_xrow[16];
+    __shared__ int s_exp_id;
+    __shared__ int s_valid_n;
+
+    if (tid == 0) {
+        int lo = 0, hi = n_expert - 1;
+        while (lo < hi) {
+            const int mid = (lo + hi + 1) >> 1;
+            if (int(tile_offs[mid]) <= tile_id) lo = mid;
+            else hi = mid - 1;
+        }
+        s_exp_id = lo;
+        const uint32_t b_start = exp_offs[lo];
+        const uint32_t b_end = exp_offs[lo + 1];
+        const uint32_t t_base = b_start + uint32_t(tile_id - int(tile_offs[lo])) * 16u;
+        const int vn = min(16, int(b_end - t_base));
+        s_valid_n = vn;
+        for (int m = 0; m < vn; ++m) {
+            const uint32_t ts = sorted_ts[t_base + m];
+            s_ts[m] = ts;
+            s_xrow[m] = (x_mode == 0) ? (ts / uint32_t(slot_count)) : ts;
+        }
+    }
+    __syncthreads();
+
+    const int exp_id = s_exp_id;
+    const int valid_n = s_valid_n;
+    const uint8_t* w_bytes = w_exps + size_t(exp_id) * expert_stride_bytes + sub_offset_bytes;
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+    wmma::fill_fragment(acc, 0.0f);
+
+    for (int k0 = 0; k0 < cols; k0 += 32) {
+        if (dtype == DTYPE_Q8_0) {
+            const int r_local = tid >> 1;
+            const int half_id = tid & 1;
+            const int r = row_base + r_local;
+            half* dst = smem_w + r_local * 32 + half_id * 16;
+            if (r < rows) {
+                const BlockQ8_0& blk = reinterpret_cast<const BlockQ8_0*>(w_bytes + size_t(r) * row_bytes)[k0 >> 5];
+                const float d = __half2float(blk.d);
+                const int8_t* qs = blk.qs + half_id * 16;
+#pragma unroll
+                for (int j = 0; j < 16; ++j) dst[j] = __float2half(d * float(qs[j]));
+            } else {
+#pragma unroll
+                for (int j = 0; j < 16; ++j) dst[j] = __float2half(0.0f);
+            }
+        } else if (dtype == DTYPE_Q4_0) {
+            const int r_local = tid >> 1;
+            const int half_id = tid & 1;
+            const int r = row_base + r_local;
+            half* dst = smem_w + r_local * 32;
+            if (r < rows) {
+                const BlockQ4_0& blk = reinterpret_cast<const BlockQ4_0*>(w_bytes + size_t(r) * row_bytes)[k0 >> 5];
+                const float d = __half2float(blk.d);
+                const uint8_t* qs = blk.qs + half_id * 8;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const uint8_t byte = qs[j];
+                    dst[half_id * 8 + j] = __float2half(d * float(int(byte & 0x0Fu) - 8));
+                    dst[16 + half_id * 8 + j] = __float2half(d * float(int(byte >> 4) - 8));
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    dst[half_id * 8 + j] = __float2half(0.0f);
+                    dst[16 + half_id * 8 + j] = __float2half(0.0f);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int idx = tid; idx < 64 * 32; idx += 128) {
+                const int r_local = idx >> 5;
+                const int c_local = idx & 31;
+                const int r = row_base + r_local;
+                const float val = (r < rows) ? dequant_elem(dtype, w_bytes + size_t(r) * row_bytes, k0 + c_local) : 0.0f;
+                smem_w[idx] = __float2half(val);
+            }
+        }
+
+        // Load `[16 token-slots x 32 cols]` of `X` (`512` elems / `128` threads = `4` elems/thread)
+#pragma unroll
+        for (int idx = tid; idx < 16 * 32; idx += 128) {
+            const int m = idx >> 5;
+            const int c_local = idx & 31;
+            const float val = (m < valid_n) ? x_f32[size_t(s_xrow[m]) * cols + k0 + c_local] : 0.0f;
+            smem_x[idx] = __float2half(val);
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int kk = 0; kk < 32; kk += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_a;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> frag_b;
+            wmma::load_matrix_sync(frag_a, smem_w + (warp_id * 16) * 32 + kk, 32);
+            wmma::load_matrix_sync(frag_b, smem_x + kk, 32);
+            wmma::mma_sync(acc, frag_a, frag_b, acc);
+        }
+        __syncthreads();
+    }
+
+    float* warp_smem = smem_c + warp_id * 256;
+    wmma::store_matrix_sync(warp_smem, acc, 16, wmma::mem_row_major);
+    __syncwarp();
+    const float e_sc = (exp_scales != nullptr) ? exp_scales[exp_id] : 1.0f;
+    for (int idx = lane; idx < 256; idx += 32) {
+        const int r = row_base + warp_id * 16 + (idx >> 4);
+        const int m = idx & 15;
+        if (r < rows && m < valid_n) {
+            const uint32_t ts_idx = s_ts[m];
+            const float w_slot = (out_mode == 1) ? top_weights[ts_idx] : 1.0f;
+            out[size_t(ts_idx) * rows + r] = warp_smem[idx] * e_sc * w_slot;
+        }
     }
 }
 
@@ -2837,18 +3238,20 @@ __global__ void moe_indexed_gemv_f32(
 // 9. Single-CTA Greedy Argmax (`vocab_size` floats -> 4-byte `uint32_t`)
 // ============================================================================
 
-// Grid: (1, 1, 1), Block: (256, 1, 1)
+// Grid: (1, n_rows, 1), Block: (256, 1, 1)
 __global__ void argmax_f32(
     const float* __restrict__ logits,
     uint32_t* __restrict__ out_id,
     int vocab_size
 ) {
     const int tid = int(threadIdx.x);
+    const int row = int(blockIdx.y);
+    const float* row_logits = logits + size_t(row) * vocab_size;
     float best_v = -CUDART_INF_F;
     uint32_t best_i = 0;
 
     for (int i = tid; i < vocab_size; i += 256) {
-        const float v = logits[i];
+        const float v = row_logits[i];
         if (v > best_v) {
             best_v = v;
             best_i = uint32_t(i);
@@ -2887,7 +3290,7 @@ __global__ void argmax_f32(
             }
         }
         if (tid == 0) {
-            *out_id = idx;
+            out_id[row] = idx;
         }
     }
 }
@@ -2895,35 +3298,6 @@ __global__ void argmax_f32(
 // ============================================================================
 // 10. Thinking Machines Lab `Inkling-2-Mini` (`inkling2_loop`) + `DSpark` (`dflash`)
 // ============================================================================
-
-__device__ __forceinline__ float accurate_tanh_f32(float x) {
-    const float ax = fabsf(x);
-    if (ax < 0.0625f) {
-        const float x2 = x * x;
-        return x * fmaf(x2, fmaf(x2, 2.0f / 15.0f, -1.0f / 3.0f), 1.0f);
-    }
-    if (ax > 10.0f) {
-        return (x >= 0.0f) ? 1.0f : -1.0f;
-    }
-    const float e = expf(-2.0f * ax);
-    const float t = (1.0f - e) / (1.0f + e);
-    return (x >= 0.0f) ? t : -t;
-}
-
-__device__ __forceinline__ float block256_reduce_sum(float v, int tid, float warp_sums[8]) {
-    v = warp_reduce_sum(v);
-    if ((tid & 31) == 0) warp_sums[tid >> 5] = v;
-    __syncthreads();
-    if (tid < 32) {
-        const float s = (tid < 8) ? warp_sums[tid] : 0.0f;
-        const float tot = warp_reduce_sum(s);
-        if (tid == 0) warp_sums[0] = tot;
-    }
-    __syncthreads();
-    const float res = warp_sums[0];
-    __syncthreads();
-    return res;
-}
 
 // Unit RMSNorm (`no weight`): Grid (n_rows, 1, 1), Block (256, 1, 1)
 __global__ void inkling2_rms_norm_unit_f32(
@@ -5199,6 +5573,435 @@ __global__ void hy4_latmoe_swiglu_sq_quantize_g64(
     if (lane == 0) {
         dst.d = d_sc;
         dst.s = d_sc * float(q_sum);
+    }
+}
+
+// `P0-3`: Fused dual `Gate + Up + clamped SwiGLU + SmoothQuant sq16` for `Hy4` `LatentMoE`!
+// Reads `xq_g64` ONCE per superblock, dots `gate` (`row`) and `up` (`lat_dim + row`) simultaneously,
+// applies clamped SwiGLU + `/ sq16[row]`, and writes `out_act_f32[ts_idx, row]` directly!
+// Grid: (ceil(lat_dim / 4), slot_count, n_tok), Block: (32, 4, 1)
+__global__ void __launch_bounds__(128, 4) hy4_latmoe_dual_gu_swiglu_sq_f32(
+    const uint8_t* __restrict__ sec4_arena,
+    const StrataExpertGpuEntry* __restrict__ layer_dir,
+    const int32_t* __restrict__ rank_of_layer,
+    const BlockQ8_1_G64* __restrict__ xq,
+    const float* __restrict__ x_f32,
+    const uint32_t* __restrict__ top_ids,
+    float* __restrict__ out_act,
+    int lat_dim,
+    int cols,
+    int slot_count,
+    float limit
+) {
+    const int row = int(blockIdx.x) * 4 + int(threadIdx.y);
+    const int slot = int(blockIdx.y);
+    const int tok = int(blockIdx.z);
+    const int lane = int(threadIdx.x);
+    if (row >= lat_dim) return;
+
+    const size_t ts_idx = size_t(tok) * slot_count + slot;
+    const uint32_t exp_id = top_ids[ts_idx];
+    const StrataExpertGpuEntry ent = layer_dir[rank_of_layer[exp_id]];
+    const int sk_code = int(ent.gu_code_id);
+    const size_t sub_off = size_t(cols) * 2ull;
+
+    float acc_g = 0.0f;
+    float acc_u = 0.0f;
+
+    if (sk_code == 101) {
+        const float* wg_row = reinterpret_cast<const float*>(sec4_arena + ent.body_offset + sub_off) + size_t(row) * cols;
+        const float* wu_row = wg_row + size_t(lat_dim) * cols;
+        const float* xr = x_f32 + size_t(tok) * cols;
+        for (int c = lane; c < cols; c += 32) {
+            const float xv = xr[c];
+            acc_g = fmaf(wg_row[c], xv, acc_g);
+            acc_u = fmaf(wu_row[c], xv, acc_u);
+        }
+    } else {
+        const size_t sb_bytes = sk_sb_bytes(sk_code);
+        const int n_sb = cols >> 8;
+        const int n_b64 = cols >> 6;
+        const size_t row_bytes = size_t(n_sb) * sb_bytes;
+        const uint8_t* wg_row = sec4_arena + ent.body_offset + sub_off + size_t(row) * row_bytes;
+        const uint8_t* wu_row = wg_row + size_t(lat_dim) * row_bytes;
+        const BlockQ8_1_G64* xr = xq + size_t(tok) * n_b64;
+
+        const int g = lane >> 3;
+        const int sub = lane & 7;
+        for (int sb = 0; sb < n_sb; ++sb) {
+            const BlockQ8_1_G64& xb = xr[sb * 4 + g];
+            const int* xqs = reinterpret_cast<const int*>(xb.qs) + 2 * sub;
+            const int x0 = xqs[0], x1 = xqs[1];
+
+            float sc_g, hb_g;
+            int g0, g1;
+            unpack_sk_lane8(wg_row + size_t(sb) * sb_bytes, sk_code, lane, sc_g, hb_g, g0, g1);
+            int dg = dp4a_i8(g0, x0, 0);
+            dg = dp4a_i8(g1, x1, dg);
+            float tg = sc_g * xb.d * float(dg);
+            if (sub == 0 && hb_g != 0.0f) tg -= sc_g * hb_g * xb.s;
+            acc_g += tg;
+
+            float sc_u, hb_u;
+            int u0, u1;
+            unpack_sk_lane8(wu_row + size_t(sb) * sb_bytes, sk_code, lane, sc_u, hb_u, u0, u1);
+            int du = dp4a_i8(u0, x0, 0);
+            du = dp4a_i8(u1, x1, du);
+            float tu = sc_u * xb.d * float(du);
+            if (sub == 0 && hb_u != 0.0f) tu -= sc_u * hb_u * xb.s;
+            acc_u += tu;
+        }
+    }
+
+    acc_g = warp_reduce_sum(acc_g);
+    acc_u = warp_reduce_sum(acc_u);
+    if (lane == 0) {
+        const half* sq16 = reinterpret_cast<const half*>(sec4_arena + ent.body_offset);
+        const float s = fminf(acc_g / (1.0f + expf(-acc_g)), limit);
+        const float uc = fminf(fmaxf(acc_u, -limit), limit);
+        out_act[ts_idx * lat_dim + row] = (s * uc) / __half2float(sq16[row]);
+    }
+}
+
+// ============================================================================
+// 13. `P1-1`: Matrix-Absorbed MLA (`latent_kv_cache` `[cap, kv_lora + qk_rope]` FP16 — `28x` smaller KV!)
+// ============================================================================
+
+// Applies RoPE to `q[..., qk_nope..qk_head]` AND RMSNorm + RoPE to `kva[0..kv_lora | kv_lora..kv_lora+qk_rope]`,
+// writing compressed `[kv_cmpr(kv_lora) | k_pe(qk_rope)]` directly into FP16 `latent_kv_cache[slot]`!
+// Grid: (n_head + 1, n_tok, 1), Block: (256, 1, 1)
+__global__ void hy4_mla_prep_latent_kv_f16(
+    float* __restrict__ q,
+    const float* __restrict__ kva,
+    const float* __restrict__ kv_ln_w,
+    const float* __restrict__ inv_freqs,
+    half* __restrict__ latent_kv_cache,
+    int n_head,
+    int qk_nope,
+    int qk_rope,
+    int kv_lora,
+    float rms_eps,
+    int ring_cap,
+    int start_pos,
+    const int* __restrict__ pos_dev
+) {
+    const int h = int(blockIdx.x);
+    const int t = int(blockIdx.y);
+    const int tid = int(threadIdx.x);
+    const int pos = (pos_dev ? (*pos_dev) : start_pos) + t;
+    const int qk_head = qk_nope + qk_rope;
+    const int kv_lat = kv_lora + qk_rope;
+    const int half_rope = qk_rope >> 1;
+
+    if (h < n_head) {
+        if (tid < half_rope) {
+            float* qp = q + (size_t(t) * n_head + h) * qk_head + qk_nope;
+            float s, c;
+            sincosf(float(pos) * inv_freqs[tid], &s, &c);
+            const float x0 = qp[2 * tid], x1 = qp[2 * tid + 1];
+            qp[2 * tid] = x0 * c - x1 * s;
+            qp[2 * tid + 1] = x0 * s + x1 * c;
+        }
+        return;
+    }
+
+    __shared__ float warp_sums[8];
+    const int slot = (ring_cap > 0) ? (pos % ring_cap) : pos;
+    const float* kva_t = kva + size_t(t) * kv_lat;
+    half* dst_lat = latent_kv_cache + size_t(slot) * kv_lat;
+
+    float ss = 0.0f;
+    for (int i = tid; i < kv_lora; i += 256) {
+        const float v = kva_t[i];
+        ss = fmaf(v, v, ss);
+    }
+    const float inv = rsqrtf(block256_reduce_sum(ss, tid, warp_sums) / float(kv_lora) + rms_eps);
+    for (int i = tid; i < kv_lora; i += 256) {
+        dst_lat[i] = __float2half_rn(kva_t[i] * inv * kv_ln_w[i]);
+    }
+    if (tid < half_rope) {
+        const float* src_pe = kva_t + kv_lora;
+        half* dst_pe = dst_lat + kv_lora;
+        float s, c;
+        sincosf(float(pos) * inv_freqs[tid], &s, &c);
+        const float x0 = src_pe[2 * tid], x1 = src_pe[2 * tid + 1];
+        dst_pe[2 * tid] = __float2half_rn(x0 * c - x1 * s);
+        dst_pe[2 * tid + 1] = __float2half_rn(x0 * s + x1 * c);
+    }
+}
+
+// Absorbs `W_kb` (`rows h*(qk_nope+v_head) .. +qk_nope` of `kv_b_proj`) into `q_nope` across up to 4 tokens per tile:
+// `qa[t, h, 0..kv_lora] = sum_{i=0..qk_nope-1} q_nope[t, h, i] * W_kb[h, i, 0..kv_lora]`
+// `qa[t, h, kv_lora..kv_lat] = q_pe[t, h, 0..qk_rope]`
+// Supports `S_K` (`0..=8`), `FMT_Q8ROW` (`100`), and `FMT_F32` (`101`)!
+// Grid: (ceil(kv_lora / 256), n_head, ceil(n_tok / 4)), Block: (32, 4, 1)
+__global__ void __launch_bounds__(128, 4) hy4_mla_absorb_q(
+    const float* __restrict__ q,
+    const uint8_t* __restrict__ w_kv_b,
+    float* __restrict__ qa_out,
+    int sk_code,
+    int n_head,
+    int qk_nope,
+    int qk_rope,
+    int v_head,
+    int kv_lora,
+    int n_tok
+) {
+    const int sb = int(blockIdx.x);
+    const int h = int(blockIdx.y);
+    const int tok_base = int(blockIdx.z) * 4;
+    const int lane = int(threadIdx.x);
+    const int warp_id = int(threadIdx.y);
+
+    const int qk_head = qk_nope + qk_rope;
+    const int kv_lat = kv_lora + qk_rope;
+    const int ex = qk_nope + v_head;
+    const int total_w_rows = n_head * ex;
+    const int base_col = sb * 256 + lane * 8;
+    const int valid_t = min(4, n_tok - tok_base);
+
+    float acc[4][8];
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[t][j] = 0.0f;
+    }
+
+    const int n_sb = kv_lora >> 8;
+    const size_t sb_bytes = sk_sb_bytes(sk_code);
+
+    for (int i = warp_id; i < qk_nope; i += 4) {
+        const int w_row_idx = h * ex + i;
+        float w8[8];
+        if (sk_code == 101) {
+            const float* wr = reinterpret_cast<const float*>(w_kv_b) + size_t(w_row_idx) * kv_lora + base_col;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) w8[j] = (base_col + j < kv_lora) ? wr[j] : 0.0f;
+        } else if (sk_code == 100) {
+            const float sc = reinterpret_cast<const float*>(w_kv_b)[w_row_idx];
+            const int8_t* wr = reinterpret_cast<const int8_t*>(w_kv_b + size_t(total_w_rows) * 4)
+                             + size_t(w_row_idx) * kv_lora + base_col;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) w8[j] = (base_col + j < kv_lora) ? (float(wr[j]) * sc) : 0.0f;
+        } else {
+            const uint8_t* sb_ptr = w_kv_b + (size_t(w_row_idx) * n_sb + sb) * sb_bytes;
+            float eff_sc, half_bias;
+            int q0, q1;
+            unpack_sk_lane8(sb_ptr, sk_code, lane, eff_sc, half_bias, q0, q1);
+            const int8_t* p0 = reinterpret_cast<const int8_t*>(&q0);
+            const int8_t* p1 = reinterpret_cast<const int8_t*>(&q1);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float r0 = (half_bias != 0.0f) ? float(uint8_t(p0[j])) : float(p0[j]);
+                const float r1 = (half_bias != 0.0f) ? float(uint8_t(p1[j])) : float(p1[j]);
+                w8[j] = (r0 - half_bias) * eff_sc;
+                w8[4 + j] = (r1 - half_bias) * eff_sc;
+            }
+        }
+
+        for (int t = 0; t < valid_t; ++t) {
+            const float qv = q[(size_t(tok_base + t) * n_head + h) * qk_head + i];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                acc[t][j] = fmaf(qv, w8[j], acc[t][j]);
+            }
+        }
+    }
+
+    __shared__ float partial[3][256];
+    for (int t = 0; t < valid_t; ++t) {
+        if (warp_id > 0) {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) partial[warp_id - 1][lane * 8 + j] = acc[t][j];
+        }
+        __syncthreads();
+        if (warp_id == 0) {
+            float* dst = qa_out + (size_t(tok_base + t) * n_head + h) * kv_lat;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int col = base_col + j;
+                if (col < kv_lora) {
+                    dst[col] = acc[t][j]
+                             + partial[0][lane * 8 + j]
+                             + partial[1][lane * 8 + j]
+                             + partial[2][lane * 8 + j];
+                }
+            }
+            if (sb == 0) {
+                const float* q_pe = q + (size_t(tok_base + t) * n_head + h) * qk_head + qk_nope;
+                for (int r = lane; r < qk_rope; r += 32) {
+                    dst[kv_lora + r] = q_pe[r];
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// FlashDecoding MQA over shared `latent_kv_cache` (`[cap, kv_lora + qk_rope]` FP16) with `learnable_sink_param[n_head]`!
+// `kv_lora <= 512`, `qk_rope <= 128` (`kv_lat <= 640`):
+// Grid: (n_head, n_tok, 1), Block: (32, 8, 1)
+__global__ void __launch_bounds__(256, 2) hy4_mla_latent_attn_f16_with_sink(
+    const float* __restrict__ qa,
+    const half* __restrict__ latent_kv_cache,
+    const float* __restrict__ sinks,
+    float* __restrict__ ctx_out,
+    int n_head,
+    int kv_lora,
+    int qk_rope,
+    int qk_head,
+    int n_swa,
+    int ring_cap,
+    int start_pos,
+    const int* __restrict__ pos_dev
+) {
+    const int h = int(blockIdx.x);
+    const int tok = int(blockIdx.y);
+    const int lane = int(threadIdx.x);
+    const int wid = int(threadIdx.y);
+    const int tid = wid * 32 + lane;
+    const int pos = (pos_dev ? (*pos_dev) : start_pos) + tok;
+    const int kv_start = (n_swa > 0 && (pos + 1) > n_swa) ? (pos + 1 - n_swa) : 0;
+    const int kv_lat = kv_lora + qk_rope;
+    const float scale = rsqrtf(float(qk_head));
+    const size_t q_idx = size_t(tok) * n_head + h;
+
+    __shared__ float q_sh[640];
+    __shared__ float wg_m[8];
+    __shared__ float wg_l[8];
+    __shared__ float wg_o[8][512];
+
+    const float* qa_h = qa + q_idx * kv_lat;
+    for (int d = tid; d < kv_lat; d += 256) q_sh[d] = qa_h[d] * scale;
+    __syncthreads();
+
+    float m_loc = -CUDART_INF_F;
+    float l_loc = 0.0f;
+    float o_reg[16] = {0.0f};
+
+    for (int s = kv_start + wid; s <= pos; s += 8) {
+        const int slot = (ring_cap > 0) ? (s % ring_cap) : s;
+        const half* lat_s = latent_kv_cache + size_t(slot) * kv_lat;
+        float dot_v = 0.0f;
+        for (int d = lane; d < kv_lat; d += 32) {
+            dot_v = fmaf(q_sh[d], __half2float(lat_s[d]), dot_v);
+        }
+        dot_v = warp_reduce_sum(dot_v);
+        const float m_new = fmaxf(m_loc, dot_v);
+        const float alpha = (l_loc == 0.0f) ? 0.0f : expf(m_loc - m_new);
+        const float p = expf(dot_v - m_new);
+        l_loc = l_loc * alpha + p;
+        m_loc = m_new;
+        for (int d = lane; d < kv_lora; d += 32) {
+            const int c = d >> 5;
+            o_reg[c] = o_reg[c] * alpha + p * __half2float(lat_s[d]);
+        }
+    }
+
+    if (lane == 0) {
+        wg_m[wid] = m_loc;
+        wg_l[wid] = l_loc;
+    }
+    for (int d = lane; d < kv_lora; d += 32) wg_o[wid][d] = o_reg[d >> 5];
+    __syncthreads();
+
+    float m_all = sinks[h];
+    for (int w = 0; w < 8; ++w) {
+        if (wg_l[w] > 0.0f) m_all = fmaxf(m_all, wg_m[w]);
+    }
+    float* out_h = ctx_out + q_idx * kv_lora;
+    for (int d = tid; d < kv_lora; d += 256) {
+        float denom = expf(sinks[h] - m_all);
+        float acc = 0.0f;
+        for (int w = 0; w < 8; ++w) {
+            if (wg_l[w] > 0.0f) {
+                const float wt = expf(wg_m[w] - m_all);
+                denom += wg_l[w] * wt;
+                acc += wg_o[w][d] * wt;
+            }
+        }
+        out_h[d] = acc / denom;
+    }
+}
+
+// Projects latent context `ctx[n_tok, n_head, kv_lora]` through `W_vb[h]` (`rows h*(qk_nope+v_head)+qk_nope .. +v_head` of `kv_b_proj`)
+// AND fuses `sigmoid(gate)` multiply in one pass!
+// Supports `S_K` (`0..=8` via `BlockQ8_1_G64`), `FMT_Q8ROW` (`100` via `BlockQ8_1`), and `FMT_F32` (`101` via `ctx_f32`)!
+// Grid: (ceil(v_head / 4), n_head, n_tok), Block: (32, 4, 1)
+__global__ void __launch_bounds__(128, 4) hy4_mla_vup_gate(
+    const uint8_t* __restrict__ w_kv_b,
+    const BlockQ8_1_G64* __restrict__ ctx_g64,
+    const BlockQ8_1* __restrict__ ctx_q8,
+    const float* __restrict__ ctx_f32,
+    const float* __restrict__ gate,
+    float* __restrict__ attn_out,
+    int sk_code,
+    int n_head,
+    int qk_nope,
+    int v_head,
+    int kv_lora
+) {
+    const int j = int(blockIdx.x) * 4 + int(threadIdx.y);
+    const int h = int(blockIdx.y);
+    const int tok = int(blockIdx.z);
+    const int lane = int(threadIdx.x);
+    if (j >= v_head) return;
+
+    const int ex = qk_nope + v_head;
+    const int total_w_rows = n_head * ex;
+    const int w_row_idx = h * ex + qk_nope + j;
+    const size_t th_idx = size_t(tok) * n_head + h;
+
+    float acc = 0.0f;
+    if (sk_code == 101) {
+        const float* wr = reinterpret_cast<const float*>(w_kv_b) + size_t(w_row_idx) * kv_lora;
+        const float* xr = ctx_f32 + th_idx * kv_lora;
+        for (int c = lane; c < kv_lora; c += 32) {
+            acc = fmaf(wr[c], xr[c], acc);
+        }
+    } else if (sk_code == 100) {
+        const float row_sc = reinterpret_cast<const float*>(w_kv_b)[w_row_idx];
+        const int8_t* q_row = reinterpret_cast<const int8_t*>(w_kv_b + size_t(total_w_rows) * 4) + size_t(w_row_idx) * kv_lora;
+        const int n_q8 = kv_lora >> 5;
+        const BlockQ8_1* xr = ctx_q8 + th_idx * n_q8;
+        const int iqs = 2 * (lane & 3);
+        for (int kbx = lane >> 2; kbx < n_q8; kbx += 8) {
+            const int w0 = reinterpret_cast<const int*>(q_row + kbx * 32)[iqs];
+            const int w1 = reinterpret_cast<const int*>(q_row + kbx * 32)[iqs + 1];
+            const BlockQ8_1& xb = xr[kbx];
+            const int* xqs = reinterpret_cast<const int*>(xb.qs);
+            int sumi = dp4a_i8(w0, xqs[iqs], 0);
+            sumi = dp4a_i8(w1, xqs[iqs + 1], sumi);
+            acc += __low2float(xb.ds) * float(sumi);
+        }
+        acc *= row_sc;
+    } else {
+        const int n_sb = kv_lora >> 8;
+        const int n_b64 = kv_lora >> 6;
+        const size_t sb_bytes = sk_sb_bytes(sk_code);
+        const uint8_t* w_row = w_kv_b + size_t(w_row_idx) * n_sb * sb_bytes;
+        const BlockQ8_1_G64* xr = ctx_g64 + th_idx * n_b64;
+        const int g = lane >> 3;
+        const int sub = lane & 7;
+        for (int sb = 0; sb < n_sb; ++sb) {
+            float eff_sc, half_bias;
+            int q0, q1;
+            unpack_sk_lane8(w_row + size_t(sb) * sb_bytes, sk_code, lane, eff_sc, half_bias, q0, q1);
+            const BlockQ8_1_G64& xb = xr[sb * 4 + g];
+            const int* xqs = reinterpret_cast<const int*>(xb.qs) + 2 * sub;
+            int dot = dp4a_i8(q0, xqs[0], 0);
+            dot = dp4a_i8(q1, xqs[1], dot);
+            float term = eff_sc * xb.d * float(dot);
+            if (sub == 0 && half_bias != 0.0f) term -= eff_sc * half_bias * xb.s;
+            acc += term;
+        }
+    }
+
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) {
+        const size_t out_idx = th_idx * v_head + j;
+        const float g_val = gate[out_idx];
+        attn_out[out_idx] = acc * (1.0f / (1.0f + expf(-g_val)));
     }
 }
 

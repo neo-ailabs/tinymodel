@@ -36,8 +36,24 @@ const CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH: c_int = 37;
 const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 const CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: c_int = 97;
+const CU_DEVICE_ATTRIBUTE_MAX_PERSISTING_L2_CACHE_SIZE: c_int = 108;
 
 const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;
+const CU_MEMHOSTALLOC_DEVICEMAP: c_uint = 0x02;
+const CU_LIMIT_PERSISTING_L2_CACHE_SIZE: c_int = 0x06;
+const CU_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW: c_int = 1;
+const CU_ACCESS_PROPERTY_STREAMING: c_int = 1;
+const CU_ACCESS_PROPERTY_PERSISTING: c_int = 2;
+
+#[repr(C)]
+pub(crate) struct CuAccessPolicyWindowAttr {
+    base_ptr: *mut c_void,
+    num_bytes: usize,
+    hit_ratio: f32,
+    hit_prop: c_int,
+    miss_prop: c_int,
+    _pad: [u8; 40],
+}
 
 type FnCuInit = unsafe extern "C" fn(c_uint) -> CUresult;
 type FnCuDriverGetVersion = unsafe extern "C" fn(*mut c_int) -> CUresult;
@@ -50,13 +66,20 @@ type FnCuDeviceGetAttribute = unsafe extern "C" fn(*mut c_int, c_int, CUdevice) 
 type FnCuDevicePrimaryCtxRetain = unsafe extern "C" fn(*mut CUcontext, CUdevice) -> CUresult;
 type FnCuDevicePrimaryCtxRelease = unsafe extern "C" fn(CUdevice) -> CUresult;
 type FnCuCtxSetCurrent = unsafe extern "C" fn(CUcontext) -> CUresult;
+type FnCuCtxSetLimit = unsafe extern "C" fn(c_int, usize) -> CUresult;
 type FnCuMemGetInfoV2 = unsafe extern "C" fn(*mut usize, *mut usize) -> CUresult;
 type FnCuMemAllocV2 = unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult;
 type FnCuMemFreeV2 = unsafe extern "C" fn(CUdeviceptr) -> CUresult;
+type FnCuMemHostAlloc = unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> CUresult;
+type FnCuMemFreeHost = unsafe extern "C" fn(*mut c_void) -> CUresult;
+type FnCuMemHostGetDevicePointerV2 =
+    unsafe extern "C" fn(*mut CUdeviceptr, *mut c_void, c_uint) -> CUresult;
 type FnCuMemsetD8V2 = unsafe extern "C" fn(CUdeviceptr, u8, usize) -> CUresult;
 type FnCuMemcpyHtoDV2 = unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) -> CUresult;
 type FnCuMemcpyDtoHV2 = unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult;
 type FnCuMemcpyDtoDV2 = unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize) -> CUresult;
+type FnCuMemcpyDtoDAsyncV2 =
+    unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize, CUstream) -> CUresult;
 type FnCuMemcpyHtoDAsyncV2 =
     unsafe extern "C" fn(CUdeviceptr, *const c_void, usize, CUstream) -> CUresult;
 type FnCuMemcpyDtoHAsyncV2 =
@@ -69,6 +92,8 @@ type FnCuFuncSetAttribute = unsafe extern "C" fn(CUfunction, c_int, c_int) -> CU
 type FnCuStreamCreate = unsafe extern "C" fn(*mut CUstream, c_uint) -> CUresult;
 type FnCuStreamDestroyV2 = unsafe extern "C" fn(CUstream) -> CUresult;
 type FnCuStreamSynchronize = unsafe extern "C" fn(CUstream) -> CUresult;
+type FnCuStreamSetAttribute =
+    unsafe extern "C" fn(CUstream, c_int, *const CuAccessPolicyWindowAttr) -> CUresult;
 type FnCuEventCreate = unsafe extern "C" fn(*mut CUevent, c_uint) -> CUresult;
 type FnCuEventDestroyV2 = unsafe extern "C" fn(CUevent) -> CUresult;
 type FnCuEventRecord = unsafe extern "C" fn(CUevent, CUstream) -> CUresult;
@@ -108,15 +133,20 @@ pub(crate) struct CudaDriver {
     pub cu_device_primary_ctx_retain: FnCuDevicePrimaryCtxRetain,
     pub cu_device_primary_ctx_release: FnCuDevicePrimaryCtxRelease,
     pub cu_ctx_set_current: FnCuCtxSetCurrent,
+    pub cu_ctx_set_limit: Option<FnCuCtxSetLimit>,
     pub cu_mem_get_info: FnCuMemGetInfoV2,
     pub cu_mem_alloc: FnCuMemAllocV2,
     pub cu_mem_free: FnCuMemFreeV2,
+    pub cu_mem_host_alloc: Option<FnCuMemHostAlloc>,
+    pub cu_mem_free_host: Option<FnCuMemFreeHost>,
+    pub cu_mem_host_get_device_pointer: Option<FnCuMemHostGetDevicePointerV2>,
     pub cu_memset_d8: FnCuMemsetD8V2,
     #[allow(dead_code)]
     pub cu_memcpy_htod: FnCuMemcpyHtoDV2,
     #[allow(dead_code)]
     pub cu_memcpy_dtoh: FnCuMemcpyDtoHV2,
     pub cu_memcpy_dtod: FnCuMemcpyDtoDV2,
+    pub cu_memcpy_dtod_async: Option<FnCuMemcpyDtoDAsyncV2>,
     pub cu_memcpy_htod_async: FnCuMemcpyHtoDAsyncV2,
     pub cu_memcpy_dtoh_async: FnCuMemcpyDtoHAsyncV2,
     pub cu_module_load_data: FnCuModuleLoadData,
@@ -126,6 +156,7 @@ pub(crate) struct CudaDriver {
     pub cu_stream_create: FnCuStreamCreate,
     pub cu_stream_destroy: FnCuStreamDestroyV2,
     pub cu_stream_synchronize: FnCuStreamSynchronize,
+    pub cu_stream_set_attribute: Option<FnCuStreamSetAttribute>,
     pub cu_event_create: FnCuEventCreate,
     pub cu_event_destroy: FnCuEventDestroyV2,
     pub cu_event_record: FnCuEventRecord,
@@ -192,13 +223,20 @@ impl CudaDriver {
                 cu_device_primary_ctx_release: load_sym(&lib, b"cuDevicePrimaryCtxRelease_v2\0")
                     .or_else(|_| load_sym(&lib, b"cuDevicePrimaryCtxRelease\0"))?,
                 cu_ctx_set_current: load_sym(&lib, b"cuCtxSetCurrent\0")?,
+                cu_ctx_set_limit: load_sym(&lib, b"cuCtxSetLimit\0").ok(),
                 cu_mem_get_info: load_sym(&lib, b"cuMemGetInfo_v2\0")?,
                 cu_mem_alloc: load_sym(&lib, b"cuMemAlloc_v2\0")?,
                 cu_mem_free: load_sym(&lib, b"cuMemFree_v2\0")?,
+                cu_mem_host_alloc: load_sym(&lib, b"cuMemHostAlloc\0").ok(),
+                cu_mem_free_host: load_sym(&lib, b"cuMemFreeHost\0").ok(),
+                cu_mem_host_get_device_pointer: load_sym(&lib, b"cuMemHostGetDevicePointer_v2\0")
+                    .or_else(|_| load_sym(&lib, b"cuMemHostGetDevicePointer\0"))
+                    .ok(),
                 cu_memset_d8: load_sym(&lib, b"cuMemsetD8_v2\0")?,
                 cu_memcpy_htod: load_sym(&lib, b"cuMemcpyHtoD_v2\0")?,
                 cu_memcpy_dtoh: load_sym(&lib, b"cuMemcpyDtoH_v2\0")?,
                 cu_memcpy_dtod: load_sym(&lib, b"cuMemcpyDtoD_v2\0")?,
+                cu_memcpy_dtod_async: load_sym(&lib, b"cuMemcpyDtoDAsync_v2\0").ok(),
                 cu_memcpy_htod_async: load_sym(&lib, b"cuMemcpyHtoDAsync_v2\0")?,
                 cu_memcpy_dtoh_async: load_sym(&lib, b"cuMemcpyDtoHAsync_v2\0")?,
                 cu_module_load_data: load_sym(&lib, b"cuModuleLoadData\0")?,
@@ -208,6 +246,7 @@ impl CudaDriver {
                 cu_stream_create: load_sym(&lib, b"cuStreamCreate\0")?,
                 cu_stream_destroy: load_sym(&lib, b"cuStreamDestroy_v2\0")?,
                 cu_stream_synchronize: load_sym(&lib, b"cuStreamSynchronize\0")?,
+                cu_stream_set_attribute: load_sym(&lib, b"cuStreamSetAttribute\0").ok(),
                 cu_event_create: load_sym(&lib, b"cuEventCreate\0")?,
                 cu_event_destroy: load_sym(&lib, b"cuEventDestroy_v2\0")?,
                 cu_event_record: load_sym(&lib, b"cuEventRecord\0")?,
@@ -265,6 +304,7 @@ pub struct CudaDeviceInfo {
     pub max_threads_per_block: u32,
     pub max_shared_mem_per_block: u32,
     pub max_shared_mem_optin: u32,
+    pub max_persisting_l2_bytes: usize,
     pub total_vram_bytes: usize,
     pub free_vram_bytes: usize,
     pub peak_mem_bw_gbps: f64,
@@ -320,7 +360,8 @@ pub struct CudaContext {
     inner: Arc<CudaInner>,
 }
 
-const EMBEDDED_PTX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cuda_ops.ptx"));
+const EMBEDDED_PTX_SM75: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cuda_ops.ptx"));
+const EMBEDDED_PTX_SM80: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cuda_ops_sm80.ptx"));
 
 impl CudaContext {
     /// Initializes CUDA, selects device `ordinal` (or `TM_CUDA_DEVICE`), retains its primary context,
@@ -395,6 +436,9 @@ impl CudaContext {
             attr(CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)? as u32;
         let max_shared_mem_optin = attr(CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
             .unwrap_or(max_shared_mem_per_block as i32) as u32;
+        let max_persisting_l2_bytes = attr(CU_DEVICE_ATTRIBUTE_MAX_PERSISTING_L2_CACHE_SIZE)
+            .unwrap_or(0)
+            .max(0) as usize;
         let _clock_khz = attr(CU_DEVICE_ATTRIBUTE_CLOCK_RATE).unwrap_or(0);
         let mem_clock_khz = attr(CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE).unwrap_or(0) as f64;
         let bus_bits = attr(CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH).unwrap_or(0) as f64;
@@ -421,21 +465,35 @@ impl CudaContext {
             )?;
         }
 
-        // Null-terminate PTX blob for `cuModuleLoadData`
-        let mut ptx_c = Vec::with_capacity(EMBEDDED_PTX.len() + 1);
-        ptx_c.extend_from_slice(EMBEDDED_PTX);
-        if ptx_c.last().copied() != Some(0) {
-            ptx_c.push(0);
-        }
+        // Dispatch `compute_80` PTX on Ampere/Ada/Hopper/Blackwell (`cc_major >= 8`), falling back to `compute_75`.
+        let make_ptx_c = |raw: &[u8]| -> Vec<u8> {
+            let mut v = Vec::with_capacity(raw.len() + 1);
+            v.extend_from_slice(raw);
+            if v.last().copied() != Some(0) {
+                v.push(0);
+            }
+            v
+        };
         let mut module: CUmodule = ptr::null_mut();
-        // SAFETY: `ptx_c` is a null-terminated PTX string; context is current.
+        // SAFETY: Null-terminated PTX strings; context is current.
         unsafe {
-            if let Err(e) = drv.check(
-                "cuModuleLoadData",
-                (drv.cu_module_load_data)(&mut module, ptx_c.as_ptr().cast::<c_void>()),
-            ) {
-                let _ = (drv.cu_device_primary_ctx_release)(dev);
-                return Err(e);
+            let loaded_sm80 = if cc_major >= 8 {
+                let ptx80 = make_ptx_c(EMBEDDED_PTX_SM80);
+                (drv.cu_module_load_data)(&mut module, ptx80.as_ptr().cast::<c_void>())
+                    == CUDA_SUCCESS
+                    && !module.is_null()
+            } else {
+                false
+            };
+            if !loaded_sm80 {
+                let ptx75 = make_ptx_c(EMBEDDED_PTX_SM75);
+                if let Err(e) = drv.check(
+                    "cuModuleLoadData",
+                    (drv.cu_module_load_data)(&mut module, ptx75.as_ptr().cast::<c_void>()),
+                ) {
+                    let _ = (drv.cu_device_primary_ctx_release)(dev);
+                    return Err(e);
+                }
             }
         }
 
@@ -460,6 +518,7 @@ impl CudaContext {
             max_threads_per_block,
             max_shared_mem_per_block,
             max_shared_mem_optin: max_shared_mem_optin.max(max_shared_mem_per_block),
+            max_persisting_l2_bytes,
             total_vram_bytes: total_vram,
             free_vram_bytes: free_vram,
             peak_mem_bw_gbps,
@@ -559,6 +618,7 @@ impl CudaContext {
         Ok(CudaBuffer {
             ctx: self.clone(),
             ptr: ptr_dev,
+            host_mapped: ptr::null_mut(),
             bytes: alloc_bytes,
         })
     }
@@ -584,8 +644,117 @@ impl CudaContext {
         Ok(CudaBuffer {
             ctx: self.clone(),
             ptr: ptr_dev,
+            host_mapped: ptr::null_mut(),
             bytes: alloc_bytes,
         })
+    }
+
+    /// Allocates page-locked host memory (`cuMemHostAlloc`) for true async DMA H2D/D2H transfers (`P1-2`).
+    pub fn alloc_pinned(&self, bytes: usize) -> Result<CudaPinnedBuffer, CudaError> {
+        let alloc_bytes = bytes.max(16);
+        self.bind_current()?;
+        let (Some(alloc_fn), Some(_free_fn)) = (
+            self.inner.drv.cu_mem_host_alloc,
+            self.inner.drv.cu_mem_free_host,
+        ) else {
+            return Err(CudaError::DriverLoad(
+                "cuMemHostAlloc/cuMemFreeHost unavailable".to_string(),
+            ));
+        };
+        let mut host_ptr: *mut c_void = ptr::null_mut();
+        // SAFETY: Context is bound; `flags = 0` allocates page-locked host memory.
+        unsafe {
+            self.inner
+                .drv
+                .check("cuMemHostAlloc", alloc_fn(&mut host_ptr, alloc_bytes, 0))?;
+            ptr::write_bytes(host_ptr.cast::<u8>(), 0, alloc_bytes);
+        }
+        Ok(CudaPinnedBuffer {
+            ctx: self.clone(),
+            ptr: host_ptr.cast::<u8>(),
+            bytes: alloc_bytes,
+        })
+    }
+
+    /// Allocates zero-copy device-mapped pinned host DDR memory (`CU_MEMHOSTALLOC_DEVICEMAP`) and copies `data`
+    /// into it (`P2`), returning a `CudaBuffer` whose `device_ptr()` is directly dereferenceable by all CUDA kernels
+    /// over PCIe without consuming GDDR VRAM!
+    pub fn alloc_host_mapped_from_bytes(&self, data: &[u8]) -> Result<CudaBuffer, CudaError> {
+        let alloc_bytes = data.len().max(16);
+        self.bind_current()?;
+        let (Some(alloc_fn), Some(free_fn), Some(dev_ptr_fn)) = (
+            self.inner.drv.cu_mem_host_alloc,
+            self.inner.drv.cu_mem_free_host,
+            self.inner.drv.cu_mem_host_get_device_pointer,
+        ) else {
+            return Err(CudaError::DriverLoad(
+                "cuMemHostAlloc/cuMemHostGetDevicePointer unavailable".to_string(),
+            ));
+        };
+        let mut host_ptr: *mut c_void = ptr::null_mut();
+        let mut ptr_dev: CUdeviceptr = 0;
+        // SAFETY: Allocates pinned host memory with `CU_MEMHOSTALLOC_DEVICEMAP`, copies `data`, and queries GPU VA.
+        unsafe {
+            self.inner.drv.check(
+                "cuMemHostAlloc(DEVICEMAP)",
+                alloc_fn(&mut host_ptr, alloc_bytes, CU_MEMHOSTALLOC_DEVICEMAP),
+            )?;
+            if !data.is_empty() {
+                ptr::copy_nonoverlapping(data.as_ptr(), host_ptr.cast::<u8>(), data.len());
+            } else {
+                ptr::write_bytes(host_ptr.cast::<u8>(), 0, alloc_bytes);
+            }
+            if let Err(e) = self.inner.drv.check(
+                "cuMemHostGetDevicePointer_v2",
+                dev_ptr_fn(&mut ptr_dev, host_ptr, 0),
+            ) {
+                let _ = free_fn(host_ptr);
+                return Err(e);
+            }
+        }
+        Ok(CudaBuffer {
+            ctx: self.clone(),
+            ptr: ptr_dev,
+            host_mapped: host_ptr,
+            bytes: alloc_bytes,
+        })
+    }
+
+    /// Best-effort Ampere/Ada/Hopper/Blackwell L2 persisting cache hint (`P1-3`) for hot weight ranges
+    /// (e.g., MTP / DFly2 / DSpark draft trunk or shared experts). Safely no-ops on `sm_75` or restricted drivers.
+    pub fn pin_l2_persisting(&self, base_ptr: CUdeviceptr, num_bytes: usize) {
+        let max_l2 = self.inner.info.max_persisting_l2_bytes;
+        if self.inner.info.cc_major < 8 || max_l2 == 0 || num_bytes == 0 || base_ptr == 0 {
+            return;
+        }
+        let (Some(set_limit), Some(set_stream_attr)) = (
+            self.inner.drv.cu_ctx_set_limit,
+            self.inner.drv.cu_stream_set_attribute,
+        ) else {
+            return;
+        };
+        // Cap window to hardware `max_persisting_l2_bytes` and CUDA's 128 MiB per-window ceiling.
+        let win_bytes = num_bytes.min(max_l2).min(128 * 1024 * 1024);
+        if self.bind_current().is_err() {
+            return;
+        }
+        let attr = CuAccessPolicyWindowAttr {
+            base_ptr: base_ptr as usize as *mut c_void,
+            num_bytes: win_bytes,
+            hit_ratio: 1.0,
+            hit_prop: CU_ACCESS_PROPERTY_PERSISTING,
+            miss_prop: CU_ACCESS_PROPERTY_STREAMING,
+            _pad: [0u8; 40],
+        };
+        // SAFETY: Best-effort hint on valid bound `ctx` and `stream`; return codes ignored on unsupported SKUs.
+        unsafe {
+            let _ = set_limit(CU_LIMIT_PERSISTING_L2_CACHE_SIZE, win_bytes);
+            let _ = set_stream_attr(
+                self.inner.stream,
+                CU_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW,
+                &attr,
+            );
+        }
     }
 
     pub fn alloc_from_bytes(&self, data: &[u8]) -> Result<CudaBuffer, CudaError> {
@@ -700,14 +869,24 @@ impl CudaContext {
     }
 }
 
-/// RAII device memory buffer (`CUdeviceptr`).
+/// RAII device (or zero-copy device-mapped host DDR) memory buffer (`CUdeviceptr`).
 pub struct CudaBuffer {
     ctx: CudaContext,
     ptr: CUdeviceptr,
+    host_mapped: *mut c_void,
     bytes: usize,
 }
 
+// SAFETY: `CUdeviceptr` and pinned `host_mapped` backing belong to `CudaContext` (thread-safe via `bind_current`).
+unsafe impl Send for CudaBuffer {}
+// SAFETY: Shared references only read metadata or enqueue stream-serialized operations.
+unsafe impl Sync for CudaBuffer {}
+
 impl CudaBuffer {
+    #[inline]
+    pub fn is_host_mapped(&self) -> bool {
+        !self.host_mapped.is_null()
+    }
     #[inline]
     pub fn device_ptr(&self) -> CUdeviceptr {
         self.ptr
@@ -853,7 +1032,22 @@ impl CudaBuffer {
         Ok(u32::from_le_bytes(val))
     }
 
-    pub fn copy_from_device(
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.bytes
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.bytes == 0
+    }
+
+    #[inline]
+    pub fn copy_from_device(&self, src: &CudaBuffer, bytes: usize) -> Result<(), CudaError> {
+        self.copy_from_device_at(0, src, 0, bytes)
+    }
+
+    pub fn copy_from_device_at(
         &self,
         dst_off: usize,
         src: &CudaBuffer,
@@ -869,8 +1063,19 @@ impl CudaBuffer {
             ));
         }
         self.ctx.bind_current()?;
-        // SAFETY: Stream-ordered or synchronous D2D copy; first sync stream so prior kernels complete.
+        // SAFETY: Stream-ordered D2D copy when `cuMemcpyDtoDAsync_v2` is available, else synchronous fallback.
         unsafe {
+            if let Some(dtod_async) = self.ctx.inner.drv.cu_memcpy_dtod_async {
+                return self.ctx.inner.drv.check(
+                    "cuMemcpyDtoDAsync_v2",
+                    dtod_async(
+                        self.ptr + dst_off as u64,
+                        src.ptr + src_off as u64,
+                        bytes,
+                        self.ctx.inner.stream,
+                    ),
+                );
+            }
             self.ctx.inner.drv.check(
                 "cuStreamSynchronize",
                 (self.ctx.inner.drv.cu_stream_synchronize)(self.ctx.inner.stream),
@@ -885,15 +1090,159 @@ impl CudaBuffer {
             )
         }
     }
+
+    /// True asynchronous H2D DMA copy from page-locked `CudaPinnedBuffer` (`P1-2`, zero host stall!).
+    pub fn copy_from_pinned_async(
+        &self,
+        dst_offset: usize,
+        pinned: &CudaPinnedBuffer,
+        src_offset: usize,
+        byte_len: usize,
+    ) -> Result<(), CudaError> {
+        if byte_len == 0 {
+            return Ok(());
+        }
+        if src_offset.saturating_add(byte_len) > pinned.bytes
+            || dst_offset.saturating_add(byte_len) > self.bytes
+        {
+            return Err(CudaError::InvalidDimensions(
+                "pinned H2D async copy out of bounds".into(),
+            ));
+        }
+        self.ctx.bind_current()?;
+        // SAFETY: `pinned.ptr + src_offset` is page-locked (`cuMemHostAlloc`) and valid for `byte_len` bytes.
+        unsafe {
+            self.ctx.inner.drv.check(
+                "cuMemcpyHtoDAsync_v2",
+                (self.ctx.inner.drv.cu_memcpy_htod_async)(
+                    self.ptr + dst_offset as u64,
+                    pinned.ptr.add(src_offset).cast::<c_void>(),
+                    byte_len,
+                    self.ctx.inner.stream,
+                ),
+            )
+        }
+    }
 }
 
 impl Drop for CudaBuffer {
     fn drop(&mut self) {
-        if self.ptr != 0 {
+        if !self.host_mapped.is_null() {
+            // SAFETY: Releases device-mapped pinned host memory (`cuMemFreeHost`).
+            unsafe {
+                let _ = (self.ctx.inner.drv.cu_ctx_set_current)(self.ctx.inner.ctx);
+                let _ = (self.ctx.inner.drv.cu_stream_synchronize)(self.ctx.inner.stream);
+                if let Some(free_host) = self.ctx.inner.drv.cu_mem_free_host {
+                    let _ = free_host(self.host_mapped);
+                }
+            }
+        } else if self.ptr != 0 {
             // SAFETY: Bind context and release `self.ptr` allocated from `self.ctx`.
             unsafe {
                 let _ = (self.ctx.inner.drv.cu_ctx_set_current)(self.ctx.inner.ctx);
                 let _ = (self.ctx.inner.drv.cu_mem_free)(self.ptr);
+            }
+        }
+    }
+}
+
+/// Page-locked (`cuMemHostAlloc`) host buffer for zero-stall async PCIe DMA (`P1-2`).
+pub struct CudaPinnedBuffer {
+    ctx: CudaContext,
+    ptr: *mut u8,
+    bytes: usize,
+}
+
+// SAFETY: Page-locked host memory is process-wide and safe to move across threads.
+unsafe impl Send for CudaPinnedBuffer {}
+// SAFETY: Shared access only reads `[u8]` or passes pointer to stream-ordered H2D DMA.
+unsafe impl Sync for CudaPinnedBuffer {}
+
+impl CudaPinnedBuffer {
+    #[inline]
+    pub fn byte_len(&self) -> usize {
+        self.bytes
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.bytes
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.bytes == 0
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: `self.ptr` is valid, initialized, and owns `self.bytes` bytes.
+        unsafe { core::slice::from_raw_parts(self.ptr, self.bytes) }
+    }
+
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: Exclusive `&mut self` guarantees unique access to `self.bytes` bytes.
+        unsafe { core::slice::from_raw_parts_mut(self.ptr, self.bytes) }
+    }
+
+    #[inline]
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
+    }
+
+    #[inline]
+    pub fn as_f32_slice_mut(&mut self, len_f32: usize) -> &mut [f32] {
+        assert!(len_f32 * 4 <= self.bytes && (self.ptr as usize).is_multiple_of(4));
+        // SAFETY: `cuMemHostAlloc` returns >= 256B-aligned page-locked memory; `len_f32 * 4 <= self.bytes`.
+        unsafe { core::slice::from_raw_parts_mut(self.ptr.cast::<f32>(), len_f32) }
+    }
+
+    #[inline]
+    pub fn write_u32_at(&mut self, byte_offset: usize, src: &[u32]) {
+        let byte_len = core::mem::size_of_val(src);
+        assert!(byte_offset.saturating_add(byte_len) <= self.bytes);
+        // SAFETY: `[u32]` is POD and `byte_offset + byte_len <= self.bytes`.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                src.as_ptr().cast::<u8>(),
+                self.ptr.add(byte_offset),
+                byte_len,
+            );
+        }
+    }
+
+    #[inline]
+    pub fn write_u32_slice(&mut self, src: &[u32]) {
+        let byte_len = core::mem::size_of_val(src);
+        assert!(byte_len <= self.bytes);
+        // SAFETY: `[u32]` is POD and `byte_len <= self.bytes`.
+        unsafe {
+            ptr::copy_nonoverlapping(src.as_ptr().cast::<u8>(), self.ptr, byte_len);
+        }
+    }
+
+    #[inline]
+    pub fn write_f32_slice(&mut self, src: &[f32]) {
+        let byte_len = core::mem::size_of_val(src);
+        assert!(byte_len <= self.bytes);
+        // SAFETY: `[f32]` is POD and `byte_len <= self.bytes`.
+        unsafe {
+            ptr::copy_nonoverlapping(src.as_ptr().cast::<u8>(), self.ptr, byte_len);
+        }
+    }
+}
+
+impl Drop for CudaPinnedBuffer {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            // SAFETY: Synchronize stream so any in-flight async DMA from/to `self.ptr` completes before `cuMemFreeHost`.
+            unsafe {
+                let _ = (self.ctx.inner.drv.cu_ctx_set_current)(self.ctx.inner.ctx);
+                let _ = (self.ctx.inner.drv.cu_stream_synchronize)(self.ctx.inner.stream);
+                if let Some(free_fn) = self.ctx.inner.drv.cu_mem_free_host {
+                    let _ = free_fn(self.ptr.cast::<c_void>());
+                }
             }
         }
     }

@@ -35,12 +35,31 @@ fn find_nvcc() -> Option<PathBuf> {
     None
 }
 
+fn compile_ptx(nvcc: &Path, arch: &str, cu_src: &Path, dst_ptx: &Path) {
+    let status = Command::new(nvcc)
+        .args([
+            "--ptx",
+            "-O3",
+            "--use_fast_math",
+            &format!("-arch={arch}"),
+            "-o",
+        ])
+        .arg(dst_ptx)
+        .arg(cu_src)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to invoke {}: {e}", nvcc.display()));
+    if !status.success() {
+        panic!("nvcc (-arch={arch}) failed compiling {}", cu_src.display());
+    }
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let cu_src = manifest_dir.join("kernels/cuda_ops.cu");
     let prebuilt_ptx = manifest_dir.join("ptx/cuda_ops.ptx");
     let dst_ptx = out_dir.join("cuda_ops.ptx");
+    let dst_ptx_sm80 = out_dir.join("cuda_ops_sm80.ptx");
 
     println!("cargo:rerun-if-changed={}", cu_src.display());
     println!("cargo:rerun-if-changed={}", prebuilt_ptx.display());
@@ -53,32 +72,25 @@ fn main() {
         .unwrap_or(false);
 
     if !force_prebuilt && let Some(nvcc) = find_nvcc() {
-        let arch = env::var("TM_CUDA_ARCH").unwrap_or_else(|_| "compute_75".to_string());
-        let status = Command::new(&nvcc)
-            .args([
-                "--ptx",
-                "-O3",
-                "--use_fast_math",
-                &format!("-arch={arch}"),
-                "-o",
-            ])
-            .arg(&dst_ptx)
-            .arg(&cu_src)
-            .status()
-            .unwrap_or_else(|e| panic!("failed to invoke {}: {e}", nvcc.display()));
-        if !status.success() {
-            panic!("nvcc failed compiling {}", cu_src.display());
+        if let Ok(explicit_arch) = env::var("TM_CUDA_ARCH") {
+            compile_ptx(&nvcc, &explicit_arch, &cu_src, &dst_ptx);
+            fs::copy(&dst_ptx, &dst_ptx_sm80).expect("failed to copy explicit arch PTX");
+        } else {
+            // Compile both Turing baseline (`compute_75`) and Ampere/Ada/Blackwell (`compute_80`) PTX in parallel!
+            std::thread::scope(|s| {
+                s.spawn(|| compile_ptx(&nvcc, "compute_75", &cu_src, &dst_ptx));
+                s.spawn(|| compile_ptx(&nvcc, "compute_80", &cu_src, &dst_ptx_sm80));
+            });
         }
         return;
     }
 
     if prebuilt_ptx.exists() {
         fs::copy(&prebuilt_ptx, &dst_ptx).expect("failed to copy prebuilt cuda_ops.ptx");
+        fs::copy(&prebuilt_ptx, &dst_ptx_sm80).expect("failed to copy prebuilt cuda_ops_sm80.ptx");
     } else {
-        fs::write(
-            &dst_ptx,
-            ".version 7.0\n.target sm_75\n.address_size 64\n\0",
-        )
-        .expect("failed to write stub PTX");
+        let stub = ".version 7.0\n.target sm_75\n.address_size 64\n\0";
+        fs::write(&dst_ptx, stub).expect("failed to write stub PTX");
+        fs::write(&dst_ptx_sm80, stub).expect("failed to write stub sm80 PTX");
     }
 }

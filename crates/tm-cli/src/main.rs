@@ -3089,6 +3089,160 @@ fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
             pending_inj = Some((pos, committed));
             pos += committed;
         }
+    } else if is_pure_greedy && opts.spec_mode != SpecMode::Off {
+        let builtin_name = runner.builtin_spec_name();
+        let use_builtin =
+            builtin_name.is_some() && matches!(opts.spec_mode, SpecMode::Auto | SpecMode::Mtp);
+        let max_k = opts.draft_max.clamp(1, tm_models::MAX_SPEC_WINDOW);
+        let mut suffix = SuffixDrafter::default();
+        suffix.observe_sequence(&history);
+        let mut ctrl = SpecController::new(max_k);
+        let mut draft_buf = [0u32; tm_models::MAX_SPEC_WINDOW];
+        let mut committed_buf = Vec::with_capacity(max_k + 1);
+        let mut spec_drafted = 0usize;
+        let mut spec_accepted = 0usize;
+        let spec_label = builtin_name.filter(|_| use_builtin).unwrap_or("suffix");
+
+        if !tok.is_stop_token(next_id) && opts.n_predict > 0 {
+            stdout.write_all(&tok.decode_token_bytes(next_id))?;
+            stdout.flush()?;
+            suffix.observe_step(&history, next_id);
+            history.push(next_id);
+            generated += 1;
+        }
+        while generated < opts.n_predict && !tok.is_stop_token(next_id) {
+            let rem_gen = opts.n_predict - generated;
+            let rem_ctx = opts.max_ctx.saturating_sub(pos + 1);
+            let cap_k = max_k.min(rem_gen.saturating_sub(1)).min(rem_ctx);
+            if cap_k == 0 {
+                let t_step = Instant::now();
+                next_id = runner.forward_token_greedy(next_id, pos)?;
+                ctrl.record_base_step(t_step.elapsed().as_nanos() as u64);
+                pos += 1;
+                if !tok.is_stop_token(next_id) {
+                    stdout.write_all(&tok.decode_token_bytes(next_id))?;
+                    stdout.flush()?;
+                    suffix.observe_step(&history, next_id);
+                    history.push(next_id);
+                    generated += 1;
+                }
+                continue;
+            }
+
+            if use_builtin {
+                let choice = ctrl
+                    .choose(
+                        if opts.spec_mode == SpecMode::Mtp {
+                            SpecMode::Mtp
+                        } else {
+                            SpecMode::Auto
+                        },
+                        true,
+                        false,
+                    )
+                    .clamp_len(cap_k);
+                if let tm_runtime::DraftChoice::Mtp(ask_k) = choice {
+                    let t_step = Instant::now();
+                    let (d_cnt, a_cnt) =
+                        runner.spec_step_builtin_greedy(next_id, pos, ask_k, &mut committed_buf)?;
+                    let step_ns = t_step.elapsed().as_nanos() as u64;
+                    ctrl.record_mtp_verify(d_cnt, a_cnt, 0, step_ns);
+                    spec_drafted += d_cnt;
+                    spec_accepted += a_cnt;
+                    let mut actual_used = 0usize;
+                    for &ct in &committed_buf {
+                        actual_used += 1;
+                        next_id = ct;
+                        if tok.is_stop_token(ct) {
+                            break;
+                        }
+                        stdout.write_all(&tok.decode_token_bytes(ct))?;
+                        stdout.flush()?;
+                        suffix.observe_step(&history, ct);
+                        history.push(ct);
+                        generated += 1;
+                        if generated >= opts.n_predict {
+                            break;
+                        }
+                    }
+                    pos += actual_used;
+                } else {
+                    let t_step = Instant::now();
+                    next_id = runner.forward_token_greedy(next_id, pos)?;
+                    ctrl.record_base_step(t_step.elapsed().as_nanos() as u64);
+                    pos += 1;
+                    if !tok.is_stop_token(next_id) {
+                        stdout.write_all(&tok.decode_token_bytes(next_id))?;
+                        stdout.flush()?;
+                        suffix.observe_step(&history, next_id);
+                        history.push(next_id);
+                        generated += 1;
+                    }
+                }
+            } else if matches!(opts.spec_mode, SpecMode::Auto | SpecMode::Suffix) {
+                let cand_n = suffix.draft(&history, cap_k, &mut draft_buf);
+                let choice = ctrl
+                    .choose(opts.spec_mode, false, cand_n > 0)
+                    .clamp_len(cand_n);
+                if let tm_runtime::DraftChoice::Suffix(ask_k) = choice {
+                    let t_step = Instant::now();
+                    let (d_cnt, a_cnt) = runner.verify_window_greedy(
+                        next_id,
+                        &draft_buf[..ask_k],
+                        pos,
+                        &mut committed_buf,
+                    )?;
+                    let step_ns = t_step.elapsed().as_nanos() as u64;
+                    ctrl.record_suffix_verify(d_cnt, a_cnt, step_ns);
+                    spec_drafted += d_cnt;
+                    spec_accepted += a_cnt;
+                    let mut actual_used = 0usize;
+                    for &ct in &committed_buf {
+                        actual_used += 1;
+                        next_id = ct;
+                        if tok.is_stop_token(ct) {
+                            break;
+                        }
+                        stdout.write_all(&tok.decode_token_bytes(ct))?;
+                        stdout.flush()?;
+                        suffix.observe_step(&history, ct);
+                        history.push(ct);
+                        generated += 1;
+                        if generated >= opts.n_predict {
+                            break;
+                        }
+                    }
+                    pos += actual_used;
+                } else {
+                    let t_step = Instant::now();
+                    next_id = runner.forward_token_greedy(next_id, pos)?;
+                    ctrl.record_base_step(t_step.elapsed().as_nanos() as u64);
+                    pos += 1;
+                    if !tok.is_stop_token(next_id) {
+                        stdout.write_all(&tok.decode_token_bytes(next_id))?;
+                        stdout.flush()?;
+                        suffix.observe_step(&history, next_id);
+                        history.push(next_id);
+                        generated += 1;
+                    }
+                }
+            } else {
+                next_id = runner.forward_token_greedy(next_id, pos)?;
+                pos += 1;
+                if !tok.is_stop_token(next_id) {
+                    stdout.write_all(&tok.decode_token_bytes(next_id))?;
+                    stdout.flush()?;
+                    history.push(next_id);
+                    generated += 1;
+                }
+            }
+        }
+        if spec_drafted > 0 {
+            eprintln!(
+                "[tinymodel] spec (cuda {spec_label}): accepted={spec_accepted}/{spec_drafted} ({:.1}%)",
+                100.0 * (spec_accepted as f64) / (spec_drafted as f64)
+            );
+        }
     } else {
         while generated < opts.n_predict {
             if tok.is_stop_token(next_id) {
@@ -3355,6 +3509,127 @@ fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
             pending_inj = Some((cur_pos, committed));
             cur_pos += committed;
         }
+    } else if opts.spec_mode != SpecMode::Off {
+        let builtin_name = runner.builtin_spec_name();
+        let use_builtin =
+            builtin_name.is_some() && matches!(opts.spec_mode, SpecMode::Auto | SpecMode::Mtp);
+        let max_k = opts.draft_max.clamp(1, tm_models::MAX_SPEC_WINDOW);
+        let mut suffix = SuffixDrafter::default();
+        if corpus_mode {
+            suffix.observe_sequence(&pp_ids);
+            suffix.observe_step(&pp_ids, tok);
+        } else {
+            suffix.observe_sequence(&[1, tok]);
+        }
+        let mut history = if corpus_mode {
+            let mut h = pp_ids.clone();
+            h.push(tok);
+            h
+        } else {
+            vec![1, tok]
+        };
+        let mut ctrl = SpecController::new(max_k);
+        ctrl.record_base_step((single_step_s * 1e9) as u64);
+        let mut draft_buf = [0u32; tm_models::MAX_SPEC_WINDOW];
+        let mut committed_buf = Vec::with_capacity(max_k + 1);
+
+        while gen_tokens.len() <= n_gen {
+            let rem_gen = (n_gen + 1) - gen_tokens.len();
+            let rem_ctx = opts.max_ctx.saturating_sub(cur_pos + 1);
+            let cap_k = max_k.min(rem_gen.saturating_sub(1)).min(rem_ctx);
+            if cap_k == 0 {
+                let t_step = Instant::now();
+                tok = runner.forward_token_greedy(tok, cur_pos)?;
+                ctrl.record_base_step(t_step.elapsed().as_nanos() as u64);
+                cur_pos += 1;
+                suffix.observe_step(&history, tok);
+                history.push(tok);
+                gen_tokens.push(tok);
+                continue;
+            }
+            if use_builtin {
+                let choice = ctrl
+                    .choose(
+                        if opts.spec_mode == SpecMode::Mtp {
+                            SpecMode::Mtp
+                        } else {
+                            SpecMode::Auto
+                        },
+                        true,
+                        false,
+                    )
+                    .clamp_len(cap_k);
+                if let tm_runtime::DraftChoice::Mtp(ask_k) = choice {
+                    let t_step = Instant::now();
+                    let (d_cnt, a_cnt) =
+                        runner.spec_step_builtin_greedy(tok, cur_pos, ask_k, &mut committed_buf)?;
+                    ctrl.record_mtp_verify(d_cnt, a_cnt, 0, t_step.elapsed().as_nanos() as u64);
+                    dspark_drafted += d_cnt;
+                    dspark_accepted += a_cnt;
+                    let mut used = 0usize;
+                    for &ct in &committed_buf {
+                        used += 1;
+                        tok = ct;
+                        suffix.observe_step(&history, ct);
+                        history.push(ct);
+                        gen_tokens.push(ct);
+                        if gen_tokens.len() > n_gen {
+                            break;
+                        }
+                    }
+                    cur_pos += used;
+                } else {
+                    let t_step = Instant::now();
+                    tok = runner.forward_token_greedy(tok, cur_pos)?;
+                    ctrl.record_base_step(t_step.elapsed().as_nanos() as u64);
+                    cur_pos += 1;
+                    suffix.observe_step(&history, tok);
+                    history.push(tok);
+                    gen_tokens.push(tok);
+                }
+            } else if matches!(opts.spec_mode, SpecMode::Auto | SpecMode::Suffix) {
+                let cand_n = suffix.draft(&history, cap_k, &mut draft_buf);
+                let choice = ctrl
+                    .choose(opts.spec_mode, false, cand_n > 0)
+                    .clamp_len(cand_n);
+                if let tm_runtime::DraftChoice::Suffix(ask_k) = choice {
+                    let t_step = Instant::now();
+                    let (d_cnt, a_cnt) = runner.verify_window_greedy(
+                        tok,
+                        &draft_buf[..ask_k],
+                        cur_pos,
+                        &mut committed_buf,
+                    )?;
+                    ctrl.record_suffix_verify(d_cnt, a_cnt, t_step.elapsed().as_nanos() as u64);
+                    dspark_drafted += d_cnt;
+                    dspark_accepted += a_cnt;
+                    let mut used = 0usize;
+                    for &ct in &committed_buf {
+                        used += 1;
+                        tok = ct;
+                        suffix.observe_step(&history, ct);
+                        history.push(ct);
+                        gen_tokens.push(ct);
+                        if gen_tokens.len() > n_gen {
+                            break;
+                        }
+                    }
+                    cur_pos += used;
+                } else {
+                    let t_step = Instant::now();
+                    tok = runner.forward_token_greedy(tok, cur_pos)?;
+                    ctrl.record_base_step(t_step.elapsed().as_nanos() as u64);
+                    cur_pos += 1;
+                    suffix.observe_step(&history, tok);
+                    history.push(tok);
+                    gen_tokens.push(tok);
+                }
+            } else {
+                tok = runner.forward_token_greedy(tok, cur_pos)?;
+                cur_pos += 1;
+                gen_tokens.push(tok);
+            }
+        }
     } else {
         for step in 0..n_gen {
             tok = runner.forward_token_greedy(tok, cur_pos + step)?;
@@ -3366,13 +3641,24 @@ fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
     let tel_after = probe::collect_telemetry();
     let info = runner.device_info().clone();
     let dev_name = format!("{} (sm_{}{})", info.name, info.cc_major, info.cc_minor);
+    let base_wmode = if runner.host_offloaded_moe_layers() > 0 {
+        format!("device-vram+ddr_moe_{}", runner.host_offloaded_moe_layers())
+    } else {
+        "device-vram".to_string()
+    };
     let wmode = if dspark_cuda.is_some() {
         format!(
-            "device-vram+dspark_gpu_k{}({}/{})",
+            "{base_wmode}+dspark_gpu_k{}({}/{})",
+            opts.draft_max, dspark_accepted, dspark_drafted
+        )
+    } else if opts.spec_mode != SpecMode::Off {
+        let tag = runner.builtin_spec_name().unwrap_or("suffix");
+        format!(
+            "{base_wmode}+{tag}_k{}({}/{})",
             opts.draft_max, dspark_accepted, dspark_drafted
         )
     } else {
-        "device-vram".to_string()
+        base_wmode
     };
 
     if opts.json {

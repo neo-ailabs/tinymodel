@@ -1008,7 +1008,7 @@ impl VisionVkRunner {
             return Ok(());
         }
         match mat.dtype {
-            DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::F32 => {
+            DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q2_0 | DType::F32 => {
                 let pipe =
                     self.ctx
                         .pipeline("gemm_tiled", dt, SPV_GEMM_TILED, 3, 20, &[128, dt])?;

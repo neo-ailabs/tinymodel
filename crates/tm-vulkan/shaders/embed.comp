@@ -152,6 +152,25 @@ void main() {
                 x[out_b + l + 96u] = d * float(sbyte_at(sc_b, is + 6u)) * float(q4);
             }
         }
+    } else if (DTYPE == 6u) {
+        const uint nb2 = pc.n_embd / 64u;
+        if (tid >= nb2) return;
+        const uint b = row_base + tid * 9u;
+        const float d = unpackHalf2x16(uint(embd16[b])).x;
+        const uint xo = x_row + tid * 64u;
+        for (uint j = 0u; j < 8u; ++j) {
+            const uint u = uint(embd16[b + 1u + j]);
+            const uint b0 = u & 0xFFu;
+            const uint b1 = u >> 8u;
+            x[xo + 8u * j + 0u] = float(int(b0 & 3u) - 1) * d;
+            x[xo + 8u * j + 1u] = float(int((b0 >> 2u) & 3u) - 1) * d;
+            x[xo + 8u * j + 2u] = float(int((b0 >> 4u) & 3u) - 1) * d;
+            x[xo + 8u * j + 3u] = float(int((b0 >> 6u) & 3u) - 1) * d;
+            x[xo + 8u * j + 4u] = float(int(b1 & 3u) - 1) * d;
+            x[xo + 8u * j + 5u] = float(int((b1 >> 2u) & 3u) - 1) * d;
+            x[xo + 8u * j + 6u] = float(int((b1 >> 4u) & 3u) - 1) * d;
+            x[xo + 8u * j + 7u] = float(int((b1 >> 6u) & 3u) - 1) * d;
+        }
     } else {
         if (tid >= pc.n_embd) return;
         const uint idx = (tok * pc.n_embd + tid) * 2u;

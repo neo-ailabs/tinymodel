@@ -332,7 +332,7 @@ impl ArenaPlanner {
 
 fn gemv_nr(dt: DType) -> u32 {
     match dt {
-        DType::Q4_0 | DType::Q8_0 | DType::Q6K => 4,
+        DType::Q4_0 | DType::Q8_0 | DType::Q6K | DType::Q2_0 => 4,
         _ => 2,
     }
 }
@@ -340,6 +340,7 @@ fn gemv_nr(dt: DType) -> u32 {
 fn embed_items(dt: DType, n_embd: usize) -> Result<u32, VulkanError> {
     let items = match dt {
         DType::Q4_0 | DType::Q4_1 | DType::Q8_0 => n_embd / 32,
+        DType::Q2_0 => n_embd / 64,
         DType::Q5K | DType::Q6K => n_embd / 256,
         DType::F32 => n_embd,
         other => return Err(VulkanError::UnsupportedDType(other)),
@@ -2377,7 +2378,7 @@ impl LlamaVkRunner {
             }
 
             match mat.dtype {
-                DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::F32 => {
+                DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q2_0 | DType::F32 => {
                     let pipe = ctx.pipeline("gemm_tiled", dt, SPV_GEMM_TILED, 3, 20, &[128, dt])?;
                     let set = alloc_set(
                         &pipe,
@@ -2514,7 +2515,7 @@ impl LlamaVkRunner {
                 }
                 if matches!(
                     mat.dtype,
-                    DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q5K | DType::Q6K
+                    DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q5K | DType::Q6K | DType::Q2_0
                 ) {
                     let dt = dtype_code(mat.dtype)?;
                     let nr = gemv_nr(mat.dtype);

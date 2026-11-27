@@ -166,6 +166,34 @@ void main() {
                     }
                 }
             }
+        } else if (DTYPE == 6u) {
+            const uint nb2 = pc.n_in / 64u;
+            const uint total_bytes = nb2 * 16u;
+            for (uint idx = lane; idx < total_bytes; idx += sg_size) {
+                const uint ib2 = idx >> 4u;
+                const uint byte_in_blk = idx & 15u;
+                float d_arr[NR];
+                vec4 q4_arr[NR];
+                [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                    const uint b = b_row[r] + ib2 * 9u;
+                    d_arr[r] = unpackHalf2x16(uint(w16[b])).x;
+                    const uint bt = ubyte_at(b + 1u, byte_in_blk);
+                    q4_arr[r] = vec4(
+                        float(int(bt & 3u) - 1),
+                        float(int((bt >> 2u) & 3u) - 1),
+                        float(int((bt >> 4u) & 3u) - 1),
+                        float(int((bt >> 6u) & 3u) - 1)
+                    );
+                }
+                [[unroll]] for (uint t = 0u; t < M; ++t) {
+                    if (t < n_tok) {
+                        const vec4 xv = x4[t * x4_stride + ib2 * 16u + byte_in_blk];
+                        [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                            b_acc[t][r] = fma(d_arr[r], dot(q4_arr[r], xv), b_acc[t][r]);
+                        }
+                    }
+                }
+            }
         } else {
             for (uint k = lane; k < pc.n_in; k += sg_size) {
                 float w_arr[NR];
@@ -384,6 +412,26 @@ void main() {
                     s = fma(float(sbyte_at(sc_b, is + 6u)) * dot(qd, xd), 1.0, s);
                     acc[r] = fma(d, s, acc[r]);
                 }
+            }
+        }
+    } else if (DTYPE == 6u) {
+        const uint nb2 = pc.n_in / 64u;
+        const uint total_bytes = nb2 * 16u;
+        for (uint idx = lane; idx < total_bytes; idx += sg_size) {
+            const uint ib2 = idx >> 4u;
+            const uint byte_in_blk = idx & 15u;
+            const vec4 xv = x4[x4_off + ib2 * 16u + byte_in_blk];
+            for (uint r = 0u; r < NR; ++r) {
+                const uint b = row_b[r] + ib2 * 9u;
+                const float d = unpackHalf2x16(uint(w16[b])).x;
+                const uint bt = ubyte_at(b + 1u, byte_in_blk);
+                const vec4 q4 = vec4(
+                    float(int(bt & 3u) - 1),
+                    float(int((bt >> 2u) & 3u) - 1),
+                    float(int((bt >> 4u) & 3u) - 1),
+                    float(int((bt >> 6u) & 3u) - 1)
+                );
+                acc[r] = fma(d, dot(q4, xv), acc[r]);
             }
         }
     } else {

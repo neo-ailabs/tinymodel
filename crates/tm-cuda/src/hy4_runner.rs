@@ -16,18 +16,23 @@ use std::path::Path;
 use std::sync::Arc;
 
 use tm_core::DType;
+use tm_models::MAX_SPEC_WINDOW;
 use tm_models::hy4::{
     FMT_F32, FMT_Q8ROW, Hy4Config, Hy4EngramCfg, Hy4EngramReader, Hy4Manifest, Hy4TensorInfo,
     discover_sibling_engram_strata, read_expert_directory, read_strata_header, read_strata_section,
 };
 
 use crate::CudaError;
-use crate::driver::{CUdeviceptr, CUfunction, CudaBuffer, CudaContext, CudaEvent, CudaGraphExec};
+use crate::driver::{
+    CUdeviceptr, CUfunction, CudaBuffer, CudaContext, CudaEvent, CudaGraphExec, CudaPinnedBuffer,
+};
 use crate::kernels::{BLOCK_Q8_1_BYTES, CudaKernels, CudaMat};
 use crate::llama_runner::{CudaProfileReport, CudaStageStat, MAX_CUDA_BATCH};
 
 const BLOCK_Q8_1_G64_BYTES: usize = 72;
 const STREAM_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+/// Default `DFly2` draft block length (`K = 4`, evaluating `B = K + 1 = 5` slots `[x_a, mask..mask]`).
+pub const DFLY2_DEFAULT_DRAFT_K: usize = 4;
 
 struct Hy4CudaKernels {
     quantize_g64: CUfunction,
@@ -37,11 +42,12 @@ struct Hy4CudaKernels {
     hc_apply_pre: CUfunction,
     hc_post: CUfunction,
     engram_gate_add: CUfunction,
-    mla_prep_rope: CUfunction,
-    pack_mla_kv: CUfunction,
-    attn_with_sink: CUfunction,
+    mla_prep_latent_kv: CUfunction,
+    mla_absorb_q: CUfunction,
+    mla_latent_attn: CUfunction,
+    mla_vup_gate: CUfunction,
     latmoe_indexed_sk: CUfunction,
-    latmoe_swiglu_sq: CUfunction,
+    latmoe_dual_gu_sq: CUfunction,
 }
 
 impl Hy4CudaKernels {
@@ -54,11 +60,12 @@ impl Hy4CudaKernels {
             hc_apply_pre: ctx.get_function("hy4_hc_apply_pre_f32")?,
             hc_post: ctx.get_function("hy4_hc_post_f32")?,
             engram_gate_add: ctx.get_function("hy4_engram_gate_add_f32")?,
-            mla_prep_rope: ctx.get_function("hy4_mla_prep_rope_f32")?,
-            pack_mla_kv: ctx.get_function("hy4_pack_mla_kv_f16")?,
-            attn_with_sink: ctx.get_function("hy4_attn_f16_kv_with_sink")?,
+            mla_prep_latent_kv: ctx.get_function("hy4_mla_prep_latent_kv_f16")?,
+            mla_absorb_q: ctx.get_function("hy4_mla_absorb_q")?,
+            mla_latent_attn: ctx.get_function("hy4_mla_latent_attn_f16_with_sink")?,
+            mla_vup_gate: ctx.get_function("hy4_mla_vup_gate")?,
             latmoe_indexed_sk: ctx.get_function("hy4_latmoe_indexed_sk_q8_1_g64")?,
-            latmoe_swiglu_sq: ctx.get_function("hy4_latmoe_swiglu_sq_quantize_g64")?,
+            latmoe_dual_gu_sq: ctx.get_function("hy4_latmoe_dual_gu_swiglu_sq_f32")?,
         })
     }
 }
@@ -127,11 +134,58 @@ struct CudaHy4Layer {
     linear_gate: TrunkWeight,
     o_proj: TrunkWeight,
     post_proj_norm: TrunkWeight,
-    k_cache: CudaBuffer,
-    v_cache: CudaBuffer,
+    /// Matrix-Absorbed MLA compressed latent cache: `[cap, kv_lora + qk_rope]` in FP16 (`P1-1`).
+    latent_kv_cache: CudaBuffer,
     hc_mlp: CudaHy4HcPre,
     post_attn_ln: TrunkWeight,
     mlp: CudaHy4Mlp,
+}
+
+struct CudaDflyLayer {
+    target_layer_idx: usize,
+    input_ln: TrunkWeight,
+    q_a_proj: TrunkWeight,
+    q_a_ln: TrunkWeight,
+    q_b_proj: TrunkWeight,
+    kv_a_proj: TrunkWeight,
+    kv_a_ln: TrunkWeight,
+    kv_b_proj: TrunkWeight,
+    sinks: TrunkWeight,
+    linear_gate: TrunkWeight,
+    o_proj: TrunkWeight,
+    post_proj_norm: TrunkWeight,
+    post_attn_ln: TrunkWeight,
+    gate_proj: TrunkWeight,
+    up_proj: TrunkWeight,
+    down_proj: TrunkWeight,
+    mlp_ff: usize,
+}
+
+struct CudaHy4DFly2 {
+    fusion_enorm: TrunkWeight,
+    fusion_hnorm: TrunkWeight,
+    fusion_eh_proj: TrunkWeight,
+    fusion_gate: TrunkWeight,
+    layers: Vec<CudaDflyLayer>,
+    final_norm: TrunkWeight,
+    corr_hidden_norm: TrunkWeight,
+    corr_embed_norm: TrunkWeight,
+    corr_gate_proj: TrunkWeight,
+    corr_up_proj: TrunkWeight,
+    corr_down_proj: TrunkWeight,
+    corr_ff: usize,
+    conf_proj: TrunkWeight,
+    conf_bias: TrunkWeight,
+    /// Post-`model.norm` hidden state at position `a - 1` (`[hidden]` F32).
+    hprev_f32: CudaBuffer,
+    h_buf: CudaBuffer,          // [MAX_SPEC_WINDOW + 1, hidden]
+    hf_buf: CudaBuffer,         // [MAX_SPEC_WINDOW + 1, hidden]
+    hcin_buf: CudaBuffer,       // [2 * hidden]
+    ec_buf: CudaBuffer,         // [hidden]
+    hcorr_buf: CudaBuffer,      // [hidden]
+    conf_logit_buf: CudaBuffer, // [1]
+    chain_ids_dev: CudaBuffer,  // [MAX_SPEC_WINDOW + 1] u32
+    conf_probs_dev: CudaBuffer, // [MAX_SPEC_WINDOW + 1] f32
 }
 
 pub struct Hy4CudaRunner {
@@ -160,13 +214,16 @@ pub struct Hy4CudaRunner {
     inv_freqs_sparse: CudaBuffer,
     inv_freqs_swa: CudaBuffer,
     layers: Vec<CudaHy4Layer>,
+    dfly2: Option<CudaHy4DFly2>,
 
-    // Host Engram state
+    // Host Engram state + pinned async staging (`P1-2`)
     engram_reader: Hy4EngramReader,
     engram_ln_weights: Vec<Vec<f32>>,
     seq_tokens: Vec<u32>,
-    engram_r_host: Vec<f32>,
-    engram_valid_host: Vec<f32>,
+    pinned_ids: CudaPinnedBuffer,
+    pinned_pos: CudaPinnedBuffer,
+    pinned_engram_r: CudaPinnedBuffer,
+    pinned_engram_valid: CudaPinnedBuffer,
 
     // Device execution buffers + captured CUDA Graphs
     token_ids_buf: CudaBuffer,
@@ -183,14 +240,14 @@ pub struct Hy4CudaRunner {
     post_buf: CudaBuffer,
     cur_buf: CudaBuffer,
     curn_buf: CudaBuffer,
+    hf_verify_buf: CudaBuffer,
     sub_buf: CudaBuffer,
     qa_buf: CudaBuffer,
     qr_buf: CudaBuffer,
     q_buf: CudaBuffer,
+    q_abs_buf: CudaBuffer,
     kva_buf: CudaBuffer,
-    kvc_buf: CudaBuffer,
-    kpe_buf: CudaBuffer,
-    kvx_buf: CudaBuffer,
+    ctx_lat_buf: CudaBuffer,
     attn_buf: CudaBuffer,
     gate_buf: CudaBuffer,
     ff1_buf: CudaBuffer,
@@ -199,7 +256,6 @@ pub struct Hy4CudaRunner {
     top_ids_buf: CudaBuffer,
     top_weights_buf: CudaBuffer,
     lat_z_buf: CudaBuffer,
-    lat_gu_buf: CudaBuffer,
     lat_act_f32_buf: CudaBuffer,
     lat_slots_buf: CudaBuffer,
     xq_q8_1_buf: CudaBuffer,
@@ -215,7 +271,7 @@ fn stream_file_region_to_vram(
     f: &mut File,
     file_offset: u64,
     byte_length: u64,
-    staging: &mut [u8],
+    pinned_staging: &mut CudaPinnedBuffer,
 ) -> Result<CudaBuffer, CudaError> {
     if byte_length == 0 {
         return ctx.alloc_zeroed(64);
@@ -224,15 +280,37 @@ fn stream_file_region_to_vram(
     f.seek(SeekFrom::Start(file_offset)).map_err(|e| {
         CudaError::InvalidDimensions(format!("seek .strata offset {file_offset}: {e}"))
     })?;
-    let mut copied = 0usize;
     let total = byte_length as usize;
-    while copied < total {
-        let want = (total - copied).min(staging.len());
-        f.read_exact(&mut staging[..want])
-            .map_err(|e| CudaError::InvalidDimensions(format!("read .strata at +{copied}: {e}")))?;
-        buf.copy_from_bytes_at(copied, &staging[..want])?;
-        copied += want;
+    let half_cap = (pinned_staging.len() / 2).max(4096);
+    if total <= half_cap {
+        let dst = &mut pinned_staging.as_bytes_mut()[..total];
+        f.read_exact(dst)
+            .map_err(|e| CudaError::InvalidDimensions(format!("read .strata: {e}")))?;
+        buf.copy_from_pinned_async(0, pinned_staging, 0, total)?;
+        ctx.synchronize()?;
+        return Ok(buf);
     }
+
+    // `P1-2`: Double-buffered disk read + async PCIe DMA overlap!
+    let evs = [CudaEvent::new(ctx)?, CudaEvent::new(ctx)?];
+    let mut copied = 0usize;
+    let mut slot = 0usize;
+    let mut slot_used = [false; 2];
+    while copied < total {
+        if slot_used[slot] {
+            evs[slot].synchronize()?;
+        }
+        let want = (total - copied).min(half_cap);
+        let pin_off = slot * half_cap;
+        f.read_exact(&mut pinned_staging.as_bytes_mut()[pin_off..pin_off + want])
+            .map_err(|e| CudaError::InvalidDimensions(format!("read .strata at +{copied}: {e}")))?;
+        buf.copy_from_pinned_async(copied, pinned_staging, pin_off, want)?;
+        evs[slot].record()?;
+        slot_used[slot] = true;
+        copied += want;
+        slot ^= 1;
+    }
+    ctx.synchronize()?;
     Ok(buf)
 }
 
@@ -258,23 +336,19 @@ impl Hy4CudaRunner {
         let sec4_bytes = hdr.sections[4].byte_length as usize;
         let model_weight_bytes = sec1_bytes + sec4_bytes;
 
+        let kv_lat = cfg.kv_lora + cfg.qk_rope;
         let mut kv_total_bytes = 0usize;
         for il in 0..cfg.n_layers {
-            let nh = if cfg.is_swa[il] {
-                cfg.heads_swa
-            } else {
-                cfg.heads_sparse
-            };
             let cap = if cfg.is_swa[il] && cfg.window > 0 {
                 (cfg.window + MAX_CUDA_BATCH).min(max_ctx)
             } else {
                 max_ctx
             };
-            kv_total_bytes += cap * nh * (cfg.qk_head + cfg.v_head) * 2;
+            kv_total_bytes += cap * kv_lat * 2;
         }
 
         let (free_vram, _) = ctx.mem_info()?;
-        let needed_bytes = model_weight_bytes + kv_total_bytes + 256 * 1024 * 1024;
+        let needed_bytes = model_weight_bytes + kv_total_bytes + 192 * 1024 * 1024;
         if needed_bytes > free_vram {
             return Err(CudaError::OutOfDeviceMemory {
                 needed_mib: needed_bytes as f64 / (1024.0 * 1024.0),
@@ -284,23 +358,24 @@ impl Hy4CudaRunner {
             });
         }
 
-        // Stream Section 1 (trunk) and Section 4 (expert bodies) in 64 MiB chunks directly to GPU!
-        let mut staging = vec![0u8; STREAM_CHUNK_BYTES.min(sec1_bytes.max(sec4_bytes).max(4096))];
+        // Stream Section 1 (trunk) and Section 4 (expert bodies) via double-buffered pinned host DMA (`P1-2`)!
+        let pin_bytes = (2 * STREAM_CHUNK_BYTES).min(2 * sec1_bytes.max(sec4_bytes).max(4096));
+        let mut pinned_staging = ctx.alloc_pinned(pin_bytes)?;
         let trunk_arena = Arc::new(stream_file_region_to_vram(
             &ctx,
             &mut f,
             hdr.sections[1].file_offset,
             hdr.sections[1].byte_length,
-            &mut staging,
+            &mut pinned_staging,
         )?);
         let sec4_arena = stream_file_region_to_vram(
             &ctx,
             &mut f,
             hdr.sections[4].file_offset,
             hdr.sections[4].byte_length,
-            &mut staging,
+            &mut pinned_staging,
         )?;
-        drop(staging);
+        drop(pinned_staging);
 
         // Read Section 2 (64 MiB hot Engram seed) + Section 3 (expert directory)
         let seed = read_strata_section(&mut f, &hdr, 2)?;
@@ -496,13 +571,96 @@ impl Hy4CudaRunner {
                 linear_gate: tw(&format!("{ap}.linear_gate.weight"))?,
                 o_proj: tw(&format!("{ap}.o_proj.weight"))?,
                 post_proj_norm: tw(&format!("{ap}.post_proj_norm.weight"))?,
-                k_cache: ctx.alloc_zeroed(cap * nh * cfg.qk_head * 2)?,
-                v_cache: ctx.alloc_zeroed(cap * nh * cfg.v_head * 2)?,
+                latent_kv_cache: ctx.alloc_zeroed(cap * kv_lat * 2)?,
                 hc_mlp,
                 post_attn_ln: tw(&format!("{lp}.post_attention_layernorm.weight"))?,
                 mlp,
             });
         }
+
+        // Optional built-in 5-layer `DFly2` speculative drafter (`model.dfly_layers.*` in Section 1)
+        let spec_rows = MAX_SPEC_WINDOW + 1;
+        let mut max_dfly_ff = 0usize;
+        let dfly2 = if !cfg.dfly_layers.is_empty()
+            && man
+                .tensors
+                .contains_key("model.dfly_layers.mtp_fusion.eh_proj.weight")
+        {
+            let pf = "model.dfly_layers";
+            let mut dfly_start = u64::MAX;
+            let mut dfly_end = 0u64;
+            for (nm, ti) in &man.tensors {
+                if nm.starts_with(pf) {
+                    dfly_start = dfly_start.min(ti.offset);
+                    dfly_end = dfly_end.max(ti.offset + ti.bytes);
+                }
+            }
+            if dfly_end > dfly_start {
+                ctx.pin_l2_persisting(
+                    trunk_arena.device_ptr() + dfly_start,
+                    (dfly_end - dfly_start) as usize,
+                );
+            }
+
+            let mut d_layers = Vec::with_capacity(cfg.dfly_layers.len());
+            for (d_idx, &target_l) in cfg.dfly_layers.iter().enumerate() {
+                let dp = format!("{pf}.{d_idx}");
+                let da = format!("{dp}.self_attn");
+                let dm = format!("{dp}.mlp");
+                let gate_proj = tw(&format!("{dm}.gate_proj.weight"))?;
+                let mlp_ff = gate_proj.rows;
+                max_dfly_ff = max_dfly_ff.max(mlp_ff);
+                d_layers.push(CudaDflyLayer {
+                    target_layer_idx: target_l,
+                    input_ln: tw(&format!("{dp}.input_layernorm.weight"))?,
+                    q_a_proj: tw(&format!("{da}.q_a_proj.weight"))?,
+                    q_a_ln: tw(&format!("{da}.q_a_layernorm.weight"))?,
+                    q_b_proj: tw(&format!("{da}.q_b_proj.weight"))?,
+                    kv_a_proj: tw(&format!("{da}.kv_a_proj_with_mqa.weight"))?,
+                    kv_a_ln: tw(&format!("{da}.kv_a_layernorm.weight"))?,
+                    kv_b_proj: tw(&format!("{da}.kv_b_proj.weight"))?,
+                    sinks: tw(&format!("{da}.learnable_sink_param"))?,
+                    linear_gate: tw(&format!("{da}.linear_gate.weight"))?,
+                    o_proj: tw(&format!("{da}.o_proj.weight"))?,
+                    post_proj_norm: tw(&format!("{da}.post_proj_norm.weight"))?,
+                    post_attn_ln: tw(&format!("{dp}.post_attention_layernorm.weight"))?,
+                    gate_proj,
+                    up_proj: tw(&format!("{dm}.up_proj.weight"))?,
+                    down_proj: tw(&format!("{dm}.down_proj.weight"))?,
+                    mlp_ff,
+                });
+            }
+            let corr_gate_proj = tw(&format!("{pf}.hidden_correction.gate_proj.weight"))?;
+            let corr_ff = corr_gate_proj.rows;
+            max_dfly_ff = max_dfly_ff.max(corr_ff);
+            Some(CudaHy4DFly2 {
+                fusion_enorm: tw(&format!("{pf}.mtp_fusion.enorm.weight"))?,
+                fusion_hnorm: tw(&format!("{pf}.mtp_fusion.hnorm.weight"))?,
+                fusion_eh_proj: tw(&format!("{pf}.mtp_fusion.eh_proj.weight"))?,
+                fusion_gate: tw(&format!("{pf}.mtp_fusion.gate"))?,
+                layers: d_layers,
+                final_norm: tw(&format!("{pf}.final_norm.weight"))?,
+                corr_hidden_norm: tw(&format!("{pf}.hidden_correction.hidden_norm.weight"))?,
+                corr_embed_norm: tw(&format!("{pf}.hidden_correction.embed_norm.weight"))?,
+                corr_gate_proj,
+                corr_up_proj: tw(&format!("{pf}.hidden_correction.up_proj.weight"))?,
+                corr_down_proj: tw(&format!("{pf}.hidden_correction.down_proj.weight"))?,
+                corr_ff,
+                conf_proj: tw(&format!("{pf}.confidence_head.proj.weight"))?,
+                conf_bias: tw(&format!("{pf}.confidence_head.proj.bias"))?,
+                hprev_f32: ctx.alloc_zeroed(h * 4)?,
+                h_buf: ctx.alloc_zeroed(spec_rows * h * 4)?,
+                hf_buf: ctx.alloc_zeroed(spec_rows * h * 4)?,
+                hcin_buf: ctx.alloc_zeroed(2 * h * 4)?,
+                ec_buf: ctx.alloc_zeroed(h * 4)?,
+                hcorr_buf: ctx.alloc_zeroed(h * 4)?,
+                conf_logit_buf: ctx.alloc_zeroed(4)?,
+                chain_ids_dev: ctx.alloc_zeroed(spec_rows * 4)?,
+                conf_probs_dev: ctx.alloc_zeroed(spec_rows * 4)?,
+            })
+        } else {
+            None
+        };
 
         let sibling_eng = if engram_path.is_none() {
             discover_sibling_engram_strata(model_path)
@@ -515,10 +673,10 @@ impl Hy4CudaRunner {
         let max_nh = cfg.heads_swa.max(cfg.heads_sparse);
         let max_qd = max_nh * cfg.qk_head;
         let max_vd = max_nh * cfg.v_head;
-        let max_ex = max_nh * (cfg.qk_nope + cfg.v_head);
-        let max_ff = cfg.dense_ff.max(max_sh_ff).max(h);
+        let max_ff = cfg.dense_ff.max(max_sh_ff).max(max_dfly_ff).max(h);
         let max_cols = [
             h,
+            2 * h,
             hc_dim,
             cfg.q_lora,
             cfg.kv_lora,
@@ -536,6 +694,10 @@ impl Hy4CudaRunner {
         let ed = ecfg.engram_dim.max(1);
         let rows_slots = MAX_CUDA_BATCH * cfg.top_k.max(1);
 
+        let pinned_ids = ctx.alloc_pinned(MAX_CUDA_BATCH * 4)?;
+        let pinned_pos = ctx.alloc_pinned(4)?;
+        let pinned_engram_r = ctx.alloc_pinned(n_mod * MAX_CUDA_BATCH * ed * 4)?;
+        let pinned_engram_valid = ctx.alloc_pinned(n_mod * MAX_CUDA_BATCH * 4)?;
         let token_ids_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * 4)?;
         let pos_buf = ctx.alloc_zeroed(4)?;
         let engram_r_dev = ctx.alloc_zeroed(n_mod * MAX_CUDA_BATCH * ed * 4)?;
@@ -549,14 +711,14 @@ impl Hy4CudaRunner {
         let post_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * hc * 4)?;
         let cur_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * h * 4)?;
         let curn_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * h * 4)?;
+        let hf_verify_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * h * 4)?;
         let sub_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * h * 4)?;
         let qa_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * cfg.q_lora * 4)?;
         let qr_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * cfg.q_lora * 4)?;
         let q_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_qd * 4)?;
-        let kva_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * (cfg.kv_lora + cfg.qk_rope) * 4)?;
-        let kvc_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * cfg.kv_lora * 4)?;
-        let kpe_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * cfg.qk_rope * 4)?;
-        let kvx_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_ex * 4)?;
+        let q_abs_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_nh * kv_lat * 4)?;
+        let kva_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * kv_lat * 4)?;
+        let ctx_lat_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_nh * cfg.kv_lora * 4)?;
         let attn_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_vd * 4)?;
         let gate_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_vd * 4)?;
         let ff1_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_ff * 4)?;
@@ -566,16 +728,21 @@ impl Hy4CudaRunner {
         let top_weights_buf = ctx.alloc_zeroed(rows_slots * 4)?;
         let lat = cfg.lat_dim.max(64);
         let lat_z_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * lat * 4)?;
-        let lat_gu_buf = ctx.alloc_zeroed(rows_slots * 2 * lat * 4)?;
         let lat_act_f32_buf = ctx.alloc_zeroed(rows_slots * lat * 4)?;
         let lat_slots_buf = ctx.alloc_zeroed(rows_slots * lat * 4)?;
-        let xq_q8_1_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * (max_cols / 32) * BLOCK_Q8_1_BYTES)?;
-        let xq_g64_buf =
-            ctx.alloc_zeroed(MAX_CUDA_BATCH * (max_cols / 64) * BLOCK_Q8_1_G64_BYTES)?;
+        let max_ctx_rows = MAX_CUDA_BATCH * max_nh;
+        let xq_q8_1_buf = ctx.alloc_zeroed(
+            (MAX_CUDA_BATCH * (max_cols / 32)).max(max_ctx_rows * cfg.kv_lora.div_ceil(32))
+                * BLOCK_Q8_1_BYTES,
+        )?;
+        let xq_g64_buf = ctx.alloc_zeroed(
+            (MAX_CUDA_BATCH * (max_cols / 64)).max(max_ctx_rows * cfg.kv_lora.div_ceil(64))
+                * BLOCK_Q8_1_G64_BYTES,
+        )?;
         let slot_xq_g64_buf =
             ctx.alloc_zeroed(rows_slots * (lat.div_ceil(64)) * BLOCK_Q8_1_G64_BYTES)?;
-        let logits_dev = ctx.alloc_zeroed(cfg.vocab_size * 4)?;
-        let argmax_dev = ctx.alloc_zeroed(4)?;
+        let logits_dev = ctx.alloc_zeroed(spec_rows * cfg.vocab_size * 4)?;
+        let argmax_dev = ctx.alloc_zeroed(spec_rows * 4)?;
         ctx.synchronize()?;
 
         let active_exp_bytes = (sec4_bytes / cfg.n_experts.max(1)) * cfg.top_k;
@@ -608,11 +775,14 @@ impl Hy4CudaRunner {
                 inv_freqs_sparse,
                 inv_freqs_swa,
                 layers,
+                dfly2,
                 engram_reader,
                 engram_ln_weights,
                 seq_tokens: vec![ecfg.pad_id as u32; max_ctx.max(1)],
-                engram_r_host: vec![0.0; n_mod * MAX_CUDA_BATCH * ed],
-                engram_valid_host: vec![0.0; n_mod * MAX_CUDA_BATCH],
+                pinned_ids,
+                pinned_pos,
+                pinned_engram_r,
+                pinned_engram_valid,
                 token_ids_buf,
                 pos_buf,
                 engram_r_dev,
@@ -626,14 +796,14 @@ impl Hy4CudaRunner {
                 post_buf,
                 cur_buf,
                 curn_buf,
+                hf_verify_buf,
                 sub_buf,
                 qa_buf,
                 qr_buf,
                 q_buf,
+                q_abs_buf,
                 kva_buf,
-                kvc_buf,
-                kpe_buf,
-                kvx_buf,
+                ctx_lat_buf,
                 attn_buf,
                 gate_buf,
                 ff1_buf,
@@ -642,7 +812,6 @@ impl Hy4CudaRunner {
                 top_ids_buf,
                 top_weights_buf,
                 lat_z_buf,
-                lat_gu_buf,
                 lat_act_f32_buf,
                 lat_slots_buf,
                 xq_q8_1_buf,
@@ -656,10 +825,17 @@ impl Hy4CudaRunner {
         ))
     }
 
+    #[inline]
+    pub fn has_builtin_dfly2(&self) -> bool {
+        self.dfly2.is_some()
+    }
+
     pub fn reset_state(&mut self) -> Result<(), CudaError> {
         for l in &self.layers {
-            l.k_cache.zero()?;
-            l.v_cache.zero()?;
+            l.latent_kv_cache.zero()?;
+        }
+        if let Some(ref dfly) = self.dfly2 {
+            dfly.hprev_f32.zero()?;
         }
         self.ctx.synchronize()
     }
@@ -678,33 +854,30 @@ impl Hy4CudaRunner {
         }
         let n_tok = token_ids.len();
         let ed = self.engram_cfg.engram_dim;
-        for m_idx in 0..n_mod {
-            let r_slice = &mut self.engram_r_host[m_idx * n_tok * ed..(m_idx + 1) * n_tok * ed];
-            let v_slice = &mut self.engram_valid_host[m_idx * n_tok..(m_idx + 1) * n_tok];
-            self.engram_reader.compute_module_input(
-                &self.engram_cfg,
-                &self.engram_ln_weights[m_idx],
-                &self.seq_tokens,
-                token_ids,
-                start_pos,
-                m_idx,
-                r_slice,
-                v_slice,
-            )?;
-        }
-        // Upload only the active `n_mod * n_tok` slices (`24 KiB` for decode instead of `1.57 MiB`!).
         let r_len = n_mod * n_tok * ed;
         let v_len = n_mod * n_tok;
-        // SAFETY: `[f32]` is plain old data.
-        let r_bytes = unsafe {
-            core::slice::from_raw_parts(self.engram_r_host.as_ptr().cast::<u8>(), r_len * 4)
-        };
-        // SAFETY: `[f32]` is plain old data.
-        let v_bytes = unsafe {
-            core::slice::from_raw_parts(self.engram_valid_host.as_ptr().cast::<u8>(), v_len * 4)
-        };
-        self.engram_r_dev.copy_from_bytes_at(0, r_bytes)?;
-        self.engram_valid_dev.copy_from_bytes_at(0, v_bytes)
+        {
+            let r_host = self.pinned_engram_r.as_f32_slice_mut(r_len);
+            let v_host = self.pinned_engram_valid.as_f32_slice_mut(v_len);
+            for m_idx in 0..n_mod {
+                let r_slice = &mut r_host[m_idx * n_tok * ed..(m_idx + 1) * n_tok * ed];
+                let v_slice = &mut v_host[m_idx * n_tok..(m_idx + 1) * n_tok];
+                self.engram_reader.compute_module_input(
+                    &self.engram_cfg,
+                    &self.engram_ln_weights[m_idx],
+                    &self.seq_tokens,
+                    token_ids,
+                    start_pos,
+                    m_idx,
+                    r_slice,
+                    v_slice,
+                )?;
+            }
+        }
+        self.engram_r_dev
+            .copy_from_pinned_async(0, &self.pinned_engram_r, 0, r_len * 4)?;
+        self.engram_valid_dev
+            .copy_from_pinned_async(0, &self.pinned_engram_valid, 0, v_len * 4)
     }
 
     fn launch_quantize_g64(
@@ -1087,207 +1260,26 @@ impl Hy4CudaRunner {
                 self.cfg.rms_eps,
             )?;
 
-            // Non-absorbed MLA (`q_a_proj` -> `q_a_ln` -> `q_b_proj`; `kv_a_proj` -> RoPE + `kv_a_ln` -> `kv_b_proj`)
-            let curn_sk = l.q_a_proj.fmt < 100 || l.kv_a_proj.fmt < 100 || l.linear_gate.fmt < 100;
-            if curn_sk {
-                self.launch_quantize_g64(
-                    self.curn_buf.device_ptr(),
-                    self.xq_g64_buf.device_ptr(),
-                    h,
-                    n_tok,
-                )?;
-            }
-            self.launch_hy4_linear(
+            // `P1-1`: Matrix-Absorbed MLA (`latent_kv_cache` `[cap, kv_lora + qk_rope]` FP16 — `28x` smaller KV!)
+            self.encode_absorbed_mla(
                 &l.q_a_proj,
-                self.curn_buf.device_ptr(),
-                self.qa_buf.device_ptr(),
-                n_tok,
-                curn_sk && l.q_a_proj.fmt < 100,
-            )?;
-            self.launch_hy4_linear(
-                &l.kv_a_proj,
-                self.curn_buf.device_ptr(),
-                self.kva_buf.device_ptr(),
-                n_tok,
-                curn_sk && l.kv_a_proj.fmt < 100,
-            )?;
-            self.launch_hy4_linear(
-                &l.linear_gate,
-                self.curn_buf.device_ptr(),
-                self.gate_buf.device_ptr(),
-                n_tok,
-                curn_sk && l.linear_gate.fmt < 100,
-            )?;
-
-            self.kernels.launch_rms_norm(
-                &self.ctx,
-                self.qa_buf.device_ptr(),
-                l.q_a_ln.ptr,
-                self.qr_buf.device_ptr(),
-                self.cfg.q_lora,
-                n_tok,
-                self.cfg.rms_eps,
-            )?;
-            self.launch_hy4_linear(
+                &l.q_a_ln,
                 &l.q_b_proj,
-                self.qr_buf.device_ptr(),
-                self.q_buf.device_ptr(),
-                n_tok,
-                false,
-            )?;
-
-            let inv_ptr = if l.is_swa {
-                self.inv_freqs_swa.device_ptr()
-            } else {
-                self.inv_freqs_sparse.device_ptr()
-            };
-            {
-                let mut pq = self.q_buf.device_ptr();
-                let mut pkva = self.kva_buf.device_ptr();
-                let mut pcm = self.qa_buf.device_ptr(); // reuse `qa_buf` (`>= kv_lora`) for `kv_cmpr_in`!
-                let mut pkpe = self.kpe_buf.device_ptr();
-                let mut pif = inv_ptr;
-                let mut nh = l.n_head as i32;
-                let mut qkn = self.cfg.qk_nope as i32;
-                let mut qkr = self.cfg.qk_rope as i32;
-                let mut kvl = self.cfg.kv_lora as i32;
-                let mut sp = start_pos as i32;
-                let mut pp = pos_dev_ptr;
-                let mut args: [*mut c_void; 11] = [
-                    (&mut pq as *mut CUdeviceptr).cast(),
-                    (&mut pkva as *mut CUdeviceptr).cast(),
-                    (&mut pcm as *mut CUdeviceptr).cast(),
-                    (&mut pkpe as *mut CUdeviceptr).cast(),
-                    (&mut pif as *mut CUdeviceptr).cast(),
-                    (&mut nh as *mut i32).cast(),
-                    (&mut qkn as *mut i32).cast(),
-                    (&mut qkr as *mut i32).cast(),
-                    (&mut kvl as *mut i32).cast(),
-                    (&mut sp as *mut i32).cast(),
-                    (&mut pp as *mut CUdeviceptr).cast(),
-                ];
-                // SAFETY: Matches `hy4_mla_prep_rope_f32`.
-                unsafe {
-                    self.ctx.launch(
-                        "hy4_mla_prep_rope_f32",
-                        self.hk.mla_prep_rope,
-                        ((l.n_head + 1) as u32, n_tok as u32, 1),
-                        (128, 1, 1),
-                        0,
-                        &mut args,
-                    )?;
-                }
-            }
-
-            self.kernels.launch_rms_norm(
-                &self.ctx,
-                self.qa_buf.device_ptr(),
-                l.kv_a_ln.ptr,
-                self.kvc_buf.device_ptr(),
-                self.cfg.kv_lora,
-                n_tok,
-                self.cfg.rms_eps,
-            )?;
-            self.launch_hy4_linear(
+                &l.kv_a_proj,
+                &l.kv_a_ln,
                 &l.kv_b_proj,
-                self.kvc_buf.device_ptr(),
-                self.kvx_buf.device_ptr(),
-                n_tok,
-                false,
-            )?;
-
-            {
-                let mut pkvx = self.kvx_buf.device_ptr();
-                let mut pkpe = self.kpe_buf.device_ptr();
-                let mut pkc = l.k_cache.device_ptr();
-                let mut pvc = l.v_cache.device_ptr();
-                let mut nh = l.n_head as i32;
-                let mut qkn = self.cfg.qk_nope as i32;
-                let mut qkr = self.cfg.qk_rope as i32;
-                let mut vh = self.cfg.v_head as i32;
-                let mut rc = l.ring_cap as i32;
-                let mut sp = start_pos as i32;
-                let mut pp = pos_dev_ptr;
-                let mut args: [*mut c_void; 11] = [
-                    (&mut pkvx as *mut CUdeviceptr).cast(),
-                    (&mut pkpe as *mut CUdeviceptr).cast(),
-                    (&mut pkc as *mut CUdeviceptr).cast(),
-                    (&mut pvc as *mut CUdeviceptr).cast(),
-                    (&mut nh as *mut i32).cast(),
-                    (&mut qkn as *mut i32).cast(),
-                    (&mut qkr as *mut i32).cast(),
-                    (&mut vh as *mut i32).cast(),
-                    (&mut rc as *mut i32).cast(),
-                    (&mut sp as *mut i32).cast(),
-                    (&mut pp as *mut CUdeviceptr).cast(),
-                ];
-                // SAFETY: Matches `hy4_pack_mla_kv_f16` (note `Block: (320, 1, 1)` when `qk_head > 256`!).
-                let blk_t = self.cfg.qk_head.max(self.cfg.v_head).next_multiple_of(32) as u32;
-                unsafe {
-                    self.ctx.launch(
-                        "hy4_pack_mla_kv_f16",
-                        self.hk.pack_mla_kv,
-                        (l.n_head as u32, n_tok as u32, 1),
-                        (blk_t, 1, 1),
-                        0,
-                        &mut args,
-                    )?;
-                }
-            }
-
-            {
-                let mut pq = self.q_buf.device_ptr();
-                let mut pkc = l.k_cache.device_ptr();
-                let mut pvc = l.v_cache.device_ptr();
-                let mut psink = l.sinks.ptr;
-                let mut po = self.attn_buf.device_ptr();
-                let mut nh = l.n_head as i32;
-                let mut qkh = self.cfg.qk_head as i32;
-                let mut vh = self.cfg.v_head as i32;
-                let mut nswa = if l.is_swa { self.cfg.window as i32 } else { 0 };
-                let mut rc = l.ring_cap as i32;
-                let mut sp = start_pos as i32;
-                let mut pp = pos_dev_ptr;
-                let mut args: [*mut c_void; 12] = [
-                    (&mut pq as *mut CUdeviceptr).cast(),
-                    (&mut pkc as *mut CUdeviceptr).cast(),
-                    (&mut pvc as *mut CUdeviceptr).cast(),
-                    (&mut psink as *mut CUdeviceptr).cast(),
-                    (&mut po as *mut CUdeviceptr).cast(),
-                    (&mut nh as *mut i32).cast(),
-                    (&mut qkh as *mut i32).cast(),
-                    (&mut vh as *mut i32).cast(),
-                    (&mut nswa as *mut i32).cast(),
-                    (&mut rc as *mut i32).cast(),
-                    (&mut sp as *mut i32).cast(),
-                    (&mut pp as *mut CUdeviceptr).cast(),
-                ];
-                // SAFETY: Matches `hy4_attn_f16_kv_with_sink`.
-                unsafe {
-                    self.ctx.launch(
-                        "hy4_attn_f16_kv_with_sink",
-                        self.hk.attn_with_sink,
-                        (l.n_head as u32, n_tok as u32, 1),
-                        (32, 8, 1),
-                        0,
-                        &mut args,
-                    )?;
-                }
-            }
-
-            let vd = l.n_head * self.cfg.v_head;
-            self.kernels.launch_sigmoid_gate_mul(
-                &self.ctx,
-                self.attn_buf.device_ptr(),
-                self.gate_buf.device_ptr(),
-                n_tok * vd,
-            )?;
-            self.launch_hy4_linear(
+                &l.sinks,
+                &l.linear_gate,
                 &l.o_proj,
-                self.attn_buf.device_ptr(),
+                l.latent_kv_cache.device_ptr(),
+                l.n_head,
+                l.is_swa,
+                l.ring_cap,
+                self.curn_buf.device_ptr(),
                 self.cur_buf.device_ptr(),
                 n_tok,
-                false,
+                start_pos,
+                pos_dev_ptr,
             )?;
             self.kernels.launch_rms_norm(
                 &self.ctx,
@@ -1439,7 +1431,7 @@ impl Hy4CudaRunner {
                         curn_sk && sh_up.fmt < 100,
                     )?;
 
-                    // Quantize `lat_z [n_tok, lat]` into `xq_g64_buf` and run parallel `ku`-slot `S_K` gate_up!
+                    // `P0-3`: Fused dual `Gate + Up + clamped SwiGLU + SmoothQuant sq16` + `BlockQ8_1_G64` quantize!
                     self.launch_quantize_g64(
                         self.lat_z_buf.device_ptr(),
                         self.xq_g64_buf.device_ptr(),
@@ -1456,76 +1448,43 @@ impl Hy4CudaRunner {
                         let mut pxq = self.xq_g64_buf.device_ptr();
                         let mut pxf = self.lat_z_buf.device_ptr();
                         let mut pid = self.top_ids_buf.device_ptr();
-                        let mut ptw = self.top_weights_buf.device_ptr();
-                        let mut po = self.lat_gu_buf.device_ptr();
-                        let mut isd = 0i32;
-                        let mut cr = (2 * lat) as i32;
+                        let mut po = self.lat_act_f32_buf.device_ptr();
+                        let mut cl = lat as i32;
                         let mut cc = lat as i32;
                         let mut csc = ku as i32;
-                        let mut args: [*mut c_void; 12] = [
+                        let mut clim = self.cfg.swiglu_limit;
+                        let mut args: [*mut c_void; 11] = [
                             (&mut ps4 as *mut CUdeviceptr).cast(),
                             (&mut pld as *mut CUdeviceptr).cast(),
                             (&mut prk as *mut CUdeviceptr).cast(),
                             (&mut pxq as *mut CUdeviceptr).cast(),
                             (&mut pxf as *mut CUdeviceptr).cast(),
                             (&mut pid as *mut CUdeviceptr).cast(),
-                            (&mut ptw as *mut CUdeviceptr).cast(),
                             (&mut po as *mut CUdeviceptr).cast(),
-                            (&mut isd as *mut i32).cast(),
-                            (&mut cr as *mut i32).cast(),
+                            (&mut cl as *mut i32).cast(),
                             (&mut cc as *mut i32).cast(),
                             (&mut csc as *mut i32).cast(),
+                            (&mut clim as *mut f32).cast(),
                         ];
-                        // SAFETY: Matches `hy4_latmoe_indexed_sk_q8_1_g64`.
+                        // SAFETY: Matches `hy4_latmoe_dual_gu_swiglu_sq_f32`.
                         unsafe {
                             self.ctx.launch(
-                                "hy4_latmoe_indexed_sk_q8_1_g64",
-                                self.hk.latmoe_indexed_sk,
-                                (((2 * lat) as u32).div_ceil(4), ku as u32, n_tok as u32),
+                                "hy4_latmoe_dual_gu_swiglu_sq_f32",
+                                self.hk.latmoe_dual_gu_sq,
+                                ((lat as u32).div_ceil(4), ku as u32, n_tok as u32),
                                 (32, 4, 1),
                                 0,
                                 &mut args,
                             )?;
                         }
                     }
-
-                    // Clipped SwiGLU + SmoothQuant `sq16` divide + `BlockQ8_1_G64` quantize!
                     let n_rows = n_tok * ku;
-                    {
-                        let mut pgu = self.lat_gu_buf.device_ptr();
-                        let mut ps4 = self.sec4_arena.device_ptr();
-                        let mut pld = layer_dir_ptr;
-                        let mut prk = rank_layer_ptr;
-                        let mut pid = self.top_ids_buf.device_ptr();
-                        let mut pxq = self.slot_xq_g64_buf.device_ptr();
-                        let mut pxf = self.lat_act_f32_buf.device_ptr();
-                        let mut cl = lat as i32;
-                        let mut cnr = n_rows as i32;
-                        let mut clim = self.cfg.swiglu_limit;
-                        let mut args: [*mut c_void; 10] = [
-                            (&mut pgu as *mut CUdeviceptr).cast(),
-                            (&mut ps4 as *mut CUdeviceptr).cast(),
-                            (&mut pld as *mut CUdeviceptr).cast(),
-                            (&mut prk as *mut CUdeviceptr).cast(),
-                            (&mut pid as *mut CUdeviceptr).cast(),
-                            (&mut pxq as *mut CUdeviceptr).cast(),
-                            (&mut pxf as *mut CUdeviceptr).cast(),
-                            (&mut cl as *mut i32).cast(),
-                            (&mut cnr as *mut i32).cast(),
-                            (&mut clim as *mut f32).cast(),
-                        ];
-                        // SAFETY: Matches `hy4_latmoe_swiglu_sq_quantize_g64`.
-                        unsafe {
-                            self.ctx.launch(
-                                "hy4_latmoe_swiglu_sq_quantize_g64",
-                                self.hk.latmoe_swiglu_sq,
-                                (((lat / 64) as u32).div_ceil(2), n_rows as u32, 1),
-                                (32, 2, 1),
-                                0,
-                                &mut args,
-                            )?;
-                        }
-                    }
+                    self.launch_quantize_g64(
+                        self.lat_act_f32_buf.device_ptr(),
+                        self.slot_xq_g64_buf.device_ptr(),
+                        lat,
+                        n_rows,
+                    )?;
 
                     // Parallel `ku`-slot `S_K` down + ordered slot reduction!
                     {
@@ -1620,40 +1579,350 @@ impl Hy4CudaRunner {
             self.launch_hc_post(self.sub_buf.device_ptr(), n_tok)?;
         }
 
-        if compute_last_logits {
+        if compute_last_logits || self.dfly2.is_some() {
             let head_hc = CudaHy4HcPre {
                 hc_fn: self.hc_head_fn.clone(),
                 hc_scale: self.hc_head_scale.clone(),
                 hc_base: self.hc_head_base.clone(),
             };
             self.launch_hc_pre(&head_hc, self.cur_buf.device_ptr(), None, n_tok)?;
-            let last_cur = self.cur_buf.device_ptr() + ((n_tok - 1) * h * 4) as u64;
-            self.kernels.launch_rms_norm(
-                &self.ctx,
-                last_cur,
-                self.final_norm.ptr,
-                self.curn_buf.device_ptr(),
-                h,
-                1,
-                self.cfg.rms_eps,
-            )?;
-            self.launch_hy4_linear(
-                &self.lm_head,
-                self.curn_buf.device_ptr(),
-                self.logits_dev.device_ptr(),
-                1,
-                false,
-            )?;
-            if compute_argmax {
-                self.kernels.launch_argmax(
+            if self.dfly2.is_some() {
+                self.kernels.launch_rms_norm(
                     &self.ctx,
-                    self.logits_dev.device_ptr(),
-                    self.argmax_dev.device_ptr(),
-                    self.cfg.vocab_size,
+                    self.cur_buf.device_ptr(),
+                    self.final_norm.ptr,
+                    self.hf_verify_buf.device_ptr(),
+                    h,
+                    n_tok,
+                    self.cfg.rms_eps,
                 )?;
+            }
+            if compute_last_logits {
+                let normed_last = if self.dfly2.is_some() {
+                    self.hf_verify_buf.device_ptr() + ((n_tok - 1) * h * 4) as u64
+                } else {
+                    let last_cur = self.cur_buf.device_ptr() + ((n_tok - 1) * h * 4) as u64;
+                    self.kernels.launch_rms_norm(
+                        &self.ctx,
+                        last_cur,
+                        self.final_norm.ptr,
+                        self.curn_buf.device_ptr(),
+                        h,
+                        1,
+                        self.cfg.rms_eps,
+                    )?;
+                    self.curn_buf.device_ptr()
+                };
+                self.launch_hy4_linear(
+                    &self.lm_head,
+                    normed_last,
+                    self.logits_dev.device_ptr(),
+                    1,
+                    false,
+                )?;
+                if compute_argmax {
+                    self.kernels.launch_argmax(
+                        &self.ctx,
+                        self.logits_dev.device_ptr(),
+                        self.argmax_dev.device_ptr(),
+                        self.cfg.vocab_size,
+                    )?;
+                }
             }
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_absorbed_mla(
+        &self,
+        q_a_proj: &TrunkWeight,
+        q_a_ln: &TrunkWeight,
+        q_b_proj: &TrunkWeight,
+        kv_a_proj: &TrunkWeight,
+        kv_a_ln: &TrunkWeight,
+        kv_b_proj: &TrunkWeight,
+        sinks: &TrunkWeight,
+        linear_gate: &TrunkWeight,
+        o_proj: &TrunkWeight,
+        latent_kv_ptr: CUdeviceptr,
+        n_head: usize,
+        is_swa: bool,
+        ring_cap: usize,
+        in_ptr: CUdeviceptr,
+        out_ptr: CUdeviceptr,
+        n_tok: usize,
+        start_pos: usize,
+        pos_dev_ptr: CUdeviceptr,
+    ) -> Result<(), CudaError> {
+        let h = self.cfg.n_embd;
+        let curn_sk = q_a_proj.fmt < 100 || kv_a_proj.fmt < 100 || linear_gate.fmt < 100;
+        if curn_sk {
+            self.launch_quantize_g64(in_ptr, self.xq_g64_buf.device_ptr(), h, n_tok)?;
+        }
+        self.launch_hy4_linear(
+            q_a_proj,
+            in_ptr,
+            self.qa_buf.device_ptr(),
+            n_tok,
+            curn_sk && q_a_proj.fmt < 100,
+        )?;
+        self.launch_hy4_linear(
+            kv_a_proj,
+            in_ptr,
+            self.kva_buf.device_ptr(),
+            n_tok,
+            curn_sk && kv_a_proj.fmt < 100,
+        )?;
+        self.launch_hy4_linear(
+            linear_gate,
+            in_ptr,
+            self.gate_buf.device_ptr(),
+            n_tok,
+            curn_sk && linear_gate.fmt < 100,
+        )?;
+
+        self.kernels.launch_rms_norm(
+            &self.ctx,
+            self.qa_buf.device_ptr(),
+            q_a_ln.ptr,
+            self.qr_buf.device_ptr(),
+            self.cfg.q_lora,
+            n_tok,
+            self.cfg.rms_eps,
+        )?;
+        self.launch_hy4_linear(
+            q_b_proj,
+            self.qr_buf.device_ptr(),
+            self.q_buf.device_ptr(),
+            n_tok,
+            false,
+        )?;
+
+        let inv_ptr = if is_swa {
+            self.inv_freqs_swa.device_ptr()
+        } else {
+            self.inv_freqs_sparse.device_ptr()
+        };
+        let kv_lat = self.cfg.kv_lora + self.cfg.qk_rope;
+        let q_row_floats = n_head * self.cfg.qk_head;
+        let qa_row_floats = n_head * kv_lat;
+        let ctx_row_floats = n_head * self.cfg.kv_lora;
+        // When `ring_cap > 0 && n_tok > ring_cap` (small-window SWA prefill), step in `<= ring_cap` chunks
+        // so `pos % ring_cap` never wraps onto a slot before earlier tokens in the batch attend to it!
+        // Note: on `CudaGraphExec` decode (`n_tok == 1`) and real `Hy4-Flash` (`ring_cap == 1024 >= 64`),
+        // `sub_step == n_tok` -> executes in a single pass with zero extra launches!
+        let max_sub = if is_swa && ring_cap > 0 {
+            ring_cap
+        } else {
+            n_tok
+        };
+        let mut t_off = 0usize;
+        while t_off < n_tok {
+            let sub_sp = start_pos + t_off;
+            let step_cap = if is_swa && ring_cap > 0 {
+                if sub_sp < ring_cap {
+                    ring_cap - sub_sp
+                } else {
+                    ring_cap.saturating_sub(self.cfg.window) + 1
+                }
+            } else {
+                max_sub
+            };
+            let sub_nt = (n_tok - t_off).min(step_cap.max(1));
+            let q_sub = self.q_buf.device_ptr() + (t_off * q_row_floats * 4) as u64;
+            let kva_sub = self.kva_buf.device_ptr() + (t_off * kv_lat * 4) as u64;
+            let qa_sub = self.q_abs_buf.device_ptr() + (t_off * qa_row_floats * 4) as u64;
+            let ctx_sub = self.ctx_lat_buf.device_ptr() + (t_off * ctx_row_floats * 4) as u64;
+
+            // 1. RoPE on `q_pe` + RMSNorm(`kva[0..kv_lora]`) + RoPE(`k_pe`) -> write FP16 `latent_kv_cache`!
+            {
+                let mut pq = q_sub;
+                let mut pkva = kva_sub;
+                let mut plnw = kv_a_ln.ptr;
+                let mut pif = inv_ptr;
+                let mut plc = latent_kv_ptr;
+                let mut nh = n_head as i32;
+                let mut qkn = self.cfg.qk_nope as i32;
+                let mut qkr = self.cfg.qk_rope as i32;
+                let mut kvl = self.cfg.kv_lora as i32;
+                let mut eps = self.cfg.rms_eps;
+                let mut rc = ring_cap as i32;
+                let mut sp = sub_sp as i32;
+                let mut pp = pos_dev_ptr;
+                let mut args: [*mut c_void; 13] = [
+                    (&mut pq as *mut CUdeviceptr).cast(),
+                    (&mut pkva as *mut CUdeviceptr).cast(),
+                    (&mut plnw as *mut CUdeviceptr).cast(),
+                    (&mut pif as *mut CUdeviceptr).cast(),
+                    (&mut plc as *mut CUdeviceptr).cast(),
+                    (&mut nh as *mut i32).cast(),
+                    (&mut qkn as *mut i32).cast(),
+                    (&mut qkr as *mut i32).cast(),
+                    (&mut kvl as *mut i32).cast(),
+                    (&mut eps as *mut f32).cast(),
+                    (&mut rc as *mut i32).cast(),
+                    (&mut sp as *mut i32).cast(),
+                    (&mut pp as *mut CUdeviceptr).cast(),
+                ];
+                // SAFETY: Matches `hy4_mla_prep_latent_kv_f16`.
+                unsafe {
+                    self.ctx.launch(
+                        "hy4_mla_prep_latent_kv_f16",
+                        self.hk.mla_prep_latent_kv,
+                        ((n_head + 1) as u32, sub_nt as u32, 1),
+                        (256, 1, 1),
+                        0,
+                        &mut args,
+                    )?;
+                }
+            }
+
+            // 2. Absorb `W_kb` into `q_nope` -> `qa_sub [sub_nt, n_head, kv_lora + qk_rope]`
+            {
+                let mut pq = q_sub;
+                let mut pw = kv_b_proj.ptr;
+                let mut pqa = qa_sub;
+                let mut sc = kv_b_proj.fmt;
+                let mut nh = n_head as i32;
+                let mut qkn = self.cfg.qk_nope as i32;
+                let mut qkr = self.cfg.qk_rope as i32;
+                let mut vh = self.cfg.v_head as i32;
+                let mut kvl = self.cfg.kv_lora as i32;
+                let mut nt = sub_nt as i32;
+                let mut args: [*mut c_void; 10] = [
+                    (&mut pq as *mut CUdeviceptr).cast(),
+                    (&mut pw as *mut CUdeviceptr).cast(),
+                    (&mut pqa as *mut CUdeviceptr).cast(),
+                    (&mut sc as *mut i32).cast(),
+                    (&mut nh as *mut i32).cast(),
+                    (&mut qkn as *mut i32).cast(),
+                    (&mut qkr as *mut i32).cast(),
+                    (&mut vh as *mut i32).cast(),
+                    (&mut kvl as *mut i32).cast(),
+                    (&mut nt as *mut i32).cast(),
+                ];
+                // SAFETY: Matches `hy4_mla_absorb_q`.
+                unsafe {
+                    self.ctx.launch(
+                        "hy4_mla_absorb_q",
+                        self.hk.mla_absorb_q,
+                        (
+                            (self.cfg.kv_lora as u32).div_ceil(256),
+                            n_head as u32,
+                            (sub_nt as u32).div_ceil(4),
+                        ),
+                        (32, 4, 1),
+                        0,
+                        &mut args,
+                    )?;
+                }
+            }
+
+            // 3. MQA over shared `latent_kv_cache` with `learnable_sink_param` -> `ctx_sub [sub_nt, n_head, kv_lora]`
+            {
+                let mut pqa = qa_sub;
+                let mut plc = latent_kv_ptr;
+                let mut psink = sinks.ptr;
+                let mut pctx = ctx_sub;
+                let mut nh = n_head as i32;
+                let mut kvl = self.cfg.kv_lora as i32;
+                let mut qkr = self.cfg.qk_rope as i32;
+                let mut qkh = self.cfg.qk_head as i32;
+                let mut nswa = if is_swa { self.cfg.window as i32 } else { 0 };
+                let mut rc = ring_cap as i32;
+                let mut sp = sub_sp as i32;
+                let mut pp = pos_dev_ptr;
+                let mut args: [*mut c_void; 12] = [
+                    (&mut pqa as *mut CUdeviceptr).cast(),
+                    (&mut plc as *mut CUdeviceptr).cast(),
+                    (&mut psink as *mut CUdeviceptr).cast(),
+                    (&mut pctx as *mut CUdeviceptr).cast(),
+                    (&mut nh as *mut i32).cast(),
+                    (&mut kvl as *mut i32).cast(),
+                    (&mut qkr as *mut i32).cast(),
+                    (&mut qkh as *mut i32).cast(),
+                    (&mut nswa as *mut i32).cast(),
+                    (&mut rc as *mut i32).cast(),
+                    (&mut sp as *mut i32).cast(),
+                    (&mut pp as *mut CUdeviceptr).cast(),
+                ];
+                // SAFETY: Matches `hy4_mla_latent_attn_f16_with_sink`.
+                unsafe {
+                    self.ctx.launch(
+                        "hy4_mla_latent_attn_f16_with_sink",
+                        self.hk.mla_latent_attn,
+                        (n_head as u32, sub_nt as u32, 1),
+                        (32, 8, 1),
+                        0,
+                        &mut args,
+                    )?;
+                }
+            }
+            t_off += sub_nt;
+        }
+
+        // 4. Quantize `ctx_lat_buf` (for `S_K` or `Q8_ROW`) + fused `W_vb * ctx * sigmoid(gate)`!
+        let n_ctx_rows = n_tok * n_head;
+        if kv_b_proj.fmt < 100 {
+            self.launch_quantize_g64(
+                self.ctx_lat_buf.device_ptr(),
+                self.xq_g64_buf.device_ptr(),
+                self.cfg.kv_lora,
+                n_ctx_rows,
+            )?;
+        } else if kv_b_proj.fmt == FMT_Q8ROW {
+            self.kernels.launch_quantize_q8_1(
+                &self.ctx,
+                self.ctx_lat_buf.device_ptr(),
+                self.xq_q8_1_buf.device_ptr(),
+                self.cfg.kv_lora,
+                n_ctx_rows,
+            )?;
+        }
+        {
+            let mut pw = kv_b_proj.ptr;
+            let mut pg64 = self.xq_g64_buf.device_ptr();
+            let mut pq8 = self.xq_q8_1_buf.device_ptr();
+            let mut pf32 = self.ctx_lat_buf.device_ptr();
+            let mut pgate = self.gate_buf.device_ptr();
+            let mut po = self.attn_buf.device_ptr();
+            let mut sc = kv_b_proj.fmt;
+            let mut nh = n_head as i32;
+            let mut qkn = self.cfg.qk_nope as i32;
+            let mut vh = self.cfg.v_head as i32;
+            let mut kvl = self.cfg.kv_lora as i32;
+            let mut args: [*mut c_void; 11] = [
+                (&mut pw as *mut CUdeviceptr).cast(),
+                (&mut pg64 as *mut CUdeviceptr).cast(),
+                (&mut pq8 as *mut CUdeviceptr).cast(),
+                (&mut pf32 as *mut CUdeviceptr).cast(),
+                (&mut pgate as *mut CUdeviceptr).cast(),
+                (&mut po as *mut CUdeviceptr).cast(),
+                (&mut sc as *mut i32).cast(),
+                (&mut nh as *mut i32).cast(),
+                (&mut qkn as *mut i32).cast(),
+                (&mut vh as *mut i32).cast(),
+                (&mut kvl as *mut i32).cast(),
+            ];
+            // SAFETY: Matches `hy4_mla_vup_gate`.
+            unsafe {
+                self.ctx.launch(
+                    "hy4_mla_vup_gate",
+                    self.hk.mla_vup_gate,
+                    (
+                        (self.cfg.v_head as u32).div_ceil(4),
+                        n_head as u32,
+                        n_tok as u32,
+                    ),
+                    (32, 4, 1),
+                    0,
+                    &mut args,
+                )?;
+            }
+        }
+
+        self.launch_hy4_linear(o_proj, self.attn_buf.device_ptr(), out_ptr, n_tok, false)
     }
 
     fn run_decode_step(
@@ -1663,8 +1932,12 @@ impl Hy4CudaRunner {
         compute_logits: bool,
         compute_argmax: bool,
     ) -> Result<(), CudaError> {
-        self.token_ids_buf.copy_from_u32(&[token_id])?;
-        self.pos_buf.copy_from_u32(&[pos as u32])?;
+        self.pinned_ids.write_u32_at(0, &[token_id]);
+        self.pinned_pos.write_u32_at(0, &[pos as u32]);
+        self.token_ids_buf
+            .copy_from_pinned_async(0, &self.pinned_ids, 0, 4)?;
+        self.pos_buf
+            .copy_from_pinned_async(0, &self.pinned_pos, 0, 4)?;
         self.stage_engram_to_gpu(&[token_id], pos)?;
         let slot = if !compute_logits {
             0
@@ -1684,7 +1957,478 @@ impl Hy4CudaRunner {
         self.decode_graphs[slot]
             .as_ref()
             .expect("captured hy4 decode graph")
-            .launch()
+            .launch()?;
+        if let Some(ref dfly) = self.dfly2 {
+            dfly.hprev_f32
+                .copy_from_device(&self.hf_verify_buf, self.cfg.n_embd * 4)?;
+        }
+        Ok(())
+    }
+
+    /// Evaluates `[x_tok, drafts...]` (`w = 1 + drafts.len()`) on the `Hy4` target model, overwriting
+    /// any speculative entries written into `latent_kv_cache[pos .. pos + w - 1]` and updating `dfly.hprev_f32`!
+    pub fn verify_window_greedy(
+        &mut self,
+        x_tok: u32,
+        drafts: &[u32],
+        pos: usize,
+        out_committed: &mut Vec<u32>,
+    ) -> Result<(usize, usize), CudaError> {
+        if drafts.is_empty() {
+            let next = self.forward_token_greedy(x_tok, pos)?;
+            out_committed.clear();
+            out_committed.push(next);
+            return Ok((1, 0));
+        }
+        let d_len = drafts.len().min(MAX_SPEC_WINDOW);
+        let w = 1 + d_len;
+        if pos + w > self.max_ctx {
+            let next = self.forward_token_greedy(x_tok, pos)?;
+            out_committed.clear();
+            out_committed.push(next);
+            return Ok((1, 0));
+        }
+
+        let mut win = [0u32; MAX_SPEC_WINDOW + 1];
+        win[0] = x_tok;
+        win[1..w].copy_from_slice(&drafts[..d_len]);
+        self.pinned_ids.write_u32_at(0, &win[..w]);
+        self.token_ids_buf
+            .copy_from_pinned_async(0, &self.pinned_ids, 0, w * 4)?;
+        self.stage_engram_to_gpu(&win[..w], pos)?;
+        self.encode_chunk(w, pos, 0, false, false)?;
+
+        let h = self.cfg.n_embd;
+        if self.dfly2.is_none() {
+            let head_hc = CudaHy4HcPre {
+                hc_fn: self.hc_head_fn.clone(),
+                hc_scale: self.hc_head_scale.clone(),
+                hc_base: self.hc_head_base.clone(),
+            };
+            self.launch_hc_pre(&head_hc, self.cur_buf.device_ptr(), None, w)?;
+            self.kernels.launch_rms_norm(
+                &self.ctx,
+                self.cur_buf.device_ptr(),
+                self.final_norm.ptr,
+                self.hf_verify_buf.device_ptr(),
+                h,
+                w,
+                self.cfg.rms_eps,
+            )?;
+        }
+
+        self.launch_hy4_linear(
+            &self.lm_head,
+            self.hf_verify_buf.device_ptr(),
+            self.logits_dev.device_ptr(),
+            w,
+            false,
+        )?;
+        self.kernels.launch_argmax_rows(
+            &self.ctx,
+            self.logits_dev.device_ptr(),
+            self.argmax_dev.device_ptr(),
+            self.cfg.vocab_size,
+            w,
+        )?;
+
+        let mut picks = [0u32; MAX_SPEC_WINDOW + 1];
+        // SAFETY: `[u32]` is POD; `w <= MAX_SPEC_WINDOW + 1`.
+        let pick_bytes =
+            unsafe { core::slice::from_raw_parts_mut(picks.as_mut_ptr().cast::<u8>(), w * 4) };
+        self.argmax_dev.copy_to_bytes(pick_bytes)?;
+
+        let mut accepted = 0usize;
+        while accepted < d_len && picks[accepted] == drafts[accepted] {
+            accepted += 1;
+        }
+        let committed = accepted + 1;
+        out_committed.clear();
+        out_committed.extend_from_slice(&picks[..committed]);
+
+        if committed < w {
+            for p in (pos + committed)..(pos + w) {
+                if p < self.seq_tokens.len() {
+                    self.seq_tokens[p] = self.engram_cfg.pad_id as u32;
+                }
+            }
+        }
+
+        if let Some(ref dfly) = self.dfly2 {
+            self.kernels.launch_copy_2d_rows(
+                &self.ctx,
+                dfly.hprev_f32.device_ptr(),
+                self.hf_verify_buf.device_ptr() + (accepted * h * 4) as u64,
+                h,
+                h,
+                h,
+                1,
+            )?;
+        }
+        Ok((committed, accepted))
+    }
+
+    /// Runs a full `P0-1` built-in 5-layer `DFly2` parallel-masked + chained-correction speculative step!
+    /// Dynamically truncates the draft prefix when cumulative `confidence_head` probability drops `< conf_thresh`.
+    pub fn spec_step_dfly2_greedy(
+        &mut self,
+        x_tok: u32,
+        pos: usize,
+        draft_k: usize,
+        conf_thresh: f32,
+        out_committed: &mut Vec<u32>,
+    ) -> Result<(usize, usize), CudaError> {
+        let k_max = draft_k.min(MAX_SPEC_WINDOW);
+        if k_max == 0 || self.dfly2.is_none() || pos + 1 + k_max > self.max_ctx {
+            let next = self.forward_token_greedy(x_tok, pos)?;
+            out_committed.clear();
+            out_committed.push(next);
+            return Ok((0, 0));
+        }
+
+        let b_len = 1 + k_max;
+        let h = self.cfg.n_embd;
+        let mut drafts = [0u32; MAX_SPEC_WINDOW];
+        let mut eff_k = k_max;
+
+        {
+            let dfly = self.dfly2.as_ref().expect("checked is_some");
+            // 1. Upload `[x_tok, mask, ..., mask]` (`B = K + 1` tokens) + seed `chain_ids_dev[0] = x_tok`
+            let mut bids = [self.cfg.dfly_mask_id; MAX_SPEC_WINDOW + 1];
+            bids[0] = x_tok;
+            self.pinned_ids.write_u32_at(0, &bids[..b_len]);
+            self.token_ids_buf
+                .copy_from_pinned_async(0, &self.pinned_ids, 0, b_len * 4)?;
+            dfly.chain_ids_dev
+                .copy_from_pinned_async(0, &self.pinned_ids, 0, 4)?;
+
+            // 2. Embed `B` rows (`hc = 1`) into `dfly.h_buf [B, h]`
+            {
+                let mut pemb = self.embed_tokens.ptr;
+                let mut pids = self.token_ids_buf.device_ptr();
+                let mut px = dfly.h_buf.device_ptr();
+                let mut sc = self.embed_tokens.fmt;
+                let mut ch = h as i32;
+                let mut chc = 1i32;
+                let mut cv = self.embed_tokens.rows as i32;
+                let mut args: [*mut c_void; 7] = [
+                    (&mut pemb as *mut CUdeviceptr).cast(),
+                    (&mut pids as *mut CUdeviceptr).cast(),
+                    (&mut px as *mut CUdeviceptr).cast(),
+                    (&mut sc as *mut i32).cast(),
+                    (&mut ch as *mut i32).cast(),
+                    (&mut chc as *mut i32).cast(),
+                    (&mut cv as *mut i32).cast(),
+                ];
+                // SAFETY: Matches `hy4_embed_sk_f32`.
+                unsafe {
+                    self.ctx.launch(
+                        "hy4_embed_sk_f32",
+                        self.hk.embed_sk,
+                        ((h / 256) as u32, b_len as u32, 1),
+                        (32, 1, 1),
+                        0,
+                        &mut args,
+                    )?;
+                }
+            }
+
+            // 3. Slot 0 `mtp_fusion`: `H[0] += gate * eh_proj([rms_norm(H[0], enorm) ; rms_norm(hprev, hnorm)])`
+            self.kernels.launch_mtp_rms_norm_cat2(
+                &self.ctx,
+                dfly.h_buf.device_ptr(),
+                dfly.fusion_enorm.ptr,
+                dfly.hprev_f32.device_ptr(),
+                dfly.fusion_hnorm.ptr,
+                dfly.hcin_buf.device_ptr(),
+                h,
+                self.cfg.rms_eps,
+                1,
+            )?;
+            self.launch_hy4_linear(
+                &dfly.fusion_eh_proj,
+                dfly.hcin_buf.device_ptr(),
+                self.cur_buf.device_ptr(),
+                1,
+                false,
+            )?;
+            self.kernels.launch_elemwise_mul_add(
+                &self.ctx,
+                dfly.h_buf.device_ptr(),
+                dfly.fusion_gate.ptr,
+                self.cur_buf.device_ptr(),
+                h,
+            )?;
+
+            // 4. Run 5 `DFly2` sparse MLA + dense SwiGLU layers sharing target `latent_kv_cache[L]`!
+            for dl in &dfly.layers {
+                let target_l = &self.layers[dl.target_layer_idx];
+                self.kernels.launch_rms_norm(
+                    &self.ctx,
+                    dfly.h_buf.device_ptr(),
+                    dl.input_ln.ptr,
+                    self.curn_buf.device_ptr(),
+                    h,
+                    b_len,
+                    self.cfg.rms_eps,
+                )?;
+                self.encode_absorbed_mla(
+                    &dl.q_a_proj,
+                    &dl.q_a_ln,
+                    &dl.q_b_proj,
+                    &dl.kv_a_proj,
+                    &dl.kv_a_ln,
+                    &dl.kv_b_proj,
+                    &dl.sinks,
+                    &dl.linear_gate,
+                    &dl.o_proj,
+                    target_l.latent_kv_cache.device_ptr(),
+                    self.cfg.heads_sparse,
+                    false,
+                    0,
+                    self.curn_buf.device_ptr(),
+                    self.cur_buf.device_ptr(),
+                    b_len,
+                    pos,
+                    0,
+                )?;
+                self.kernels.launch_rms_norm(
+                    &self.ctx,
+                    self.cur_buf.device_ptr(),
+                    dl.post_proj_norm.ptr,
+                    self.sub_buf.device_ptr(),
+                    h,
+                    b_len,
+                    self.cfg.rms_eps,
+                )?;
+                self.kernels.launch_add_scaled(
+                    &self.ctx,
+                    dfly.h_buf.device_ptr(),
+                    self.sub_buf.device_ptr(),
+                    1.0,
+                    b_len * h,
+                )?;
+
+                self.kernels.launch_rms_norm(
+                    &self.ctx,
+                    dfly.h_buf.device_ptr(),
+                    dl.post_attn_ln.ptr,
+                    self.curn_buf.device_ptr(),
+                    h,
+                    b_len,
+                    self.cfg.rms_eps,
+                )?;
+                let sk = dl.gate_proj.fmt < 100 || dl.up_proj.fmt < 100;
+                if sk {
+                    self.launch_quantize_g64(
+                        self.curn_buf.device_ptr(),
+                        self.xq_g64_buf.device_ptr(),
+                        h,
+                        b_len,
+                    )?;
+                }
+                self.launch_hy4_linear(
+                    &dl.gate_proj,
+                    self.curn_buf.device_ptr(),
+                    self.ff1_buf.device_ptr(),
+                    b_len,
+                    sk && dl.gate_proj.fmt < 100,
+                )?;
+                self.launch_hy4_linear(
+                    &dl.up_proj,
+                    self.curn_buf.device_ptr(),
+                    self.ff2_buf.device_ptr(),
+                    b_len,
+                    sk && dl.up_proj.fmt < 100,
+                )?;
+                self.kernels.launch_swiglu(
+                    &self.ctx,
+                    self.ff1_buf.device_ptr(),
+                    self.ff2_buf.device_ptr(),
+                    b_len * dl.mlp_ff,
+                )?;
+                self.launch_hy4_linear(
+                    &dl.down_proj,
+                    self.ff1_buf.device_ptr(),
+                    self.cur_buf.device_ptr(),
+                    b_len,
+                    false,
+                )?;
+                self.kernels.launch_add_scaled(
+                    &self.ctx,
+                    dfly.h_buf.device_ptr(),
+                    self.cur_buf.device_ptr(),
+                    1.0,
+                    b_len * h,
+                )?;
+            }
+
+            // 5. Final norm `Hf = rms_norm(H, dfly.final_norm)`
+            self.kernels.launch_rms_norm(
+                &self.ctx,
+                dfly.h_buf.device_ptr(),
+                dfly.final_norm.ptr,
+                dfly.hf_buf.device_ptr(),
+                h,
+                b_len,
+                self.cfg.rms_eps,
+            )?;
+
+            // 6. Chained `hidden_correction` + `confidence_head` + `lm_head` argmax across `j = 1..=K` (`0` host syncs!)
+            for j in 1..=k_max {
+                {
+                    let mut pemb = self.embed_tokens.ptr;
+                    let mut pids = dfly.chain_ids_dev.device_ptr() + ((j - 1) * 4) as u64;
+                    let mut px = dfly.ec_buf.device_ptr();
+                    let mut sc = self.embed_tokens.fmt;
+                    let mut ch = h as i32;
+                    let mut chc = 1i32;
+                    let mut cv = self.embed_tokens.rows as i32;
+                    let mut args: [*mut c_void; 7] = [
+                        (&mut pemb as *mut CUdeviceptr).cast(),
+                        (&mut pids as *mut CUdeviceptr).cast(),
+                        (&mut px as *mut CUdeviceptr).cast(),
+                        (&mut sc as *mut i32).cast(),
+                        (&mut ch as *mut i32).cast(),
+                        (&mut chc as *mut i32).cast(),
+                        (&mut cv as *mut i32).cast(),
+                    ];
+                    // SAFETY: Matches `hy4_embed_sk_f32`.
+                    unsafe {
+                        self.ctx.launch(
+                            "hy4_embed_sk_f32",
+                            self.hk.embed_sk,
+                            ((h / 256) as u32, 1, 1),
+                            (32, 1, 1),
+                            0,
+                            &mut args,
+                        )?;
+                    }
+                }
+
+                let hf_j = dfly.hf_buf.device_ptr() + (j * h * 4) as u64;
+                self.kernels.launch_mtp_rms_norm_cat2(
+                    &self.ctx,
+                    hf_j,
+                    dfly.corr_hidden_norm.ptr,
+                    dfly.ec_buf.device_ptr(),
+                    dfly.corr_embed_norm.ptr,
+                    dfly.hcin_buf.device_ptr(),
+                    h,
+                    self.cfg.rms_eps,
+                    1,
+                )?;
+                let sk = dfly.corr_gate_proj.fmt < 100 || dfly.corr_up_proj.fmt < 100;
+                if sk {
+                    self.launch_quantize_g64(
+                        dfly.hcin_buf.device_ptr(),
+                        self.xq_g64_buf.device_ptr(),
+                        2 * h,
+                        1,
+                    )?;
+                }
+                self.launch_hy4_linear(
+                    &dfly.corr_gate_proj,
+                    dfly.hcin_buf.device_ptr(),
+                    self.ff1_buf.device_ptr(),
+                    1,
+                    sk && dfly.corr_gate_proj.fmt < 100,
+                )?;
+                self.launch_hy4_linear(
+                    &dfly.corr_up_proj,
+                    dfly.hcin_buf.device_ptr(),
+                    self.ff2_buf.device_ptr(),
+                    1,
+                    sk && dfly.corr_up_proj.fmt < 100,
+                )?;
+                self.kernels.launch_swiglu(
+                    &self.ctx,
+                    self.ff1_buf.device_ptr(),
+                    self.ff2_buf.device_ptr(),
+                    dfly.corr_ff,
+                )?;
+                self.launch_hy4_linear(
+                    &dfly.corr_down_proj,
+                    self.ff1_buf.device_ptr(),
+                    dfly.hcorr_buf.device_ptr(),
+                    1,
+                    false,
+                )?;
+                self.kernels.launch_add_scaled(
+                    &self.ctx,
+                    dfly.hcorr_buf.device_ptr(),
+                    hf_j,
+                    1.0,
+                    h,
+                )?;
+
+                self.launch_hy4_linear(
+                    &dfly.conf_proj,
+                    dfly.hcorr_buf.device_ptr(),
+                    dfly.conf_logit_buf.device_ptr(),
+                    1,
+                    false,
+                )?;
+                self.kernels.launch_dfly_bias_sigmoid_slot(
+                    &self.ctx,
+                    dfly.conf_logit_buf.device_ptr(),
+                    dfly.conf_bias.ptr,
+                    dfly.conf_probs_dev.device_ptr(),
+                    j,
+                )?;
+
+                self.launch_hy4_linear(
+                    &self.lm_head,
+                    dfly.hcorr_buf.device_ptr(),
+                    self.logits_dev.device_ptr(),
+                    1,
+                    false,
+                )?;
+                self.kernels.launch_argmax(
+                    &self.ctx,
+                    self.logits_dev.device_ptr(),
+                    dfly.chain_ids_dev.device_ptr() + (j * 4) as u64,
+                    self.cfg.vocab_size,
+                )?;
+            }
+
+            // Single 40-byte readback of `chain_ids[0..=K]` + `conf_probs[0..=K]`!
+            let mut chain_host = [0u32; MAX_SPEC_WINDOW + 1];
+            let mut conf_host = [0.0f32; MAX_SPEC_WINDOW + 1];
+            // SAFETY: `[u32]` and `[f32]` are POD; `b_len <= MAX_SPEC_WINDOW + 1`.
+            unsafe {
+                dfly.chain_ids_dev
+                    .copy_to_bytes(core::slice::from_raw_parts_mut(
+                        chain_host.as_mut_ptr().cast::<u8>(),
+                        b_len * 4,
+                    ))?;
+                dfly.conf_probs_dev
+                    .copy_to_bytes(core::slice::from_raw_parts_mut(
+                        conf_host.as_mut_ptr().cast::<u8>(),
+                        b_len * 4,
+                    ))?;
+            }
+            drafts[..k_max].copy_from_slice(&chain_host[1..b_len]);
+
+            if conf_thresh > 0.0 {
+                let mut cum = 1.0f32;
+                let mut keep = 0usize;
+                for (j, &cp) in conf_host.iter().enumerate().take(k_max + 1).skip(1) {
+                    cum *= cp;
+                    if keep == 0 || cum >= conf_thresh {
+                        keep = j;
+                    } else {
+                        break;
+                    }
+                }
+                eff_k = keep.max(1);
+            }
+        }
+
+        // 7. Verify `[x_tok, drafts[0..eff_k]]` on the 42-layer target `Hy4` trunk; return `(drafted, accepted)`.
+        let (_committed, accepted) =
+            self.verify_window_greedy(x_tok, &drafts[..eff_k], pos, out_committed)?;
+        Ok((eff_k, accepted))
     }
 
     pub fn forward_token(
@@ -1737,7 +2481,9 @@ impl Hy4CudaRunner {
         while off < token_ids.len() {
             let chunk = &token_ids[off..(off + MAX_CUDA_BATCH).min(token_ids.len())];
             let is_last = off + chunk.len() == token_ids.len();
-            self.token_ids_buf.copy_from_u32(chunk)?;
+            self.pinned_ids.write_u32_at(0, chunk);
+            self.token_ids_buf
+                .copy_from_pinned_async(0, &self.pinned_ids, 0, chunk.len() * 4)?;
             self.stage_engram_to_gpu(chunk, start_pos + off)?;
             self.encode_chunk(
                 chunk.len(),
@@ -1746,6 +2492,18 @@ impl Hy4CudaRunner {
                 compute_last_logits && is_last,
                 false,
             )?;
+            if is_last && let Some(ref dfly) = self.dfly2 {
+                let h = self.cfg.n_embd;
+                self.kernels.launch_copy_2d_rows(
+                    &self.ctx,
+                    dfly.hprev_f32.device_ptr(),
+                    self.hf_verify_buf.device_ptr() + ((chunk.len() - 1) * h * 4) as u64,
+                    h,
+                    h,
+                    h,
+                    1,
+                )?;
+            }
             off += chunk.len();
         }
         if compute_last_logits {

@@ -207,6 +207,28 @@ void main() {
                                 float16_t(sc * float(int(ql1 | qh1) - 32))
                             );
                         }
+                    } else if (DTYPE == 6u) {
+                        const uint b = row_b + (ib >> 1u) * 9u;
+                        const float d = unpackHalf2x16(uint(w16[b])).x;
+                        const uint u = uint(w16[b + 1u + (ib & 1u) * 4u + sub]);
+                        const uint b0 = u & 0xFFu;
+                        const uint b1 = u >> 8u;
+                        W_sh[sh_base + sub * 4u + 0u] = f16vec2(
+                            float16_t(float(int(b0 & 3u) - 1) * d),
+                            float16_t(float(int((b0 >> 2u) & 3u) - 1) * d)
+                        );
+                        W_sh[sh_base + sub * 4u + 1u] = f16vec2(
+                            float16_t(float(int((b0 >> 4u) & 3u) - 1) * d),
+                            float16_t(float(int((b0 >> 6u) & 3u) - 1) * d)
+                        );
+                        W_sh[sh_base + sub * 4u + 2u] = f16vec2(
+                            float16_t(float(int(b1 & 3u) - 1) * d),
+                            float16_t(float(int((b1 >> 2u) & 3u) - 1) * d)
+                        );
+                        W_sh[sh_base + sub * 4u + 3u] = f16vec2(
+                            float16_t(float(int((b1 >> 4u) & 3u) - 1) * d),
+                            float16_t(float(int((b1 >> 6u) & 3u) - 1) * d)
+                        );
                     } else {
                         const uint b32 = (row_b >> 1u) + ib * 32u + sub * 8u;
                         [[unroll]] for (uint i = 0u; i < 4u; ++i) {

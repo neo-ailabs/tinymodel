@@ -11,16 +11,18 @@ use std::ffi::c_void;
 use tm_core::KvType;
 use tm_gguf::GgufFile;
 use tm_models::{
-    Qwen4ExpAttnWeights, Qwen4ExpConfig, Qwen4ExpHcWeights, Qwen4ExpModel, Qwen4ExpPleWeights,
-    RawMatView,
+    MAX_SPEC_WINDOW, Qwen4ExpAttnWeights, Qwen4ExpConfig, Qwen4ExpHcWeights, Qwen4ExpModel,
+    Qwen4ExpPleWeights, RawMatView,
 };
 
 use crate::CudaError;
-use crate::driver::{CUdeviceptr, CUfunction, CudaBuffer, CudaContext, CudaEvent, CudaGraphExec};
+use crate::driver::{
+    CUdeviceptr, CUfunction, CudaBuffer, CudaContext, CudaEvent, CudaGraphExec, CudaPinnedBuffer,
+};
 use crate::kernels::{BLOCK_Q8_1_BYTES, CudaKernels, CudaMat, is_q8_1_mmvq_dtype};
 use crate::llama_runner::{
     CudaMoeLayer, CudaMoeScratch, CudaProfileReport, CudaStageStat, MAX_CUDA_BATCH,
-    moe_weight_bytes, upload_mat,
+    moe_expert_only_bytes, moe_weight_bytes, plan_moe_host_offload_count, upload_mat,
 };
 
 struct Qwen4ExpCudaKernels {
@@ -100,6 +102,7 @@ impl CudaPle {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum CudaQwen4Attn {
     FullQsa {
         q_norm: CudaBuffer,
@@ -130,6 +133,11 @@ enum CudaQwen4Attn {
         w_out: CudaMat,
         conv_hist: CudaBuffer,
         ssm_state: CudaBuffer,
+        conv_snap: CudaBuffer,
+        ssm_snap: CudaBuffer,
+        spec_qkv: CudaBuffer,
+        spec_alpha: CudaBuffer,
+        spec_beta: CudaBuffer,
     },
 }
 
@@ -151,6 +159,7 @@ pub struct Qwen4ExpCudaRunner {
     pub vram_bytes: usize,
     pub model_weight_bytes: usize,
     pub active_decode_bytes: usize,
+    pub host_offloaded_moe_layers: usize,
 
     token_embd: CudaMat,
     hc_head: CudaHc,
@@ -161,13 +170,17 @@ pub struct Qwen4ExpCudaRunner {
     // Host PLE N-gram state (owns read-only `GgufFile` mmap handle — zero RAM copy, 100% safe!)
     ple_gguf: Option<(GgufFile, tm_core::DType, usize)>,
     seq_tokens: Vec<u32>,
-    ple_host_staging: Vec<f32>,
+    pinned_ids: CudaPinnedBuffer,
+    pinned_pos: CudaPinnedBuffer,
+    pinned_ple: CudaPinnedBuffer,
 
     token_ids_buf: CudaBuffer,
     pos_buf: CudaBuffer,
     decode_graphs: [Option<CudaGraphExec>; 3],
     ple_emb_buf: CudaBuffer,
     ple_conv_hist: CudaBuffer,
+    ple_conv_snap: CudaBuffer,
+    spec_ple_normed: CudaBuffer,
     ple_key_buf: CudaBuffer,
     ple_val_buf: CudaBuffer,
     ple_gated_buf: CudaBuffer,
@@ -252,6 +265,7 @@ impl Qwen4ExpCudaRunner {
             cpu_m.output.bytes.len() + cpu_m.token_embd.dtype.row_bytes(d)
         } + hc_bytes(&cpu_m.hc_head);
 
+        let mut moe_exp_sizes = Vec::new();
         for lw in &cpu_m.layers {
             let hb = hc_bytes(&lw.hc_attn) + hc_bytes(&lw.hc_ffn);
             let ab = match &lw.attn {
@@ -293,19 +307,8 @@ impl Qwen4ExpCudaRunner {
             let mb = moe_weight_bytes(&lw.moe);
             model_weight_bytes += hb + ab + pb + mb;
 
-            let exp_only = match &lw.moe.experts {
-                tm_models::PackedExperts::Separate {
-                    gate_exps,
-                    up_exps,
-                    down_exps,
-                    ..
-                } => gate_exps.map_or(0, |b| b.len()) + up_exps.len() + down_exps.len(),
-                tm_models::PackedExperts::FusedGateUp {
-                    gate_up_exps,
-                    down_exps,
-                    ..
-                } => gate_up_exps.len() + down_exps.len(),
-            };
+            let exp_only = moe_expert_only_bytes(&lw.moe);
+            moe_exp_sizes.push(exp_only);
             let non_exp_mb = mb.saturating_sub(exp_only);
             let active_exp = (exp_only / cfg.n_expert.max(1)) * cfg.n_expert_used;
             active_decode_bytes += hb + ab + pb + non_exp_mb + active_exp;
@@ -313,7 +316,10 @@ impl Qwen4ExpCudaRunner {
 
         let (free_vram, _) = ctx.mem_info()?;
         let needed_bytes = model_weight_bytes + total_state_bytes + 128 * 1024 * 1024;
-        if needed_bytes > free_vram {
+        let offload_moe_count =
+            plan_moe_host_offload_count(free_vram, needed_bytes, &moe_exp_sizes);
+        let offloaded_bytes: usize = moe_exp_sizes.iter().rev().take(offload_moe_count).sum();
+        if needed_bytes.saturating_sub(offloaded_bytes) > free_vram {
             return Err(CudaError::OutOfDeviceMemory {
                 needed_mib: needed_bytes as f64 / (1024.0 * 1024.0),
                 free_mib: free_vram as f64 / (1024.0 * 1024.0),
@@ -364,6 +370,8 @@ impl Qwen4ExpCudaRunner {
             None => None,
         };
 
+        let spec_rows = MAX_SPEC_WINDOW + 1;
+        let total_moe_layers = moe_exp_sizes.len();
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for (il, lw) in cpu_m.layers.iter().enumerate() {
             let hc_attn = CudaHc::upload(&ctx, &lw.hc_attn)?;
@@ -414,24 +422,31 @@ impl Qwen4ExpCudaRunner {
                     ssm_dt_bias,
                     ssm_norm,
                     w_out,
-                } => CudaQwen4Attn::GdnSigmoid {
-                    wqkv: upload_mat(&ctx, wqkv)?,
-                    wz: upload_mat(&ctx, wz)?,
-                    w_alpha: upload_mat(&ctx, w_alpha)?,
-                    w_beta: upload_mat(&ctx, w_beta)?,
-                    conv1d: ctx.alloc_from_f32(conv1d)?,
-                    ssm_a: ctx.alloc_from_f32(ssm_a)?,
-                    ssm_dt_bias: ctx.alloc_from_f32(ssm_dt_bias)?,
-                    ssm_norm: ctx.alloc_from_f32(ssm_norm)?,
-                    w_out: upload_mat(&ctx, w_out)?,
-                    conv_hist: ctx
-                        .alloc_zeroed(cfg.ssm_conv_kernel.saturating_sub(1) * conv_dim * 4)?,
-                    ssm_state: ctx.alloc_zeroed(
-                        cfg.ssm_dt_rank * cfg.ssm_state_size * cfg.ssm_head_v_dim() * 4,
-                    )?,
-                },
+                } => {
+                    let hist_b = cfg.ssm_conv_kernel.saturating_sub(1).max(1) * conv_dim * 4;
+                    let state_b = cfg.ssm_dt_rank * cfg.ssm_state_size * cfg.ssm_head_v_dim() * 4;
+                    CudaQwen4Attn::GdnSigmoid {
+                        wqkv: upload_mat(&ctx, wqkv)?,
+                        wz: upload_mat(&ctx, wz)?,
+                        w_alpha: upload_mat(&ctx, w_alpha)?,
+                        w_beta: upload_mat(&ctx, w_beta)?,
+                        conv1d: ctx.alloc_from_f32(conv1d)?,
+                        ssm_a: ctx.alloc_from_f32(ssm_a)?,
+                        ssm_dt_bias: ctx.alloc_from_f32(ssm_dt_bias)?,
+                        ssm_norm: ctx.alloc_from_f32(ssm_norm)?,
+                        w_out: upload_mat(&ctx, w_out)?,
+                        conv_hist: ctx.alloc_zeroed(hist_b)?,
+                        ssm_state: ctx.alloc_zeroed(state_b)?,
+                        conv_snap: ctx.alloc_zeroed(hist_b)?,
+                        ssm_snap: ctx.alloc_zeroed(state_b)?,
+                        spec_qkv: ctx.alloc_zeroed(spec_rows * conv_dim * 4)?,
+                        spec_alpha: ctx.alloc_zeroed(spec_rows * cfg.ssm_dt_rank * 4)?,
+                        spec_beta: ctx.alloc_zeroed(spec_rows * cfg.ssm_dt_rank * 4)?,
+                    }
+                }
             };
-            let moe = CudaMoeLayer::upload(&ctx, &lw.moe, d)?;
+            let host_map_moe = il + offload_moe_count >= total_moe_layers;
+            let moe = CudaMoeLayer::upload_with_offload(&ctx, &lw.moe, d, host_map_moe)?;
             layers.push(CudaQwen4Layer {
                 hc_attn,
                 hc_ffn,
@@ -456,10 +471,17 @@ impl Qwen4ExpCudaRunner {
         .unwrap_or(d)
         .next_multiple_of(256);
 
+        let pinned_ids = ctx.alloc_pinned(MAX_CUDA_BATCH * 4)?;
+        let pinned_pos = ctx.alloc_pinned(4)?;
+        let pinned_ple = ctx.alloc_pinned(MAX_CUDA_BATCH * d * 4)?;
         let token_ids_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * 4)?;
         let pos_buf = ctx.alloc_zeroed(4)?;
         let ple_emb_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * d * 4)?;
-        let ple_conv_hist = ctx.alloc_zeroed(cfg.ple_hist_len().max(1) * hc_dim * 4)?;
+        let ple_hist_bytes = cfg.ple_hist_len().max(1) * hc_dim * 4;
+        let ple_conv_hist = ctx.alloc_zeroed(ple_hist_bytes)?;
+        let ple_conv_snap = ctx.alloc_zeroed(ple_hist_bytes)?;
+        let n_ple_layers = layers.iter().filter(|l| l.ple.is_some()).count().max(1);
+        let spec_ple_normed = ctx.alloc_zeroed(n_ple_layers * spec_rows * hc_dim * 4)?;
         let ple_key_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * hc_dim * 4)?;
         let ple_val_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * d * 4)?;
         let ple_gated_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * hc_dim * 4)?;
@@ -494,8 +516,8 @@ impl Qwen4ExpCudaRunner {
         let xq_scratch = ctx.alloc_zeroed(MAX_CUDA_BATCH * (max_cols / 32) * BLOCK_Q8_1_BYTES)?;
         let moe_scratch =
             CudaMoeScratch::alloc(&ctx, d, cfg.n_expert, cfg.n_expert_used, cfg.max_n_ff_exp)?;
-        let logits_dev = ctx.alloc_zeroed(cfg.vocab_size * 4)?;
-        let argmax_dev = ctx.alloc_zeroed(4)?;
+        let logits_dev = ctx.alloc_zeroed(spec_rows * cfg.vocab_size * 4)?;
+        let argmax_dev = ctx.alloc_zeroed(spec_rows * 4)?;
         ctx.synchronize()?;
 
         let (free_after, _) = ctx.mem_info()?;
@@ -511,6 +533,7 @@ impl Qwen4ExpCudaRunner {
             vram_bytes,
             model_weight_bytes,
             active_decode_bytes,
+            host_offloaded_moe_layers: offload_moe_count,
             token_embd,
             hc_head,
             output,
@@ -518,12 +541,16 @@ impl Qwen4ExpCudaRunner {
             layers,
             ple_gguf,
             seq_tokens: vec![cfg.ple_eos_token_id; max_ctx.max(1)],
-            ple_host_staging: vec![0.0; MAX_CUDA_BATCH * d],
+            pinned_ids,
+            pinned_pos,
+            pinned_ple,
             token_ids_buf,
             pos_buf,
             decode_graphs: [None, None, None],
             ple_emb_buf,
             ple_conv_hist,
+            ple_conv_snap,
+            spec_ple_normed,
             ple_key_buf,
             ple_val_buf,
             ple_gated_buf,
@@ -627,7 +654,8 @@ impl Qwen4ExpCudaRunner {
                     }
                 }
             }
-            let dst = &mut self.ple_host_staging[i * d..(i + 1) * d];
+            let dst_all = self.pinned_ple.as_f32_slice_mut(n_tok * d);
+            let dst = &mut dst_all[i * d..(i + 1) * d];
             for n in 2..=ng {
                 let mut mixed = ctx_toks[0].wrapping_mul(self.cfg.ple_layer_multipliers[0]);
                 for (j, &cj) in ctx_toks.iter().enumerate().take(n).skip(1) {
@@ -647,7 +675,7 @@ impl Qwen4ExpCudaRunner {
             }
         }
         self.ple_emb_buf
-            .copy_from_f32(&self.ple_host_staging[..n_tok * d])
+            .copy_from_pinned_async(0, &self.pinned_ple, 0, n_tok * d * 4)
     }
 
     fn launch_hc_mix(
@@ -825,6 +853,28 @@ impl Qwen4ExpCudaRunner {
         compute_last_logits: bool,
         compute_argmax: bool,
     ) -> Result<(), CudaError> {
+        self.encode_chunk_impl(
+            n_tok,
+            start_pos,
+            pos_dev_ptr,
+            preloaded_embed,
+            compute_last_logits,
+            compute_argmax,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_chunk_impl(
+        &self,
+        n_tok: usize,
+        start_pos: usize,
+        pos_dev_ptr: CUdeviceptr,
+        preloaded_embed: bool,
+        compute_last_logits: bool,
+        compute_argmax: bool,
+        save_spec_state: bool,
+    ) -> Result<(), CudaError> {
         let d = self.cfg.n_embd;
         let hc = self.cfg.hc_count;
         let hc_dim = hc * d;
@@ -878,6 +928,7 @@ impl Qwen4ExpCudaRunner {
             }
         }
 
+        let mut ple_ordinal = 0usize;
         for l in &self.layers {
             if let Some(ref ple) = l.ple {
                 self.kernels.launch_linear(
@@ -937,6 +988,19 @@ impl Qwen4ExpCudaRunner {
                         )?;
                     }
                 }
+                if save_spec_state {
+                    let dst_off = ple_ordinal * (MAX_SPEC_WINDOW + 1) * hc_dim * 4;
+                    self.kernels.launch_copy_2d_rows(
+                        &self.ctx,
+                        self.spec_ple_normed.device_ptr() + dst_off as u64,
+                        self.ple_normed_buf.device_ptr(),
+                        n_tok * hc_dim,
+                        n_tok * hc_dim,
+                        n_tok * hc_dim,
+                        1,
+                    )?;
+                }
+                ple_ordinal += 1;
                 {
                     let mut pr = self.res_hc_buf.device_ptr();
                     let mut pg = self.ple_gated_buf.device_ptr();
@@ -994,6 +1058,10 @@ impl Qwen4ExpCudaRunner {
                     w_out,
                     conv_hist,
                     ssm_state,
+                    spec_qkv,
+                    spec_alpha,
+                    spec_beta,
+                    ..
                 } => {
                     let qkv_q8 = is_q8_1_mmvq_dtype(wqkv.dtype);
                     let z_q8 = is_q8_1_mmvq_dtype(wz.dtype);
@@ -1046,6 +1114,11 @@ impl Qwen4ExpCudaRunner {
                         n_tok,
                         true,
                     )?;
+                    if save_spec_state {
+                        spec_qkv.copy_from_device(&self.qkv_buf, n_tok * conv_dim * 4)?;
+                        spec_alpha.copy_from_device(&self.alpha_buf, n_tok * hv * 4)?;
+                        spec_beta.copy_from_device(&self.beta_buf, n_tok * hv * 4)?;
+                    }
 
                     for t in 0..n_tok {
                         let qkv_t = self.qkv_buf.device_ptr() + (t * conv_dim * 4) as u64;
@@ -1577,7 +1650,26 @@ impl Qwen4ExpCudaRunner {
         }
 
         // Output head HC Mix + `output.weight`
-        if compute_last_logits {
+        if save_spec_state {
+            self.launch_hc_mix(&self.hc_head, self.cur_buf.device_ptr(), None, n_tok)?;
+            self.kernels.launch_linear(
+                &self.ctx,
+                &self.output,
+                self.cur_buf.device_ptr(),
+                self.xq_scratch.device_ptr(),
+                false,
+                self.logits_dev.device_ptr(),
+                n_tok,
+                false,
+            )?;
+            self.kernels.launch_argmax_rows(
+                &self.ctx,
+                self.logits_dev.device_ptr(),
+                self.argmax_dev.device_ptr(),
+                self.cfg.vocab_size,
+                n_tok,
+            )?;
+        } else if compute_last_logits {
             self.launch_hc_mix(&self.hc_head, self.cur_buf.device_ptr(), None, n_tok)?;
             let last_x = self.cur_buf.device_ptr() + ((n_tok - 1) * d * 4) as u64;
             self.kernels.launch_linear(
@@ -1609,8 +1701,12 @@ impl Qwen4ExpCudaRunner {
         compute_logits: bool,
         compute_argmax: bool,
     ) -> Result<(), CudaError> {
-        self.token_ids_buf.copy_from_u32(&[token_id])?;
-        self.pos_buf.copy_from_u32(&[pos as u32])?;
+        self.pinned_ids.write_u32_at(0, &[token_id]);
+        self.pinned_pos.write_u32_at(0, &[pos as u32]);
+        self.token_ids_buf
+            .copy_from_pinned_async(0, &self.pinned_ids, 0, 4)?;
+        self.pos_buf
+            .copy_from_pinned_async(0, &self.pinned_pos, 0, 4)?;
         self.stage_ple_to_gpu(&[token_id], pos)?;
         let slot = if !compute_logits {
             0
@@ -1631,6 +1727,281 @@ impl Qwen4ExpCudaRunner {
             .as_ref()
             .expect("captured qwen4exp decode graph")
             .launch()
+    }
+
+    /// Evaluates `[x_tok, drafts...]` (`w = 1 + drafts.len()`) at `pos`, writes the `1 + accepted`
+    /// committed greedy predictions into `out_committed`, and rolls back `ple_conv_hist`,
+    /// `seq_tokens`, and all `GdnSigmoid` states to `pos + committed` without re-running matmuls.
+    pub fn verify_window_greedy(
+        &mut self,
+        x_tok: u32,
+        drafts: &[u32],
+        pos: usize,
+        out_committed: &mut Vec<u32>,
+    ) -> Result<(usize, usize), CudaError> {
+        if drafts.is_empty() {
+            let next = self.forward_token_greedy(x_tok, pos)?;
+            out_committed.clear();
+            out_committed.push(next);
+            return Ok((1, 0));
+        }
+        let d_len = drafts.len().min(MAX_SPEC_WINDOW);
+        let w = 1 + d_len;
+        if pos + w > self.max_ctx {
+            let next = self.forward_token_greedy(x_tok, pos)?;
+            out_committed.clear();
+            out_committed.push(next);
+            return Ok((1, 0));
+        }
+        let start_pos = pos;
+        let mut win_buf = [0u32; MAX_SPEC_WINDOW + 1];
+        win_buf[0] = x_tok;
+        win_buf[1..w].copy_from_slice(&drafts[..d_len]);
+        let win_toks = &win_buf[..w];
+        let mut picks = [0u32; MAX_SPEC_WINDOW + 1];
+
+        // Snapshot recurrent PLE + GDN states before speculative window execution.
+        self.ple_conv_snap
+            .copy_from_device(&self.ple_conv_hist, self.ple_conv_hist.byte_len())?;
+        for l in &self.layers {
+            if let CudaQwen4Attn::GdnSigmoid {
+                conv_hist,
+                ssm_state,
+                conv_snap,
+                ssm_snap,
+                ..
+            } = &l.attn
+            {
+                conv_snap.copy_from_device(conv_hist, conv_hist.byte_len())?;
+                ssm_snap.copy_from_device(ssm_state, ssm_state.byte_len())?;
+            }
+        }
+
+        self.pinned_ids.write_u32_at(0, win_toks);
+        self.token_ids_buf
+            .copy_from_pinned_async(0, &self.pinned_ids, 0, w * 4)?;
+        self.stage_ple_to_gpu(win_toks, start_pos)?;
+        self.encode_chunk_impl(w, start_pos, 0, false, false, false, true)?;
+        // SAFETY: `[u32]` is POD; `w <= MAX_SPEC_WINDOW + 1`.
+        let pick_bytes =
+            unsafe { core::slice::from_raw_parts_mut(picks.as_mut_ptr().cast::<u8>(), w * 4) };
+        self.argmax_dev.copy_to_bytes(pick_bytes)?;
+
+        let mut accepted = 0usize;
+        while accepted < d_len && picks[accepted] == drafts[accepted] {
+            accepted += 1;
+        }
+        let committed = accepted + 1;
+        out_committed.clear();
+        out_committed.extend_from_slice(&picks[..committed]);
+
+        if committed < w {
+            // Clear rejected `seq_tokens` slots so future PLE N-gram hashes see clean history.
+            for p in (start_pos + committed)..(start_pos + w) {
+                if p < self.seq_tokens.len() {
+                    self.seq_tokens[p] = self.cfg.ple_eos_token_id;
+                }
+            }
+            // Replay exact `committed` PLE dilated-conv steps from `ple_conv_snap` + `spec_ple_normed`.
+            self.ple_conv_hist
+                .copy_from_device(&self.ple_conv_snap, self.ple_conv_hist.byte_len())?;
+            let hc_dim = self.cfg.hc_count * self.cfg.n_embd;
+            let mut ple_ord = 0usize;
+            for l in &self.layers {
+                if let Some(ref ple) = l.ple {
+                    let src_off = ple_ord * (MAX_SPEC_WINDOW + 1) * hc_dim * 4;
+                    let mut pr = self.res_hc_buf.device_ptr();
+                    let mut pg = self.ple_gated_buf.device_ptr();
+                    let mut pn = self.spec_ple_normed.device_ptr() + src_off as u64;
+                    let mut pcw = ple.conv1d.device_ptr();
+                    let mut ph = self.ple_conv_hist.device_ptr();
+                    let mut chd = hc_dim as i32;
+                    let mut ck = self.cfg.ple_conv_kernel as i32;
+                    let mut cs = self.cfg.ple_ngram_size as i32;
+                    let mut nt = committed as i32;
+                    let mut args: [*mut c_void; 9] = [
+                        (&mut pr as *mut CUdeviceptr).cast(),
+                        (&mut pg as *mut CUdeviceptr).cast(),
+                        (&mut pn as *mut CUdeviceptr).cast(),
+                        (&mut pcw as *mut CUdeviceptr).cast(),
+                        (&mut ph as *mut CUdeviceptr).cast(),
+                        (&mut chd as *mut i32).cast(),
+                        (&mut ck as *mut i32).cast(),
+                        (&mut cs as *mut i32).cast(),
+                        (&mut nt as *mut i32).cast(),
+                    ];
+                    // SAFETY: Replays `committed` steps of `ple_conv_hist` into scratch `res_hc_buf`.
+                    unsafe {
+                        self.ctx.launch(
+                            "qwen4exp_ple_dilated_conv_add_f32",
+                            self.qk.ple_dilated_conv,
+                            ((hc_dim as u32).div_ceil(256), 1, 1),
+                            (256, 1, 1),
+                            0,
+                            &mut args,
+                        )?;
+                    }
+                    ple_ord += 1;
+                }
+            }
+
+            // Replay exact `committed` GDN recurrence steps from `conv_snap` / `ssm_snap` + `spec_*`.
+            let hk = self.cfg.ssm_n_group;
+            let hv = self.cfg.ssm_dt_rank;
+            let s_dim = self.cfg.ssm_state_size;
+            let dv_dim = self.cfg.ssm_head_v_dim();
+            let conv_dim = self.cfg.conv_dim();
+            for l in &self.layers {
+                if let CudaQwen4Attn::GdnSigmoid {
+                    conv1d,
+                    ssm_a,
+                    ssm_dt_bias,
+                    conv_hist,
+                    ssm_state,
+                    conv_snap,
+                    ssm_snap,
+                    spec_qkv,
+                    spec_alpha,
+                    spec_beta,
+                    ..
+                } = &l.attn
+                {
+                    conv_hist.copy_from_device(conv_snap, conv_snap.byte_len())?;
+                    ssm_state.copy_from_device(ssm_snap, ssm_snap.byte_len())?;
+                    for t in 0..committed {
+                        let qkv_t = spec_qkv.device_ptr() + (t * conv_dim * 4) as u64;
+                        let a_t = spec_alpha.device_ptr() + (t * hv * 4) as u64;
+                        let b_t = spec_beta.device_ptr() + (t * hv * 4) as u64;
+                        let out_t = self.v_buf.device_ptr();
+                        {
+                            let mut pqkv = qkv_t;
+                            let mut phist = conv_hist.device_ptr();
+                            let mut pcw = conv1d.device_ptr();
+                            let mut pq = self.q_buf.device_ptr();
+                            let mut pk = self.k_buf.device_ptr();
+                            let mut pv = self.hb_buf.device_ptr();
+                            let mut cd = conv_dim as i32;
+                            let mut dc = self.cfg.ssm_conv_kernel as i32;
+                            let mut kd = (hk * s_dim) as i32;
+                            let mut args: [*mut c_void; 9] = [
+                                (&mut pqkv as *mut CUdeviceptr).cast(),
+                                (&mut phist as *mut CUdeviceptr).cast(),
+                                (&mut pcw as *mut CUdeviceptr).cast(),
+                                (&mut pq as *mut CUdeviceptr).cast(),
+                                (&mut pk as *mut CUdeviceptr).cast(),
+                                (&mut pv as *mut CUdeviceptr).cast(),
+                                (&mut cd as *mut i32).cast(),
+                                (&mut dc as *mut i32).cast(),
+                                (&mut kd as *mut i32).cast(),
+                            ];
+                            // SAFETY: Matches `gdn_conv1d_silu_split_step_f32`.
+                            unsafe {
+                                self.ctx.launch(
+                                    "gdn_conv1d_silu_split_step_f32",
+                                    self.kernels.gdn_conv1d_silu_split_step_f32,
+                                    ((conv_dim as u32).div_ceil(256), 1, 1),
+                                    (256, 1, 1),
+                                    0,
+                                    &mut args,
+                                )?;
+                            }
+                        }
+                        {
+                            let mut pq = self.q_buf.device_ptr();
+                            let mut pk = self.k_buf.device_ptr();
+                            let mut sd = s_dim as i32;
+                            let mut eps = self.cfg.rms_eps;
+                            let mut args: [*mut c_void; 4] = [
+                                (&mut pq as *mut CUdeviceptr).cast(),
+                                (&mut pk as *mut CUdeviceptr).cast(),
+                                (&mut sd as *mut i32).cast(),
+                                (&mut eps as *mut f32).cast(),
+                            ];
+                            // SAFETY: Matches `gdn_l2_norm_qk_f32`.
+                            unsafe {
+                                self.ctx.launch(
+                                    "gdn_l2_norm_qk_f32",
+                                    self.kernels.gdn_l2_norm_qk_f32,
+                                    (hk as u32, 1, 1),
+                                    (32, 1, 1),
+                                    0,
+                                    &mut args,
+                                )?;
+                            }
+                        }
+                        {
+                            let mut pa = a_t;
+                            let mut pb = b_t;
+                            let mut psa = ssm_a.device_ptr();
+                            let mut pdb = ssm_dt_bias.device_ptr();
+                            let mut pg = self.gdn_g_buf.device_ptr();
+                            let mut pbo = self.gdn_b_buf.device_ptr();
+                            let mut chv = hv as i32;
+                            let mut args: [*mut c_void; 7] = [
+                                (&mut pa as *mut CUdeviceptr).cast(),
+                                (&mut pb as *mut CUdeviceptr).cast(),
+                                (&mut psa as *mut CUdeviceptr).cast(),
+                                (&mut pdb as *mut CUdeviceptr).cast(),
+                                (&mut pg as *mut CUdeviceptr).cast(),
+                                (&mut pbo as *mut CUdeviceptr).cast(),
+                                (&mut chv as *mut i32).cast(),
+                            ];
+                            // SAFETY: Matches `gdn_gates_f32`.
+                            unsafe {
+                                self.ctx.launch(
+                                    "gdn_gates_f32",
+                                    self.kernels.gdn_gates_f32,
+                                    ((hv as u32).div_ceil(64), 1, 1),
+                                    (64, 1, 1),
+                                    0,
+                                    &mut args,
+                                )?;
+                            }
+                        }
+                        {
+                            let mut pst = ssm_state.device_ptr();
+                            let mut pq = self.q_buf.device_ptr();
+                            let mut pk = self.k_buf.device_ptr();
+                            let mut pv = self.hb_buf.device_ptr();
+                            let mut pg = self.gdn_g_buf.device_ptr();
+                            let mut pb = self.gdn_b_buf.device_ptr();
+                            let mut py = out_t;
+                            let mut chk = hk as i32;
+                            let mut chv = hv as i32;
+                            let mut csd = s_dim as i32;
+                            let mut cdv = dv_dim as i32;
+                            let mut args: [*mut c_void; 11] = [
+                                (&mut pst as *mut CUdeviceptr).cast(),
+                                (&mut pq as *mut CUdeviceptr).cast(),
+                                (&mut pk as *mut CUdeviceptr).cast(),
+                                (&mut pv as *mut CUdeviceptr).cast(),
+                                (&mut pg as *mut CUdeviceptr).cast(),
+                                (&mut pb as *mut CUdeviceptr).cast(),
+                                (&mut py as *mut CUdeviceptr).cast(),
+                                (&mut chk as *mut i32).cast(),
+                                (&mut chv as *mut i32).cast(),
+                                (&mut csd as *mut i32).cast(),
+                                (&mut cdv as *mut i32).cast(),
+                            ];
+                            // SAFETY: Matches `gdn_recurrence_step_f32`.
+                            unsafe {
+                                self.ctx.launch(
+                                    "gdn_recurrence_step_f32",
+                                    self.kernels.gdn_recurrence_step_f32,
+                                    (hv as u32, (dv_dim as u32).div_ceil(4), 1),
+                                    (32, 4, 1),
+                                    0,
+                                    &mut args,
+                                )?;
+                            }
+                        }
+                    }
+                }
+            }
+            self.ctx.synchronize()?;
+        }
+
+        Ok((committed, accepted))
     }
 
     pub fn forward_token(
@@ -1691,7 +2062,9 @@ impl Qwen4ExpCudaRunner {
         while off < token_ids.len() {
             let chunk = &token_ids[off..(off + MAX_CUDA_BATCH).min(token_ids.len())];
             let is_last = off + chunk.len() == token_ids.len();
-            self.token_ids_buf.copy_from_u32(chunk)?;
+            self.pinned_ids.write_u32_at(0, chunk);
+            self.token_ids_buf
+                .copy_from_pinned_async(0, &self.pinned_ids, 0, chunk.len() * 4)?;
             self.stage_ple_to_gpu(chunk, start_pos + off)?;
             self.encode_chunk(
                 chunk.len(),

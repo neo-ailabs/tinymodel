@@ -234,6 +234,27 @@ void main() {
                 }
             }
         }
+    } else if (DTYPE == 6u) {
+        const uint nb2 = pc.n_in / 64u;
+        const uint total_bytes = nb2 * 16u;
+        for (uint idx = lane; idx < total_bytes; idx += sg_size) {
+            const uint ib2 = idx >> 4u;
+            const uint byte_in_blk = idx & 15u;
+            const uint x0 = x_base + ib2 * 64u + byte_in_blk * 4u;
+            const vec4 xv = vec4(x[x0], x[x0 + 1u], x[x0 + 2u], x[x0 + 3u]);
+            for (uint r = 0u; r < NR; ++r) {
+                const uint b = row_b[r] + ib2 * 9u;
+                const float d = unpackHalf2x16(uint(w16[b])).x;
+                const uint bt = ubyte_at(b + 1u, byte_in_blk);
+                const vec4 q4 = vec4(
+                    float(int(bt & 3u) - 1),
+                    float(int((bt >> 2u) & 3u) - 1),
+                    float(int((bt >> 4u) & 3u) - 1),
+                    float(int((bt >> 6u) & 3u) - 1)
+                );
+                acc[r] = fma(d, dot(q4, xv), acc[r]);
+            }
+        }
     } else {
         for (uint k_i = lane; k_i < pc.n_in; k_i += sg_size) {
             const float xv = x[x_base + k_i];

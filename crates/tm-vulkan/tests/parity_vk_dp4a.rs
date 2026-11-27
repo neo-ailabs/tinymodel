@@ -166,6 +166,20 @@ fn make_f32_bytes(rng: &mut Rng, len: usize, center: f32, scale: f32) -> Vec<u8>
     out
 }
 
+fn make_q2_0_bytes(rng: &mut Rng, rows: usize, cols: usize) -> Vec<u8> {
+    assert!(cols.is_multiple_of(64));
+    let n_blocks = rows * (cols / 64);
+    let mut out = Vec::with_capacity(n_blocks * 18);
+    for _ in 0..n_blocks {
+        let d = f32_to_f16(0.02 + rng.f32().abs() * 0.04);
+        out.extend_from_slice(&d.to_le_bytes());
+        for _ in 0..16 {
+            out.push((rng.next_u64() & 0xFF) as u8);
+        }
+    }
+    out
+}
+
 fn write_gguf(kv: &[u8], n_kv: u64, ts: &[TensorEntry]) -> Vec<u8> {
     let mut tinfos = Vec::new();
     let mut offset = 0u64;
@@ -595,8 +609,12 @@ fn parity_vk_dp4a_qwen35_and_llama_and_inkling2() {
         ts_l.push(TensorEntry {
             name: format!("{p}.ffn_down.weight"),
             dims: vec![n_ff as u64, n_embd as u64],
-            ggml_type: 3,
-            data: make_q4_1_bytes(&mut rng, n_embd, n_ff),
+            ggml_type: if l == 0 { 3 } else { 42 }, // l=0: Q4_1, l=1: native Q2_0 (`DTYPE == 6u`)!
+            data: if l == 0 {
+                make_q4_1_bytes(&mut rng, n_embd, n_ff)
+            } else {
+                make_q2_0_bytes(&mut rng, n_embd, n_ff)
+            },
         });
     }
     let q3_gguf = open_temp_gguf("q3", &write_gguf(&kv_l, 12, &ts_l));

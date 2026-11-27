@@ -73,15 +73,16 @@ pub(crate) fn dtype_code(dt: DType) -> Result<u32, VulkanError> {
         DType::Q5K => Ok(3),
         DType::Q6K => Ok(4),
         DType::F32 => Ok(5),
+        DType::Q2_0 => Ok(6),
         other => Err(VulkanError::UnsupportedDType(other)),
     }
 }
 
 /// Normalizes a 2D `[rows, cols]` GGUF weight slice into a GPU-native dtype:
-/// - `Q4_0 / Q4_1 / Q8_0 / Q5K / Q6K / F32`: zero-copy borrowed slice.
+/// - `Q4_0 / Q4_1 / Q8_0 / Q5K / Q6K / Q2_0 / F32`: zero-copy borrowed slice.
 /// - `Q4_0x4` (M3 offline 4-row interleaved `Q4_0`): 0-ULP lossless byte uninterleave back to `Q4_0`
 ///   so `CoopMatF16`, `CoopMatI8`, and fused QKV/SwiGLU GEMV run at full native speed.
-/// - `F16 / BF16 / Q2_0 / TQ2_0 / Iq2Xxs / Iq3Xxs / Iq4Nl`: load-time dequantization to `F32`
+/// - `F16 / BF16 / TQ2_0 / Iq2Xxs / Iq3Xxs / Iq4Nl`: load-time dequantization to `F32`
 ///   so M2/M4 converted or pruned GGUFs also execute seamlessly on Vulkan.
 pub(crate) fn normalize_vk_mat_bytes<'a>(
     dtype: DType,
@@ -91,6 +92,9 @@ pub(crate) fn normalize_vk_mat_bytes<'a>(
 ) -> Result<(DType, std::borrow::Cow<'a, [u8]>), VulkanError> {
     match dtype {
         DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q5K | DType::Q6K | DType::F32 => {
+            Ok((dtype, std::borrow::Cow::Borrowed(bytes)))
+        }
+        DType::Q2_0 if cols.is_multiple_of(tm_core::QK2_0) => {
             Ok((dtype, std::borrow::Cow::Borrowed(bytes)))
         }
         DType::Q4_0x4 => {
@@ -285,7 +289,7 @@ impl VulkanContext {
         let row_bytes = dtype.row_bytes(cols);
         let sg = self.info().subgroup_size;
         let (pipe, gx, gy) = match dtype {
-            DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::F32 => (
+            DType::Q4_0 | DType::Q4_1 | DType::Q8_0 | DType::Q2_0 | DType::F32 => (
                 self.pipeline("gemm_tiled", dt, SPV_GEMM_TILED, 3, 20, &[128, dt])?,
                 (rows as u32).div_ceil(64),
                 (n_tok as u32).div_ceil(32),

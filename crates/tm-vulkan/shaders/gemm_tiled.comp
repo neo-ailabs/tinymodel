@@ -140,6 +140,21 @@ void main() {
                         W_sh[2u * j][lr]      = float(sbyte_lo(u)) * d;
                         W_sh[2u * j + 1u][lr] = float(sbyte_hi(u)) * d;
                     }
+                } else if (DTYPE == 6u) {
+                    const uint b = w_row_base + (ib >> 1u) * 9u;
+                    const float d = unpackHalf2x16(uint(w16[b])).x;
+                    const uint u = uint(w16[b + 1u + (ib & 1u) * 4u + sub]);
+                    const uint b0 = u & 0xFFu;
+                    const uint b1 = u >> 8u;
+                    const uint k0 = sub * 8u;
+                    W_sh[k0 + 0u][lr] = float(int(b0 & 3u) - 1) * d;
+                    W_sh[k0 + 1u][lr] = float(int((b0 >> 2u) & 3u) - 1) * d;
+                    W_sh[k0 + 2u][lr] = float(int((b0 >> 4u) & 3u) - 1) * d;
+                    W_sh[k0 + 3u][lr] = float(int((b0 >> 6u) & 3u) - 1) * d;
+                    W_sh[k0 + 4u][lr] = float(int(b1 & 3u) - 1) * d;
+                    W_sh[k0 + 5u][lr] = float(int((b1 >> 2u) & 3u) - 1) * d;
+                    W_sh[k0 + 6u][lr] = float(int((b1 >> 4u) & 3u) - 1) * d;
+                    W_sh[k0 + 7u][lr] = float(int((b1 >> 6u) & 3u) - 1) * d;
                 } else {
                     const uint b = w_row_base + (ib * 32u + load_col) * 2u;
                     [[unroll]] for (uint j = 0u; j < 8u; ++j) {

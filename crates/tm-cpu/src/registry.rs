@@ -1341,6 +1341,31 @@ mod x86_64_wrappers {
         // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
         unsafe { avx2::gemm_q8_0_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
     }
+    fn avx2_vec_dot_q2_0(a: &[BlockQ2_0], b: &[BlockQ8_0]) -> f32 {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::vec_dot_q2_0_q8_0(a, b) }
+    }
+    fn avx2_gemv_q2_0(
+        w: &[BlockQ2_0],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::gemv_q2_0_q8_0(w, x, out, rows, cols_blocks) }
+    }
+    fn avx2_gemm_q2_0(
+        w: &[BlockQ2_0],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::gemm_q2_0_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
+    }
     fn avx2_dot_f32_bf16(x: &[f32], w_bf16: &[u16]) -> f32 {
         // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
         unsafe { avx2::dot_f32_bf16(x, w_bf16) }
@@ -1444,9 +1469,9 @@ mod x86_64_wrappers {
         vec_dot_q6_k_q8_k: generic::vec_dot_q6_k_q8_k,
         gemv_q6_k_q8_k: generic::gemv_q6_k_q8_k,
         gemm_q6_k_q8_k: generic::gemm_q6_k_q8_k,
-        vec_dot_q2_0_q8_0: generic::vec_dot_q2_0_q8_0,
-        gemv_q2_0_q8_0: generic::gemv_q2_0_q8_0,
-        gemm_q2_0_q8_0: generic::gemm_q2_0_q8_0,
+        vec_dot_q2_0_q8_0: avx2_vec_dot_q2_0,
+        gemv_q2_0_q8_0: avx2_gemv_q2_0,
+        gemm_q2_0_q8_0: avx2_gemm_q2_0,
         vec_dot_tq2_0_q8_k: generic::vec_dot_tq2_0_q8_k,
         gemv_tq2_0_q8_k: generic::gemv_tq2_0_q8_k,
         gemm_tq2_0_q8_k: generic::gemm_tq2_0_q8_k,

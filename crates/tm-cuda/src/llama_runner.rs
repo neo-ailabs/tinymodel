@@ -8,12 +8,14 @@ use tm_core::{DType, KvType, dequantize_q4_0x4_single_row, dequantize_row_bytes,
 use tm_cpu::RopeType;
 use tm_gguf::GgufFile;
 use tm_models::{
-    ExpertGatingFunc, LlamaConfig, LlamaModel, PackedExperts, RawMatView, SharedExpertWeights,
-    SparseMoeConfig, SparseMoeFfn,
+    ExpertGatingFunc, LlamaConfig, LlamaModel, MAX_SPEC_WINDOW, PackedExperts, RawMatView,
+    SharedExpertWeights, SparseMoeConfig, SparseMoeFfn,
 };
 
 use crate::CudaError;
-use crate::driver::{CUdeviceptr, CudaBuffer, CudaContext, CudaEvent, CudaGraphExec};
+use crate::driver::{
+    CUdeviceptr, CudaBuffer, CudaContext, CudaEvent, CudaGraphExec, CudaPinnedBuffer,
+};
 use crate::kernels::{BLOCK_Q8_1_BYTES, CudaKernels, CudaMat, dtype_cuda_tag};
 
 /// Maximum batch chunk processed in a single prefill pass on GPU (`128` tokens).
@@ -132,6 +134,9 @@ pub(crate) struct CudaMoeScratch {
     pub logits: CudaBuffer,
     pub top_ids: CudaBuffer,
     pub top_weights: CudaBuffer,
+    pub exp_offs: CudaBuffer,
+    pub tile_offs: CudaBuffer,
+    pub sorted_ts: CudaBuffer,
     pub exp_gate: CudaBuffer,
     pub exp_up: CudaBuffer,
     pub slot_outs: CudaBuffer,
@@ -156,6 +161,9 @@ impl CudaMoeScratch {
             logits: ctx.alloc_zeroed(MAX_CUDA_BATCH * ne * 4)?,
             top_ids: ctx.alloc_zeroed(rows_slots * 4)?,
             top_weights: ctx.alloc_zeroed(rows_slots * 4)?,
+            exp_offs: ctx.alloc_zeroed((ne + 2) * 4)?,
+            tile_offs: ctx.alloc_zeroed((ne + 2) * 4)?,
+            sorted_ts: ctx.alloc_zeroed(rows_slots * 4)?,
             exp_gate: ctx.alloc_zeroed(rows_slots * 2 * n_ff_exp * 4)?,
             exp_up: ctx.alloc_zeroed(rows_slots * n_ff_exp * 4)?,
             slot_outs: ctx.alloc_zeroed(rows_slots * n_embd.max(1) * 4)?,
@@ -203,11 +211,85 @@ pub(crate) fn moe_weight_bytes(moe: &SparseMoeFfn<'_>) -> usize {
     bytes
 }
 
+pub(crate) fn moe_expert_only_bytes(moe: &SparseMoeFfn<'_>) -> usize {
+    match &moe.experts {
+        PackedExperts::Separate {
+            gate_exps,
+            up_exps,
+            down_exps,
+            ..
+        } => gate_exps.map_or(0, |b| b.len()) + up_exps.len() + down_exps.len(),
+        PackedExperts::FusedGateUp {
+            gate_up_exps,
+            down_exps,
+            ..
+        } => gate_up_exps.len() + down_exps.len(),
+    }
+}
+
+/// Decides how many trailing MoE layers (`0..=moe_exp_sizes.len()`) should place their expert
+/// weight matrices in zero-copy device-mapped pinned DDR (`P2`: `TM_CUDA_MOE_HOST_OFFLOAD` or
+/// automatic fallback when `needed_bytes > free_vram`).
+pub(crate) fn plan_moe_host_offload_count(
+    free_vram: usize,
+    needed_bytes: usize,
+    moe_exp_sizes: &[usize],
+) -> usize {
+    if moe_exp_sizes.is_empty() {
+        return 0;
+    }
+    if let Ok(raw) = std::env::var("TM_CUDA_MOE_HOST_OFFLOAD") {
+        let s = raw.trim().to_ascii_lowercase();
+        if matches!(s.as_str(), "true" | "all" | "yes") {
+            return moe_exp_sizes.len();
+        }
+        if let Ok(n) = s.parse::<usize>() {
+            return n.min(moe_exp_sizes.len());
+        }
+    }
+    if needed_bytes <= free_vram {
+        return 0;
+    }
+    let deficit = needed_bytes - free_vram;
+    let mut saved = 0usize;
+    let mut count = 0usize;
+    for &sz in moe_exp_sizes.iter().rev() {
+        saved += sz;
+        count += 1;
+        if saved >= deficit {
+            return count;
+        }
+    }
+    0
+}
+
+fn alloc_expert_buf(
+    ctx: &CudaContext,
+    bytes: &[u8],
+    host_mapped: bool,
+) -> Result<CudaBuffer, CudaError> {
+    if host_mapped {
+        ctx.alloc_host_mapped_from_bytes(bytes)
+    } else {
+        ctx.alloc_from_bytes(bytes)
+    }
+}
+
 impl CudaMoeLayer {
+    #[allow(dead_code)]
     pub(crate) fn upload(
         ctx: &CudaContext,
         moe: &SparseMoeFfn<'_>,
         n_embd: usize,
+    ) -> Result<Self, CudaError> {
+        Self::upload_with_offload(ctx, moe, n_embd, false)
+    }
+
+    pub(crate) fn upload_with_offload(
+        ctx: &CudaContext,
+        moe: &SparseMoeFfn<'_>,
+        n_embd: usize,
+        host_mapped: bool,
     ) -> Result<Self, CudaError> {
         let gate_inp = upload_mat(ctx, &moe.gate_inp)?;
         let gate_inp_bias = match &moe.gate_inp_bias {
@@ -232,17 +314,17 @@ impl CudaMoeLayer {
                 down_exp_bytes,
             } => CudaPackedExperts::Separate {
                 gate_exps: match gate_exps {
-                    Some(b) => Some(ctx.alloc_from_bytes(b)?),
+                    Some(b) => Some(alloc_expert_buf(ctx, b, host_mapped)?),
                     None => None,
                 },
                 gate_dtype: dtype_cuda_tag(*gate_dtype)?,
                 gate_row_bytes: gate_dtype.row_bytes(n_embd),
                 gate_exp_bytes: *gate_exp_bytes,
-                up_exps: ctx.alloc_from_bytes(up_exps)?,
+                up_exps: alloc_expert_buf(ctx, up_exps, host_mapped)?,
                 up_dtype: dtype_cuda_tag(*up_dtype)?,
                 up_row_bytes: up_dtype.row_bytes(n_embd),
                 up_exp_bytes: *up_exp_bytes,
-                down_exps: ctx.alloc_from_bytes(down_exps)?,
+                down_exps: alloc_expert_buf(ctx, down_exps, host_mapped)?,
                 down_dtype: dtype_cuda_tag(*down_dtype)?,
                 down_row_bytes: down_dtype.row_bytes(n_ff_exp),
                 down_exp_bytes: *down_exp_bytes,
@@ -256,12 +338,12 @@ impl CudaMoeLayer {
                 down_dtype,
                 down_exp_bytes,
             } => CudaPackedExperts::FusedGateUp {
-                gate_up_exps: ctx.alloc_from_bytes(gate_up_exps)?,
+                gate_up_exps: alloc_expert_buf(ctx, gate_up_exps, host_mapped)?,
                 gate_up_dtype: dtype_cuda_tag(*gate_up_dtype)?,
                 gate_up_row_bytes: gate_up_dtype.row_bytes(n_embd),
                 gate_up_exp_bytes: *gate_up_exp_bytes,
                 half_exp_bytes: *half_exp_bytes,
-                down_exps: ctx.alloc_from_bytes(down_exps)?,
+                down_exps: alloc_expert_buf(ctx, down_exps, host_mapped)?,
                 down_dtype: dtype_cuda_tag(*down_dtype)?,
                 down_row_bytes: down_dtype.row_bytes(n_ff_exp),
                 down_exp_bytes: *down_exp_bytes,
@@ -315,7 +397,7 @@ impl CudaMoeLayer {
         let n_ff_exp = self.cfg.n_ff_exp;
         let rows_slots = n_tok * ku;
 
-        // 1. Router logits `[n_tok, n_expert]`
+        // 1. Router logits `[n_tok, n_expert]` (`force_mmvq = false` so `n_tok > 8` uses Tensor Cores!)
         kernels.launch_linear(
             ctx,
             &self.gate_inp,
@@ -324,7 +406,7 @@ impl CudaMoeLayer {
             false,
             scratch.logits.device_ptr(),
             n_tok,
-            true,
+            false,
         )?;
         if let Some(ref b) = self.gate_inp_bias {
             kernels.launch_add_bias(ctx, scratch.logits.device_ptr(), b.device_ptr(), ne, n_tok)?;
@@ -352,161 +434,148 @@ impl CudaMoeLayer {
             n_tok,
         )?;
 
-        // 3. Parallel multi-slot `__dp4a` expert evaluation across ALL `(n_tok, ku)` slots at once!
-        let in_xq_ptr = if d.is_multiple_of(32) {
-            kernels.launch_quantize_q8_1(ctx, ffn_in_ptr, scratch.exp_xq.device_ptr(), d, n_tok)?;
-            scratch.exp_xq.device_ptr()
-        } else {
-            0
-        };
-
-        match &self.experts {
-            CudaPackedExperts::Separate {
-                gate_exps,
-                gate_dtype,
-                gate_row_bytes,
-                gate_exp_bytes,
-                up_exps,
-                up_dtype,
-                up_row_bytes,
-                up_exp_bytes,
-                down_exps,
-                down_dtype,
-                down_row_bytes,
-                down_exp_bytes,
-            } => {
-                kernels.launch_moe_indexed_gemv_q8_1(
-                    ctx,
-                    up_exps.device_ptr(),
-                    in_xq_ptr,
-                    ffn_in_ptr,
-                    scratch.top_ids.device_ptr(),
-                    scratch.top_weights.device_ptr(),
-                    0,
-                    scratch.exp_up.device_ptr(),
-                    *up_dtype,
-                    n_ff_exp,
-                    d,
-                    *up_row_bytes,
-                    *up_exp_bytes,
-                    ku,
-                    n_tok,
-                    0,
-                    0,
-                )?;
-                let down_uses_q8 = is_q8_1_moe_dtype(*down_dtype, n_ff_exp);
-                let (down_xq_ptr, down_f32_ptr) = if let Some(ge) = gate_exps {
-                    kernels.launch_moe_indexed_gemv_q8_1(
+        // 3a. `P0-2`: Grouped `wmma` Tensor Core prefill GEMM when `n_tok >= 16`!
+        let use_grouped_wmma = n_tok >= 16
+            && ne <= 512
+            && ctx.info().has_fp16_wmma()
+            && d.is_multiple_of(32)
+            && n_ff_exp.is_multiple_of(32);
+        if use_grouped_wmma {
+            kernels.launch_moe_build_expert_buckets(
+                ctx,
+                scratch.top_ids.device_ptr(),
+                scratch.exp_offs.device_ptr(),
+                scratch.tile_offs.device_ptr(),
+                scratch.sorted_ts.device_ptr(),
+                rows_slots,
+                ne,
+            )?;
+            match &self.experts {
+                CudaPackedExperts::Separate {
+                    gate_exps,
+                    gate_dtype,
+                    gate_row_bytes,
+                    gate_exp_bytes,
+                    up_exps,
+                    up_dtype,
+                    up_row_bytes,
+                    up_exp_bytes,
+                    down_exps,
+                    down_dtype,
+                    down_row_bytes,
+                    down_exp_bytes,
+                } => {
+                    kernels.launch_wmma_moe_grouped(
                         ctx,
-                        ge.device_ptr(),
-                        in_xq_ptr,
+                        up_exps.device_ptr(),
                         ffn_in_ptr,
-                        scratch.top_ids.device_ptr(),
+                        scratch.exp_offs.device_ptr(),
+                        scratch.tile_offs.device_ptr(),
+                        scratch.sorted_ts.device_ptr(),
                         scratch.top_weights.device_ptr(),
                         0,
-                        scratch.exp_gate.device_ptr(),
-                        *gate_dtype,
+                        scratch.exp_up.device_ptr(),
+                        *up_dtype,
                         n_ff_exp,
                         d,
-                        *gate_row_bytes,
-                        *gate_exp_bytes,
+                        *up_row_bytes,
+                        *up_exp_bytes,
+                        0,
+                        ne,
                         ku,
                         n_tok,
                         0,
                         0,
                     )?;
-                    if down_uses_q8 {
-                        kernels.launch_swiglu_quantize_q8_1(
+                    let down_f32_ptr = if let Some(ge) = gate_exps {
+                        kernels.launch_wmma_moe_grouped(
                             ctx,
+                            ge.device_ptr(),
+                            ffn_in_ptr,
+                            scratch.exp_offs.device_ptr(),
+                            scratch.tile_offs.device_ptr(),
+                            scratch.sorted_ts.device_ptr(),
+                            scratch.top_weights.device_ptr(),
+                            0,
                             scratch.exp_gate.device_ptr(),
-                            scratch.exp_up.device_ptr(),
-                            scratch.exp_xq.device_ptr(),
+                            *gate_dtype,
                             n_ff_exp,
-                            rows_slots,
+                            d,
+                            *gate_row_bytes,
+                            *gate_exp_bytes,
+                            0,
+                            ne,
+                            ku,
+                            n_tok,
+                            0,
+                            0,
                         )?;
-                        (scratch.exp_xq.device_ptr(), scratch.exp_gate.device_ptr())
-                    } else {
                         kernels.launch_swiglu(
                             ctx,
                             scratch.exp_gate.device_ptr(),
                             scratch.exp_up.device_ptr(),
                             rows_slots * n_ff_exp,
                         )?;
-                        (0, scratch.exp_gate.device_ptr())
-                    }
-                } else if down_uses_q8 {
-                    kernels.launch_quantize_q8_1(
+                        scratch.exp_gate.device_ptr()
+                    } else {
+                        scratch.exp_up.device_ptr()
+                    };
+                    kernels.launch_wmma_moe_grouped(
                         ctx,
-                        scratch.exp_up.device_ptr(),
-                        scratch.exp_xq.device_ptr(),
+                        down_exps.device_ptr(),
+                        down_f32_ptr,
+                        scratch.exp_offs.device_ptr(),
+                        scratch.tile_offs.device_ptr(),
+                        scratch.sorted_ts.device_ptr(),
+                        scratch.top_weights.device_ptr(),
+                        0,
+                        scratch.slot_outs.device_ptr(),
+                        *down_dtype,
+                        d,
                         n_ff_exp,
-                        rows_slots,
+                        *down_row_bytes,
+                        *down_exp_bytes,
+                        0,
+                        ne,
+                        ku,
+                        n_tok,
+                        1,
+                        1,
                     )?;
-                    (scratch.exp_xq.device_ptr(), scratch.exp_up.device_ptr())
-                } else {
-                    (0, scratch.exp_up.device_ptr())
-                };
-                kernels.launch_moe_indexed_gemv_q8_1(
-                    ctx,
-                    down_exps.device_ptr(),
-                    down_xq_ptr,
-                    down_f32_ptr,
-                    scratch.top_ids.device_ptr(),
-                    scratch.top_weights.device_ptr(),
-                    0,
-                    scratch.slot_outs.device_ptr(),
-                    *down_dtype,
-                    d,
-                    n_ff_exp,
-                    *down_row_bytes,
-                    *down_exp_bytes,
-                    ku,
-                    n_tok,
-                    1,
-                    1,
-                )?;
-            }
-            CudaPackedExperts::FusedGateUp {
-                gate_up_exps,
-                gate_up_dtype,
-                gate_up_row_bytes,
-                gate_up_exp_bytes,
-                down_exps,
-                down_dtype,
-                down_row_bytes,
-                down_exp_bytes,
-                ..
-            } => {
-                kernels.launch_moe_indexed_gemv_q8_1(
-                    ctx,
-                    gate_up_exps.device_ptr(),
-                    in_xq_ptr,
-                    ffn_in_ptr,
-                    scratch.top_ids.device_ptr(),
-                    scratch.top_weights.device_ptr(),
-                    0,
-                    scratch.exp_gate.device_ptr(),
-                    *gate_up_dtype,
-                    2 * n_ff_exp,
-                    d,
-                    *gate_up_row_bytes,
-                    *gate_up_exp_bytes,
-                    ku,
-                    n_tok,
-                    0,
-                    0,
-                )?;
-                let down_uses_q8 = is_q8_1_moe_dtype(*down_dtype, n_ff_exp);
-                let (down_xq_ptr, down_f32_ptr) = if down_uses_q8 {
-                    kernels.launch_swiglu_fused_quantize_q8_1(
+                }
+                CudaPackedExperts::FusedGateUp {
+                    gate_up_exps,
+                    gate_up_dtype,
+                    gate_up_row_bytes,
+                    gate_up_exp_bytes,
+                    down_exps,
+                    down_dtype,
+                    down_row_bytes,
+                    down_exp_bytes,
+                    ..
+                } => {
+                    kernels.launch_wmma_moe_grouped(
                         ctx,
+                        gate_up_exps.device_ptr(),
+                        ffn_in_ptr,
+                        scratch.exp_offs.device_ptr(),
+                        scratch.tile_offs.device_ptr(),
+                        scratch.sorted_ts.device_ptr(),
+                        scratch.top_weights.device_ptr(),
+                        0,
                         scratch.exp_gate.device_ptr(),
-                        scratch.exp_xq.device_ptr(),
-                        n_ff_exp,
-                        rows_slots,
+                        *gate_up_dtype,
+                        2 * n_ff_exp,
+                        d,
+                        *gate_up_row_bytes,
+                        *gate_up_exp_bytes,
+                        0,
+                        ne,
+                        ku,
+                        n_tok,
+                        0,
+                        0,
                     )?;
-                    (scratch.exp_xq.device_ptr(), scratch.exp_up.device_ptr())
-                } else {
                     kernels.launch_swiglu_fused(
                         ctx,
                         scratch.exp_gate.device_ptr(),
@@ -514,27 +583,259 @@ impl CudaMoeLayer {
                         n_ff_exp,
                         rows_slots,
                     )?;
-                    (0, scratch.exp_up.device_ptr())
-                };
-                kernels.launch_moe_indexed_gemv_q8_1(
+                    kernels.launch_wmma_moe_grouped(
+                        ctx,
+                        down_exps.device_ptr(),
+                        scratch.exp_up.device_ptr(),
+                        scratch.exp_offs.device_ptr(),
+                        scratch.tile_offs.device_ptr(),
+                        scratch.sorted_ts.device_ptr(),
+                        scratch.top_weights.device_ptr(),
+                        0,
+                        scratch.slot_outs.device_ptr(),
+                        *down_dtype,
+                        d,
+                        n_ff_exp,
+                        *down_row_bytes,
+                        *down_exp_bytes,
+                        0,
+                        ne,
+                        ku,
+                        n_tok,
+                        1,
+                        1,
+                    )?;
+                }
+            }
+        } else {
+            // 3b. `P0-3`: Fused dual `Gate + Up + SwiGLU` `__dp4a` decode/verify path!
+            let in_xq_ptr = if d.is_multiple_of(32) {
+                kernels.launch_quantize_q8_1(
                     ctx,
-                    down_exps.device_ptr(),
-                    down_xq_ptr,
-                    down_f32_ptr,
-                    scratch.top_ids.device_ptr(),
-                    scratch.top_weights.device_ptr(),
-                    0,
-                    scratch.slot_outs.device_ptr(),
-                    *down_dtype,
+                    ffn_in_ptr,
+                    scratch.exp_xq.device_ptr(),
                     d,
-                    n_ff_exp,
-                    *down_row_bytes,
-                    *down_exp_bytes,
-                    ku,
                     n_tok,
-                    1,
-                    1,
                 )?;
+                scratch.exp_xq.device_ptr()
+            } else {
+                0
+            };
+
+            match &self.experts {
+                CudaPackedExperts::Separate {
+                    gate_exps,
+                    gate_dtype,
+                    gate_row_bytes,
+                    gate_exp_bytes,
+                    up_exps,
+                    up_dtype,
+                    up_row_bytes,
+                    up_exp_bytes,
+                    down_exps,
+                    down_dtype,
+                    down_row_bytes,
+                    down_exp_bytes,
+                } => {
+                    let down_uses_q8 = is_q8_1_moe_dtype(*down_dtype, n_ff_exp);
+                    let (down_xq_ptr, down_f32_ptr) = if let Some(ge) = gate_exps
+                        && *gate_dtype == *up_dtype
+                        && *gate_row_bytes == *up_row_bytes
+                    {
+                        kernels.launch_moe_indexed_dual_gu_act(
+                            ctx,
+                            ge.device_ptr(),
+                            up_exps.device_ptr(),
+                            in_xq_ptr,
+                            ffn_in_ptr,
+                            scratch.top_ids.device_ptr(),
+                            0,
+                            0,
+                            scratch.exp_up.device_ptr(),
+                            *gate_dtype,
+                            n_ff_exp,
+                            d,
+                            *gate_row_bytes,
+                            *gate_exp_bytes,
+                            *up_exp_bytes,
+                            0,
+                            ku,
+                            n_tok,
+                            0,
+                            1.0,
+                            0.0,
+                        )?;
+                        if down_uses_q8 {
+                            kernels.launch_quantize_q8_1(
+                                ctx,
+                                scratch.exp_up.device_ptr(),
+                                scratch.exp_xq.device_ptr(),
+                                n_ff_exp,
+                                rows_slots,
+                            )?;
+                            (scratch.exp_xq.device_ptr(), scratch.exp_up.device_ptr())
+                        } else {
+                            (0, scratch.exp_up.device_ptr())
+                        }
+                    } else {
+                        kernels.launch_moe_indexed_gemv_q8_1(
+                            ctx,
+                            up_exps.device_ptr(),
+                            in_xq_ptr,
+                            ffn_in_ptr,
+                            scratch.top_ids.device_ptr(),
+                            scratch.top_weights.device_ptr(),
+                            0,
+                            scratch.exp_up.device_ptr(),
+                            *up_dtype,
+                            n_ff_exp,
+                            d,
+                            *up_row_bytes,
+                            *up_exp_bytes,
+                            ku,
+                            n_tok,
+                            0,
+                            0,
+                        )?;
+                        if let Some(ge) = gate_exps {
+                            kernels.launch_moe_indexed_gemv_q8_1(
+                                ctx,
+                                ge.device_ptr(),
+                                in_xq_ptr,
+                                ffn_in_ptr,
+                                scratch.top_ids.device_ptr(),
+                                scratch.top_weights.device_ptr(),
+                                0,
+                                scratch.exp_gate.device_ptr(),
+                                *gate_dtype,
+                                n_ff_exp,
+                                d,
+                                *gate_row_bytes,
+                                *gate_exp_bytes,
+                                ku,
+                                n_tok,
+                                0,
+                                0,
+                            )?;
+                            if down_uses_q8 {
+                                kernels.launch_swiglu_quantize_q8_1(
+                                    ctx,
+                                    scratch.exp_gate.device_ptr(),
+                                    scratch.exp_up.device_ptr(),
+                                    scratch.exp_xq.device_ptr(),
+                                    n_ff_exp,
+                                    rows_slots,
+                                )?;
+                                (scratch.exp_xq.device_ptr(), scratch.exp_gate.device_ptr())
+                            } else {
+                                kernels.launch_swiglu(
+                                    ctx,
+                                    scratch.exp_gate.device_ptr(),
+                                    scratch.exp_up.device_ptr(),
+                                    rows_slots * n_ff_exp,
+                                )?;
+                                (0, scratch.exp_gate.device_ptr())
+                            }
+                        } else if down_uses_q8 {
+                            kernels.launch_quantize_q8_1(
+                                ctx,
+                                scratch.exp_up.device_ptr(),
+                                scratch.exp_xq.device_ptr(),
+                                n_ff_exp,
+                                rows_slots,
+                            )?;
+                            (scratch.exp_xq.device_ptr(), scratch.exp_up.device_ptr())
+                        } else {
+                            (0, scratch.exp_up.device_ptr())
+                        }
+                    };
+                    kernels.launch_moe_indexed_gemv_q8_1(
+                        ctx,
+                        down_exps.device_ptr(),
+                        down_xq_ptr,
+                        down_f32_ptr,
+                        scratch.top_ids.device_ptr(),
+                        scratch.top_weights.device_ptr(),
+                        0,
+                        scratch.slot_outs.device_ptr(),
+                        *down_dtype,
+                        d,
+                        n_ff_exp,
+                        *down_row_bytes,
+                        *down_exp_bytes,
+                        ku,
+                        n_tok,
+                        1,
+                        1,
+                    )?;
+                }
+                CudaPackedExperts::FusedGateUp {
+                    gate_up_exps,
+                    gate_up_dtype,
+                    gate_up_row_bytes,
+                    gate_up_exp_bytes,
+                    half_exp_bytes,
+                    down_exps,
+                    down_dtype,
+                    down_row_bytes,
+                    down_exp_bytes,
+                } => {
+                    kernels.launch_moe_indexed_dual_gu_act(
+                        ctx,
+                        gate_up_exps.device_ptr(),
+                        gate_up_exps.device_ptr(),
+                        in_xq_ptr,
+                        ffn_in_ptr,
+                        scratch.top_ids.device_ptr(),
+                        0,
+                        0,
+                        scratch.exp_up.device_ptr(),
+                        *gate_up_dtype,
+                        n_ff_exp,
+                        d,
+                        *gate_up_row_bytes,
+                        *gate_up_exp_bytes,
+                        *gate_up_exp_bytes,
+                        *half_exp_bytes,
+                        ku,
+                        n_tok,
+                        0,
+                        1.0,
+                        0.0,
+                    )?;
+                    let down_uses_q8 = is_q8_1_moe_dtype(*down_dtype, n_ff_exp);
+                    let down_xq_ptr = if down_uses_q8 {
+                        kernels.launch_quantize_q8_1(
+                            ctx,
+                            scratch.exp_up.device_ptr(),
+                            scratch.exp_xq.device_ptr(),
+                            n_ff_exp,
+                            rows_slots,
+                        )?;
+                        scratch.exp_xq.device_ptr()
+                    } else {
+                        0
+                    };
+                    kernels.launch_moe_indexed_gemv_q8_1(
+                        ctx,
+                        down_exps.device_ptr(),
+                        down_xq_ptr,
+                        scratch.exp_up.device_ptr(),
+                        scratch.top_ids.device_ptr(),
+                        scratch.top_weights.device_ptr(),
+                        0,
+                        scratch.slot_outs.device_ptr(),
+                        *down_dtype,
+                        d,
+                        n_ff_exp,
+                        *down_row_bytes,
+                        *down_exp_bytes,
+                        ku,
+                        n_tok,
+                        1,
+                        1,
+                    )?;
+                }
             }
         }
 
@@ -687,6 +988,8 @@ pub struct LlamaCudaRunner {
     layers: Vec<CudaLlamaLayer>,
 
     // Pre-allocated Arena scratch on GPU (zero allocations on forward/decode!)
+    pinned_ids: CudaPinnedBuffer,
+    pinned_pos: CudaPinnedBuffer,
     token_ids_buf: CudaBuffer,
     pos_buf: CudaBuffer,
     decode_graphs: [Option<CudaGraphExec>; 3], // [no_logits, logits, greedy]
@@ -703,6 +1006,7 @@ pub struct LlamaCudaRunner {
     logits_dev: CudaBuffer,
     argmax_dev: CudaBuffer,
     logits_host: Vec<f32>,
+    pub host_offloaded_moe_layers: usize,
 }
 
 impl LlamaCudaRunner {
@@ -743,17 +1047,22 @@ impl LlamaCudaRunner {
             } else {
                 cpu_m.output.bytes.len()
             };
+        let mut moe_exp_sizes = Vec::new();
         for l in &cpu_m.layers {
             weight_bytes +=
                 l.wq.bytes.len() + l.wk.bytes.len() + l.wv.bytes.len() + l.wo.bytes.len();
             weight_bytes += l.w_gate.bytes.len() + l.w_up.bytes.len() + l.w_down.bytes.len();
             if let Some(ref moe) = l.moe {
                 weight_bytes += moe_weight_bytes(moe);
+                moe_exp_sizes.push(moe_expert_only_bytes(moe));
             }
         }
         let (free_vram, _) = ctx.mem_info()?;
         let needed_bytes = weight_bytes + total_kv_bytes + 64 * 1024 * 1024;
-        if needed_bytes > free_vram {
+        let offload_moe_count =
+            plan_moe_host_offload_count(free_vram, needed_bytes, &moe_exp_sizes);
+        let offloaded_bytes: usize = moe_exp_sizes.iter().rev().take(offload_moe_count).sum();
+        if needed_bytes.saturating_sub(offloaded_bytes) > free_vram {
             return Err(CudaError::OutOfDeviceMemory {
                 needed_mib: needed_bytes as f64 / (1024.0 * 1024.0),
                 free_mib: free_vram as f64 / (1024.0 * 1024.0),
@@ -796,6 +1105,8 @@ impl LlamaCudaRunner {
             }
         };
 
+        let total_moe_layers = moe_exp_sizes.len();
+        let mut moe_seen = 0usize;
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for l in &cpu_m.layers {
             let q_norm = match &l.q_norm {
@@ -823,7 +1134,13 @@ impl LlamaCudaRunner {
 
             let has_dense_ffn = l.w_up.rows > 0;
             let moe = match &l.moe {
-                Some(m) => Some(CudaMoeLayer::upload(&ctx, m, cfg.n_embd)?),
+                Some(m) => {
+                    let host_map = moe_seen + offload_moe_count >= total_moe_layers;
+                    moe_seen += 1;
+                    Some(CudaMoeLayer::upload_with_offload(
+                        &ctx, m, cfg.n_embd, host_map,
+                    )?)
+                }
                 None => None,
             };
 
@@ -873,6 +1190,8 @@ impl LlamaCudaRunner {
             .max(cfg.n_embd);
         let max_cols = cfg.n_embd.max(ff_max).max(q_dim).next_multiple_of(32);
 
+        let pinned_ids = ctx.alloc_pinned(MAX_CUDA_BATCH * 4)?;
+        let pinned_pos = ctx.alloc_pinned(4)?;
         let token_ids_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * 4)?;
         let pos_buf = ctx.alloc_zeroed(4)?;
         let x = ctx.alloc_zeroed(MAX_CUDA_BATCH * cfg.n_embd * 4)?;
@@ -897,8 +1216,9 @@ impl LlamaCudaRunner {
             None
         };
 
-        let logits_dev = ctx.alloc_zeroed(cfg.vocab_size * 4)?;
-        let argmax_dev = ctx.alloc_zeroed(4)?;
+        let spec_rows = MAX_SPEC_WINDOW + 1;
+        let logits_dev = ctx.alloc_zeroed(spec_rows * cfg.vocab_size * 4)?;
+        let argmax_dev = ctx.alloc_zeroed(spec_rows * 4)?;
         ctx.synchronize()?;
 
         let (free_after, _) = ctx.mem_info()?;
@@ -919,6 +1239,8 @@ impl LlamaCudaRunner {
             rope_inv_freqs,
             rope_inv_freqs_swa,
             layers,
+            pinned_ids,
+            pinned_pos,
             token_ids_buf,
             pos_buf,
             decode_graphs: [None, None, None],
@@ -935,6 +1257,7 @@ impl LlamaCudaRunner {
             logits_dev,
             argmax_dev,
             logits_host: vec![0.0f32; cfg.vocab_size],
+            host_offloaded_moe_layers: offload_moe_count,
         })
     }
 
@@ -1454,9 +1777,13 @@ impl LlamaCudaRunner {
         compute_logits: bool,
         compute_argmax: bool,
     ) -> Result<(), CudaError> {
-        self.token_ids_buf.copy_from_u32(&[token_id])?;
+        self.pinned_ids.write_u32_at(0, &[token_id]);
+        self.token_ids_buf
+            .copy_from_pinned_async(0, &self.pinned_ids, 0, 4)?;
         if self.can_use_decode_graph() {
-            self.pos_buf.copy_from_u32(&[pos as u32])?;
+            self.pinned_pos.write_u32_at(0, &[pos as u32]);
+            self.pos_buf
+                .copy_from_pinned_async(0, &self.pinned_pos, 0, 4)?;
             let slot = if !compute_logits {
                 0
             } else if !compute_argmax {
@@ -1479,6 +1806,95 @@ impl LlamaCudaRunner {
         } else {
             self.encode_chunk(1, pos, 0, false, compute_logits, compute_argmax)
         }
+    }
+
+    /// Evaluates `[x_tok, drafts...]` (`w = 1 + drafts.len() <= MAX_SPEC_WINDOW + 1`) in one pass
+    /// and returns `(committed_count, accepted_drafts)` with committed greedy picks in `out_committed`.
+    pub fn verify_window_greedy(
+        &mut self,
+        x_tok: u32,
+        drafts: &[u32],
+        pos: usize,
+        out_committed: &mut Vec<u32>,
+    ) -> Result<(usize, usize), CudaError> {
+        if drafts.is_empty() {
+            let next = self.forward_token_greedy(x_tok, pos)?;
+            out_committed.clear();
+            out_committed.push(next);
+            return Ok((1, 0));
+        }
+        let d_len = drafts.len().min(MAX_SPEC_WINDOW);
+        let w = 1 + d_len;
+        if pos + w > self.max_ctx {
+            let next = self.forward_token_greedy(x_tok, pos)?;
+            out_committed.clear();
+            out_committed.push(next);
+            return Ok((1, 0));
+        }
+        let mut win = [0u32; MAX_SPEC_WINDOW + 1];
+        win[0] = x_tok;
+        win[1..w].copy_from_slice(&drafts[..d_len]);
+        self.pinned_ids.write_u32_at(0, &win[..w]);
+        self.token_ids_buf
+            .copy_from_pinned_async(0, &self.pinned_ids, 0, w * 4)?;
+        self.encode_chunk(w, pos, 0, false, false, false)?;
+
+        let d = self.cfg.n_embd;
+        self.kernels.launch_rms_norm(
+            &self.ctx,
+            self.x.device_ptr(),
+            self.output_norm.device_ptr(),
+            self.xb.device_ptr(),
+            d,
+            w,
+            self.cfg.rms_eps,
+        )?;
+        self.kernels.launch_linear(
+            &self.ctx,
+            &self.output,
+            self.xb.device_ptr(),
+            self.xq_scratch.device_ptr(),
+            false,
+            self.logits_dev.device_ptr(),
+            w,
+            false,
+        )?;
+        if let Some(ref ob) = self.output_bias {
+            self.kernels.launch_add_bias(
+                &self.ctx,
+                self.logits_dev.device_ptr(),
+                ob.device_ptr(),
+                self.cfg.vocab_size,
+                w,
+            )?;
+        }
+        self.kernels.launch_scale_inplace(
+            &self.ctx,
+            self.logits_dev.device_ptr(),
+            self.cfg.inv_logit_scale,
+            w * self.cfg.vocab_size,
+        )?;
+        self.kernels.launch_argmax_rows(
+            &self.ctx,
+            self.logits_dev.device_ptr(),
+            self.argmax_dev.device_ptr(),
+            self.cfg.vocab_size,
+            w,
+        )?;
+        let mut picks = [0u32; MAX_SPEC_WINDOW + 1];
+        // SAFETY: `[u32]` is POD; `w <= MAX_SPEC_WINDOW + 1`.
+        let pick_bytes =
+            unsafe { core::slice::from_raw_parts_mut(picks.as_mut_ptr().cast::<u8>(), w * 4) };
+        self.argmax_dev.copy_to_bytes(pick_bytes)?;
+
+        let mut accepted = 0usize;
+        while accepted < d_len && picks[accepted] == drafts[accepted] {
+            accepted += 1;
+        }
+        let committed = accepted + 1;
+        out_committed.clear();
+        out_committed.extend_from_slice(&picks[..committed]);
+        Ok((committed, accepted))
     }
 
     pub fn forward_token(
@@ -1549,7 +1965,9 @@ impl LlamaCudaRunner {
         while off < token_ids.len() {
             let b = (token_ids.len() - off).min(MAX_CUDA_BATCH);
             let is_last = off + b == token_ids.len();
-            self.token_ids_buf.copy_from_u32(&token_ids[off..off + b])?;
+            self.pinned_ids.write_u32_at(0, &token_ids[off..off + b]);
+            self.token_ids_buf
+                .copy_from_pinned_async(0, &self.pinned_ids, 0, b * 4)?;
             self.encode_chunk(
                 b,
                 start_pos + off,

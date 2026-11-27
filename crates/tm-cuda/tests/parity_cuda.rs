@@ -1285,6 +1285,42 @@ write_gguf(s2, kvs2, t2)
                 );
             }
         }
+
+        // Verify `Qwen4ExpCudaRunner::verify_window_greedy` PLE + GDN rollback determinism!
+        cuda_r.reset_state().unwrap();
+        let _ = cuda_r.forward_batch(&pp, 0, true).unwrap();
+        let mut ref_q4 = Vec::with_capacity(6);
+        let mut cur_q4 = 11u32;
+        for s in 0..6 {
+            cur_q4 = cuda_r.forward_token_greedy(cur_q4, pp.len() + s).unwrap();
+            ref_q4.push(cur_q4);
+        }
+        cuda_r.reset_state().unwrap();
+        let _ = cuda_r.forward_batch(&pp, 0, true).unwrap();
+        let mut spec_q4 = Vec::with_capacity(6);
+        let mut comm_q4 = Vec::new();
+        let mut pos_q4 = pp.len();
+        let mut tok_q4 = 11u32;
+        // Step 1: pass 1 matching draft (`ref_q4[0]`) + 2 intentionally wrong drafts (`31, 30`) to force partial rollback!
+        let fake_drafts = [ref_q4[0], (ref_q4[1] + 7) % 30, 29];
+        let (_d, acc_q4) = cuda_r
+            .verify_window_greedy(tok_q4, &fake_drafts, pos_q4, &mut comm_q4)
+            .unwrap();
+        assert_eq!(acc_q4, 1);
+        for &ct in &comm_q4 {
+            tok_q4 = ct;
+            spec_q4.push(ct);
+            pos_q4 += 1;
+        }
+        while spec_q4.len() < 6 {
+            tok_q4 = cuda_r.forward_token_greedy(tok_q4, pos_q4).unwrap();
+            spec_q4.push(tok_q4);
+            pos_q4 += 1;
+        }
+        assert_eq!(
+            ref_q4, spec_q4,
+            "qwen4exp ({mode}) verify_window_greedy rollback diverged from greedy baseline!"
+        );
     }
 
     let _ = std::fs::remove_dir_all(&out_dir);
@@ -1765,6 +1801,469 @@ pack_strata_file(m_path, 1, m_secs, eng_sha)
             }
         }
     }
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+#[test]
+fn parity_cuda_p0_p1_p2_mtp_dfly2_moe_wmma_and_ddr_offload() {
+    if try_ctx().is_none() {
+        return;
+    }
+    let out_dir = std::env::temp_dir().join(format!("tm_cuda_opt_suite_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out_dir);
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let py = find_python3_with_numpy();
+
+    // Part A: `Qwen35` with built-in `blk.{L}.nextn.*` MTP (`P0-1`), `n_tok = 20`
+    //         MoE grouped WMMA prefill (`P0-2`), fused dual gate+up (`P0-3`), AND
+    //         `TM_CUDA_MOE_HOST_OFFLOAD=1` zero-copy DDR MoE (`P2`)!
+    let q35_mtp_path = out_dir.join("qwen35moe_nextn_mtp.gguf");
+    let gen_q35_mtp = r#"
+import struct, sys
+from pathlib import Path
+import numpy as np
+
+out = Path(sys.argv[1])
+rng = np.random.default_rng(20261127)
+def gstr(s):
+    b = s.encode()
+    return struct.pack("<Q", len(b)) + b
+
+n_layers = 2
+d, vocab = 128, 32
+n_head, n_head_kv, head_dim, rope_dim = 4, 2, 32, 16
+hk, hv, s_dim, d_inner, d_conv = 2, 4, 32, 128, 4
+conv_dim = 2 * hk * s_dim + d_inner
+n_exp, top_k, n_ff_exp, n_ff_sh = 4, 2, 64, 128
+
+kvs = [
+    ("general.architecture", 8, "qwen35moe"),
+    ("qwen35moe.block_count", 4, n_layers),
+    ("qwen35moe.nextn_predict_layers", 4, 1),
+    ("qwen35moe.embedding_length", 4, d),
+    ("qwen35moe.expert_count", 4, n_exp),
+    ("qwen35moe.expert_used_count", 4, top_k),
+    ("qwen35moe.expert_feed_forward_length", 4, n_ff_exp),
+    ("qwen35moe.expert_shared_feed_forward_length", 4, n_ff_sh),
+    ("qwen35moe.attention.head_count", 4, n_head),
+    ("qwen35moe.attention.head_count_kv", 4, n_head_kv),
+    ("qwen35moe.attention.key_length", 4, head_dim),
+    ("qwen35moe.rope.dimension_count", 4, rope_dim),
+    ("qwen35moe.rope.freq_base", 6, 1000000.0),
+    ("qwen35moe.attention.layer_norm_rms_epsilon", 6, 1e-6),
+    ("qwen35moe.full_attention_interval", 4, 2),
+    ("qwen35moe.ssm.conv_kernel", 4, d_conv),
+    ("qwen35moe.ssm.state_size", 4, s_dim),
+    ("qwen35moe.ssm.group_count", 4, hk),
+    ("qwen35moe.ssm.time_step_rank", 4, hv),
+    ("qwen35moe.ssm.inner_size", 4, d_inner),
+    ("qwen35moe.vocab_size", 4, vocab),
+]
+
+def pack_q8_0(a):
+    flat = a.reshape(-1, 32)
+    mx = np.maximum(np.max(np.abs(flat), axis=1), 1e-8)
+    sc = np.float16(mx / 127.0)
+    sf = sc.astype(np.float32)[:, None]
+    q = np.clip(np.round(flat / sf), -127, 127).astype(np.int8)
+    buf = bytearray()
+    for i in range(flat.shape[0]):
+        buf.extend(sc[i].tobytes() + q[i].tobytes())
+    return bytes(buf)
+
+tensors = []
+def add_1d(name, n, lo=0.85, hi=1.15):
+    a = rng.uniform(lo, hi, n).astype(np.float32)
+    tensors.append((name, (n,), 0, a.tobytes()))
+def add_f32_2d(name, rows, cols, s=0.12):
+    a = rng.uniform(-s, s, (rows, cols)).astype(np.float32)
+    tensors.append((name, (cols, rows), 0, a.tobytes()))
+def add_q8_2d(name, rows, cols, s=0.12):
+    a = rng.uniform(-s, s, (rows, cols)).astype(np.float32)
+    tensors.append((name, (cols, rows), 8, pack_q8_0(a)))
+def add_q8_3d(name, ne, rows, cols, s=0.12):
+    a = rng.uniform(-s, s, (ne, rows, cols)).astype(np.float32)
+    tensors.append((name, (cols, rows, ne), 8, pack_q8_0(a)))
+
+add_q8_2d("token_embd.weight", vocab, d, 0.2)
+add_1d("output_norm.weight", d)
+add_q8_2d("output.weight", vocab, d, 0.2)
+
+for il in [0, 1, 2]:
+    p = f"blk.{il}"
+    add_1d(f"{p}.attn_norm.weight", d)
+    add_1d(f"{p}.post_attention_norm.weight", d)
+    if il == 0:
+        add_q8_2d(f"{p}.attn_qkv.weight", conv_dim, d)
+        add_q8_2d(f"{p}.attn_gate.weight", d_inner, d)
+        add_f32_2d(f"{p}.ssm_alpha.weight", hv, d)
+        add_f32_2d(f"{p}.ssm_beta.weight", hv, d)
+        cw = rng.uniform(-0.2, 0.2, (conv_dim, d_conv)).astype(np.float32)
+        tensors.append((f"{p}.ssm_conv1d.weight", (d_conv, conv_dim), 0, cw.tobytes()))
+        add_1d(f"{p}.ssm_a", hv, -1.2, -0.5)
+        add_1d(f"{p}.ssm_dt.bias", hv, -0.1, 0.1)
+        add_1d(f"{p}.ssm_norm.weight", s_dim)
+        add_q8_2d(f"{p}.ssm_out.weight", d, d_inner)
+    else:
+        add_1d(f"{p}.attn_q_norm.weight", head_dim)
+        add_1d(f"{p}.attn_k_norm.weight", head_dim)
+        add_q8_2d(f"{p}.attn_q.weight", 2 * n_head * head_dim, d)
+        add_q8_2d(f"{p}.attn_k.weight", n_head_kv * head_dim, d)
+        add_q8_2d(f"{p}.attn_v.weight", n_head_kv * head_dim, d)
+        add_q8_2d(f"{p}.attn_output.weight", d, n_head * head_dim)
+    add_f32_2d(f"{p}.ffn_gate_inp.weight", n_exp, d, 0.4)
+    eb = np.linspace(-1.2, 1.2, n_exp).astype(np.float32)
+    tensors.append((f"{p}.exp_probs_b.bias", (n_exp,), 0, eb.tobytes()))
+    add_q8_3d(f"{p}.ffn_gate_exps.weight", n_exp, n_ff_exp, d)
+    add_q8_3d(f"{p}.ffn_up_exps.weight", n_exp, n_ff_exp, d)
+    add_q8_3d(f"{p}.ffn_down_exps.weight", n_exp, d, n_ff_exp)
+    add_q8_2d(f"{p}.ffn_gate_shexp.weight", n_ff_sh, d)
+    add_q8_2d(f"{p}.ffn_up_shexp.weight", n_ff_sh, d)
+    add_q8_2d(f"{p}.ffn_down_shexp.weight", d, n_ff_sh)
+    add_f32_2d(f"{p}.ffn_gate_inp_shexp.weight", 1, d)
+
+add_1d("blk.2.nextn.enorm.weight", d)
+add_1d("blk.2.nextn.hnorm.weight", d)
+add_q8_2d("blk.2.nextn.eh_proj.weight", d, 2 * d)
+add_1d("blk.2.nextn.shared_head_norm.weight", d)
+
+hdr = bytearray(b"GGUF")
+hdr.extend(struct.pack("<IQQ", 3, len(tensors), len(kvs)))
+for k, vt, v in kvs:
+    hdr.extend(gstr(k))
+    hdr.extend(struct.pack("<I", vt))
+    if vt == 4: hdr.extend(struct.pack("<I", v))
+    elif vt == 6: hdr.extend(struct.pack("<f", v))
+    elif vt == 8: hdr.extend(gstr(v))
+offs, cur = [], 0
+for _, _, _, raw in tensors:
+    cur = (cur + 31) // 32 * 32
+    offs.append(cur)
+    cur += len(raw)
+for (n, dims, dt, _), off in zip(tensors, offs):
+    hdr.extend(gstr(n))
+    hdr.extend(struct.pack("<I", len(dims)))
+    for dm in dims: hdr.extend(struct.pack("<Q", dm))
+    hdr.extend(struct.pack("<IQ", dt, off))
+while len(hdr) % 32 != 0: hdr.append(0)
+base = len(hdr)
+for (_, _, _, raw), off in zip(tensors, offs):
+    if len(hdr) < base + off: hdr.extend(b"\x00" * (base + off - len(hdr)))
+    hdr.extend(raw)
+out.write_bytes(bytes(hdr))
+"#;
+    assert!(
+        Command::new(&py)
+            .args(["-c", gen_q35_mtp, q35_mtp_path.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let gguf_q35 = GgufFile::open(&q35_mtp_path).unwrap();
+    let cpu_q35 = Qwen35Model::from_gguf(&gguf_q35).unwrap();
+    assert!(cpu_q35.mtp.is_some());
+    let mut cpu_st = Qwen35State::new(&cpu_q35, 64);
+    let pool = ThreadPool::new(2);
+    let kt = active_kernels();
+
+    // SAFETY: `--test-threads=1` serializes env var changes across tests.
+    unsafe { std::env::set_var("TM_CUDA_MOE_HOST_OFFLOAD", "1") };
+    let mut cuda_q35 =
+        tm_cuda::Qwen35CudaRunner::from_gguf_with_kv_type(&gguf_q35, 64, KvType::F16).unwrap();
+    unsafe { std::env::remove_var("TM_CUDA_MOE_HOST_OFFLOAD") };
+    assert!(cuda_q35.has_builtin_mtp());
+    assert_eq!(cuda_q35.host_offloaded_moe_layers, 1);
+
+    let pp20: Vec<u32> = (0..20).map(|i| ((i * 3 + 1) % 31) as u32).collect();
+    cpu_q35
+        .forward_batch(&mut cpu_st, &pool, kt, &pp20, 0, true)
+        .unwrap();
+    let cuda_pp20 = cuda_q35.forward_batch(&pp20, 0, true).unwrap().to_vec();
+    assert_eq!(argmax(cpu_st.logits()), argmax(&cuda_pp20));
+
+    let first_tok = argmax(&cuda_pp20);
+    let mut ref_seq = Vec::with_capacity(16);
+    let mut cur = first_tok;
+    for s in 0..16 {
+        cur = cuda_q35.forward_token_greedy(cur, pp20.len() + s).unwrap();
+        ref_seq.push(cur);
+    }
+
+    cuda_q35.reset_state().unwrap();
+    let _ = cuda_q35.forward_batch(&pp20, 0, true).unwrap();
+    let mut spec_seq = Vec::with_capacity(16);
+    let mut committed_buf = Vec::new();
+    let mut pos = pp20.len();
+    let mut cur_s = first_tok;
+    while spec_seq.len() < 16 {
+        let rem = 16 - spec_seq.len();
+        let dk = 3usize.min(rem.saturating_sub(1));
+        let (_d_cnt, _a_cnt) = cuda_q35
+            .spec_step_mtp_greedy(cur_s, pos, dk, &mut committed_buf)
+            .unwrap();
+        for &ct in &committed_buf {
+            cur_s = ct;
+            spec_seq.push(ct);
+            pos += 1;
+            if spec_seq.len() >= 16 {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        ref_seq, spec_seq,
+        "Qwen35 built-in nextn MTP speculative sequence diverged from greedy baseline!"
+    );
+
+    // Part B: `Hy4-Flash` `.strata` with built-in `DFly2` (`P0-1`) + Matrix-Absorbed MLA (`P1-1`)!
+    let hy4_dfly_strata = out_dir.join("Hy4-DFly2-Synth.strata");
+    let gen_hy4_dfly = r#"
+import hashlib, json, struct, sys
+from pathlib import Path
+import numpy as np
+
+m_path = Path(sys.argv[1])
+rng = np.random.default_rng(9090)
+
+def pack_strata_file(path, profile_id, secs):
+    frame = bytearray(4096)
+    frame[0:8] = b"STRATA\x00\x01"
+    struct.pack_into("<IHH", frame, 8, 0, profile_id, 6)
+    cur = 4096
+    payloads = []
+    for idx in range(6):
+        raw, flg = secs[idx]
+        cur = (cur + 4095) // 4096 * 4096
+        off = cur if len(raw) > 0 else 0
+        sha = hashlib.sha256(raw).digest() if len(raw) > 0 else b"\x00" * 32
+        struct.pack_into("<QQ32sIIQ", frame, 16 + idx * 64, off, len(raw), sha, idx, flg, 0)
+        payloads.append((off, raw))
+        cur += len(raw)
+    out = bytearray(frame)
+    for off, raw in payloads:
+        if len(raw) == 0: continue
+        if len(out) < off: out.extend(b"\x00" * (off - len(out)))
+        out.extend(raw)
+    path.write_bytes(bytes(out))
+
+h, hc, vocab = 256, 4, 32
+hc_dim = hc * h
+q_lora, kv_lora, qk_nope, qk_rope, qk_head, v_head = 256, 256, 48, 16, 64, 64
+heads_swa, heads_sp = 2, 4
+dense_ff, lat_dim, sh_ff = 256, 256, 256
+n_exp, top_k = 4, 2
+
+trunk_buf = bytearray()
+trunk_list = []
+def add_trunk(name, shape, fmt_name, raw):
+    while len(trunk_buf) % 64 != 0: trunk_buf.append(0)
+    off = len(trunk_buf)
+    trunk_buf.extend(raw)
+    trunk_list.append({"name": name, "format": fmt_name, "shape": list(shape), "offset": off, "bytes": len(raw)})
+def add_vec(name, n, lo=0.85, hi=1.15):
+    a = rng.uniform(lo, hi, size=(n,)).astype(np.float32)
+    add_trunk(name, [n], "F32", a.tobytes())
+def add_mat(name, rows, cols, s=0.08):
+    a = rng.uniform(-s, s, size=(rows, cols)).astype(np.float32)
+    add_trunk(name, [rows, cols], "F32", a.tobytes())
+
+add_mat("model.embed_tokens.weight", vocab, h, 0.12)
+add_mat("lm_head.weight", vocab, h, 0.10)
+add_vec("model.norm.weight", h)
+add_mat("model.hc_head.hc_head_fn", hc, hc_dim, 0.05)
+add_vec("model.hc_head.hc_head_scale", 1, 0.5, 1.0)
+add_vec("model.hc_head.hc_head_base", hc, -0.2, 0.2)
+
+for il in range(2):
+    lp = f"model.layers.{il}"
+    for sub_k in ["hc_attn_layer", "hc_mlp_layer"]:
+        add_mat(f"{lp}.{sub_k}.hc_pre.hc_fn", 2 * hc, hc_dim, 0.05)
+        add_vec(f"{lp}.{sub_k}.hc_pre.hc_scale", 2, 0.5, 1.0)
+        add_vec(f"{lp}.{sub_k}.hc_pre.hc_base", 2 * hc, -0.2, 0.2)
+    add_vec(f"{lp}.input_layernorm.weight", h)
+    add_vec(f"{lp}.post_attention_layernorm.weight", h)
+    nh = heads_swa if il == 0 else heads_sp
+    ap = f"{lp}.self_attn"
+    add_mat(f"{ap}.q_a_proj.weight", q_lora, h)
+    add_vec(f"{ap}.q_a_layernorm.weight", q_lora)
+    add_mat(f"{ap}.q_b_proj.weight", nh * qk_head, q_lora)
+    add_mat(f"{ap}.kv_a_proj_with_mqa.weight", kv_lora + qk_rope, h)
+    add_vec(f"{ap}.kv_a_layernorm.weight", kv_lora)
+    add_mat(f"{ap}.kv_b_proj.weight", nh * (qk_nope + v_head), kv_lora)
+    add_vec(f"{ap}.learnable_sink_param", nh, -1.0, 0.5)
+    add_mat(f"{ap}.linear_gate.weight", nh * v_head, h)
+    add_mat(f"{ap}.o_proj.weight", h, nh * v_head)
+    add_vec(f"{ap}.post_proj_norm.weight", h)
+    mp = f"{lp}.mlp"
+    if il == 0:
+        add_mat(f"{mp}.gate_proj.weight", dense_ff, h)
+        add_mat(f"{mp}.up_proj.weight", dense_ff, h)
+        add_mat(f"{mp}.down_proj.weight", h, dense_ff)
+        add_vec(f"{mp}.post_fc2_norm.weight", h)
+    else:
+        add_mat(f"{mp}.gate.weight", n_exp, h, 0.15)
+        add_vec(f"{mp}.gate.e_score_correction_bias", n_exp, -0.05, 0.05)
+        add_mat(f"{mp}.routed_expert_down_proj.weight", lat_dim, h)
+        add_mat(f"{mp}.routed_expert_up_proj.weight", h, lat_dim)
+        add_mat(f"{mp}.shared_experts.gate_proj.weight", sh_ff, h)
+        add_mat(f"{mp}.shared_experts.up_proj.weight", sh_ff, h)
+        add_mat(f"{mp}.shared_experts.down_proj.weight", h, sh_ff)
+        add_vec(f"{mp}.combine_output_norm.weight", h)
+
+dp = "model.dfly_layers"
+add_vec(f"{dp}.mtp_fusion.enorm.weight", h)
+add_vec(f"{dp}.mtp_fusion.hnorm.weight", h)
+add_mat(f"{dp}.mtp_fusion.eh_proj.weight", h, 2 * h)
+add_vec(f"{dp}.mtp_fusion.gate", h, 0.1, 0.5)
+for dl in range(2):
+    dlp = f"{dp}.{dl}"
+    add_vec(f"{dlp}.input_layernorm.weight", h)
+    add_vec(f"{dlp}.post_attention_layernorm.weight", h)
+    ap = f"{dlp}.self_attn"
+    add_mat(f"{ap}.q_a_proj.weight", q_lora, h)
+    add_vec(f"{ap}.q_a_layernorm.weight", q_lora)
+    add_mat(f"{ap}.q_b_proj.weight", heads_sp * qk_head, q_lora)
+    add_mat(f"{ap}.kv_a_proj_with_mqa.weight", kv_lora + qk_rope, h)
+    add_vec(f"{ap}.kv_a_layernorm.weight", kv_lora)
+    add_mat(f"{ap}.kv_b_proj.weight", heads_sp * (qk_nope + v_head), kv_lora)
+    add_vec(f"{ap}.learnable_sink_param", heads_sp, -1.0, 0.5)
+    add_mat(f"{ap}.linear_gate.weight", heads_sp * v_head, h)
+    add_mat(f"{ap}.o_proj.weight", h, heads_sp * v_head)
+    add_vec(f"{ap}.post_proj_norm.weight", h)
+    add_mat(f"{dlp}.mlp.gate_proj.weight", dense_ff, h)
+    add_mat(f"{dlp}.mlp.up_proj.weight", dense_ff, h)
+    add_mat(f"{dlp}.mlp.down_proj.weight", h, dense_ff)
+add_vec(f"{dp}.final_norm.weight", h)
+add_vec(f"{dp}.hidden_correction.hidden_norm.weight", h)
+add_vec(f"{dp}.hidden_correction.embed_norm.weight", h)
+add_mat(f"{dp}.hidden_correction.gate_proj.weight", dense_ff, 2 * h)
+add_mat(f"{dp}.hidden_correction.up_proj.weight", dense_ff, 2 * h)
+add_mat(f"{dp}.hidden_correction.down_proj.weight", h, dense_ff)
+add_mat(f"{dp}.confidence_head.proj.weight", 1, h, 0.2)
+add_vec(f"{dp}.confidence_head.proj.bias", 1, 1.5, 2.5)
+
+sec3_buf, sec4_buf = bytearray(), bytearray()
+for eid in range(n_exp):
+    while len(sec4_buf) % 64 != 0: sec4_buf.append(0)
+    body_off = len(sec4_buf)
+    sq = np.float16(rng.uniform(0.8, 1.2, size=(lat_dim,))).tobytes()
+    gu_b = rng.uniform(-0.08, 0.08, size=(2 * lat_dim, lat_dim)).astype(np.float32).tobytes()
+    dn_b = rng.uniform(-0.08, 0.08, size=(lat_dim, lat_dim)).astype(np.float32).tobytes()
+    dn_off = len(sq) + len(gu_b)
+    body = sq + gu_b + dn_b
+    sec4_buf.extend(body)
+    sec3_buf.extend(struct.pack("<HBBHHQIIII", eid, 101, 101, 0, 0, body_off, len(body), dn_off, 0, 0))
+
+manifest = {
+    "config": {
+        "text_config": {
+            "dfly_mask_id": 30,
+            "dfly_layers": [1, 1],
+            "num_hidden_layers": 2,
+            "hidden_size": h,
+            "hc_mult": hc,
+            "vocab_size": vocab,
+            "rms_norm_eps": 1e-6,
+            "hc_eps": 0.01,
+            "hc_magnitude": 2.0,
+            "q_lora_rank": q_lora,
+            "kv_lora_rank": kv_lora,
+            "qk_nope_head_dim": qk_nope,
+            "qk_rope_head_dim": qk_rope,
+            "qk_head_dim": qk_head,
+            "v_head_dim": v_head,
+            "sliding_window": 4,
+            "compressed_indexer_compress_ratio": 4,
+            "index_topk": 64,
+            "compressed_indexer_num_attention_heads": 2,
+            "compressed_indexer_head_dim": 32,
+            "swiglu_limit": 7.0,
+            "routed_scaling_factor": 2.5,
+            "n_routed_experts": n_exp,
+            "num_experts_per_tok": top_k,
+            "num_attention_heads": heads_sp,
+            "swa_num_attention_heads": heads_swa,
+            "bos_token_id": 1,
+            "eos_token_id": 2,
+            "rope_parameters": {
+                "deepseek_sparse_attention": {"rope_theta": 1000000.0},
+                "sliding_attention": {"rope_theta": 10000.0},
+            },
+            "layer_types": ["sliding_attention", "deepseek_sparse_attention"],
+        },
+    },
+    "engram_meta": {
+        "ple_ngram_size": 3,
+        "ple_heads_per_ngram": 4,
+        "engram_pad_id": 0,
+        "ple_layers": [],
+        "engram_token_map": list(range(vocab)),
+        "ple_layer_multipliers": [],
+        "ple_head_vocab_sizes": [],
+        "ple_head_offsets": [],
+    },
+    "trunk_tensors": trunk_list,
+    "tokenizer_json": "{}",
+    "chat_template": "",
+}
+secs = [(b"", 0) for _ in range(6)]
+secs[0] = (json.dumps(manifest).encode("utf-8"), 0)
+secs[1] = (bytes(trunk_buf), 0)
+secs[3] = (bytes(sec3_buf), 0)
+secs[4] = (bytes(sec4_buf), 0)
+pack_strata_file(m_path, 1, secs)
+"#;
+    assert!(
+        Command::new(&py)
+            .args(["-c", gen_hy4_dfly, hy4_dfly_strata.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let (mut hy4_cuda, _) =
+        tm_cuda::Hy4CudaRunner::from_strata(&hy4_dfly_strata, None, 64).unwrap();
+    assert!(hy4_cuda.has_builtin_dfly2());
+    let pp_hy = [1u32, 4, 7, 11, 15];
+    let lg_hy = hy4_cuda.forward_batch(&pp_hy, 0, true).unwrap().to_vec();
+    let hy_first = argmax(&lg_hy);
+
+    let mut hy_ref_seq = Vec::with_capacity(12);
+    let mut hy_cur = hy_first;
+    for s in 0..12 {
+        hy_cur = hy4_cuda
+            .forward_token_greedy(hy_cur, pp_hy.len() + s)
+            .unwrap();
+        hy_ref_seq.push(hy_cur);
+    }
+
+    hy4_cuda.reset_state().unwrap();
+    let _ = hy4_cuda.forward_batch(&pp_hy, 0, true).unwrap();
+    let mut hy_spec_seq = Vec::with_capacity(12);
+    let mut hy_committed = Vec::new();
+    let mut hy_pos = pp_hy.len();
+    let mut hy_tok = hy_first;
+    while hy_spec_seq.len() < 12 {
+        let rem = 12 - hy_spec_seq.len();
+        let dk = 3usize.min(rem.saturating_sub(1));
+        let (_d_cnt, _a_cnt) = hy4_cuda
+            .spec_step_dfly2_greedy(hy_tok, hy_pos, dk, 0.25, &mut hy_committed)
+            .unwrap();
+        for &ct in &hy_committed {
+            hy_tok = ct;
+            hy_spec_seq.push(ct);
+            hy_pos += 1;
+            if hy_spec_seq.len() >= 12 {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        hy_ref_seq, hy_spec_seq,
+        "Hy4 built-in DFly2 speculative sequence diverged from greedy baseline!"
+    );
 
     let _ = std::fs::remove_dir_all(&out_dir);
 }

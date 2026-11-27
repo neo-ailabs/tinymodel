@@ -55,7 +55,7 @@ pub use qwen4exp::{
 };
 pub use qwen35::{
     Qwen35AttnWeights, Qwen35Config, Qwen35DecodeProfile, Qwen35FfnWeights, Qwen35LayerWeights,
-    Qwen35Model, Qwen35State,
+    Qwen35Model, Qwen35MtpWeights, Qwen35State,
 };
 pub use sampler::{Sampler, SamplerConfig, argmax};
 pub use state::{LayerState, MAX_SPEC_WINDOW, SpecVerifyBuf, decode_embedding_row};

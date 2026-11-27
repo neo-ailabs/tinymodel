@@ -12,7 +12,9 @@ pub mod llama_runner;
 pub mod qwen35_runner;
 pub mod qwen4exp_runner;
 
-pub use driver::{CUdeviceptr, CudaBuffer, CudaContext, CudaDeviceInfo, CudaEvent};
+pub use driver::{
+    CUdeviceptr, CudaBuffer, CudaContext, CudaDeviceInfo, CudaEvent, CudaPinnedBuffer,
+};
 pub use hy4_runner::Hy4CudaRunner;
 pub use inkling2_runner::{DFlashCudaRunner, Inkling2CudaRunner, MAX_INKLING2_CUDA_SPEC_WINDOW};
 pub use kernels::{BLOCK_Q8_1_BYTES, CudaKernels, CudaMat, MMVQ_MAX_TOK, dtype_cuda_tag};
@@ -183,6 +185,93 @@ impl CudaRunner {
         match self {
             CudaRunner::Hy4(r) => Some((r.cfg.bos_id, r.cfg.eos_id)),
             _ => None,
+        }
+    }
+
+    pub fn host_offloaded_moe_layers(&self) -> usize {
+        match self {
+            CudaRunner::Llama(r) => r.host_offloaded_moe_layers,
+            CudaRunner::Qwen35(r) => r.host_offloaded_moe_layers,
+            CudaRunner::Qwen4Exp(r) => r.host_offloaded_moe_layers,
+            _ => 0,
+        }
+    }
+
+    pub fn builtin_spec_name(&self) -> Option<&'static str> {
+        match self {
+            CudaRunner::Qwen35(r) if r.has_builtin_mtp() => Some("mtp"),
+            CudaRunner::Hy4(r) if r.has_builtin_dfly2() => Some("dfly2"),
+            _ => None,
+        }
+    }
+
+    /// Runs a greedy speculative step using a built-in GPU draft head (`nextn` MTP or `DFly2`),
+    /// writing `1 + accepted` committed tokens into `out_committed` and returning `(drafted, accepted)`.
+    pub fn spec_step_builtin_greedy(
+        &mut self,
+        x_tok: u32,
+        pos: usize,
+        draft_k: usize,
+        out_committed: &mut Vec<u32>,
+    ) -> Result<(usize, usize), CudaError> {
+        match self {
+            CudaRunner::Qwen35(r) if r.has_builtin_mtp() => {
+                r.spec_step_mtp_greedy(x_tok, pos, draft_k, out_committed)
+            }
+            CudaRunner::Hy4(r) if r.has_builtin_dfly2() => {
+                r.spec_step_dfly2_greedy(x_tok, pos, draft_k, 0.25, out_committed)
+            }
+            _ => {
+                let next = self.forward_token_greedy(x_tok, pos)?;
+                out_committed.clear();
+                out_committed.push(next);
+                Ok((0, 0))
+            }
+        }
+    }
+
+    /// Verifies `[x_tok, drafts...]` greedily on the target model, writing `1 + accepted` committed
+    /// tokens into `out_committed` and returning `(drafted, accepted)`.
+    pub fn verify_window_greedy(
+        &mut self,
+        x_tok: u32,
+        drafts: &[u32],
+        pos: usize,
+        out_committed: &mut Vec<u32>,
+    ) -> Result<(usize, usize), CudaError> {
+        if drafts.is_empty() {
+            let next = self.forward_token_greedy(x_tok, pos)?;
+            out_committed.clear();
+            out_committed.push(next);
+            return Ok((0, 0));
+        }
+        match self {
+            CudaRunner::Llama(r) => {
+                let (_c, acc) = r.verify_window_greedy(x_tok, drafts, pos, out_committed)?;
+                let eff_d = drafts.len().min(tm_models::MAX_SPEC_WINDOW);
+                Ok((eff_d, acc))
+            }
+            CudaRunner::Qwen35(r) => {
+                let (_c, acc) = r.verify_window_greedy(x_tok, drafts, pos, out_committed)?;
+                let eff_d = drafts.len().min(tm_models::MAX_SPEC_WINDOW);
+                Ok((eff_d, acc))
+            }
+            CudaRunner::Qwen4Exp(r) => {
+                let (_c, acc) = r.verify_window_greedy(x_tok, drafts, pos, out_committed)?;
+                let eff_d = drafts.len().min(tm_models::MAX_SPEC_WINDOW);
+                Ok((eff_d, acc))
+            }
+            CudaRunner::Hy4(r) => {
+                let (_c, acc) = r.verify_window_greedy(x_tok, drafts, pos, out_committed)?;
+                let eff_d = drafts.len().min(tm_models::MAX_SPEC_WINDOW);
+                Ok((eff_d, acc))
+            }
+            CudaRunner::Inkling2(r) => {
+                let next = r.forward_token_greedy(x_tok, pos)?;
+                out_committed.clear();
+                out_committed.push(next);
+                Ok((0, 0))
+            }
         }
     }
 

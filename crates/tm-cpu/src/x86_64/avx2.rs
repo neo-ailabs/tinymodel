@@ -1573,3 +1573,193 @@ pub unsafe fn f32_to_f16_slice(src: &[f32], dst: &mut [u16]) {
         }
     }
 }
+
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn unpack_q2_0_half32_u2(half8: __m128i) -> __m256i {
+    // Expands 8 bytes (`32` 2-bit codes in `[4*j + k]` layout) into 32 unsigned bytes `{0, 1, 2, 3}`!
+    let dw = _mm256_cvtepu8_epi32(half8);
+    let m0 = _mm256_set1_epi32(0x0000_0003);
+    let m1 = _mm256_set1_epi32(0x0000_0300);
+    let m2 = _mm256_set1_epi32(0x0003_0000);
+    let m3 = _mm256_set1_epi32(0x0300_0000);
+    let c0 = _mm256_and_si256(dw, m0);
+    let c1 = _mm256_and_si256(_mm256_slli_epi32::<6>(dw), m1);
+    let c2 = _mm256_and_si256(_mm256_slli_epi32::<12>(dw), m2);
+    let c3 = _mm256_and_si256(_mm256_slli_epi32::<18>(dw), m3);
+    _mm256_or_si256(_mm256_or_si256(c0, c1), _mm256_or_si256(c2, c3))
+}
+
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn dot_q2_half_q8_i32(u2: __m256i, y_s8: __m256i) -> i32 {
+    let one = _mm256_set1_epi8(1);
+    let ones16 = _mm256_set1_epi16(1);
+    let prod = _mm256_sub_epi16(
+        _mm256_maddubs_epi16(u2, y_s8),
+        _mm256_maddubs_epi16(one, y_s8),
+    );
+    // SAFETY: Caller guarantees `avx2` is available.
+    unsafe { hsum_epi32_avx2(_mm256_madd_epi16(prod, ones16)) }
+}
+
+/// `AVX2 + FMA` `vec_dot_q2_0_q8_0` (`0-ULP` bit-exact with `generic::vec_dot_q2_0_q8_0`).
+///
+/// # Safety
+/// Caller must ensure `avx2` and `fma` CPU features are supported.
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn vec_dot_q2_0_q8_0(x: &[tm_core::BlockQ2_0], y: &[BlockQ8_0]) -> f32 {
+    assert_eq!(x.len() * 2, y.len());
+    let mut sumf = 0.0f32;
+    // SAFETY: `y.len() == 2 * x.len()`, each `BlockQ2_0.qs` is 16 bytes and `BlockQ8_0.qs` is 32 bytes.
+    unsafe {
+        for (i, xb) in x.iter().enumerate() {
+            let yb0 = y.get_unchecked(2 * i);
+            let yb1 = y.get_unchecked(2 * i + 1);
+            let raw = _mm_loadu_si128(xb.qs.as_ptr().cast::<__m128i>());
+            let u2_0 = unpack_q2_0_half32_u2(raw);
+            let u2_1 = unpack_q2_0_half32_u2(_mm_srli_si128::<8>(raw));
+            let y0 = _mm256_loadu_si256(yb0.qs.as_ptr().cast::<__m256i>());
+            let y1 = _mm256_loadu_si256(yb1.qs.as_ptr().cast::<__m256i>());
+            let s0 = dot_q2_half_q8_i32(u2_0, y0);
+            let s1 = dot_q2_half_q8_i32(u2_1, y1);
+            let sub = (s0 as f32) * f16_to_f32(yb0.d) + (s1 as f32) * f16_to_f32(yb1.d);
+            sumf = f16_to_f32(xb.d).mul_add(sub, sumf);
+        }
+    }
+    sumf
+}
+
+/// 4-row shared-activation `AVX2 + FMA` `gemv_q2_0_q8_0` (`0-ULP` bit-exact with `generic::gemv_q2_0_q8_0`).
+///
+/// # Safety
+/// Caller must ensure `avx2` and `fma` CPU features are supported.
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn gemv_q2_0_q8_0(
+    w: &[tm_core::BlockQ2_0],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), cols_blocks * 2);
+    assert_eq!(out.len(), rows);
+
+    let mut r = 0usize;
+    // SAFETY: Bounds checked by assertions above.
+    unsafe {
+        while r + 4 <= rows {
+            let w0 = &w[r * cols_blocks..(r + 1) * cols_blocks];
+            let w1 = &w[(r + 1) * cols_blocks..(r + 2) * cols_blocks];
+            let w2 = &w[(r + 2) * cols_blocks..(r + 3) * cols_blocks];
+            let w3 = &w[(r + 3) * cols_blocks..(r + 4) * cols_blocks];
+            let mut sum0 = 0.0f32;
+            let mut sum1 = 0.0f32;
+            let mut sum2 = 0.0f32;
+            let mut sum3 = 0.0f32;
+
+            for i in 0..cols_blocks {
+                let yb0 = x.get_unchecked(2 * i);
+                let yb1 = x.get_unchecked(2 * i + 1);
+                let y0 = _mm256_loadu_si256(yb0.qs.as_ptr().cast::<__m256i>());
+                let y1 = _mm256_loadu_si256(yb1.qs.as_ptr().cast::<__m256i>());
+                let yd0 = f16_to_f32(yb0.d);
+                let yd1 = f16_to_f32(yb1.d);
+
+                let b0 = w0.get_unchecked(i);
+                let r0 = _mm_loadu_si128(b0.qs.as_ptr().cast::<__m128i>());
+                let sub0 = (dot_q2_half_q8_i32(unpack_q2_0_half32_u2(r0), y0) as f32) * yd0
+                    + (dot_q2_half_q8_i32(unpack_q2_0_half32_u2(_mm_srli_si128::<8>(r0)), y1)
+                        as f32)
+                        * yd1;
+                sum0 = f16_to_f32(b0.d).mul_add(sub0, sum0);
+
+                let b1 = w1.get_unchecked(i);
+                let r1 = _mm_loadu_si128(b1.qs.as_ptr().cast::<__m128i>());
+                let sub1 = (dot_q2_half_q8_i32(unpack_q2_0_half32_u2(r1), y0) as f32) * yd0
+                    + (dot_q2_half_q8_i32(unpack_q2_0_half32_u2(_mm_srli_si128::<8>(r1)), y1)
+                        as f32)
+                        * yd1;
+                sum1 = f16_to_f32(b1.d).mul_add(sub1, sum1);
+
+                let b2 = w2.get_unchecked(i);
+                let r2 = _mm_loadu_si128(b2.qs.as_ptr().cast::<__m128i>());
+                let sub2 = (dot_q2_half_q8_i32(unpack_q2_0_half32_u2(r2), y0) as f32) * yd0
+                    + (dot_q2_half_q8_i32(unpack_q2_0_half32_u2(_mm_srli_si128::<8>(r2)), y1)
+                        as f32)
+                        * yd1;
+                sum2 = f16_to_f32(b2.d).mul_add(sub2, sum2);
+
+                let b3 = w3.get_unchecked(i);
+                let r3 = _mm_loadu_si128(b3.qs.as_ptr().cast::<__m128i>());
+                let sub3 = (dot_q2_half_q8_i32(unpack_q2_0_half32_u2(r3), y0) as f32) * yd0
+                    + (dot_q2_half_q8_i32(unpack_q2_0_half32_u2(_mm_srli_si128::<8>(r3)), y1)
+                        as f32)
+                        * yd1;
+                sum3 = f16_to_f32(b3.d).mul_add(sub3, sum3);
+            }
+
+            *out.get_unchecked_mut(r) = sum0;
+            *out.get_unchecked_mut(r + 1) = sum1;
+            *out.get_unchecked_mut(r + 2) = sum2;
+            *out.get_unchecked_mut(r + 3) = sum3;
+            r += 4;
+        }
+
+        while r < rows {
+            *out.get_unchecked_mut(r) =
+                vec_dot_q2_0_q8_0(&w[r * cols_blocks..(r + 1) * cols_blocks], x);
+            r += 1;
+        }
+    }
+}
+
+/// Multi-token `AVX2 + FMA` `gemm_q2_0_q8_0` (`0-ULP` bit-exact with `generic::gemm_q2_0_q8_0`).
+///
+/// # Safety
+/// Caller must ensure `avx2` and `fma` CPU features are supported.
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn gemm_q2_0_q8_0(
+    w: &[tm_core::BlockQ2_0],
+    x: &[BlockQ8_0],
+    out: &mut [f32],
+    rows: usize,
+    cols_blocks: usize,
+    n_tok: usize,
+) {
+    assert_eq!(w.len(), rows * cols_blocks);
+    assert_eq!(x.len(), n_tok * cols_blocks * 2);
+    assert_eq!(out.len(), n_tok * rows);
+
+    // SAFETY: `avx2,fma` guaranteed by caller; unpacks each `BlockQ2_0` once across up to 4 tokens!
+    unsafe {
+        let mut t0 = 0usize;
+        while t0 < n_tok {
+            let bt = (n_tok - t0).min(4);
+            for r in 0..rows {
+                let w_row = &w[r * cols_blocks..(r + 1) * cols_blocks];
+                let mut sums = [0.0f32; 4];
+                for (i, xb) in w_row.iter().enumerate() {
+                    let raw = _mm_loadu_si128(xb.qs.as_ptr().cast::<__m128i>());
+                    let u2_0 = unpack_q2_0_half32_u2(raw);
+                    let u2_1 = unpack_q2_0_half32_u2(_mm_srli_si128::<8>(raw));
+                    let wd = f16_to_f32(xb.d);
+                    for (ti, st) in sums.iter_mut().enumerate().take(bt) {
+                        let yb0 = x.get_unchecked((t0 + ti) * cols_blocks * 2 + 2 * i);
+                        let yb1 = x.get_unchecked((t0 + ti) * cols_blocks * 2 + 2 * i + 1);
+                        let y0 = _mm256_loadu_si256(yb0.qs.as_ptr().cast::<__m256i>());
+                        let y1 = _mm256_loadu_si256(yb1.qs.as_ptr().cast::<__m256i>());
+                        let sub = (dot_q2_half_q8_i32(u2_0, y0) as f32) * f16_to_f32(yb0.d)
+                            + (dot_q2_half_q8_i32(u2_1, y1) as f32) * f16_to_f32(yb1.d);
+                        *st = wd.mul_add(sub, *st);
+                    }
+                }
+                for (ti, &sv) in sums.iter().enumerate().take(bt) {
+                    *out.get_unchecked_mut((t0 + ti) * rows + r) = sv;
+                }
+            }
+            t0 += bt;
+        }
+    }
+}

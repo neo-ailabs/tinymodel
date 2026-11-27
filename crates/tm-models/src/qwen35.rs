@@ -132,6 +132,15 @@ pub struct Qwen35LayerWeights<'a> {
     pub ffn: Qwen35FfnWeights<'a>,
 }
 
+/// Optional built-in `nextn` Multi-Token Prediction (MTP) draft layer (`blk.{n_layers}`).
+pub struct Qwen35MtpWeights<'a> {
+    pub enorm: Vec<f32>,
+    pub hnorm: Vec<f32>,
+    pub eh_proj: RawMatView<'a>,
+    pub shared_head_norm: Vec<f32>,
+    pub layer: Qwen35LayerWeights<'a>,
+}
+
 /// Loaded Qwen3.5 hybrid model borrowing quantized weight slices directly from `GgufFile`.
 pub struct Qwen35Model<'a> {
     pub cfg: Qwen35Config,
@@ -140,6 +149,7 @@ pub struct Qwen35Model<'a> {
     pub output_norm: Vec<f32>,
     pub rope_inv_freqs: Vec<f64>,
     pub layers: Vec<Qwen35LayerWeights<'a>>,
+    pub mtp: Option<Qwen35MtpWeights<'a>>,
     pub lora: BoundLora,
 }
 
@@ -337,7 +347,16 @@ impl<'a> Qwen35Model<'a> {
             .get_meta(&format!("{pfx}.nextn_predict_layers"))
             .and_then(|v| v.as_usize())
             .unwrap_or(0);
-        let n_layers = raw_blocks.saturating_sub(nextn_layers);
+        let n_layers = if nextn_layers > 0
+            && gguf
+                .tensor_info(&format!("blk.{raw_blocks}.attn_norm.weight"))
+                .is_none()
+        {
+            raw_blocks.saturating_sub(nextn_layers)
+        } else {
+            raw_blocks
+        };
+        let total_gguf_blocks = n_layers + nextn_layers;
         if n_layers == 0 {
             return Err(ModelError::InvalidConfig(format!(
                 "{arch}: block_count ({raw_blocks}) <= nextn_predict_layers ({nextn_layers})"
@@ -348,7 +367,7 @@ impl<'a> Qwen35Model<'a> {
             .get_meta(&format!("{pfx}.feed_forward_length"))
             .and_then(|v| v.as_usize())
             .unwrap_or(0);
-        let moe_params = parse_moe_arch_params(gguf, pfx, &arch, n_layers, n_ff_meta)?;
+        let moe_params = parse_moe_arch_params(gguf, pfx, &arch, total_gguf_blocks, n_ff_meta)?;
         let n_ff = if n_ff_meta > 0 {
             n_ff_meta
         } else if moe_params.is_some() {
@@ -472,8 +491,9 @@ impl<'a> Qwen35Model<'a> {
         let conv_dim = cfg.conv_dim();
         let head_v_dim = cfg.ssm_head_v_dim();
 
-        let mut layers = Vec::with_capacity(n_layers);
-        for l in 0..n_layers {
+        let load_one_layer = |l: usize,
+                              cfg: &mut Qwen35Config|
+         -> Result<Qwen35LayerWeights<'a>, ModelError> {
             let ltag = format!("blk.{l}");
             let attn_norm =
                 load_f32_vec(gguf, &format!("{ltag}.attn_norm.weight"), &ltag, &[n_embd])?;
@@ -625,13 +645,66 @@ impl<'a> Qwen35Model<'a> {
                 }
             };
 
-            layers.push(Qwen35LayerWeights {
+            Ok(Qwen35LayerWeights {
                 attn_norm,
                 post_attn_norm,
                 attn,
                 ffn,
-            });
+            })
+        };
+
+        let mut layers = Vec::with_capacity(n_layers);
+        for l in 0..n_layers {
+            layers.push(load_one_layer(l, &mut cfg)?);
         }
+
+        let mtp_pfx = if nextn_layers >= 1 {
+            let p_nextn = format!("blk.{n_layers}.nextn");
+            let p_plain = format!("blk.{n_layers}");
+            if gguf
+                .tensor_info(&format!("{p_nextn}.eh_proj.weight"))
+                .is_some()
+            {
+                Some(p_nextn)
+            } else if gguf
+                .tensor_info(&format!("{p_plain}.eh_proj.weight"))
+                .is_some()
+            {
+                Some(p_plain)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mtp = if let Some(mpfx) = mtp_pfx {
+            let mtag = format!("blk.{n_layers}");
+            let enorm = load_f32_vec(gguf, &format!("{mpfx}.enorm.weight"), &mtag, &[n_embd])?;
+            let hnorm = load_f32_vec(gguf, &format!("{mpfx}.hnorm.weight"), &mtag, &[n_embd])?;
+            let eh_proj = load_mat(
+                gguf,
+                &format!("{mpfx}.eh_proj.weight"),
+                &mtag,
+                2 * n_embd,
+                n_embd,
+            )?;
+            let shared_head_norm = load_f32_vec(
+                gguf,
+                &format!("{mpfx}.shared_head_norm.weight"),
+                &mtag,
+                &[n_embd],
+            )?;
+            let layer = load_one_layer(n_layers, &mut cfg)?;
+            Some(Qwen35MtpWeights {
+                enorm,
+                hnorm,
+                eh_proj,
+                shared_head_norm,
+                layer,
+            })
+        } else {
+            None
+        };
 
         Ok(Self {
             cfg,
@@ -640,6 +713,7 @@ impl<'a> Qwen35Model<'a> {
             output_norm,
             rope_inv_freqs,
             layers,
+            mtp,
             lora: BoundLora::default(),
         })
     }

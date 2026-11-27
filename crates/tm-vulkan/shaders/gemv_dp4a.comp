@@ -183,6 +183,38 @@ void main() {
                     }
                 }
             }
+        } else if (DTYPE == 6u) {
+            const uint sub_blk = lane >> 3u;
+            const uint sub_lane = lane & 7u;
+            const uint step_blk = max(sg_size >> 3u, 1u);
+            const uint u16_in_half = sub_lane >> 1u;
+            const uint byte_sh = (sub_lane & 1u) * 8u;
+            for (uint ib = sub_blk; ib < nb; ib += step_blk) {
+                const uint ib2 = ib >> 1u;
+                const uint sh = ib & 1u;
+                float d_arr[NR];
+                int q4s_arr[NR];
+                [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                    const uint b = b_row[r] + ib2 * 9u;
+                    d_arr[r] = unpackHalf2x16(uint(w16[b])).x;
+                    const uint bt = (uint(w16[b + 1u + sh * 4u + u16_in_half]) >> byte_sh) & 0xFFu;
+                    const uint q4s = (((bt & 3u) + 0xFFu) & 0xFFu)
+                                   | (((((bt >> 2u) & 3u) + 0xFFu) & 0xFFu) << 8u)
+                                   | (((((bt >> 4u) & 3u) + 0xFFu) & 0xFFu) << 16u)
+                                   | (((((bt >> 6u) & 3u) + 0xFFu) & 0xFFu) << 24u);
+                    q4s_arr[r] = int(q4s);
+                }
+                [[unroll]] for (uint t = 0u; t < M; ++t) {
+                    if (t < n_tok) {
+                        const uint gblk = t * nb + ib;
+                        const int xqv = xq[gblk * 8u + sub_lane];
+                        const float dx = xd[gblk].x;
+                        [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                            b_acc[t][r] = fma(d_arr[r] * dx, float(sdot4x8(q4s_arr[r], xqv, 0)), b_acc[t][r]);
+                        }
+                    }
+                }
+            }
         }
 
         [[unroll]] for (uint t = 0u; t < M; ++t) {
@@ -384,6 +416,30 @@ void main() {
                 const uint m6 = t6 & 0x20202020u;
                 const int q4s = int(t6 | (m6 << 1u) | (m6 << 2u));
                 acc[r] = fma((d * float(sc)) * dx, float(sdot4x8(q4s, xqv, 0)), acc[r]);
+            }
+        }
+    } else if (DTYPE == 6u) {
+        // Coalesced 8-lane-per-Q8_1-subblock Q2_0 DP4A GEMV (64 elems = 2x32 sub-blocks = 18B = 9 u16).
+        const uint sub_blk = lane >> 3u;
+        const uint sub_lane = lane & 7u;
+        const uint step_blk = max(sg_size >> 3u, 1u);
+        const uint u16_in_half = sub_lane >> 1u;
+        const uint byte_sh = (sub_lane & 1u) * 8u;
+        for (uint ib = sub_blk; ib < nb; ib += step_blk) {
+            const uint gblk = x_blk_off + ib;
+            const int xqv = xq[gblk * 8u + sub_lane];
+            const float dx = xd[gblk].x;
+            const uint ib2 = ib >> 1u;
+            const uint sh = ib & 1u;
+            [[unroll]] for (uint r = 0u; r < NR; ++r) {
+                const uint b = row_b[r] + ib2 * 9u;
+                const float d = unpackHalf2x16(uint(w16[b])).x;
+                const uint bt = (uint(w16[b + 1u + sh * 4u + u16_in_half]) >> byte_sh) & 0xFFu;
+                const uint q4s = (((bt & 3u) + 0xFFu) & 0xFFu)
+                               | (((((bt >> 2u) & 3u) + 0xFFu) & 0xFFu) << 8u)
+                               | (((((bt >> 4u) & 3u) + 0xFFu) & 0xFFu) << 16u)
+                               | (((((bt >> 6u) & 3u) + 0xFFu) & 0xFFu) << 24u);
+                acc[r] = fma(d * dx, float(sdot4x8(int(q4s), xqv, 0)), acc[r]);
             }
         }
     }
