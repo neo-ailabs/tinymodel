@@ -81,7 +81,7 @@ impl<'a> CpuModel<'a> {
             "llama" | "qwen2" | "qwen3" | "smollm3" | "phi3" | "mistral" | "mistral3" | "olmo2"
             | "olmo3" | "granite" | "exaone" | "olmoe" | "granitemoe" | "qwen2moe" | "qwen3moe"
             | "bailingmoe2" => Ok(CpuModel::Llama(LlamaModel::from_gguf(gguf)?)),
-            "qwen35" => Ok(CpuModel::Qwen35(Qwen35Model::from_gguf(gguf)?)),
+            "qwen35" | "qwen35moe" => Ok(CpuModel::Qwen35(Qwen35Model::from_gguf(gguf)?)),
             "gemma2" | "gemma3" | "gemma4" => Ok(CpuModel::Gemma4(Gemma4Model::from_gguf(gguf)?)),
             "lfm2" | "lfm3" => Ok(CpuModel::Lfm2(Lfm2Model::from_gguf(gguf)?)),
             "mamba2" | "nemotron_h" | "falcon-h1" | "granitehybrid" | "granitemoehybrid" => {
@@ -166,7 +166,9 @@ impl<'a> CpuModel<'a> {
                     * (c.ssm_dt_rank * c.ssm_state_size * c.ssm_head_v_dim()
                         + c.conv_dim() * c.ssm_conv_kernel)
                     * 4) as u64;
-                let sc = ((c.vocab_size + 40 * (c.n_embd + c.n_ff + c.conv_dim())) * 4) as u64;
+                let ff_max = c.n_ff.max(c.max_n_ff_exp).max(c.max_n_ff_shexp);
+                let sc = ((c.vocab_size + 40 * (c.n_embd + ff_max + c.conv_dim() + c.n_expert)) * 4)
+                    as u64;
                 kv + gdn + sc
             }
             CpuModel::Gemma4(m) => {

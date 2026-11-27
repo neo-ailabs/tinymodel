@@ -735,18 +735,18 @@ fn plan_mat_3d<'a>(
     })
 }
 
-struct MoeArchParams {
-    n_expert: usize,
-    n_expert_used: usize,
-    n_layer_dense_lead: usize,
-    n_ff_exp_per_layer: Vec<usize>,
-    gating_func: u32,
-    norm_weights: bool,
-    norm_weights_eps: f32,
-    weights_scale: f32,
+pub(crate) struct MoeArchParams {
+    pub(crate) n_expert: usize,
+    pub(crate) n_expert_used: usize,
+    pub(crate) n_layer_dense_lead: usize,
+    pub(crate) n_ff_exp_per_layer: Vec<usize>,
+    pub(crate) gating_func: u32,
+    pub(crate) norm_weights: bool,
+    pub(crate) norm_weights_eps: f32,
+    pub(crate) weights_scale: f32,
 }
 
-fn parse_moe_arch_params(
+pub(crate) fn parse_moe_arch_params(
     gguf: &GgufFile,
     pfx: &str,
     arch: &str,
@@ -771,7 +771,7 @@ fn parse_moe_arch_params(
         .and_then(|v| v.as_usize())
         .unwrap_or(0);
     let fallback_ff_exp =
-        if matches!(arch, "qwen2moe" | "qwen3moe") && n_ff_default >= n_expert_used {
+        if matches!(arch, "qwen2moe" | "qwen3moe" | "qwen35moe") && n_ff_default >= n_expert_used {
             n_ff_default / n_expert_used
         } else {
             n_ff_default
@@ -807,7 +807,7 @@ fn parse_moe_arch_params(
             )));
         }
     };
-    let default_norm_w = matches!(arch, "granite" | "granitemoe" | "qwen3moe");
+    let default_norm_w = matches!(arch, "granite" | "granitemoe" | "qwen3moe" | "qwen35moe");
     let norm_weights = gguf
         .get_meta(&format!("{pfx}.expert_weights_norm"))
         .and_then(|v| v.as_bool())
@@ -3795,7 +3795,7 @@ impl LlamaVkRunner {
             &self.pipes.moe_router,
             moe.router_topk_set,
             &r_push,
-            n_tok.div_ceil(64),
+            n_tok,
             1,
             true,
         )?;

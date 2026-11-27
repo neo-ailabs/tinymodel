@@ -856,6 +856,27 @@ fn cmd_run_metal(opts: RunOpts) -> Result<()> {
 fn compute_active_decode_bytes(gguf: &GgufFile) -> u64 {
     let arch = gguf.req_str("general.architecture").unwrap_or("");
     let is_inkling2 = arch == "inkling2" || arch == "inkling2_loop";
+    let raw_blocks = gguf
+        .get_meta(&format!("{arch}.block_count"))
+        .and_then(|v| v.as_usize())
+        .unwrap_or(usize::MAX);
+    let nextn_layers = gguf
+        .get_meta(&format!("{arch}.nextn_predict_layers"))
+        .and_then(|v| v.as_usize())
+        .unwrap_or(0);
+    let n_trunk_layers = raw_blocks.saturating_sub(nextn_layers);
+    let gen_n_exp = gguf
+        .get_meta(&format!("{arch}.expert_count"))
+        .and_then(|v| v.as_usize())
+        .unwrap_or(1)
+        .max(1);
+    let gen_n_exp_used = gguf
+        .get_meta(&format!("{arch}.expert_used_count"))
+        .and_then(|v| {
+            v.as_usize()
+                .or_else(|| v.as_usize_array().and_then(|a| a.first().copied()))
+        })
+        .unwrap_or(gen_n_exp);
     let (core_start, core_end, n_passes, n_exp, n_exp_used) = if is_inkling2 {
         let cs = gguf
             .get_meta(&format!("{arch}.loop.start"))
@@ -869,21 +890,9 @@ fn compute_active_decode_bytes(gguf: &GgufFile) -> u64 {
             .get_meta(&format!("{arch}.loop.count"))
             .and_then(|v| v.as_usize())
             .unwrap_or(1);
-        let ne = gguf
-            .get_meta(&format!("{arch}.expert_count"))
-            .and_then(|v| v.as_usize())
-            .unwrap_or(1)
-            .max(1);
-        let eu = gguf
-            .get_meta(&format!("{arch}.expert_used_count"))
-            .and_then(|v| {
-                v.as_usize()
-                    .or_else(|| v.as_usize_array().and_then(|a| a.first().copied()))
-            })
-            .unwrap_or(ne);
-        (cs, ce, np, ne, eu)
+        (cs, ce, np, gen_n_exp, gen_n_exp_used)
     } else {
-        (0, 0, 1, 1, 1)
+        (0, 0, 1, gen_n_exp, gen_n_exp_used)
     };
 
     let mut total = 0u64;
@@ -904,26 +913,35 @@ fn compute_active_decode_bytes(gguf: &GgufFile) -> u64 {
                 }
                 continue;
             }
-            if is_inkling2
-                && let Some(rest) = name.strip_prefix("blk.")
+            if let Some(rest) = name.strip_prefix("blk.")
                 && let Some((idx_str, suffix)) = rest.split_once('.')
                 && let Ok(ip) = idx_str.parse::<usize>()
             {
-                let in_core = (core_start..core_end).contains(&ip) && n_passes > 1;
-                let mult = if suffix.starts_with("loop_") {
-                    n_passes.saturating_sub(1) as u64
-                } else if in_core {
-                    n_passes as u64
-                } else {
-                    1
-                };
-                if suffix.ends_with("_exps.weight") {
-                    let per_exp = (info.byte_len / n_exp) as u64;
-                    total += mult * (n_exp_used as u64) * per_exp;
-                } else {
-                    total += mult * (info.byte_len as u64);
+                if ip >= n_trunk_layers {
+                    continue;
                 }
-                continue;
+                if is_inkling2 {
+                    let in_core = (core_start..core_end).contains(&ip) && n_passes > 1;
+                    let mult = if suffix.starts_with("loop_") {
+                        n_passes.saturating_sub(1) as u64
+                    } else if in_core {
+                        n_passes as u64
+                    } else {
+                        1
+                    };
+                    if suffix.ends_with("_exps.weight") {
+                        let per_exp = (info.byte_len / n_exp) as u64;
+                        total += mult * (n_exp_used as u64) * per_exp;
+                    } else {
+                        total += mult * (info.byte_len as u64);
+                    }
+                    continue;
+                }
+                if n_exp > 1 && suffix.ends_with("_exps.weight") {
+                    let per_exp = (info.byte_len / n_exp) as u64;
+                    total += (n_exp_used as u64) * per_exp;
+                    continue;
+                }
             }
             total += info.byte_len as u64;
         }
@@ -2072,7 +2090,7 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
         return Ok(());
     }
 
-    if arch == "qwen35" {
+    if matches!(arch.as_str(), "qwen35" | "qwen35moe") {
         let vision_embeds = if !opts.image_paths.is_empty() {
             encode_cli_images_vulkan(&opts)?
         } else {
@@ -2085,7 +2103,8 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
         }
         let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
         eprintln!(
-            "[tinymodel] arch=qwen35 backend=vulkan ({} · {} · {}) loras={} load={:.1}ms prompt_tokens={} vocab={} layers={} (gdn={}, full={})",
+            "[tinymodel] arch={} backend=vulkan ({} · {} · {}) loras={} load={:.1}ms prompt_tokens={} vocab={} layers={} (gdn={}, full={})",
+            arch,
             runner.device_name(),
             runner.driver_info(),
             runner.weights_mode(),
@@ -2585,7 +2604,7 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
         return Ok(());
     }
 
-    if arch == "qwen35" {
+    if matches!(arch.as_str(), "qwen35" | "qwen35moe") {
         let mut runner =
             tm_vulkan::Qwen35VkRunner::from_gguf_with_kv(gguf, opts.max_ctx, opts.kv_type)?;
         if let Some(ref ls) = loras {
@@ -2768,7 +2787,7 @@ fn cmd_profile_vulkan(opts: RunOpts) -> Result<()> {
         None
     };
     let n_runs = opts.n_predict.max(16);
-    if arch == "qwen35" {
+    if matches!(arch.as_str(), "qwen35" | "qwen35moe") {
         let mut runner =
             tm_vulkan::Qwen35VkRunner::from_gguf_with_kv(gguf, opts.max_ctx, opts.kv_type)?;
         if let Some(ref ls) = loras {
@@ -3185,7 +3204,7 @@ fn cmd_profile(opts: RunOpts) -> Result<()> {
     let pool = ThreadPool::new(opts.threads);
     let kt = active_kernels();
 
-    if arch == "qwen35" {
+    if matches!(arch.as_str(), "qwen35" | "qwen35moe") {
         let model = Qwen35Model::from_gguf(&gguf)?;
         let mut state = Qwen35State::new(&model, opts.max_ctx);
         for i in 0..4 {
@@ -3471,7 +3490,7 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
                 );
                 return Ok(());
             }
-            if arch == "qwen35" {
+            if matches!(arch.as_str(), "qwen35" | "qwen35moe") {
                 let mut runner =
                     tm_vulkan::Qwen35VkRunner::from_gguf_with_kv(gguf, opts.max_ctx, opts.kv_type)?;
                 if let Some(ref ls) = loras {
@@ -3491,9 +3510,10 @@ fn cmd_logits(opts: RunOpts) -> Result<()> {
                 }
                 writer.flush()?;
                 eprintln!(
-                    "[tinymodel logits] wrote {} steps x {} vocab (vulkan qwen35, loras={}) -> {}",
+                    "[tinymodel logits] wrote {} steps x {} vocab (vulkan {}, loras={}) -> {}",
                     n_steps,
                     vocab,
+                    arch,
                     opts.lora_specs.len(),
                     out_path.display()
                 );

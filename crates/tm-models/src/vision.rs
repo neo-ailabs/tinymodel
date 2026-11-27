@@ -464,7 +464,8 @@ impl VisionProjectorType {
             "gemma4" => Ok(Self::Gemma4),
             "qwen2vl_merger" | "qwen2vl" => Ok(Self::Qwen2Vl),
             "qwen2.5vl_merger" | "qwen25vl_merger" | "qwen2.5vl" => Ok(Self::Qwen25Vl),
-            "qwen3vl_merger" | "qwen35_merger" | "qwen3vl" | "qwen35" => Ok(Self::Qwen3Vl),
+            "qwen3vl_merger" | "qwen35_merger" | "qwen35moe_merger" | "qwen3vl" | "qwen35"
+            | "qwen35moe" => Ok(Self::Qwen3Vl),
             "pixtral" | "mistral3" => Ok(Self::Pixtral),
             "smolvlm" | "idefics3" | "lfm2" => Ok(Self::SmolVlm),
             "mlp" | "siglip" | "linear" | "ldp" | "ldpv2" => Ok(Self::Mlp),

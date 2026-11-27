@@ -414,9 +414,19 @@ impl<'a> Qwen35Trainer<'a> {
         let hist_len = d_conv.saturating_sub(1);
         let state_elems = hv * s_dim * c.ssm_head_v_dim();
 
-        let slot_wg = bound.slot_for(lw.w_gate.name);
-        let slot_wu = bound.slot_for(lw.w_up.name);
-        let slot_wd = bound.slot_for(lw.w_down.name);
+        let (w_gate, w_up, w_down) = match &lw.ffn {
+            tm_models::Qwen35FfnWeights::Dense {
+                w_gate,
+                w_up,
+                w_down,
+            } => (w_gate, w_up, w_down),
+            tm_models::Qwen35FfnWeights::Moe(_) => {
+                unreachable!("Qwen35Trainer only supports dense Qwen3.5 models")
+            }
+        };
+        let slot_wg = bound.slot_for(w_gate.name);
+        let slot_wu = bound.slot_for(w_up.name);
+        let slot_wd = bound.slot_for(w_down.name);
 
         if matches!(lw.attn, Qwen35AttnWeights::Gdn { .. }) {
             arena.ssm_state_work[..state_elems].fill(0.0);
@@ -1007,7 +1017,7 @@ impl<'a> Qwen35Trainer<'a> {
                     accel.as_deref_mut(),
                     pool,
                     kt,
-                    &lw.w_gate,
+                    w_gate,
                     bound,
                     slot_wg,
                     xfn_chunk,
@@ -1021,7 +1031,7 @@ impl<'a> Qwen35Trainer<'a> {
                     accel.as_deref_mut(),
                     pool,
                     kt,
-                    &lw.w_up,
+                    w_up,
                     bound,
                     slot_wu,
                     xfn_chunk,
@@ -1036,13 +1046,13 @@ impl<'a> Qwen35Trainer<'a> {
                     matvec_pair_f32(
                         pool,
                         kt,
-                        lw.w_gate.dtype,
-                        lw.w_gate.bytes,
-                        lw.w_gate.rows,
+                        w_gate.dtype,
+                        w_gate.bytes,
+                        w_gate.rows,
                         &mut arena.gate_pre[..ff],
-                        lw.w_up.dtype,
-                        lw.w_up.bytes,
-                        lw.w_up.rows,
+                        w_up.dtype,
+                        w_up.bytes,
+                        w_up.rows,
                         &mut arena.up_pre[..ff],
                         xfn_chunk,
                         &mut arena.mv_scratch,
@@ -1052,13 +1062,13 @@ impl<'a> Qwen35Trainer<'a> {
                     matmul_pair_f32(
                         pool,
                         kt,
-                        lw.w_gate.dtype,
-                        lw.w_gate.bytes,
-                        lw.w_gate.rows,
+                        w_gate.dtype,
+                        w_gate.bytes,
+                        w_gate.rows,
                         &mut arena.gate_pre[offset * ff..(offset + b) * ff],
-                        lw.w_up.dtype,
-                        lw.w_up.bytes,
-                        lw.w_up.rows,
+                        w_up.dtype,
+                        w_up.bytes,
+                        w_up.rows,
                         &mut arena.up_pre[offset * ff..(offset + b) * ff],
                         xfn_chunk,
                         &mut arena.mv_scratch,
@@ -1100,7 +1110,7 @@ impl<'a> Qwen35Trainer<'a> {
                 accel.as_deref_mut(),
                 pool,
                 kt,
-                &lw.w_down,
+                w_down,
                 bound,
                 slot_wd,
                 &arena.swiglu_out[offset * ff..(offset + b) * ff],
@@ -1379,13 +1389,23 @@ impl<'a> Qwen35Trainer<'a> {
             );
 
             let lw = &self.model.layers[l];
+            let (w_gate, w_up, w_down) = match &lw.ffn {
+                tm_models::Qwen35FfnWeights::Dense {
+                    w_gate,
+                    w_up,
+                    w_down,
+                } => (w_gate, w_up, w_down),
+                tm_models::Qwen35FfnWeights::Moe(_) => {
+                    unreachable!("Qwen35Trainer only supports dense Qwen3.5 models")
+                }
+            };
 
             // 3a. SwiGLU FFN backward (`post_attn_norm`)
             linear_bwd_with_accel(
                 accel.as_deref_mut(),
                 pool,
                 kt,
-                &lw.w_down,
+                w_down,
                 adapter,
                 grads,
                 &self.arena.swiglu_out[..seq_len * ff],
@@ -1408,7 +1428,7 @@ impl<'a> Qwen35Trainer<'a> {
                 accel.as_deref_mut(),
                 pool,
                 kt,
-                &lw.w_gate,
+                w_gate,
                 adapter,
                 grads,
                 &self.arena.x_ffn_norm[..seq_len * d],
@@ -1424,7 +1444,7 @@ impl<'a> Qwen35Trainer<'a> {
                 accel.as_deref_mut(),
                 pool,
                 kt,
-                &lw.w_up,
+                w_up,
                 adapter,
                 grads,
                 &self.arena.x_ffn_norm[..seq_len * d],

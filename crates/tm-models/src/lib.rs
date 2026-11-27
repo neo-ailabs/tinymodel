@@ -42,8 +42,8 @@ pub use moe::{
     eval_sparse_moe_ffn, load_layer_moe_ffn, parse_moe_arch_params,
 };
 pub use qwen35::{
-    Qwen35AttnWeights, Qwen35Config, Qwen35DecodeProfile, Qwen35LayerWeights, Qwen35Model,
-    Qwen35State,
+    Qwen35AttnWeights, Qwen35Config, Qwen35DecodeProfile, Qwen35FfnWeights, Qwen35LayerWeights,
+    Qwen35Model, Qwen35State,
 };
 pub use sampler::{Sampler, SamplerConfig, argmax};
 pub use state::{LayerState, MAX_SPEC_WINDOW, SpecVerifyBuf, decode_embedding_row};
