@@ -288,11 +288,69 @@ fn bench_q2_0_gemv() {
     );
 }
 
+fn bench_q5_k_gemv() {
+    let rows = 2048usize;
+    let cols = 2048usize;
+    let cols_blocks = cols / 256;
+    let iters = 200usize;
+
+    let w: Vec<tm_core::BlockQ5K> = (0..rows * cols_blocks)
+        .map(|i| tm_core::BlockQ5K {
+            d: tm_core::f32_to_f16(0.025),
+            dmin: tm_core::f32_to_f16(0.01),
+            scales: [((i % 15) as u8) | (((i * 3 % 15) as u8) << 4); 12],
+            qh: [(i * 7 % 256) as u8; 32],
+            qs: [(i * 13 % 256) as u8; 128],
+        })
+        .collect();
+
+    let x_f32: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.019).cos()).collect();
+    let mut x_q8k = vec![
+        tm_core::BlockQ8K {
+            d: 0.0,
+            qs: [0; 256],
+            bsums: [0; 16],
+        };
+        cols_blocks
+    ];
+    tm_core::quantize_row_q8_k(&x_f32, &mut x_q8k);
+    let mut out = vec![0.0f32; rows];
+    let kt = active_kernels();
+
+    for _ in 0..10 {
+        (kt.gemv_q5_k_q8_k)(
+            black_box(&w),
+            black_box(&x_q8k),
+            &mut out,
+            rows,
+            cols_blocks,
+        );
+    }
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        (kt.gemv_q5_k_q8_k)(
+            black_box(&w),
+            black_box(&x_q8k),
+            &mut out,
+            rows,
+            cols_blocks,
+        );
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    let gflops = (2.0 * (rows * cols * iters) as f64) / secs / 1e9;
+    println!(
+        "gemv_q5_k_q8_k 2048x2048 (isa={}): {gflops:.1} GFLOP/s (out[0]={:.3})",
+        kt.isa.name(),
+        out[0]
+    );
+}
+
 fn main() {
     bench_mamba2_scan();
     bench_q4_0_gemv();
     bench_q2_0_gemv();
     bench_nvfp4_gemv();
+    bench_q5_k_gemv();
     bench_f32_q8_0_gemv_gemm();
     bench_f16_kv_ops();
 }

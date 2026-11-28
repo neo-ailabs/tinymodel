@@ -2740,3 +2740,370 @@ write_gguf(mtp_out, [("general.architecture", 8, "qwen4exp-mtp")], tm)
 
     let _ = std::fs::remove_dir_all(&out_dir);
 }
+
+#[test]
+fn parity_cuda_inkling2_mixed_nvfp4_q5k_vram_and_devicemap() {
+    if try_ctx().is_none() {
+        return;
+    }
+    let out_dir = std::env::temp_dir().join(format!("tm_cuda_ik_ud4_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out_dir);
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let gguf_path = out_dir.join("synthetic_inkling2_ud_q4km.gguf");
+    let py = find_python3_with_numpy();
+    let gen_py = r#"
+import struct, sys
+from pathlib import Path
+import numpy as np
+
+out = Path(sys.argv[1])
+rng = np.random.default_rng(20261128)
+
+def gstr(s):
+    b = s.encode()
+    return struct.pack("<Q", len(b)) + b
+
+arch = "inkling2_loop"
+n_phys = 6
+n_embd = 256
+n_head, n_head_kv, head_dim = 4, 2, 64
+q_dim, kv_dim = 256, 128
+n_ff_exp = 256
+n_expert, n_expert_used = 4, 2
+n_rel, n_swa, n_rel_extent, n_conv = 8, 4, 6, 4
+core_start, core_end, n_passes, gate_rank, block_size = 2, 4, 2, 8, 2
+vocab_padded, vocab_unpadded = 64, 50
+is_swa = [True, False, True, False, True, False]
+
+kvs = [
+    ("general.architecture", 8, arch),
+    ("general.name", 8, "synthetic-inkling2-ud-q4km"),
+    (f"{arch}.block_count", 4, n_phys),
+    (f"{arch}.context_length", 4, 64),
+    (f"{arch}.embedding_length", 4, n_embd),
+    (f"{arch}.expert_feed_forward_length", 4, n_ff_exp),
+    (f"{arch}.expert_count", 4, n_expert),
+    (f"{arch}.expert_used_count", 4, n_expert_used),
+    (f"{arch}.expert_weights_scale", 6, 8.0),
+    (f"{arch}.attention.head_count", 94, [n_head] * n_phys),
+    (f"{arch}.attention.head_count_kv", 94, [n_head_kv] * n_phys),
+    (f"{arch}.attention.key_length", 4, head_dim),
+    (f"{arch}.attention.value_length", 4, head_dim),
+    (f"{arch}.attention.layer_norm_rms_epsilon", 6, 1e-6),
+    (f"{arch}.rope.dimension_count", 4, 0),
+    (f"{arch}.attention.sliding_window", 4, n_swa),
+    (f"{arch}.attention.sliding_window_pattern", 97, is_swa),
+    (f"{arch}.shortconv.l_cache", 4, n_conv),
+    (f"{arch}.activation.situ_beta", 6, 4.0),
+    (f"{arch}.activation.situ_linear_beta", 6, 25.0),
+    (f"{arch}.attn_res.block_size", 4, block_size),
+    (f"{arch}.final_logit_softcapping", 6, 30.0),
+    (f"{arch}.attention.relative_length", 4, n_rel),
+    (f"{arch}.attention.relative_extent", 4, n_rel_extent),
+    (f"{arch}.attention.qk_clip", 6, 22.6274166),
+    (f"{arch}.attention.relative_clip", 6, 8.0),
+    (f"{arch}.attention.log_scale_floor", 4, 3),
+    (f"{arch}.attention.log_scale_alpha", 6, 0.15),
+    (f"{arch}.vocab_size", 4, vocab_padded),
+    (f"{arch}.vocab_size_unpadded", 4, vocab_unpadded),
+    (f"{arch}.loop.start", 4, core_start),
+    (f"{arch}.loop.end", 4, core_end),
+    (f"{arch}.loop.count", 4, n_passes),
+    (f"{arch}.loop.gate_rank", 4, gate_rank),
+    (f"{arch}.loop.varying", 7, False),
+]
+
+tensors = []
+def add_f32(name, shape_rm, ne, lo=-0.08, hi=0.08):
+    a = rng.uniform(lo, hi, shape_rm).astype(np.float32)
+    tensors.append((name, ne, 0, a.tobytes()))
+def add_norm(name, n):
+    a = rng.uniform(0.88, 1.12, (n,)).astype(np.float32)
+    tensors.append((name, (n,), 0, a.tobytes()))
+def add_bf16(name, shape_rm, ne, s=0.03):
+    a = rng.uniform(-s, s, shape_rm).astype(np.float32)
+    bf = (a.view(np.uint32) >> 16).astype(np.uint16)
+    tensors.append((name, ne, 30, bf.tobytes()))
+def pack_nvfp4(rows, cols):
+    # 36 bytes per 64 weights: Xavier-scaled UE4M3 scales (~+-0.035 for cols=256) + 32 packed nibble bytes
+    raw = bytearray()
+    for _ in range(rows * (cols // 64)):
+        d = rng.integers(0x04, 0x0A, size=4, dtype=np.uint8).tobytes()
+        qs = rng.integers(0, 256, size=32, dtype=np.uint8).tobytes()
+        raw.extend(d + qs)
+    return bytes(raw)
+def pack_q5_k(rows, cols):
+    # 176 bytes per 256 weights: Xavier-scaled zero-mean (~+-0.035) across all 8 sub-blocks (j=0..7)!
+    raw = bytearray()
+    for _ in range(rows * (cols // 256)):
+        d = np.float16(rng.uniform(0.00015, 0.00030)).tobytes()
+        dm = np.float16(rng.uniform(0.0023, 0.0046)).tobytes()
+        sc03 = rng.integers(6, 11, size=4, dtype=np.uint8)
+        m03 = rng.integers(6, 11, size=4, dtype=np.uint8)
+        sc47 = rng.integers(6, 11, size=4, dtype=np.uint8)
+        m47 = rng.integers(6, 11, size=4, dtype=np.uint8)
+        sc = bytes(sc03) + bytes(m03) + bytes(sc47 | (m47 << 4))
+        qh = rng.integers(0, 256, size=32, dtype=np.uint8).tobytes()
+        qs = rng.integers(0, 256, size=128, dtype=np.uint8).tobytes()
+        raw.extend(d + dm + sc + qh + qs)
+    return bytes(raw)
+def pack_q8_0(rows, cols):
+    raw = bytearray()
+    for _ in range(rows * (cols // 32)):
+        d = np.float16(rng.uniform(0.0003, 0.0008)).tobytes()
+        qs = rng.integers(-60, 61, size=32, dtype=np.int8).tobytes()
+        raw.extend(d + qs)
+    return bytes(raw)
+
+add_f32("token_embd.weight", (vocab_padded, n_embd), (n_embd, vocab_padded), -0.1, 0.1)
+add_norm("token_embd_norm.weight", n_embd)
+add_f32("output_res_query.weight", (n_embd,), (n_embd,), -0.15, 0.15)
+add_norm("output_norm.weight", n_embd)
+tensors.append(("output.weight", (n_embd, vocab_padded), 8, pack_q8_0(vocab_padded, n_embd)))
+
+for i in range(n_phys):
+    swa = is_swa[i]
+    ext = n_swa if swa else n_rel_extent
+    tensors.append((f"blk.{i}.attn_q.weight", (n_embd, q_dim), 8, pack_q8_0(q_dim, n_embd)))
+    tensors.append((f"blk.{i}.attn_k.weight", (n_embd, kv_dim), 8, pack_q8_0(kv_dim, n_embd)))
+    tensors.append((f"blk.{i}.attn_v.weight", (n_embd, kv_dim), 8, pack_q8_0(kv_dim, n_embd)))
+    tensors.append((f"blk.{i}.attn_output.weight", (q_dim, n_embd), 8, pack_q8_0(n_embd, q_dim)))
+    tensors.append((f"blk.{i}.attn_gate.weight", (n_embd, q_dim), 8, pack_q8_0(q_dim, n_embd)))
+    add_f32(f"blk.{i}.attn_q_clip.weight", (n_head, head_dim), (head_dim, n_head), 0.8, 1.2)
+    add_bf16(f"blk.{i}.attn_sink_proj.weight", (n_head, n_embd), (n_embd, n_head), 0.08)
+    tensors.append((f"blk.{i}.attn_rel.weight", (n_embd, n_rel * n_head), 8, pack_q8_0(n_rel * n_head, n_embd)))
+    add_f32(f"blk.{i}.attn_rel_bias.weight", (ext, n_rel), (n_rel, ext), -0.2, 0.2)
+    add_f32(f"blk.{i}.attn_rel_clip.weight", (n_head, n_rel), (n_rel, n_head), 0.8, 1.2)
+    add_f32(f"blk.{i}.attn_k_conv.weight", (kv_dim, n_conv), (n_conv, kv_dim), -0.15, 0.15)
+    add_f32(f"blk.{i}.attn_v_conv.weight", (kv_dim, n_conv), (n_conv, kv_dim), -0.15, 0.15)
+    add_f32(f"blk.{i}.attn_post_conv.weight", (n_embd, n_conv), (n_conv, n_embd), -0.15, 0.15)
+    add_f32(f"blk.{i}.ffn_post_conv.weight", (n_embd, n_conv), (n_conv, n_embd), -0.15, 0.15)
+    if swa:
+        add_norm(f"blk.{i}.attn_norm.weight", n_embd)
+    else:
+        add_norm(f"blk.{i}.attn_q_inp_norm.weight", n_embd)
+        add_norm(f"blk.{i}.attn_k_inp_norm.weight", n_embd)
+        add_norm(f"blk.{i}.attn_v_inp_norm.weight", n_embd)
+        tensors.append((f"blk.{i}.attn_k_conv_proj.weight", (n_embd, n_conv * n_head_kv), 8, pack_q8_0(n_conv * n_head_kv, n_embd)))
+        tensors.append((f"blk.{i}.attn_v_conv_proj.weight", (n_embd, n_conv * n_head_kv), 8, pack_q8_0(n_conv * n_head_kv, n_embd)))
+    if i > 0:
+        if swa:
+            add_f32(f"blk.{i}.attn_res_query.weight", (n_embd,), (n_embd,), -0.15, 0.15)
+        else:
+            add_f32(f"blk.{i}.attn_res_query.weight", (3, n_embd), (n_embd, 3), -0.15, 0.15)
+    add_f32(f"blk.{i}.ffn_res_query.weight", (n_embd,), (n_embd,), -0.15, 0.15)
+    add_norm(f"blk.{i}.ffn_norm.weight", n_embd)
+    add_f32(f"blk.{i}.ffn_gate_inp.weight", (n_expert, n_embd), (n_embd, n_expert), -0.02, 0.02)
+    perm_b = np.array([((e * 3 + i) % n_expert) * 0.8 - 1.2 for e in range(n_expert)], dtype=np.float32)
+    tensors.append((f"blk.{i}.exp_probs_b.bias", (n_expert,), 0, perm_b.tobytes()))
+
+    # Mirror UD-Q4_K_M: core layers use NVFP4 + `.scale`; outer layers use Q5_K gate_up + Q8_0 down + `.scale`!
+    if i in (2, 3):
+        tensors.append((f"blk.{i}.ffn_gate_up_exps.weight", (n_embd, 2 * n_ff_exp, n_expert), 40, pack_nvfp4(n_expert * 2 * n_ff_exp, n_embd)))
+        tensors.append((f"blk.{i}.ffn_down_exps.weight", (n_ff_exp, n_embd, n_expert), 40, pack_nvfp4(n_expert * n_embd, n_ff_exp)))
+    else:
+        tensors.append((f"blk.{i}.ffn_gate_up_exps.weight", (n_embd, 2 * n_ff_exp, n_expert), 13, pack_q5_k(n_expert * 2 * n_ff_exp, n_embd)))
+        tensors.append((f"blk.{i}.ffn_down_exps.weight", (n_ff_exp, n_embd, n_expert), 8, pack_q8_0(n_expert * n_embd, n_ff_exp)))
+    sc_gu = np.linspace(0.6, 1.2, n_expert, dtype=np.float32)
+    sc_dn = np.linspace(0.7, 1.1, n_expert, dtype=np.float32)
+    tensors.append((f"blk.{i}.ffn_gate_up_exps.scale", (n_expert,), 0, sc_gu.tobytes()))
+    tensors.append((f"blk.{i}.ffn_down_exps.scale", (n_expert,), 0, sc_dn.tobytes()))
+
+    if core_start <= i < core_end:
+        add_f32(f"blk.{i}.loop_msg_query.weight", (4, n_embd), (n_embd, 4), -0.15, 0.15)
+        for ctrl in ["q", "k", "v", "ffn"]:
+            add_f32(f"blk.{i}.loop_{ctrl}_ctrl_down.weight", (gate_rank, 2 * n_embd), (2 * n_embd, gate_rank), -0.1, 0.1)
+            add_f32(f"blk.{i}.loop_{ctrl}_ctrl_gain.weight", (n_embd, gate_rank), (gate_rank, n_embd), -0.1, 0.1)
+            add_f32(f"blk.{i}.loop_{ctrl}_ctrl_forget.weight", (n_embd, gate_rank), (gate_rank, n_embd), -0.1, 0.1)
+
+hdr = bytearray(b"GGUF")
+hdr.extend(struct.pack("<IQQ", 3, len(tensors), len(kvs)))
+for k, vt, v in kvs:
+    hdr.extend(gstr(k))
+    if vt == 94:
+        hdr.extend(struct.pack("<IIQ", 9, 4, len(v)))
+        for x in v: hdr.extend(struct.pack("<I", x))
+    elif vt == 97:
+        hdr.extend(struct.pack("<IIQ", 9, 7, len(v)))
+        for x in v: hdr.append(1 if x else 0)
+    else:
+        hdr.extend(struct.pack("<I", vt))
+        if vt == 4: hdr.extend(struct.pack("<I", v))
+        elif vt == 6: hdr.extend(struct.pack("<f", v))
+        elif vt == 7: hdr.append(1 if v else 0)
+        elif vt == 8: hdr.extend(gstr(v))
+offs, cur = [], 0
+for _, _, _, raw in tensors:
+    cur = (cur + 31) // 32 * 32
+    offs.append(cur)
+    cur += len(raw)
+for (n, dims, dt, _), off in zip(tensors, offs):
+    hdr.extend(gstr(n))
+    hdr.extend(struct.pack("<I", len(dims)))
+    for d in dims: hdr.extend(struct.pack("<Q", d))
+    hdr.extend(struct.pack("<IQ", dt, off))
+while len(hdr) % 32 != 0: hdr.append(0)
+base = len(hdr)
+for (_, _, _, raw), off in zip(tensors, offs):
+    if len(hdr) < base + off: hdr.extend(b"\x00" * (base + off - len(hdr)))
+    hdr.extend(raw)
+out.write_bytes(bytes(hdr))
+"#;
+    assert!(
+        Command::new(&py)
+            .args(["-c", gen_py, gguf_path.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let gguf = GgufFile::open(&gguf_path).unwrap();
+    let cpu_m = tm_models::Inkling2Model::from_gguf(&gguf).unwrap();
+    let mut cpu_st = tm_models::Inkling2State::new(&cpu_m, 32);
+    let pool = ThreadPool::new(2);
+    let kt = active_kernels();
+
+    // Test 1: All-VRAM (`NVFP4` + `Q5_K` + `BF16` + `.scale`) prefill (`wmma_moe_grouped_f32`) + decode (`dot_moe_row_q8_1`)
+    let mut cuda_vram = Inkling2CudaRunner::from_gguf_with_kv_type(&gguf, 32, KvType::F16).unwrap();
+    assert!(!cuda_vram.has_host_offload_layers());
+
+    // Test 1: Compare 16-token `wmma_moe_grouped_f32` (`NVFP4` + `Q5_K` Tensor Core WMMA),
+    // 16-step single-token `dot_moe_row_q8_1` (`NVFP4` + `Q5_K` `__dp4a`), and CPU `Inkling2Model`!
+    let pp_toks = [2u32, 7, 13, 21, 3, 9, 14, 22, 4, 10, 15, 23, 5, 11, 16, 24];
+    cpu_m
+        .forward_batch(&mut cpu_st, &pool, kt, &pp_toks, 0, true)
+        .unwrap();
+    let mut cuda_seq_last = Vec::new();
+    for (s, &tid) in pp_toks.iter().enumerate() {
+        let lg = cuda_vram
+            .forward_token(tid, s, s + 1 == pp_toks.len())
+            .unwrap();
+        if s + 1 == pp_toks.len() {
+            cuda_seq_last = lg.to_vec();
+        }
+    }
+    cuda_vram.reset_state().unwrap();
+    let cuda_pp = cuda_vram
+        .forward_window_with_taps(&pp_toks, 0, true, false, &[], None)
+        .unwrap()
+        .to_vec();
+
+    // `dp4a` (`Q8_1`) vs `WMMA` (`FP16`) must agree tightly (`< 2e-2`) and share exact Top-1 with CPU!
+    assert_eq!(argmax(cpu_st.logits()), argmax(&cuda_seq_last));
+    assert_eq!(argmax(cpu_st.logits()), argmax(&cuda_pp));
+    let mut max_dp4a_wmma = 0.0f32;
+    let (mut dot_cc, mut n_c, mut n_g) = (0.0f64, 0.0f64, 0.0f64);
+    for ((&c, &g_dp), &g_wm) in cpu_st
+        .logits()
+        .iter()
+        .zip(cuda_seq_last.iter())
+        .zip(cuda_pp.iter())
+    {
+        max_dp4a_wmma = max_dp4a_wmma.max((g_dp - g_wm).abs());
+        dot_cc += (c as f64) * (g_dp as f64);
+        n_c += (c as f64) * (c as f64);
+        n_g += (g_dp as f64) * (g_dp as f64);
+    }
+    let cos_cpu_cuda = dot_cc / (n_c.sqrt() * n_g.sqrt());
+    assert!(
+        max_dp4a_wmma < 2.5e-2,
+        "UD-Q4_K_M dp4a vs WMMA max_diff={max_dp4a_wmma} | cpu={:?} dp4a={:?} wmma={:?}",
+        &cpu_st.logits()[0..4],
+        &cuda_seq_last[0..4],
+        &cuda_pp[0..4],
+    );
+    assert!(
+        cos_cpu_cuda > 0.998,
+        "UD-Q4_K_M CPU (Q8_K) vs CUDA (Q8_1) cosine={cos_cpu_cuda} too low!"
+    );
+
+    for (step, &tid) in [29u32, 37].iter().enumerate() {
+        let pos = pp_toks.len() + step;
+        cpu_m
+            .forward_token(&mut cpu_st, &pool, kt, tid, pos, true)
+            .unwrap();
+        let cuda_tg = cuda_vram.forward_token(tid, pos, true).unwrap().to_vec();
+        assert_eq!(argmax(cpu_st.logits()), argmax(&cuda_tg));
+    }
+
+    // Test 2: Zero-copy `DEVICEMAP` + Hybrid GPU+CPU co-execution (`NVFP4` + `Q5_K` shared `HugePageBytes`, `nvme = 0`)!
+    {
+        // SAFETY: Single-threaded test (`--test-threads=1`) temporarily sets VRAM budget env var.
+        unsafe {
+            std::env::set_var("TM_CUDA_INKLING2_VRAM_MIB", "0");
+            std::env::set_var("TM_CUDA_HYBRID_GPU_EXPS", "1");
+        }
+        let mut cuda_dm =
+            Inkling2CudaRunner::from_gguf_with_kv_type(&gguf, 32, KvType::F16).unwrap();
+        assert!(cuda_dm.has_host_offload_layers());
+        let host_m = tm_models::Inkling2Model::from_gguf_with_options(
+            &gguf,
+            &tm_models::Inkling2LoadOptions {
+                vram_expert_layers: cuda_dm.vram_expert_mask().to_vec(),
+                ram_expert_budget_bytes: Some(64 * 1024 * 1024),
+                host_moe_only: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(host_m.stats.nvme_direct_expert_layers, 0);
+        for ip in 0..6 {
+            let (gu_pin, gu_len, dn_pin, dn_len) = host_m
+                .host_importable_expert_pins(ip)
+                .expect("All 6 NVFP4/Q5_K layers must be HugePage-importable!");
+            assert!(
+                cuda_dm
+                    .register_host_moe_layer(ip, gu_pin, gu_len, dn_pin, dn_len)
+                    .unwrap(),
+                "register_host_moe_layer failed on layer {ip}"
+            );
+        }
+        assert_eq!(
+            cuda_dm.weights_mode(),
+            "tiered_cuda(vram=0,devmap=6,nvme=0)"
+        );
+        let mut hs = tm_models::Inkling2State::new_host_moe_only(&host_m);
+        let dm_pp = {
+            let mut cb_w = |ip: usize,
+                            w_len: usize,
+                            cur_w: &[f32],
+                            ids_w: &[usize],
+                            ws_w: &[f32],
+                            out_w: &mut [f32]| {
+                let mut hctx = hs.host_moe_ctx_mut();
+                host_m.eval_moe_experts_window_ctx(
+                    ip, w_len, cur_w, ids_w, ws_w, &pool, kt, &mut hctx, out_w, false,
+                );
+            };
+            cuda_dm
+                .forward_window_hybrid(&pp_toks, 0, true, false, &[], Some(&mut cb_w), None)
+                .unwrap()
+                .to_vec()
+        };
+        assert_eq!(argmax(&dm_pp), argmax(&cuda_pp));
+        for (step, &tid) in [29u32, 37].iter().enumerate() {
+            let pos = pp_toks.len() + step;
+            let mut cb =
+                |ip: usize, cur_n: &[f32], t_ids: &[usize], t_w: &[f32], m_out: &mut [f32]| {
+                    let mut hctx = hs.host_moe_ctx_mut();
+                    host_m.eval_moe_experts_ctx(
+                        ip, cur_n, t_ids, t_w, &pool, kt, &mut hctx, m_out, false,
+                    );
+                };
+            let dm_tg = cuda_dm
+                .forward_token_hybrid(tid, pos, true, Some(&mut cb))
+                .unwrap()
+                .to_vec();
+            if step == 1 {
+                assert_eq!(argmax(&dm_tg), argmax(cpu_st.logits()));
+            }
+        }
+        // SAFETY: Restore environment variables.
+        unsafe {
+            std::env::remove_var("TM_CUDA_INKLING2_VRAM_MIB");
+            std::env::remove_var("TM_CUDA_HYBRID_GPU_EXPS");
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}

@@ -39,6 +39,22 @@ __constant__ int8_t c_kvalues_iq4nl[16] = {
        1,   13,  25,  38,  53,  69,  89, 113
 };
 
+__constant__ int8_t c_kvalues_fp4[16] = {
+    0,  1,  2,  3,  4,  6,  8,  12,
+    0, -1, -2, -3, -4, -6, -8, -12
+};
+
+__device__ __forceinline__ float decode_ue4m3_f32(uint8_t ue) {
+    const uint8_t mag = ue & 0x7Fu;
+    if (mag == 0u || mag == 0x7Fu) return 0.0f;
+    const uint32_t exp = (ue >> 3) & 0x0Fu;
+    const uint32_t mant = ue & 0x07u;
+    const float raw = (exp == 0u)
+        ? (float(mant) * (1.0f / 1024.0f))
+        : __uint_as_float(((exp + 119u) << 23) | (mant << 20));
+    return (ue & 0x80u) ? -raw : raw;
+}
+
 struct BlockQ5_0 {
     half d;
     uint8_t qh[4];
@@ -1598,6 +1614,45 @@ static __device__ __forceinline__ void dequant_tile_64x32_to_smem_f16(
         } else {
 #pragma unroll
             for (int j = 0; j < 16; ++j) dst[j] = __float2half(d_sc * float(qs[j] >> 4) - d_min);
+        }
+    } else if (dtype == DTYPE_Q5_K) {
+        const BlockQ5K& blk = reinterpret_cast<const BlockQ5K*>(w_row)[k0 >> 8];
+        const float2 dm = __half22float2(blk.dm);
+        const int rem32 = k0 & 255;
+        const int chunk64 = rem32 >> 6;
+        const int half32 = (rem32 >> 5) & 1;
+        uint8_t sc, m;
+        decode_q4k_scale_min(2 * chunk64 + half32, blk.scales, sc, m);
+        const float d_sc = dm.x * float(sc);
+        const float d_min = dm.y * float(m);
+        const uint8_t* qs = blk.qs + chunk64 * 32 + half_id * 16;
+        const uint8_t* qh = blk.qh + half_id * 16;
+        const int qh_shift = 2 * chunk64 + half32;
+        half* dst = dst_row + half_id * 16;
+        if (half32 == 0) {
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int q5 = int(qs[j] & 0x0Fu) | int(((qh[j] >> qh_shift) & 1u) << 4);
+                dst[j] = __float2half(d_sc * float(q5) - d_min);
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int q5 = int(qs[j] >> 4) | int(((qh[j] >> qh_shift) & 1u) << 4);
+                dst[j] = __float2half(d_sc * float(q5) - d_min);
+            }
+        }
+    } else if (dtype == DTYPE_NVFP4) {
+        const BlockNvFp4& blk = reinterpret_cast<const BlockNvFp4*>(w_row)[k0 >> 6];
+        const int sub = ((k0 & 32) >> 4) + half_id;
+        const float d = decode_ue4m3_f32(blk.d[sub]);
+        const uint8_t* qs = blk.qs + sub * 8;
+        half* dst = dst_row + half_id * 16;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const uint8_t qb = qs[j];
+            dst[j] = __float2half(d * float(c_kvalues_fp4[qb & 0x0Fu]));
+            dst[8 + j] = __float2half(d * float(c_kvalues_fp4[qb >> 4]));
         }
     } else if (dtype == DTYPE_Q6_K) {
         const BlockQ6K& blk = reinterpret_cast<const BlockQ6K*>(w_row)[k0 >> 8];
@@ -3249,6 +3304,35 @@ __device__ __forceinline__ float dot_moe_row_q8_1(
             int sumi = dp4a_i8(int(w0), xqs[0], 0);
             sumi = dp4a_i8(int(w1), xqs[1], sumi);
             acc += dl * __low2float(xb.ds) * float(sumi);
+        }
+    } else if (dtype == DTYPE_NVFP4 && xr != nullptr && (cols & 63) == 0) {
+        const BlockNvFp4* wr = reinterpret_cast<const BlockNvFp4*>(w_row);
+        const int n_b64 = cols >> 6;
+        const int sub = lane & 3;
+        const int q8_half = sub >> 1;
+        const int q8_quad = (sub & 1) * 4;
+        for (int b64 = lane >> 2; b64 < n_b64; b64 += 8) {
+            const BlockNvFp4& wb = wr[b64];
+            const float d_w = decode_ue4m3_f32(wb.d[sub]);
+            const uint32_t qs0 = uint32_t(load_i32_2b(wb.qs + sub * 8));
+            const uint32_t qs1 = uint32_t(load_i32_2b(wb.qs + sub * 8 + 4));
+            uint32_t w_lo0 = 0u, w_lo1 = 0u, w_hi0 = 0u, w_hi1 = 0u;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const uint32_t b0 = (qs0 >> (8 * k)) & 0xFFu;
+                const uint32_t b1 = (qs1 >> (8 * k)) & 0xFFu;
+                w_lo0 |= uint32_t(uint8_t(c_kvalues_fp4[b0 & 0x0Fu])) << (8 * k);
+                w_lo1 |= uint32_t(uint8_t(c_kvalues_fp4[b1 & 0x0Fu])) << (8 * k);
+                w_hi0 |= uint32_t(uint8_t(c_kvalues_fp4[b0 >> 4])) << (8 * k);
+                w_hi1 |= uint32_t(uint8_t(c_kvalues_fp4[b1 >> 4])) << (8 * k);
+            }
+            const BlockQ8_1& xb = xr[2 * b64 + q8_half];
+            const int* xqs = reinterpret_cast<const int*>(xb.qs) + q8_quad;
+            int sumi = dp4a_i8(int(w_lo0), xqs[0], 0);
+            sumi = dp4a_i8(int(w_lo1), xqs[1], sumi);
+            sumi = dp4a_i8(int(w_hi0), xqs[2], sumi);
+            sumi = dp4a_i8(int(w_hi1), xqs[3], sumi);
+            acc += d_w * __low2float(xb.ds) * float(sumi);
         }
     } else if (dtype == DTYPE_IQ4_XS && xr != nullptr && (cols & 255) == 0) {
         const BlockIQ4XS* wr = reinterpret_cast<const BlockIQ4XS*>(w_row);

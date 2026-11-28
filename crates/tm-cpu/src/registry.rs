@@ -1451,6 +1451,45 @@ mod x86_64_wrappers {
         // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma + f16c` detection.
         unsafe { avx2::f32_to_f16_slice(src, dst) }
     }
+    fn avx2_vec_dot_nvfp4(x: &[BlockNvFp4], y: &[BlockQ8_0]) -> f32 {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::vec_dot_nvfp4_q8_0(x, y) }
+    }
+    fn avx2_gemv_nvfp4(
+        w: &[BlockNvFp4],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::gemv_nvfp4_q8_0(w, x, out, rows, cols_blocks) }
+    }
+    fn avx2_gemm_nvfp4(
+        w: &[BlockNvFp4],
+        x: &[BlockQ8_0],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+        n_tokens: usize,
+    ) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::gemm_nvfp4_q8_0(w, x, out, rows, cols_blocks, n_tokens) }
+    }
+    fn avx2_vec_dot_q5_k(x: &[BlockQ5K], y: &[BlockQ8K]) -> f32 {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::vec_dot_q5_k_q8_k(x, y) }
+    }
+    fn avx2_gemv_q5_k(
+        w: &[BlockQ5K],
+        x: &[BlockQ8K],
+        out: &mut [f32],
+        rows: usize,
+        cols_blocks: usize,
+    ) {
+        // SAFETY: `AVX2_TABLE` is only selected after runtime `avx2 + fma` detection.
+        unsafe { avx2::gemv_q5_k_q8_k(w, x, out, rows, cols_blocks) }
+    }
 
     pub const AVX2_TABLE: KernelTable = KernelTable {
         isa: Isa::Avx2,
@@ -1464,8 +1503,8 @@ mod x86_64_wrappers {
         vec_dot_q8_0_q8_0: avx2_vec_dot_q8_0,
         gemv_q8_0_q8_0: avx2_gemv_q8_0,
         gemm_q8_0_q8_0: avx2_gemm_q8_0,
-        vec_dot_q5_k_q8_k: generic::vec_dot_q5_k_q8_k,
-        gemv_q5_k_q8_k: generic::gemv_q5_k_q8_k,
+        vec_dot_q5_k_q8_k: avx2_vec_dot_q5_k,
+        gemv_q5_k_q8_k: avx2_gemv_q5_k,
         vec_dot_q6_k_q8_k: generic::vec_dot_q6_k_q8_k,
         gemv_q6_k_q8_k: generic::gemv_q6_k_q8_k,
         gemm_q6_k_q8_k: generic::gemm_q6_k_q8_k,
@@ -1484,9 +1523,9 @@ mod x86_64_wrappers {
         vec_dot_iq4_nl_q8_0: generic::vec_dot_iq4_nl_q8_0,
         gemv_iq4_nl_q8_0: generic::gemv_iq4_nl_q8_0,
         gemm_iq4_nl_q8_0: generic::gemm_iq4_nl_q8_0,
-        vec_dot_nvfp4_q8_0: generic::vec_dot_nvfp4_q8_0,
-        gemv_nvfp4_q8_0: generic::gemv_nvfp4_q8_0,
-        gemm_nvfp4_q8_0: generic::gemm_nvfp4_q8_0,
+        vec_dot_nvfp4_q8_0: avx2_vec_dot_nvfp4,
+        gemv_nvfp4_q8_0: avx2_gemv_nvfp4,
+        gemm_nvfp4_q8_0: avx2_gemm_nvfp4,
         dot_f32_f16: avx2_dot_f32_f16,
         dot_f32_bf16: avx2_dot_f32_bf16,
         dot_f32_q8_0: avx2_dot_f32_q8_0,

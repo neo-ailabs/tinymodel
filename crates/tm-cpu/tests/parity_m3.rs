@@ -321,6 +321,45 @@ fn l1_and_l1b_q6_k_q8_0_shared_weight_and_quantize_q8_k_parity() {
             );
         }
     }
+
+    // 4. `vec_dot_q5_k_q8_k` & `gemv_q5_k_q8_k` 0-ULP bit-exact parity across all ISAs
+    let rows5 = 11usize;
+    let w5: Vec<tm_core::BlockQ5K> = (0..rows5 * cb6)
+        .map(|_| {
+            let mut scales = [0u8; 12];
+            let mut qh = [0u8; 32];
+            let mut qs = [0u8; 128];
+            for b in &mut scales {
+                *b = rng.next_u8();
+            }
+            for b in &mut qh {
+                *b = rng.next_u8();
+            }
+            for b in &mut qs {
+                *b = rng.next_u8();
+            }
+            tm_core::BlockQ5K {
+                d: rng.arb_scale(),
+                dmin: rng.arb_scale(),
+                scales,
+                qh,
+                qs,
+            }
+        })
+        .collect();
+    let mut ref_5k = vec![0.0f32; rows5];
+    generic::gemv_q5_k_q8_k(&w5, &x8k[..cb6], &mut ref_5k, rows5, cb6);
+    for &isa in &isas {
+        let kt = select_kernels(isa);
+        let mut got_5k = vec![0.0f32; rows5];
+        (kt.gemv_q5_k_q8_k)(&w5, &x8k[..cb6], &mut got_5k, rows5, cb6);
+        assert_eq!(
+            got_5k.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            ref_5k.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "gemv_q5_k_q8_k 0-ULP mismatch: isa={}",
+            isa.name()
+        );
+    }
 }
 
 #[test]

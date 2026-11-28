@@ -1090,7 +1090,8 @@ impl<'a> Inkling2Model<'a> {
                 .ok()
                 .and_then(|s| s.trim().parse::<usize>().ok());
             if nvme_cnt > 0 {
-                let single_exp_b = (expert_layer_bytes[0] / (n_exp as u64)).max(1);
+                let max_layer_b = expert_layer_bytes.iter().copied().max().unwrap_or(0);
+                let single_exp_b = (max_layer_b / (n_exp as u64)).max(1);
                 let slots_per_layer = if let Some(k) = env_cache_exps {
                     k.min(n_exp)
                 } else if explicit_budget.is_none() {
@@ -1710,9 +1711,7 @@ impl<'a> Inkling2Model<'a> {
         match self.layers.get(ip)?.experts {
             ExpertLayerStore::InMemory {
                 gate_up: BytesBacking::HugePage(ref gu_hp),
-                gate_up_dtype: DType::Q8_0,
                 down: BytesBacking::HugePage(ref dn_hp),
-                down_dtype: DType::Q8_0,
                 ..
             } => Some((
                 Arc::new(HugePageAlignedPin(Arc::clone(gu_hp))),

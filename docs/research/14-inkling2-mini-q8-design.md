@@ -285,3 +285,38 @@ flowchart LR
 - **4. Google Pixel 8（Tensor G3，`8 GB` Android 手机）**：空闲 RAM 仅 `3.8–4.1 GiB`，无法容纳 `12.1 GiB` 的 `3×` 循环核专家，持续 UFS 读取会迅速触发机身 `VIRTUAL-SKIN` 温控，仍应部署 `Gemma 4 E2B`（已实测 `14.56 tok/s`）或 `Qwen3.5-0.8B`（`38.96 tok/s`）。
 - **5. Raspberry Pi 5（`8 GB` / `16 GB` + PCIe Gen3×1 NVMe HAT）**：`16 GB` 板可借助 `NvmeLayerRamCache` 减少约 `15%–25%` 的外层热门专家 Gen3×1 读盘次数，单步吞吐预计微升至 **`0.9–1.2 tok/s`**（预填充受益于 `16` 专家连续超块顺序 DMA 提升至 **`4.5–6.5 tok/s`**）。
 - **6. Raspberry Pi 4B / Pi Zero 2W（`micro` 档，`512 MB – 8 GB`）**：超出物理存储与带宽边界，不可运行 `25.90 GiB` `Q8_0`；`micro` 纯静态编译路径保持零新增体积。
+
+---
+
+## 9. 2026-11-28 `Inkling-2-Mini-UD-Q4_K_M.gguf`（`15.47 GiB`）混合精度快路径与同机实测横向对比（`ADR-028`）
+
+在同一台 **`i7-12700 + 15.39 GiB DDR4 + NVIDIA T1000 8GB (sm_75) + PCIe 4.0 NVMe`** 工作站、完全相同的 `p_code`（`71` pp / `64` tg）与 `p64`（`60` pp / `64` tg）语料上，实测了 Unsloth Dynamic 2.0 混合精度版 `Inkling-2-Mini-UD-Q4_K_M.gguf`（`15.470 GiB`：`20` 层 `NVFP4 + F32 .scale` 专家 + `4` 层 `Q5_K/Q8_0 + .scale` 专家 + `BF16` `attn_sink_proj` + `Q8_0` 主干），并与同机 `Q8_0`（`25.90 GiB`）及 `Strata 0.1.70` 对比：
+
+### 9.1 内核微基准提升（同机 `i7-12700` 单线程，`0-ULP` 逐位对齐）
+
+| 内核 | `generic` 标量参考 | `avx2` 向量化快路径 | 单核加速比 | 逐位一致性 |
+|---|---:|---:|---:|---|
+| `gemv_nvfp4_q8_0`（4 行共享激活 + `pshufb` LUT） | `1.5–1.6 GB/s` | **`12.2 GB/s`** | **`7.6×–8.1×`** | ✅ `0-ULP`（`sink=1998.00`） |
+| `gemv_q5_k_q8_k`（256 维超块解包 + `pmaddubsw`） | `8.4 GFLOP/s` | **`39.6 GFLOP/s`** | **`4.71×`** | ✅ `0-ULP`（`out[0]=2351.998`） |
+
+### 9.2 同机 `UD-Q4_K_M`（`15.47 GiB`）vs `Q8_0`（`25.90 GiB`）vs `Strata 0.1.70` 实测总表
+
+| 模型与引擎模式 | 24 专家层实际驻留分布 | 每步 SSD 读盘 | 峰值 RSS | `p_code` 预填充 | `p_code` 解码 (`64` tg) | `p64` 预填充 / 解码 | 相对 `Q8_0` 同后端提升 |
+|---|---|---:|---:|---:|---:|---:|---|
+| **`UD-Q4_K_M` · `tinymodel --cuda`**（默认 `k_gpu=2`） | **`vram=9, devmap=15, nvme=0`** | **`0.0 MiB/tok`** | **`9.18 GiB`** | **`18.53 tok/s`** | **`8.05 tok/s` (`124.2 ms`)** | **`20.55` / `8.03 tok/s`** | **解码 `+64.6%`，预填充 `+34%–58%`，省 `1.62 GiB` RSS** |
+| **`UD-Q4_K_M` · `tinymodel --cuda`**（`k_gpu=3`） | `vram=9, devmap=15, nvme=0` | `0.0 MiB/tok` | `9.18 GiB` | **`19.67 tok/s`** | `8.00 tok/s` (`125.1 ms`) | **`20.70`** / `8.01 tok/s` | 解码 `+63.6%`，预填充 **`+42%–59%`** |
+| **`UD-Q4_K_M` · `tinymodel --cuda + DSpark`**（`k=5 / k=7`） | `vram=8, devmap=16, nvme=0` | `0.0 MiB/tok` | `9.72 GiB` | `19.68 tok/s` | `6.44 tok/s`（`40/78=51.3%`） | `20.48` / **`7.00 tok/s`** | 与单步哈希 `7c2aa17a338affe8` **100% 一致** |
+| **`UD-Q4_K_M` · `tinymodel --gpu cpu`**（8T `AVX2`） | **`ram=19 (`12/12` 循环核!), nvme=5`** | `231.6 MiB/tok` | `12.34 GiB` | **`4.62 tok/s`** | **`2.84 tok/s` (`352.4 ms`)** | — | **解码 `+58.7%`（达 `Strata` CPU `Q8_0` 的 `2.58×`）** |
+| `Q8_0` · `tinymodel --vulkan`（`ADR-027`） | `vram=5, ext=10, nvme=9` | `~279 MiB/tok` | `11.04 GiB` | `15.86 tok/s` | `5.21 tok/s` (`191.9 ms`) | `14.70` / `5.35 tok/s` | `Q8_0` 最优 GPU 档（`UD-Q4_K_M --cuda` 快 **`+54.5%`**） |
+| `Q8_0` · `tinymodel --cuda`（`ADR-027`） | `vram=4, devmap=10, nvme=10` | `~310 MiB/tok` | `10.80 GiB` | `13.88 tok/s` | `4.89 tok/s` (`204.4 ms`) | `12.99` / `5.00 tok/s` | 同后端对照基线 |
+| `Q8_0` · `tinymodel --gpu cpu`（`ADR-027`） | `ram=10, nvme=14` | `~434 MiB/tok` | `12.44 GiB` | `3.89–4.22 tok/s` | `1.79 tok/s` (`557.8 ms`) | — | 同后端对照基线 |
+| `Q8_0` · `Strata 0.1.70 --gpu 0 / --cpu` | 无循环感知分层 | Swap 抖动 / SSD | Swap / `12.1 GiB` | 超时 / `18.8 tok/s` | `< 0.25` / `1.10 tok/s` | — | 外部引擎参考基线 |
+
+### 9.3 六大固定参考设备 `UD-Q4_K_M`（`15.47 GiB`）部署结论（`AGENTS.md` §8）
+
+- **1. 本机工作站（`i7-12700 + 15.4 GiB DDR4 + NVIDIA T1000 8GB`）**：**该硬件配置下的甜点首选模型**。`9` 层 `3×` 循环核驻留 GDDR6 显存 + 剩余 `15` 层 **100% 驻留主机 `HugePage` 内存（`nvme = 0`）**，彻底消灭 SSD I/O，单步解码稳定 **`8.05 tok/s`**（等效活跃权重带宽 **`31.79 GB/s`**，逼近主机 DDR4 物理极限 `32.69 GB/s`！）。
+- **2. Apple M4（`16 GB` vs `24 GB / 32 GB` macOS UMA）**：`24 GB+` M4 可全量零拷贝常驻 Metal 统一内存，预计达 **`45–60 tok/s`**；`16 GB` M4 受 XNU `52%`（`~8.3 GiB`）防压缩线约束，可常驻全部稠密主干 + `12/12` `3×` 循环核（约 `8.4 GiB`），仅 `12` 个 `1×` 外层走 NVMe `F_NOCACHE` 流式读取，预计从 `Q8_0` 的 `3.6–4.3 tok/s` 跃升至 **`10–14 tok/s`**。
+- **3. Rockchip RK3588（`16 GB` / `32 GB` Linux SBC，`4×A76 + 4×A55` + PCIe 3.0 ×4 NVMe）**：**质变级提升**——`16 GB` RK3588 在纯 CPU `84%`（`13.4 GiB`）安全水位下可常驻 `1.6 GiB` 主干 + **`20/24` 层专家（含全部 `12/12` `3×` 循环核）**，每 token 仅剩 `4` 个 `1×` 外层需从 NVMe 读取约 `70 MiB`，预计解码从 `Q8_0` 的 `2.0–2.5 tok/s` 翻倍至 **`4.2–5.5 tok/s`**；`32 GB` RK3588 全量常驻 RAM 零读盘可达 **`6.5–8.5 tok/s`（`< 9.5 W`）**。
+- **4. Google Pixel 8（Tensor G3，`8 GB` Android 手机）**：`15.47 GiB` 体积仍约为手机可用内存（`~3.9 GiB`）的 `4×`，即使仅 `12` 层 `3×` 循环核（`6.75 GiB`）也超出 RAM 容量，持续 UFS 4.0 读取会迅速触发机身温控降频，仍推荐 `Gemma 4 E2B` 或 `Qwen3.5-2B/0.8B`。
+- **5. Raspberry Pi 5（`16 GB` + PCIe Gen3×1 NVMe HAT）**：`16 GB` Pi 5 同样可将全部 `12/12` `3×` 循环核常驻 LPDDR4X 内存，把 Gen3×1（`~800 MB/s`）NVMe 读盘量从 `Q8_0` 的 `~400 MiB/tok` 压降至 **`~70 MiB/tok`**，预计解码从 `0.9–1.2 tok/s` 大幅跃升至 **`2.5–3.4 tok/s`**，首次达到端侧树莓派可交互速率。
+- **6. Raspberry Pi 4B / Pi Zero 2W（`micro` 档，`512 MB – 8 GB`）**：超出内存与存储带宽边界，不适用 `26B` 级稀疏 MoE（Zero 2W 请使用 `SmolLM2-360M` / `Qwen3.5-0.8B` 低比特裁剪版）。

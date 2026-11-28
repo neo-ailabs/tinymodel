@@ -188,7 +188,7 @@ impl CudaMoeScratch {
 pub(crate) fn is_q8_1_moe_dtype(dtype_tag: i32, cols: usize) -> bool {
     match dtype_tag {
         2 | 3 | 6 | 8 | 20 => cols.is_multiple_of(32),
-        42 => cols.is_multiple_of(64),
+        40 | 42 => cols.is_multiple_of(64),
         11..=14 | 23 => cols.is_multiple_of(256),
         _ => false,
     }
