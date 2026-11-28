@@ -170,6 +170,42 @@ impl ThreadPool {
             }
         });
     }
+
+    /// Executes two independent closures `fa` and `fb` concurrently on this pool (`n_threads >= 2`),
+    /// allowing safe callers (`#![forbid(unsafe_code)]`) to overlap NVMe `O_DIRECT` I/O with
+    /// multi-threaded CPU SIMD compute over disjoint mutable borrows with zero heap allocations.
+    pub fn join_pair<FA, FB>(&self, fa: FA, fb: FB)
+    where
+        FA: FnOnce() + Send,
+        FB: FnOnce() + Send,
+    {
+        if self.n_threads <= 1 {
+            fa();
+            fb();
+            return;
+        }
+        let slot_a = core::cell::UnsafeCell::new(Some(fa));
+        let slot_b = core::cell::UnsafeCell::new(Some(fb));
+        let ptr_a = slot_a.get() as usize;
+        let ptr_b = slot_b.get() as usize;
+        self.parallel_for(2, 1, |start, end| {
+            for idx in start..end {
+                if idx == 0 {
+                    // SAFETY: `idx == 0` is claimed by at most one thread via atomic `fetch_add`
+                    // in `parallel_for`, and `slot_a` lives on the stack until `parallel_for` joins.
+                    if let Some(f) = unsafe { (*{ ptr_a as *mut Option<FA> }).take() } {
+                        f();
+                    }
+                } else {
+                    // SAFETY: `idx == 1` is claimed by at most one thread via atomic `fetch_add`
+                    // in `parallel_for`, and `slot_b` lives on the stack until `parallel_for` joins.
+                    if let Some(f) = unsafe { (*{ ptr_b as *mut Option<FB> }).take() } {
+                        f();
+                    }
+                }
+            }
+        });
+    }
 }
 
 fn worker_loop(s: Arc<Shared>) {

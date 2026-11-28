@@ -1535,9 +1535,25 @@ impl<'a> VkDSparkCtx<'a> {
 }
 
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
+fn compute_draft_vram_reserve_bytes(draft_gguf: Option<&GgufFile>) -> u64 {
+    let Some(dg) = draft_gguf else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for tname in dg.tensor_names() {
+        if let Some(ti) = dg.tensor_info(tname) {
+            total += ti.byte_len as u64;
+        }
+    }
+    // Exact DSpark weight bytes + 28 MiB KV/scratch slack (`~410 MiB` vs legacy `512 MiB`).
+    total + 28 * 1024 * 1024
+}
+
+#[cfg(any(feature = "vulkan", feature = "cuda"))]
 struct DSparkAdaptiveCtrl {
     max_k: usize,
     active_k: usize,
+    nvme_tiered: bool,
     ema_acc: f32,
     ema_tok_per_step: f64,
     ema_step_s: f64,
@@ -1549,12 +1565,15 @@ struct DSparkAdaptiveCtrl {
 
 #[cfg(any(feature = "vulkan", feature = "cuda"))]
 impl DSparkAdaptiveCtrl {
-    fn new(max_k: usize, single_step_s: f64) -> Self {
+    fn new_with_tier(max_k: usize, single_step_s: f64, nvme_tiered: bool) -> Self {
+        let eff_max = if nvme_tiered { max_k.min(3) } else { max_k };
+        let init_k = if nvme_tiered { eff_max.min(2) } else { eff_max };
         Self {
-            max_k,
-            active_k: max_k,
+            max_k: eff_max,
+            active_k: init_k,
+            nvme_tiered,
             ema_acc: 0.75,
-            ema_tok_per_step: 1.0 + 0.75 * (max_k as f64),
+            ema_tok_per_step: 1.0 + 0.75 * (init_k as f64),
             ema_step_s: 0.0,
             single_step_s,
             spec_steps: 0,
@@ -1573,6 +1592,10 @@ impl DSparkAdaptiveCtrl {
         if cap_k == 0 || self.max_k == 0 || self.cooldown == usize::MAX {
             return 0;
         }
+        if self.single_step_s <= 0.0 && self.spec_steps == 0 {
+            // Measure 1 clean single-token step (`W = 1`) when caller has not pre-calibrated `single_step_s`.
+            return 0;
+        }
         if self.cooldown > 0 {
             self.cooldown -= 1;
             if self.cooldown == 0 {
@@ -1586,15 +1609,21 @@ impl DSparkAdaptiveCtrl {
     }
 
     #[inline]
-    fn gate_drafts(drafted: usize, probs: &[f32]) -> usize {
+    fn gate_drafts_tiered(drafted: usize, probs: &[f32], nvme_tiered: bool) -> usize {
         let mut keep = 0usize;
         let mut cum_p = 1.0f32;
         for (j, &p) in probs.iter().enumerate().take(drafted) {
             cum_p *= p;
-            // Calibrated for 201k-vocab `logit_softcap = 30.0` softmax:
-            // confident code/boilerplate tokens satisfy `p >= 0.10`, while uncertain open-class
-            // prose tails (`p < 0.06..0.10` or cumulative `< 0.03`) are truncated early.
-            let ok = if j == 0 {
+            // On NVMe-tiered systems (`nvme_tiered == true`), each speculative token amplifies
+            // unique expert reads across outer SSD layers (`8 * W` up to `24..32` experts/layer),
+            // so require high draft confidence (`p >= 0.25` at j=0, `p >= 0.40 && cum_p >= 0.22` at j>=1).
+            let ok = if nvme_tiered {
+                if j == 0 {
+                    p >= 0.25
+                } else {
+                    p >= 0.40 && cum_p >= 0.22
+                }
+            } else if j == 0 {
                 p >= 0.06
             } else {
                 p >= 0.10 && cum_p >= 0.03
@@ -1651,10 +1680,12 @@ impl DSparkAdaptiveCtrl {
         };
 
         // Profitability guard against measured pure single-token `W=1` latency:
+        let max_probes = if self.nvme_tiered { 1 } else { 2 };
+        let min_gain = if self.nvme_tiered { 1.04 } else { 1.02 };
         if self.single_step_s > 0.0 && self.ema_step_s > 0.0 {
             let spec_tps = self.ema_tok_per_step / self.ema_step_s;
             let base_tps = 1.0 / self.single_step_s;
-            if spec_tps < 1.02 * base_tps {
+            if spec_tps < min_gain * base_tps {
                 if self.active_k > 1 && self.ema_acc >= 0.20 {
                     self.active_k = 1;
                     self.ema_step_s = 0.0;
@@ -1662,7 +1693,7 @@ impl DSparkAdaptiveCtrl {
                 }
                 self.active_k = 0;
                 self.failed_probes += 1;
-                self.cooldown = if self.failed_probes >= 2 {
+                self.cooldown = if self.failed_probes >= max_probes {
                     usize::MAX
                 } else {
                     12
@@ -1675,7 +1706,7 @@ impl DSparkAdaptiveCtrl {
         self.active_k = target_k;
         if self.active_k == 0 {
             self.failed_probes += 1;
-            self.cooldown = if self.failed_probes >= 2 {
+            self.cooldown = if self.failed_probes >= max_probes {
                 usize::MAX
             } else {
                 12
@@ -1699,27 +1730,16 @@ fn eval_inkling2_vk_window<'a>(
     out_argmax: Option<&mut [u32]>,
 ) -> Result<&'a [f32]> {
     if let Some((hm, hs)) = host_helper {
+        let float_act = !runner.fused_q8_active();
         let mut cb = |ip: usize,
                       w_len: usize,
                       cur_win: &[f32],
                       t_ids_win: &[usize],
                       t_w_win: &[f32],
                       m_out_win: &mut [f32]| {
-            let (serial_pool, expert_slots, mv_scratch, win_slot_outs) =
-                hs.host_moe_window_parts_mut();
-            hm.eval_moe_experts_window_f32(
-                ip,
-                w_len,
-                cur_win,
-                t_ids_win,
-                t_w_win,
-                pool,
-                serial_pool,
-                kt,
-                expert_slots,
-                mv_scratch,
-                win_slot_outs,
-                m_out_win,
+            let mut hctx = hs.host_moe_ctx_mut();
+            hm.eval_moe_experts_window_ctx(
+                ip, w_len, cur_win, t_ids_win, t_w_win, pool, kt, &mut hctx, m_out_win, float_act,
             );
         };
         Ok(runner.forward_window_hybrid(
@@ -1801,20 +1821,10 @@ fn eval_inkling2_vk_token<'a>(
     compute_logits: bool,
 ) -> Result<&'a [f32]> {
     if let Some((hm, hs)) = host_helper {
+        let float_act = !runner.fused_q8_active();
         let mut cb = |ip: usize, cur_n: &[f32], t_ids: &[usize], t_w: &[f32], m_out: &mut [f32]| {
-            let (serial_pool, expert_slots, mv_scratch) = hs.host_moe_parts_mut();
-            hm.eval_moe_experts_f32(
-                ip,
-                cur_n,
-                t_ids,
-                t_w,
-                pool,
-                serial_pool,
-                kt,
-                expert_slots,
-                mv_scratch,
-                m_out,
-            );
+            let mut hctx = hs.host_moe_ctx_mut();
+            hm.eval_moe_experts_ctx(ip, cur_n, t_ids, t_w, pool, kt, &mut hctx, m_out, float_act);
         };
         Ok(runner.forward_token_hybrid(token_id, pos, compute_logits, Some(&mut cb))?)
     } else {
@@ -1832,20 +1842,10 @@ fn eval_inkling2_vk_greedy(
     pos: usize,
 ) -> Result<u32> {
     if let Some((hm, hs)) = host_helper {
+        let float_act = !runner.fused_q8_active();
         let mut cb = |ip: usize, cur_n: &[f32], t_ids: &[usize], t_w: &[f32], m_out: &mut [f32]| {
-            let (serial_pool, expert_slots, mv_scratch) = hs.host_moe_parts_mut();
-            hm.eval_moe_experts_f32(
-                ip,
-                cur_n,
-                t_ids,
-                t_w,
-                pool,
-                serial_pool,
-                kt,
-                expert_slots,
-                mv_scratch,
-                m_out,
-            );
+            let mut hctx = hs.host_moe_ctx_mut();
+            hm.eval_moe_experts_ctx(ip, cur_n, t_ids, t_w, pool, kt, &mut hctx, m_out, float_act);
         };
         Ok(runner.forward_token_greedy_hybrid(token_id, pos, Some(&mut cb))?)
     } else {
@@ -1879,11 +1879,7 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
             Some(ref dp) => Some(GgufFile::open(dp)?),
             None => None,
         };
-        let draft_reserve = if draft_gguf.is_some() {
-            512 * 1024 * 1024u64
-        } else {
-            0
-        };
+        let draft_reserve = compute_draft_vram_reserve_bytes(draft_gguf.as_ref());
         let mut runner = tm_vulkan::Inkling2VkRunner::from_gguf_with_draft_reserve(
             gguf.clone(),
             opts.max_ctx,
@@ -1914,13 +1910,19 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
         };
         let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
         let tier_info = if let Some((ref hm, _)) = host_helper {
+            let cache_tag = if hm.stats.nvme_cache_slots_per_layer > 0 {
+                format!(" cache={}/layer", hm.stats.nvme_cache_slots_per_layer)
+            } else {
+                String::new()
+            };
             format!(
-                "vram_exps={} ram_exps={} nvme_exps={} ({:.1} MiB/tok direct_io={})",
+                "vram_exps={} ram_exps={} nvme_exps={} ({:.1} MiB/tok direct_io={}{})",
                 hm.stats.vram_expert_layers,
                 hm.stats.ram_owned_expert_layers + hm.stats.ram_mmap_expert_layers,
                 hm.stats.nvme_direct_expert_layers,
                 hm.stats.nvme_bytes_per_decode_tok as f64 / 1048576.0,
-                hm.stats.direct_io_active
+                hm.stats.direct_io_active,
+                cache_tag
             )
         } else {
             "all-vram".to_string()
@@ -1982,7 +1984,11 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
             let target_visits = ds.target_layers().to_vec();
             let bs = ds.block_size();
             let max_d_cfg = ds.max_draft_tokens();
-            let mut ctrl = DSparkAdaptiveCtrl::new(opts.draft_max.min(max_d_cfg), 0.0);
+            let nvme_tiered = host_helper
+                .as_ref()
+                .is_some_and(|(hm, _)| hm.stats.nvme_direct_expert_layers > 0);
+            let mut ctrl =
+                DSparkAdaptiveCtrl::new_with_tier(opts.draft_max.min(max_d_cfg), 0.0, nvme_tiered);
 
             // Emit `next_id` (first token predicted from prompt) immediately
             if !tok.is_stop_token(next_id) {
@@ -2006,6 +2012,28 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
                 } else {
                     0
                 };
+                if ask_k == 0 && ctrl.is_permanently_disabled() {
+                    if let Some((inj_pos, inj_cnt)) = pending_inj.take() {
+                        ds.inject_batch(&runner, &pool, kt, inj_pos, inj_cnt)?;
+                    }
+                    next_id = eval_inkling2_vk_greedy(
+                        &mut runner,
+                        &mut host_helper,
+                        &pool,
+                        kt,
+                        next_id,
+                        pos,
+                    )?;
+                    pos += 1;
+                    verify_steps += 1;
+                    if !tok.is_stop_token(next_id) && generated < opts.n_predict {
+                        stdout.write_all(&tok.decode_token_bytes(next_id))?;
+                        stdout.flush()?;
+                        history.push(next_id);
+                        generated += 1;
+                    }
+                    continue;
+                }
 
                 let mut tap_slot = 0usize;
                 let drafted = if ask_k > 0 {
@@ -2022,7 +2050,11 @@ fn cmd_run_vulkan(opts: RunOpts) -> Result<()> {
                         &mut drafts[..ask_k],
                         &mut draft_probs[..ask_k],
                     )?;
-                    DSparkAdaptiveCtrl::gate_drafts(raw_d, &draft_probs[..raw_d])
+                    DSparkAdaptiveCtrl::gate_drafts_tiered(
+                        raw_d,
+                        &draft_probs[..raw_d],
+                        nvme_tiered,
+                    )
                 } else {
                     if let Some((inj_pos, inj_cnt)) = pending_inj {
                         if inj_cnt >= tm_vulkan::MAX_INKLING2_SPEC_WINDOW {
@@ -2389,11 +2421,7 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
             Some(ref dp) => Some(GgufFile::open(dp)?),
             None => None,
         };
-        let draft_reserve = if draft_gguf.is_some() {
-            512 * 1024 * 1024u64
-        } else {
-            0
-        };
+        let draft_reserve = compute_draft_vram_reserve_bytes(draft_gguf.as_ref());
         let mut runner = tm_vulkan::Inkling2VkRunner::from_gguf_with_draft_reserve(
             gguf.clone(),
             opts.max_ctx,
@@ -2521,7 +2549,14 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
             let target_visits = ds.target_layers().to_vec();
             let bs = ds.block_size();
             let max_d_cfg = ds.max_draft_tokens();
-            let mut ctrl = DSparkAdaptiveCtrl::new(opts.draft_max.min(max_d_cfg), single_tok_s);
+            let nvme_tiered = host_helper
+                .as_ref()
+                .is_some_and(|(hm, _)| hm.stats.nvme_direct_expert_layers > 0);
+            let mut ctrl = DSparkAdaptiveCtrl::new_with_tier(
+                opts.draft_max.min(max_d_cfg),
+                single_tok_s,
+                nvme_tiered,
+            );
             let mut pending_inj: Option<(usize, usize)> = None;
 
             while gen_tokens.len() < n_gen + 1 {
@@ -2537,6 +2572,22 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
                 } else {
                     0
                 };
+                if ask_k == 0 && ctrl.is_permanently_disabled() {
+                    if let Some((inj_pos, inj_cnt)) = pending_inj.take() {
+                        ds.inject_batch(&runner, &pool, kt, inj_pos, inj_cnt)?;
+                    }
+                    tok = eval_inkling2_vk_greedy(
+                        &mut runner,
+                        &mut host_helper,
+                        &pool,
+                        kt,
+                        tok,
+                        cur_pos,
+                    )?;
+                    cur_pos += 1;
+                    gen_tokens.push(tok);
+                    continue;
+                }
 
                 let mut tap_slot = 0usize;
                 let drafted = if ask_k > 0 {
@@ -2553,7 +2604,11 @@ fn cmd_bench_vulkan(opts: RunOpts) -> Result<()> {
                         &mut drafts[..ask_k],
                         &mut draft_probs[..ask_k],
                     )?;
-                    DSparkAdaptiveCtrl::gate_drafts(raw_d, &draft_probs[..raw_d])
+                    DSparkAdaptiveCtrl::gate_drafts_tiered(
+                        raw_d,
+                        &draft_probs[..raw_d],
+                        nvme_tiered,
+                    )
                 } else {
                     if let Some((inj_pos, inj_cnt)) = pending_inj {
                         if inj_cnt >= tm_vulkan::MAX_INKLING2_SPEC_WINDOW {
@@ -2908,10 +2963,144 @@ fn cmd_profile_vulkan(opts: RunOpts) -> Result<()> {
 }
 
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn eval_inkling2_cuda_window<'a>(
+    ik: &'a mut tm_cuda::Inkling2CudaRunner,
+    host_helper: &mut Option<(tm_models::Inkling2Model<'_>, tm_models::Inkling2State)>,
+    pool: &ThreadPool,
+    kt: &tm_cpu::KernelTable,
+    window_tokens: &[u32],
+    start_pos: usize,
+    compute_last_logits: bool,
+    save_conv_snapshots: bool,
+    dspark_visits: &[usize],
+    out_argmax: Option<&mut [u32]>,
+) -> Result<&'a [f32]> {
+    if let Some((hm, hs)) = host_helper {
+        let mut cb = |ip: usize,
+                      w_len: usize,
+                      cur_win: &[f32],
+                      t_ids_win: &[usize],
+                      t_w_win: &[f32],
+                      m_out_win: &mut [f32]| {
+            let mut hctx = hs.host_moe_ctx_mut();
+            hm.eval_moe_experts_window_ctx(
+                ip, w_len, cur_win, t_ids_win, t_w_win, pool, kt, &mut hctx, m_out_win, false,
+            );
+        };
+        Ok(ik.forward_window_hybrid(
+            window_tokens,
+            start_pos,
+            compute_last_logits,
+            save_conv_snapshots,
+            dspark_visits,
+            Some(&mut cb),
+            out_argmax,
+        )?)
+    } else {
+        Ok(ik.forward_window_with_taps(
+            window_tokens,
+            start_pos,
+            compute_last_logits,
+            save_conv_snapshots,
+            dspark_visits,
+            out_argmax,
+        )?)
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn eval_inkling2_cuda_token<'a>(
+    ik: &'a mut tm_cuda::Inkling2CudaRunner,
+    host_helper: &mut Option<(tm_models::Inkling2Model<'_>, tm_models::Inkling2State)>,
+    pool: &ThreadPool,
+    kt: &tm_cpu::KernelTable,
+    token_id: u32,
+    pos: usize,
+    compute_logits: bool,
+) -> Result<&'a [f32]> {
+    if let Some((hm, hs)) = host_helper {
+        let mut cb = |ip: usize, cur_n: &[f32], t_ids: &[usize], t_w: &[f32], m_out: &mut [f32]| {
+            let mut hctx = hs.host_moe_ctx_mut();
+            hm.eval_moe_experts_ctx(ip, cur_n, t_ids, t_w, pool, kt, &mut hctx, m_out, false);
+        };
+        Ok(ik.forward_token_hybrid(token_id, pos, compute_logits, Some(&mut cb))?)
+    } else {
+        Ok(ik.forward_token(token_id, pos, compute_logits)?)
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn eval_inkling2_cuda_greedy(
+    ik: &mut tm_cuda::Inkling2CudaRunner,
+    host_helper: &mut Option<(tm_models::Inkling2Model<'_>, tm_models::Inkling2State)>,
+    pool: &ThreadPool,
+    kt: &tm_cpu::KernelTable,
+    token_id: u32,
+    pos: usize,
+) -> Result<u32> {
+    if let Some((hm, hs)) = host_helper {
+        let mut cb = |ip: usize, cur_n: &[f32], t_ids: &[usize], t_w: &[f32], m_out: &mut [f32]| {
+            let mut hctx = hs.host_moe_ctx_mut();
+            hm.eval_moe_experts_ctx(ip, cur_n, t_ids, t_w, pool, kt, &mut hctx, m_out, false);
+        };
+        Ok(ik.forward_token_greedy_hybrid(token_id, pos, Some(&mut cb))?)
+    } else {
+        Ok(ik.forward_token_greedy(token_id, pos)?)
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn eval_inkling2_cuda_batch<'a>(
+    ik: &'a mut tm_cuda::Inkling2CudaRunner,
+    host_helper: &mut Option<(tm_models::Inkling2Model<'_>, tm_models::Inkling2State)>,
+    mut dspark: Option<&mut tm_cuda::DFlashCudaRunner>,
+    pool: &ThreadPool,
+    kt: &tm_cpu::KernelTable,
+    token_ids: &[u32],
+    start_pos: usize,
+    compute_last_logits: bool,
+) -> Result<&'a [f32]> {
+    if token_ids.is_empty() {
+        return Ok(ik.forward_window_with_taps(&[], start_pos, false, false, &[], None)?);
+    }
+    let visits: Vec<usize> = match dspark.as_deref() {
+        Some(ds) => ds.cfg.target_layers.clone(),
+        None => Vec::new(),
+    };
+    let cap = ik.batch_cap;
+    let mut off = 0usize;
+    while off < token_ids.len() {
+        let b = (token_ids.len() - off).min(cap);
+        let is_last = off + b == token_ids.len();
+        let _ = eval_inkling2_cuda_window(
+            ik,
+            host_helper,
+            pool,
+            kt,
+            &token_ids[off..off + b],
+            start_pos + off,
+            compute_last_logits && is_last,
+            false,
+            &visits,
+            None,
+        )?;
+        if let Some(ds) = dspark.as_deref_mut() {
+            ds.inject_batch(ik, start_pos + off, b)?;
+        }
+        off += b;
+    }
+    Ok(ik.forward_window_with_taps(&[], start_pos + token_ids.len(), false, false, &[], None)?)
+}
+
+#[cfg(feature = "cuda")]
 fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
     let t_load = Instant::now();
     let is_pure_greedy =
         opts.sampler.temperature <= 0.0 && (opts.sampler.repeat_penalty - 1.0).abs() < 1e-6;
+    let kt = active_kernels();
+    let mut opt_gguf: Option<std::sync::Arc<GgufFile>> = None;
 
     let (mut runner, tok, prompt_ids, mut dspark_cuda) = if tm_models::is_strata_file(&opts.model) {
         let (r, tok_json) = tm_cuda::CudaRunner::from_strata(
@@ -2924,19 +3113,24 @@ fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
         let prompt_ids = resolve_prompt_ids(&opts, &tok)?;
         (r, tok, prompt_ids, None)
     } else {
-        let gguf = GgufFile::open(&opts.model)?;
+        let gguf = std::sync::Arc::new(GgufFile::open(&opts.model)?);
         let tok = Tokenizer::from_gguf(&gguf)?;
         let prompt_ids = resolve_prompt_ids(&opts, &tok)?;
-        let mut runner =
-            tm_cuda::CudaRunner::from_gguf_with_kv_type(&gguf, opts.max_ctx, opts.kv_type)?;
-        if let Some(ref mp) = opts.mtp_path {
-            let mg = GgufFile::open(mp)?;
-            runner.attach_mtp_gguf(&mg)?;
-        }
         let draft_gguf = match &opts.draft_model {
             Some(p) => Some(GgufFile::open(p)?),
             None => None,
         };
+        let draft_reserve = compute_draft_vram_reserve_bytes(draft_gguf.as_ref()) as usize;
+        let mut runner = tm_cuda::CudaRunner::from_gguf_with_draft_reserve(
+            &gguf,
+            opts.max_ctx,
+            opts.kv_type,
+            draft_reserve,
+        )?;
+        if let Some(ref mp) = opts.mtp_path {
+            let mg = GgufFile::open(mp)?;
+            runner.attach_mtp_gguf(&mg)?;
+        }
         let dspark_cuda = match (&runner, &draft_gguf) {
             (tm_cuda::CudaRunner::Inkling2(ik), Some(dg))
                 if is_pure_greedy && dg.req_str("general.architecture").ok() == Some("dflash") =>
@@ -2945,16 +3139,56 @@ fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
             }
             _ => None,
         };
+        opt_gguf = Some(gguf);
         (runner, tok, prompt_ids, dspark_cuda)
+    };
+    let mut ink_host_helper = match (&mut runner, opt_gguf.as_deref()) {
+        (tm_cuda::CudaRunner::Inkling2(ik), Some(gguf_ref)) if ik.has_host_offload_layers() => {
+            let hm = tm_models::Inkling2Model::from_gguf_with_options(
+                gguf_ref,
+                &tm_models::Inkling2LoadOptions {
+                    vram_expert_layers: ik.vram_expert_mask().to_vec(),
+                    ram_expert_budget_bytes: None,
+                    host_moe_only: true,
+                },
+            )?;
+            for ip in 0..hm.cfg.n_layers_phys {
+                if let Some((gu_pin, gu_len, dn_pin, dn_len)) = hm.host_importable_expert_pins(ip) {
+                    let _ = ik.register_host_moe_layer(ip, gu_pin, gu_len, dn_pin, dn_len)?;
+                }
+            }
+            let hs = tm_models::Inkling2State::new_host_moe_only(&hm);
+            Some((hm, hs))
+        }
+        _ => None,
+    };
+    let tier_note = if let Some((ref hm, _)) = ink_host_helper {
+        let cache_tag = if hm.stats.nvme_cache_slots_per_layer > 0 {
+            format!(" cache={}/layer", hm.stats.nvme_cache_slots_per_layer)
+        } else {
+            String::new()
+        };
+        format!(
+            " · vram_exps={} ram_exps={} nvme_exps={} ({:.1} MiB/tok direct_io={}{})",
+            hm.stats.vram_expert_layers,
+            hm.stats.ram_owned_expert_layers + hm.stats.ram_mmap_expert_layers,
+            hm.stats.nvme_direct_expert_layers,
+            hm.stats.nvme_bytes_per_decode_tok as f64 / 1048576.0,
+            hm.stats.direct_io_active,
+            cache_tag,
+        )
+    } else {
+        String::new()
     };
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
     let info = runner.device_info().clone();
     eprintln!(
-        "[tinymodel] arch={} backend=cuda ({}, sm_{}{}) vram={:.1}MiB kv={} dspark={} load={:.1}ms prompt_tokens={} vocab={} layers={}",
+        "[tinymodel] arch={} backend=cuda ({}, sm_{}{}{}) vram={:.1}MiB kv={} dspark={} load={:.1}ms prompt_tokens={} vocab={} layers={}",
         runner.arch(),
         info.name,
         info.cc_major,
         info.cc_minor,
+        tier_note,
         runner.vram_allocated_bytes() as f64 / (1024.0 * 1024.0),
         opts.kv_type.as_str(),
         if dspark_cuda.is_some() { "gpu" } else { "off" },
@@ -2982,25 +3216,19 @@ fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
         }
     }
     let logits = if !prompt_ids.is_empty() {
-        if let (tm_cuda::CudaRunner::Inkling2(ik), Some(ds)) = (&mut runner, &mut dspark_cuda) {
-            let visits = ds.cfg.target_layers.clone();
-            let mut off = 0usize;
-            while off < prompt_ids.len() {
-                let b = (prompt_ids.len() - off).min(tm_cuda::llama_runner::MAX_CUDA_BATCH);
-                let is_last = off + b == prompt_ids.len();
-                let _ = ik.forward_window_with_taps(
-                    &prompt_ids[off..off + b],
-                    pos + off,
-                    is_last,
-                    false,
-                    &visits,
-                    None,
-                )?;
-                ds.inject_batch(ik, pos + off, b)?;
-                off += b;
-            }
+        if let tm_cuda::CudaRunner::Inkling2(ik) = &mut runner {
+            let l = eval_inkling2_cuda_batch(
+                ik,
+                &mut ink_host_helper,
+                dspark_cuda.as_mut(),
+                &pool,
+                kt,
+                &prompt_ids,
+                pos,
+                true,
+            )?;
             pos += prompt_ids.len();
-            ik.forward_window_with_taps(&[], pos, false, false, &[], None)?
+            l
         } else {
             let l = runner.forward_batch(&prompt_ids, pos, true)?;
             pos += prompt_ids.len();
@@ -3021,16 +3249,20 @@ fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
     if let (tm_cuda::CudaRunner::Inkling2(ik), Some(ds)) = (&mut runner, &mut dspark_cuda) {
         let visits = ds.cfg.target_layers.clone();
         let max_k = opts.draft_max.min(ds.cfg.block_size.saturating_sub(1));
-        // Measure single-step `CudaGraphExec` baseline latency before starting DSpark!
-        let single_step_s = if pos + 1 < opts.max_ctx {
-            let _ = ik.forward_token_greedy(next_id, pos)?;
+        let nvme_tiered = ink_host_helper
+            .as_ref()
+            .is_some_and(|(hm, _)| hm.stats.nvme_direct_expert_layers > 0);
+        // Measure single-step baseline latency when All-VRAM; on NVMe-tiered hosts `choose_k`
+        // calibrates cleanly on step 0 without redundant SSD reads!
+        let single_step_s = if !nvme_tiered && pos + 1 < opts.max_ctx {
+            let _ = eval_inkling2_cuda_greedy(ik, &mut ink_host_helper, &pool, kt, next_id, pos)?;
             let t_s1 = Instant::now();
-            let _ = ik.forward_token_greedy(next_id, pos)?;
+            let _ = eval_inkling2_cuda_greedy(ik, &mut ink_host_helper, &pool, kt, next_id, pos)?;
             t_s1.elapsed().as_secs_f64()
         } else {
             0.0
         };
-        let mut ctrl = DSparkAdaptiveCtrl::new(max_k, single_step_s);
+        let mut ctrl = DSparkAdaptiveCtrl::new_with_tier(max_k, single_step_s, nvme_tiered);
         let mut drafts = [0u32; tm_cuda::MAX_INKLING2_CUDA_SPEC_WINDOW];
         let mut probs = [0.0f32; tm_cuda::MAX_INKLING2_CUDA_SPEC_WINDOW];
         let mut win_toks = [0u32; tm_cuda::MAX_INKLING2_CUDA_SPEC_WINDOW];
@@ -3050,8 +3282,11 @@ fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
             let cap_k = max_k.min(rem_gen.saturating_sub(1)).min(rem_ctx);
             let ask_k = ctrl.choose_k(cap_k);
             if ask_k == 0 && ctrl.is_permanently_disabled() {
-                // Circuit breaker permanently open: run pure `CudaGraphExec` single-step fast path!
-                next_id = ik.forward_token_greedy(next_id, pos)?;
+                if let Some((inj_pos, inj_cnt)) = pending_inj.take() {
+                    ds.inject_batch(ik, inj_pos, inj_cnt)?;
+                }
+                next_id =
+                    eval_inkling2_cuda_greedy(ik, &mut ink_host_helper, &pool, kt, next_id, pos)?;
                 pos += 1;
                 if !tok.is_stop_token(next_id) && generated < opts.n_predict {
                     stdout.write_all(&tok.decode_token_bytes(next_id))?;
@@ -3075,7 +3310,7 @@ fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
                     &mut drafts,
                     &mut probs,
                 )?;
-                DSparkAdaptiveCtrl::gate_drafts(raw_d, &probs)
+                DSparkAdaptiveCtrl::gate_drafts_tiered(raw_d, &probs, nvme_tiered)
             } else {
                 if let Some((inj_pos, inj_cnt)) = pending_inj {
                     if inj_cnt >= tm_cuda::MAX_INKLING2_CUDA_SPEC_WINDOW {
@@ -3092,7 +3327,11 @@ fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
             win_toks[1..w].copy_from_slice(&drafts[..drafted]);
 
             ik.set_dspark_tap_slot(tap_slot);
-            let _ = ik.forward_window_with_taps(
+            let _ = eval_inkling2_cuda_window(
+                ik,
+                &mut ink_host_helper,
+                &pool,
+                kt,
                 &win_toks[..w],
                 pos,
                 false,
@@ -3150,6 +3389,37 @@ fn cmd_run_cuda(opts: RunOpts) -> Result<()> {
                 None => Some((pos, committed)),
             };
             pos += committed;
+        }
+    } else if let tm_cuda::CudaRunner::Inkling2(ik) = &mut runner
+        && ik.has_host_offload_layers()
+    {
+        while generated < opts.n_predict {
+            if tok.is_stop_token(next_id) {
+                break;
+            }
+            stdout.write_all(&tok.decode_token_bytes(next_id))?;
+            stdout.flush()?;
+            history.push(next_id);
+            generated += 1;
+            if generated >= opts.n_predict {
+                break;
+            }
+            if is_pure_greedy {
+                next_id =
+                    eval_inkling2_cuda_greedy(ik, &mut ink_host_helper, &pool, kt, next_id, pos)?;
+            } else {
+                let logits = eval_inkling2_cuda_token(
+                    ik,
+                    &mut ink_host_helper,
+                    &pool,
+                    kt,
+                    next_id,
+                    pos,
+                    true,
+                )?;
+                next_id = sampler.sample(logits, &history);
+            }
+            pos += 1;
         }
     } else if is_pure_greedy && opts.spec_mode != SpecMode::Off {
         let builtin_name = runner.builtin_spec_name();
@@ -3393,6 +3663,7 @@ fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
         .unwrap_or("?")
         .to_string();
 
+    let mut opt_bench_gguf: Option<std::sync::Arc<GgufFile>> = None;
     let (mut runner, arch, active_decode_bytes, pp_ids, corpus_mode, mut dspark_cuda) =
         if tm_models::is_strata_file(&opts.model) {
             let (r, tok_json) = tm_cuda::CudaRunner::from_strata(
@@ -3426,20 +3697,25 @@ fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
             };
             (r, arch, active_decode_bytes, pp_ids, corpus_mode, None)
         } else {
-            let gguf = GgufFile::open(&opts.model)?;
+            let gguf = std::sync::Arc::new(GgufFile::open(&opts.model)?);
             let arch = gguf.req_str("general.architecture")?.to_string();
             let active_decode_bytes = compute_active_decode_bytes(&gguf);
             let (pp_ids, corpus_mode) = resolve_bench_pp_ids(&opts, &gguf)?;
-            let mut runner =
-                tm_cuda::CudaRunner::from_gguf_with_kv_type(&gguf, opts.max_ctx, opts.kv_type)?;
-            if let Some(ref mp) = opts.mtp_path {
-                let mg = GgufFile::open(mp)?;
-                runner.attach_mtp_gguf(&mg)?;
-            }
             let draft_gguf = match &opts.draft_model {
                 Some(p) => Some(GgufFile::open(p)?),
                 None => None,
             };
+            let draft_reserve = compute_draft_vram_reserve_bytes(draft_gguf.as_ref()) as usize;
+            let mut runner = tm_cuda::CudaRunner::from_gguf_with_draft_reserve(
+                &gguf,
+                opts.max_ctx,
+                opts.kv_type,
+                draft_reserve,
+            )?;
+            if let Some(ref mp) = opts.mtp_path {
+                let mg = GgufFile::open(mp)?;
+                runner.attach_mtp_gguf(&mg)?;
+            }
             let dspark_cuda = match (&runner, &draft_gguf) {
                 (tm_cuda::CudaRunner::Inkling2(ik), Some(dg))
                     if dg.req_str("general.architecture").ok() == Some("dflash") =>
@@ -3448,6 +3724,7 @@ fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
                 }
                 _ => None,
             };
+            opt_bench_gguf = Some(gguf);
             (
                 runner,
                 arch,
@@ -3457,48 +3734,76 @@ fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
                 dspark_cuda,
             )
         };
+    let pool = ThreadPool::new(opts.threads);
+    let kt = active_kernels();
+    let mut ink_host_helper = match (&mut runner, opt_bench_gguf.as_deref()) {
+        (tm_cuda::CudaRunner::Inkling2(ik), Some(gguf_ref)) if ik.has_host_offload_layers() => {
+            let hm = tm_models::Inkling2Model::from_gguf_with_options(
+                gguf_ref,
+                &tm_models::Inkling2LoadOptions {
+                    vram_expert_layers: ik.vram_expert_mask().to_vec(),
+                    ram_expert_budget_bytes: None,
+                    host_moe_only: true,
+                },
+            )?;
+            for ip in 0..hm.cfg.n_layers_phys {
+                if let Some((gu_pin, gu_len, dn_pin, dn_len)) = hm.host_importable_expert_pins(ip) {
+                    let _ = ik.register_host_moe_layer(ip, gu_pin, gu_len, dn_pin, dn_len)?;
+                }
+            }
+            let hs = tm_models::Inkling2State::new_host_moe_only(&hm);
+            Some((hm, hs))
+        }
+        _ => None,
+    };
     let n_pp = pp_ids.len();
     let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
 
-    // Warmup both MMVQ decode and WMMA Tensor Core prefill paths + measure single-step baseline
-    let _ = runner.forward_token_greedy(1, 0)?;
-    let t_s1 = Instant::now();
-    let _ = runner.forward_token_greedy(2, 1)?;
-    let single_step_s = t_s1.elapsed().as_secs_f64();
-    runner.reset_state()?;
-    let warmup_ids = [1u32; 16];
-    let _ = runner.forward_batch(&warmup_ids, 0, true)?;
-    runner.reset_state()?;
+    // Warmup decode/graph capture + measure single-step baseline
+    let single_step_s = if let tm_cuda::CudaRunner::Inkling2(ref mut ik) = runner
+        && ik.has_host_offload_layers()
+    {
+        let _ = eval_inkling2_cuda_greedy(ik, &mut ink_host_helper, &pool, kt, 1, 0)?;
+        let t_s1 = Instant::now();
+        let _ = eval_inkling2_cuda_greedy(ik, &mut ink_host_helper, &pool, kt, 2, 1)?;
+        let s_lat = t_s1.elapsed().as_secs_f64();
+        ik.reset_state()?;
+        if let Some((_, ref mut hs)) = ink_host_helper {
+            hs.reset();
+        }
+        s_lat
+    } else {
+        let _ = runner.forward_token_greedy(1, 0)?;
+        let t_s1 = Instant::now();
+        let _ = runner.forward_token_greedy(2, 1)?;
+        let s_lat = t_s1.elapsed().as_secs_f64();
+        runner.reset_state()?;
+        let warmup_ids = [1u32; 16];
+        let _ = runner.forward_batch(&warmup_ids, 0, true)?;
+        runner.reset_state()?;
+        s_lat
+    };
 
     let t_pp = Instant::now();
-    let first_tok =
-        if let (tm_cuda::CudaRunner::Inkling2(ik), Some(ds)) = (&mut runner, &mut dspark_cuda) {
+    let first_tok = if let tm_cuda::CudaRunner::Inkling2(ik) = &mut runner {
+        if let Some(ref mut ds) = dspark_cuda {
             ds.reset_state(ik)?;
-            let visits = ds.cfg.target_layers.clone();
-            let mut off = 0usize;
-            while off < pp_ids.len() {
-                let b = (pp_ids.len() - off).min(tm_cuda::llama_runner::MAX_CUDA_BATCH);
-                let is_last = off + b == pp_ids.len();
-                let _ = ik.forward_window_with_taps(
-                    &pp_ids[off..off + b],
-                    off,
-                    is_last && corpus_mode,
-                    false,
-                    &visits,
-                    None,
-                )?;
-                ds.inject_batch(ik, off, b)?;
-                off += b;
-            }
-            if corpus_mode {
-                argmax(ik.forward_window_with_taps(&[], n_pp, false, false, &[], None)?)
-            } else {
-                0
-            }
-        } else {
-            let pp_logits = runner.forward_batch(&pp_ids, 0, corpus_mode)?;
-            if corpus_mode { argmax(pp_logits) } else { 0 }
-        };
+        }
+        let lg = eval_inkling2_cuda_batch(
+            ik,
+            &mut ink_host_helper,
+            dspark_cuda.as_mut(),
+            &pool,
+            kt,
+            &pp_ids,
+            0,
+            corpus_mode,
+        )?;
+        if corpus_mode { argmax(lg) } else { 0 }
+    } else {
+        let pp_logits = runner.forward_batch(&pp_ids, 0, corpus_mode)?;
+        if corpus_mode { argmax(pp_logits) } else { 0 }
+    };
     let pp_sec = t_pp.elapsed().as_secs_f64();
     let pp_tps = (n_pp as f64) / pp_sec.max(1e-9);
 
@@ -3511,13 +3816,32 @@ fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
         (first_tok, n_pp)
     } else {
         runner.reset_state()?;
+        if let Some((_, ref mut hs)) = ink_host_helper {
+            hs.reset();
+        }
         if let (tm_cuda::CudaRunner::Inkling2(ik), Some(ds)) = (&mut runner, &mut dspark_cuda) {
             ds.reset_state(ik)?;
             let visits = ds.cfg.target_layers.clone();
             let mut a0 = [0u32; 1];
-            let _ = ik.forward_window_with_taps(&[1], 0, false, false, &visits, Some(&mut a0))?;
+            let _ = eval_inkling2_cuda_window(
+                ik,
+                &mut ink_host_helper,
+                &pool,
+                kt,
+                &[1],
+                0,
+                false,
+                false,
+                &visits,
+                Some(&mut a0),
+            )?;
             ds.inject_batch(ik, 0, 1)?;
             (a0[0], 1)
+        } else if let tm_cuda::CudaRunner::Inkling2(ik) = &mut runner {
+            (
+                eval_inkling2_cuda_greedy(ik, &mut ink_host_helper, &pool, kt, 1, 0)?,
+                1,
+            )
         } else {
             (runner.forward_token_greedy(1, 0)?, 1)
         }
@@ -3528,7 +3852,10 @@ fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
     if let (tm_cuda::CudaRunner::Inkling2(ik), Some(ds)) = (&mut runner, &mut dspark_cuda) {
         let visits = ds.cfg.target_layers.clone();
         let max_k = opts.draft_max.min(ds.cfg.block_size.saturating_sub(1));
-        let mut ctrl = DSparkAdaptiveCtrl::new(max_k, single_step_s);
+        let nvme_tiered = ink_host_helper
+            .as_ref()
+            .is_some_and(|(hm, _)| hm.stats.nvme_direct_expert_layers > 0);
+        let mut ctrl = DSparkAdaptiveCtrl::new_with_tier(max_k, single_step_s, nvme_tiered);
         let mut drafts = [0u32; tm_cuda::MAX_INKLING2_CUDA_SPEC_WINDOW];
         let mut probs = [0.0f32; tm_cuda::MAX_INKLING2_CUDA_SPEC_WINDOW];
         let mut win_toks = [0u32; tm_cuda::MAX_INKLING2_CUDA_SPEC_WINDOW];
@@ -3542,8 +3869,10 @@ fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
             let cap_k = max_k.min(rem_gen.saturating_sub(1)).min(rem_ctx);
             let ask_k = ctrl.choose_k(cap_k);
             if ask_k == 0 && ctrl.is_permanently_disabled() {
-                // Circuit breaker permanently open: run pure `CudaGraphExec` single-step fast path!
-                tok = ik.forward_token_greedy(tok, cur_pos)?;
+                if let Some((inj_pos, inj_cnt)) = pending_inj.take() {
+                    ds.inject_batch(ik, inj_pos, inj_cnt)?;
+                }
+                tok = eval_inkling2_cuda_greedy(ik, &mut ink_host_helper, &pool, kt, tok, cur_pos)?;
                 cur_pos += 1;
                 gen_tokens.push(tok);
                 continue;
@@ -3562,7 +3891,7 @@ fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
                     &mut drafts,
                     &mut probs,
                 )?;
-                DSparkAdaptiveCtrl::gate_drafts(raw_d, &probs)
+                DSparkAdaptiveCtrl::gate_drafts_tiered(raw_d, &probs, nvme_tiered)
             } else {
                 if let Some((inj_pos, inj_cnt)) = pending_inj {
                     if inj_cnt >= tm_cuda::MAX_INKLING2_CUDA_SPEC_WINDOW {
@@ -3579,7 +3908,11 @@ fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
             win_toks[1..w].copy_from_slice(&drafts[..drafted]);
 
             ik.set_dspark_tap_slot(tap_slot);
-            let _ = ik.forward_window_with_taps(
+            let _ = eval_inkling2_cuda_window(
+                ik,
+                &mut ink_host_helper,
+                &pool,
+                kt,
                 &win_toks[..w],
                 cur_pos,
                 false,
@@ -3626,6 +3959,20 @@ fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
                 None => Some((cur_pos, committed)),
             };
             cur_pos += committed;
+        }
+    } else if let tm_cuda::CudaRunner::Inkling2(ik) = &mut runner
+        && ik.has_host_offload_layers()
+    {
+        for step in 0..n_gen {
+            tok = eval_inkling2_cuda_greedy(
+                ik,
+                &mut ink_host_helper,
+                &pool,
+                kt,
+                tok,
+                cur_pos + step,
+            )?;
+            gen_tokens.push(tok);
         }
     } else if opts.spec_mode != SpecMode::Off {
         let builtin_name = runner.builtin_spec_name();
@@ -3763,7 +4110,11 @@ fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
     let tel_after = probe::collect_telemetry();
     let info = runner.device_info().clone();
     let dev_name = format!("{} (sm_{}{})", info.name, info.cc_major, info.cc_minor);
-    let base_wmode = if runner.host_offloaded_moe_layers() > 0 {
+    let base_wmode = if let tm_cuda::CudaRunner::Inkling2(ref ik) = runner
+        && ik.has_host_offload_layers()
+    {
+        ik.weights_mode()
+    } else if runner.host_offloaded_moe_layers() > 0 {
         format!("device-vram+ddr_moe_{}", runner.host_offloaded_moe_layers())
     } else {
         "device-vram".to_string()
@@ -3773,7 +4124,12 @@ fn cmd_bench_cuda(opts: RunOpts) -> Result<()> {
             "{base_wmode}+dspark_gpu_k{}({}/{})",
             opts.draft_max, dspark_accepted, dspark_drafted
         )
-    } else if opts.spec_mode != SpecMode::Off {
+    } else if opts.spec_mode != SpecMode::Off
+        && !matches!(
+            runner,
+            tm_cuda::CudaRunner::Inkling2(ref ik) if ik.has_host_offload_layers()
+        )
+    {
         let tag = runner.builtin_spec_name().unwrap_or("suffix");
         format!(
             "{base_wmode}+{tag}_k{}({}/{})",

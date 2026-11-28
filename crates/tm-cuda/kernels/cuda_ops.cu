@@ -2988,6 +2988,9 @@ __global__ void moe_router_topk_f32(
                 win_v = sh_w0[1];
                 win_i = sh_i0[1];
             }
+            if (win_i < 0 || win_i >= ne) {
+                win_i = k % max(ne, 1);
+            }
             out_ids[k] = uint32_t(win_i);
             out_w[k] = sh_probs[win_i];
             sh_sel[win_i] = -CUDART_INF_F;

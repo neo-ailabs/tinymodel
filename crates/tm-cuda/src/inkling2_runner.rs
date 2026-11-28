@@ -2,17 +2,36 @@
 //! and 100%-GPU `DSpark` (`dflash`) block speculative drafter + recurrent Markov head.
 
 use std::ffi::c_void;
+use std::sync::Arc;
 
 use tm_core::{DType, KvType, dequantize_row_bytes};
 use tm_gguf::{DirectTensorReader, GgufFile, PageAlignedSlot};
 use tm_models::{DFlashConfig, Inkling2Config, LOOP_CTRL_COUNT, LOOP_CTRL_FFN, RawMatView};
 
 use crate::CudaError;
-use crate::driver::{CUdeviceptr, CUfunction, CudaBuffer, CudaContext, CudaEvent, CudaGraphExec};
+use crate::driver::{
+    CUdeviceptr, CUfunction, CudaBuffer, CudaContext, CudaEvent, CudaGraphExec, CudaHostRegistered,
+    CudaPinnedBuffer,
+};
 use crate::kernels::{BLOCK_Q8_1_BYTES, CudaKernels, CudaMat, dtype_cuda_tag};
 use crate::llama_runner::{
     CudaProfileReport, CudaStageStat, MAX_CUDA_BATCH, is_q8_1_moe_dtype, upload_mat,
 };
+
+/// Callback for host-side single-token MoE evaluation (`ip, cur_normed, top_ids, top_weights, moe_out`).
+pub type CudaHostMoeFn<'a> = dyn FnMut(usize, &[f32], &[usize], &[f32], &mut [f32]) + 'a;
+
+/// Callback for host-side multi-token window MoE evaluation (`ip, w, cur_win, ids_win, ws_win, out_win`).
+pub type CudaHostMoeWindowFn<'a> =
+    dyn FnMut(usize, usize, &[f32], &[usize], &[f32], &mut [f32]) + 'a;
+
+struct CudaImportedHostExperts {
+    // Field drop order: unregister `CUdeviceptr` mappings BEFORE dropping `Arc` host pins!
+    gu_reg: CudaHostRegistered,
+    dn_reg: CudaHostRegistered,
+    _gu_pin: Arc<dyn AsRef<[u8]> + Send + Sync>,
+    _dn_pin: Arc<dyn AsRef<[u8]> + Send + Sync>,
+}
 
 const LOOP_CTRL_NAMES: [&str; LOOP_CTRL_COUNT] = ["q", "k", "v", "ffn"];
 
@@ -82,16 +101,17 @@ struct CudaInklingLayer {
     ffn_norm: CudaBuffer,
     ffn_gate_inp: CudaMat,
     exp_probs_b: Option<CudaBuffer>,
-    gate_up_exps: CudaBuffer,
+    gate_up_exps: Option<CudaBuffer>,
     gate_up_dtype: i32,
     gate_up_row_bytes: usize,
     gate_up_exp_bytes: usize,
     gate_up_scales: Option<CudaBuffer>,
-    down_exps: CudaBuffer,
+    down_exps: Option<CudaBuffer>,
     down_dtype: i32,
     down_row_bytes: usize,
     down_exp_bytes: usize,
     down_scales: Option<CudaBuffer>,
+    host_imported_experts: Option<CudaImportedHostExperts>,
 }
 
 fn load_f32_dev(
@@ -156,16 +176,22 @@ fn load_mat_dev(
     }
 }
 
-/// 100%-VRAM CUDA runner for `Inkling-2-Mini` (`inkling2` / `inkling2_loop`).
+/// All-VRAM or Loop-Aware 3-Tier (`VRAM + Zero-Copy DEVICEMAP Host RAM + NVMe O_DIRECT`)
+/// CUDA runner for `Inkling-2-Mini` (`inkling2` / `inkling2_loop`).
 pub struct Inkling2CudaRunner {
     pub ctx: CudaContext,
     pub kernels: CudaKernels,
     ik: Inkling2CudaKernels,
     pub cfg: Inkling2Config,
     pub max_ctx: usize,
+    pub batch_cap: usize,
     pub vram_bytes: usize,
     pub model_weight_bytes: usize,
     pub active_decode_bytes: usize,
+    pub host_offloaded_moe_layers: usize,
+    vram_expert_mask: Vec<bool>,
+    hybrid_gpu_exps: usize,
+    core_vram_prefix: usize,
 
     pub(crate) token_embd: CudaMat,
     pub(crate) token_embd_norm: CudaBuffer,
@@ -184,11 +210,21 @@ pub struct Inkling2CudaRunner {
     shortconv_snap: CudaBuffer,
 
     // Pre-allocated Arena scratch on GPU (`0` allocations on forward/decode/verify!)
-    pinned_ids: crate::driver::CudaPinnedBuffer,
-    pinned_pos: crate::driver::CudaPinnedBuffer,
+    pinned_ids: CudaPinnedBuffer,
+    pinned_pos: CudaPinnedBuffer,
+    pinned_moe_x: CudaPinnedBuffer,
+    pinned_moe_ids: CudaPinnedBuffer,
+    pinned_moe_ws: CudaPinnedBuffer,
+    pinned_moe_out: CudaPinnedBuffer,
+    ev_dtoh: CudaEvent,
+    host_top_ids_scratch: Vec<usize>,
+    host_top_ws_scratch: Vec<f32>,
+    host_x_scratch: Vec<f32>,
+    host_out_scratch: Vec<f32>,
     pub(crate) token_ids_buf: CudaBuffer,
     pos_buf: CudaBuffer,
     decode_graphs: [Option<CudaGraphExec>; 3],
+    core_prefix_graphs: [Option<CudaGraphExec>; 3],
     pub(crate) cur_buf: CudaBuffer,
     inp_sa_buf: CudaBuffer,
     ffn_inp_buf: CudaBuffer,
@@ -236,17 +272,39 @@ impl Inkling2CudaRunner {
     pub fn from_gguf_with_kv_type(
         gguf: &GgufFile,
         max_ctx: usize,
+        kv_type: KvType,
+    ) -> Result<Self, CudaError> {
+        Self::from_gguf_with_draft_reserve(gguf, max_ctx, kv_type, 0)
+    }
+
+    pub fn from_gguf_with_draft_reserve(
+        gguf: &GgufFile,
+        max_ctx: usize,
         _kv_type: KvType,
+        draft_reserve_bytes: usize,
     ) -> Result<Self, CudaError> {
         let cfg = Inkling2Config::from_gguf(gguf)?;
         let ctx = CudaContext::new(None)?;
         let kernels = CudaKernels::load(&ctx)?;
         let ik = Inkling2CudaKernels::load(&ctx)?;
 
+        let n_phys = cfg.n_layers_phys;
         let mut total_file_bytes = 0usize;
+        let mut dense_file_bytes = 0usize;
+        let mut expert_layer_bytes = vec![0usize; n_phys];
         for tname in gguf.tensor_names() {
             if let Some(ti) = gguf.tensor_info(tname) {
                 total_file_bytes += ti.byte_len;
+                if let Some(rest) = tname.strip_prefix("blk.")
+                    && let Some((idx_s, suf)) = rest.split_once('.')
+                    && let Ok(ip) = idx_s.parse::<usize>()
+                    && ip < n_phys
+                    && suf.ends_with("_exps.weight")
+                {
+                    expert_layer_bytes[ip] += ti.byte_len;
+                } else {
+                    dense_file_bytes += ti.byte_len;
+                }
             }
         }
         let mut kv_total_bytes = 0usize;
@@ -255,20 +313,70 @@ impl Inkling2CudaRunner {
             kv_total_bytes += 2 * max_ctx * cfg.kv_dim(ip) * 2;
         }
         let (free_vram, _) = ctx.mem_info()?;
-        let needed_bytes = total_file_bytes + kv_total_bytes + 192 * 1024 * 1024;
-        if needed_bytes > free_vram {
-            return Err(CudaError::OutOfDeviceMemory {
-                needed_mib: needed_bytes as f64 / (1024.0 * 1024.0),
-                free_mib: free_vram as f64 / (1024.0 * 1024.0),
-                max_ctx,
-                device: ctx.info().name.clone(),
-            });
-        }
+        let env_vram_mib: Option<usize> = std::env::var("TM_CUDA_INKLING2_VRAM_MIB")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok());
+
+        let all_fit = env_vram_mib.is_none()
+            && total_file_bytes
+                .saturating_add(kv_total_bytes)
+                .saturating_add(192 * 1024 * 1024)
+                .saturating_add(draft_reserve_bytes)
+                <= free_vram;
+
+        let mut vram_expert_mask = vec![false; n_phys];
+        let batch_cap = if all_fit {
+            vram_expert_mask.fill(true);
+            MAX_CUDA_BATCH
+        } else {
+            let headroom = 340 * 1024 * 1024usize;
+            let force_zero_vram_exps = env_vram_mib == Some(0);
+            let vram_budget = match env_vram_mib {
+                Some(0) | None => free_vram.saturating_sub(headroom),
+                Some(m) => m * 1024 * 1024,
+            };
+            let scratch_est = 220 * 1024 * 1024usize;
+            let base_needed = dense_file_bytes
+                .saturating_add(kv_total_bytes)
+                .saturating_add(scratch_est)
+                .saturating_add(draft_reserve_bytes);
+            if base_needed > vram_budget {
+                return Err(CudaError::OutOfDeviceMemory {
+                    needed_mib: base_needed as f64 / (1024.0 * 1024.0),
+                    free_mib: vram_budget as f64 / (1024.0 * 1024.0),
+                    max_ctx,
+                    device: ctx.info().name.clone(),
+                });
+            }
+            let mut rem = if force_zero_vram_exps {
+                0
+            } else {
+                vram_budget - base_needed
+            };
+            let mut order: Vec<usize> = (cfg.core_start..cfg.core_end).collect();
+            order.extend(0..cfg.core_start);
+            order.extend(cfg.core_end..n_phys);
+            for ip in order {
+                let need = expert_layer_bytes[ip];
+                if need <= rem {
+                    vram_expert_mask[ip] = true;
+                    rem -= need;
+                }
+            }
+            128usize.min(MAX_CUDA_BATCH)
+        };
+        let default_hybrid_gpu_exps = (cfg.n_expert_used / 4).clamp(1, 4);
+        let hybrid_gpu_exps = std::env::var("TM_CUDA_HYBRID_GPU_EXPS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(default_hybrid_gpu_exps)
+            .min(cfg.n_expert_used);
 
         let sys_avail = tm_core::probe_system_memory()
             .map(|b| b.available_bytes as usize)
             .unwrap_or(32 * 1024 * 1024 * 1024);
-        let use_direct = gguf.path().exists() && total_file_bytes + (4 << 30) > sys_avail;
+        let use_direct =
+            gguf.path().exists() && (!all_fit || total_file_bytes + (4 << 30) > sys_avail);
         let direct_rdr = if use_direct {
             DirectTensorReader::open(gguf.path()).ok()
         } else {
@@ -328,7 +436,7 @@ impl Inkling2CudaRunner {
         let mut active_decode_bytes = out_b;
         let mut layers = Vec::with_capacity(cfg.n_layers_phys);
 
-        for ip in 0..cfg.n_layers_phys {
+        for (ip, &in_vram) in vram_expert_mask.iter().enumerate() {
             let ltag = format!("blk.{ip}");
             let q_dim = cfg.q_dim(ip);
             let kv_dim = cfg.kv_dim(ip);
@@ -610,39 +718,64 @@ impl Inkling2CudaRunner {
                 None
             };
 
-            let (gu_dt, gu_buf, gu_len) = if let Some(ref rdr) = direct_rdr {
-                let (ti, off, len) = gguf.req_tensor_file_range(
-                    &format!("blk.{ip}.ffn_gate_up_exps.weight"),
-                    &ltag,
-                    &[d, 2 * n_ff, n_exp],
-                )?;
-                let mut raw = vec![0u8; len];
-                rdr.read_exact_uncached(off, &mut raw, &mut io_slot)?;
-                (ti.dtype, ctx.alloc_from_bytes(&raw)?, len)
+            let (gu_ti, gu_off, gu_len) = gguf.req_tensor_file_range(
+                &format!("blk.{ip}.ffn_gate_up_exps.weight"),
+                &ltag,
+                &[d, 2 * n_ff, n_exp],
+            )?;
+            let (dn_ti, dn_off, dn_len) = gguf.req_tensor_file_range(
+                &format!("blk.{ip}.ffn_down_exps.weight"),
+                &ltag,
+                &[n_ff, d, n_exp],
+            )?;
+            let gu_dt = gu_ti.dtype;
+            let dn_dt = dn_ti.dtype;
+            let (gu_buf, dn_buf) = if in_vram {
+                // Live VRAM guard: if CUDA driver page rounding or display server pressure left less
+                // than `gu_len + dn_len + kv_total_bytes + draft_reserve_bytes + 280 MiB` free,
+                // gracefully spill this layer to host `DEVICEMAP` instead of failing `cuMemAlloc_v2`!
+                let live_ok = if all_fit {
+                    true
+                } else {
+                    let (free_now, _) = ctx.mem_info()?;
+                    let rem_layers = n_phys.saturating_sub(ip + 1);
+                    let tail_need = kv_total_bytes
+                        .saturating_add(draft_reserve_bytes)
+                        .saturating_add(rem_layers * 42 * 1024 * 1024)
+                        .saturating_add(240 * 1024 * 1024);
+                    free_now >= gu_len.saturating_add(dn_len).saturating_add(tail_need)
+                };
+                if live_ok {
+                    let gb = if let Some(ref rdr) = direct_rdr {
+                        let mut raw = vec![0u8; gu_len];
+                        rdr.read_exact_uncached(gu_off, &mut raw, &mut io_slot)?;
+                        ctx.alloc_from_bytes(&raw)?
+                    } else {
+                        let (_, bytes) = gguf.req_tensor(
+                            &format!("blk.{ip}.ffn_gate_up_exps.weight"),
+                            &ltag,
+                            &[d, 2 * n_ff, n_exp],
+                        )?;
+                        ctx.alloc_from_bytes(bytes)?
+                    };
+                    let db = if let Some(ref rdr) = direct_rdr {
+                        let mut raw = vec![0u8; dn_len];
+                        rdr.read_exact_uncached(dn_off, &mut raw, &mut io_slot)?;
+                        ctx.alloc_from_bytes(&raw)?
+                    } else {
+                        let (_, bytes) = gguf.req_tensor(
+                            &format!("blk.{ip}.ffn_down_exps.weight"),
+                            &ltag,
+                            &[n_ff, d, n_exp],
+                        )?;
+                        ctx.alloc_from_bytes(bytes)?
+                    };
+                    (Some(gb), Some(db))
+                } else {
+                    (None, None)
+                }
             } else {
-                let (ti, bytes) = gguf.req_tensor(
-                    &format!("blk.{ip}.ffn_gate_up_exps.weight"),
-                    &ltag,
-                    &[d, 2 * n_ff, n_exp],
-                )?;
-                (ti.dtype, ctx.alloc_from_bytes(bytes)?, bytes.len())
-            };
-            let (dn_dt, dn_buf, dn_len) = if let Some(ref rdr) = direct_rdr {
-                let (ti, off, len) = gguf.req_tensor_file_range(
-                    &format!("blk.{ip}.ffn_down_exps.weight"),
-                    &ltag,
-                    &[n_ff, d, n_exp],
-                )?;
-                let mut raw = vec![0u8; len];
-                rdr.read_exact_uncached(off, &mut raw, &mut io_slot)?;
-                (ti.dtype, ctx.alloc_from_bytes(&raw)?, len)
-            } else {
-                let (ti, bytes) = gguf.req_tensor(
-                    &format!("blk.{ip}.ffn_down_exps.weight"),
-                    &ltag,
-                    &[n_ff, d, n_exp],
-                )?;
-                (ti.dtype, ctx.alloc_from_bytes(bytes)?, bytes.len())
+                (None, None)
             };
 
             let dense_b = b_wq + b_wk + b_wv + b_wo + b_wg + b_sp + b_ar + b_dyn + b_gi;
@@ -686,7 +819,22 @@ impl Inkling2CudaRunner {
                 down_row_bytes: dn_dt.row_bytes(n_ff),
                 down_exp_bytes: dn_len / n_exp,
                 down_scales,
+                host_imported_experts: None,
             });
+        }
+        for (ip, l) in layers.iter().enumerate() {
+            vram_expert_mask[ip] = l.gate_up_exps.is_some();
+        }
+        let host_offloaded_moe_layers = vram_expert_mask.iter().filter(|&&v| !v).count();
+        let mut core_vram_prefix = 0usize;
+        if cfg.is_looped() {
+            for &in_vram in &vram_expert_mask[cfg.core_start..cfg.core_end] {
+                if in_vram {
+                    core_vram_prefix += 1;
+                } else {
+                    break;
+                }
+            }
         }
 
         let mut loop_layers = Vec::new();
@@ -774,48 +922,58 @@ impl Inkling2CudaRunner {
         let ku = cfg.n_expert_used;
         let max_cols = (2 * d).max(max_q_dim).max(n_ff).next_multiple_of(32);
 
-        let pinned_ids = ctx.alloc_pinned(MAX_CUDA_BATCH * 4)?;
+        let pinned_ids = ctx.alloc_pinned(batch_cap * 4)?;
         let pinned_pos = ctx.alloc_pinned(4)?;
-        let token_ids_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * 4)?;
+        let moe_pin_cap = if host_offloaded_moe_layers > 0 {
+            batch_cap
+        } else {
+            1
+        };
+        let pinned_moe_x = ctx.alloc_pinned(moe_pin_cap * d * 4)?;
+        let pinned_moe_ids = ctx.alloc_pinned(moe_pin_cap * ku * 4)?;
+        let pinned_moe_ws = ctx.alloc_pinned(moe_pin_cap * ku * 4)?;
+        let pinned_moe_out = ctx.alloc_pinned(moe_pin_cap * d * 4)?;
+        let ev_dtoh = CudaEvent::new(&ctx)?;
+        let token_ids_buf = ctx.alloc_zeroed(batch_cap * 4)?;
         let pos_buf = ctx.alloc_zeroed(4)?;
-        let cur_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * d * 4)?;
-        let inp_sa_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * d * 4)?;
-        let ffn_inp_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * d * 4)?;
-        let prelude_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * d * 4)?;
-        let bank_out_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * d * 4)?;
-        let blocks_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_blocks * d * 4)?;
-        let prelude_blocks_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_blocks * d * 4)?;
-        let bank_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_blocks * d * 4)?;
-        let inputs_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * 3 * d * 4)?;
-        let messages_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * LOOP_CTRL_COUNT * d * 4)?;
-        let ctrl_in_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * 2 * d * 4)?;
-        let ctrl_g_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * cfg.gate_rank.max(1) * 4)?;
-        let ctrl_gain_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * d * 4)?;
-        let ctrl_forget_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * d * 4)?;
-        let q_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_q_dim * 4)?;
-        let k_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_kv_dim * 4)?;
-        let v_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_kv_dim * 4)?;
-        let r_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_nh * cfg.n_relative * 4)?;
-        let sinks_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_nh * 4)?;
-        let gate_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_q_dim * 4)?;
-        let k_dyn_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * n_conv * max_nh_kv * 4)?;
-        let v_dyn_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * n_conv * max_nh_kv * 4)?;
-        let attn_vec_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * max_q_dim * 4)?;
-        let wo_out_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * d * 4)?;
-        let xq_scratch = ctx.alloc_zeroed(MAX_CUDA_BATCH * (max_cols / 32) * BLOCK_Q8_1_BYTES)?;
-        let moe_logits = ctx.alloc_zeroed(MAX_CUDA_BATCH * n_exp * 4)?;
-        let moe_top_ids = ctx.alloc_zeroed(MAX_CUDA_BATCH * ku * 4)?;
-        let moe_top_weights = ctx.alloc_zeroed(MAX_CUDA_BATCH * ku * 4)?;
+        let cur_buf = ctx.alloc_zeroed(batch_cap * d * 4)?;
+        let inp_sa_buf = ctx.alloc_zeroed(batch_cap * d * 4)?;
+        let ffn_inp_buf = ctx.alloc_zeroed(batch_cap * d * 4)?;
+        let prelude_buf = ctx.alloc_zeroed(batch_cap * d * 4)?;
+        let bank_out_buf = ctx.alloc_zeroed(batch_cap * d * 4)?;
+        let blocks_buf = ctx.alloc_zeroed(batch_cap * max_blocks * d * 4)?;
+        let prelude_blocks_buf = ctx.alloc_zeroed(batch_cap * max_blocks * d * 4)?;
+        let bank_buf = ctx.alloc_zeroed(batch_cap * max_blocks * d * 4)?;
+        let inputs_buf = ctx.alloc_zeroed(batch_cap * 3 * d * 4)?;
+        let messages_buf = ctx.alloc_zeroed(batch_cap * LOOP_CTRL_COUNT * d * 4)?;
+        let ctrl_in_buf = ctx.alloc_zeroed(batch_cap * 2 * d * 4)?;
+        let ctrl_g_buf = ctx.alloc_zeroed(batch_cap * cfg.gate_rank.max(1) * 4)?;
+        let ctrl_gain_buf = ctx.alloc_zeroed(batch_cap * d * 4)?;
+        let ctrl_forget_buf = ctx.alloc_zeroed(batch_cap * d * 4)?;
+        let q_buf = ctx.alloc_zeroed(batch_cap * max_q_dim * 4)?;
+        let k_buf = ctx.alloc_zeroed(batch_cap * max_kv_dim * 4)?;
+        let v_buf = ctx.alloc_zeroed(batch_cap * max_kv_dim * 4)?;
+        let r_buf = ctx.alloc_zeroed(batch_cap * max_nh * cfg.n_relative * 4)?;
+        let sinks_buf = ctx.alloc_zeroed(batch_cap * max_nh * 4)?;
+        let gate_buf = ctx.alloc_zeroed(batch_cap * max_q_dim * 4)?;
+        let k_dyn_buf = ctx.alloc_zeroed(batch_cap * n_conv * max_nh_kv * 4)?;
+        let v_dyn_buf = ctx.alloc_zeroed(batch_cap * n_conv * max_nh_kv * 4)?;
+        let attn_vec_buf = ctx.alloc_zeroed(batch_cap * max_q_dim * 4)?;
+        let wo_out_buf = ctx.alloc_zeroed(batch_cap * d * 4)?;
+        let xq_scratch = ctx.alloc_zeroed(batch_cap * (max_cols / 32) * BLOCK_Q8_1_BYTES)?;
+        let moe_logits = ctx.alloc_zeroed(batch_cap * n_exp * 4)?;
+        let moe_top_ids = ctx.alloc_zeroed(batch_cap * ku * 4)?;
+        let moe_top_weights = ctx.alloc_zeroed(batch_cap * ku * 4)?;
         let moe_exp_offs = ctx.alloc_zeroed((n_exp.max(1) + 2) * 4)?;
         let moe_tile_offs = ctx.alloc_zeroed((n_exp.max(1) + 2) * 4)?;
-        let moe_sorted_ts = ctx.alloc_zeroed(MAX_CUDA_BATCH * ku * 4)?;
-        let moe_exp_gu = ctx.alloc_zeroed(MAX_CUDA_BATCH * ku * 2 * n_ff * 4)?;
-        let moe_exp_hid = ctx.alloc_zeroed(MAX_CUDA_BATCH * ku * n_ff * 4)?;
-        let moe_slot_outs = ctx.alloc_zeroed(MAX_CUDA_BATCH * ku * d * 4)?;
+        let moe_sorted_ts = ctx.alloc_zeroed(batch_cap * ku * 4)?;
+        let moe_exp_gu = ctx.alloc_zeroed(batch_cap * ku * 2 * n_ff * 4)?;
+        let moe_exp_hid = ctx.alloc_zeroed(batch_cap * ku * n_ff * 4)?;
+        let moe_slot_outs = ctx.alloc_zeroed(batch_cap * ku * d * 4)?;
         let moe_exp_xq =
-            ctx.alloc_zeroed(MAX_CUDA_BATCH * ku * d.max(n_ff).div_ceil(32) * BLOCK_Q8_1_BYTES)?;
-        let moe_out_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * d * 4)?;
-        let dspark_taps_buf = ctx.alloc_zeroed(MAX_CUDA_BATCH * 8 * d * 4)?;
+            ctx.alloc_zeroed(batch_cap * ku * d.max(n_ff).div_ceil(32) * BLOCK_Q8_1_BYTES)?;
+        let moe_out_buf = ctx.alloc_zeroed(batch_cap * d * 4)?;
+        let dspark_taps_buf = ctx.alloc_zeroed(batch_cap * 8 * d * 4)?;
         let logits_padded_buf =
             ctx.alloc_zeroed(MAX_INKLING2_CUDA_SPEC_WINDOW * cfg.vocab_padded * 4)?;
         let argmax_dev = ctx.alloc_zeroed(MAX_INKLING2_CUDA_SPEC_WINDOW * 4)?;
@@ -830,9 +988,14 @@ impl Inkling2CudaRunner {
             ik,
             cfg: cfg.clone(),
             max_ctx,
+            batch_cap,
             vram_bytes,
             model_weight_bytes,
             active_decode_bytes,
+            host_offloaded_moe_layers,
+            vram_expert_mask,
+            hybrid_gpu_exps,
+            core_vram_prefix,
             token_embd,
             token_embd_norm,
             output_res_query,
@@ -848,9 +1011,19 @@ impl Inkling2CudaRunner {
             shortconv_snap,
             pinned_ids,
             pinned_pos,
+            pinned_moe_x,
+            pinned_moe_ids,
+            pinned_moe_ws,
+            pinned_moe_out,
+            ev_dtoh,
+            host_top_ids_scratch: vec![0usize; moe_pin_cap * ku],
+            host_top_ws_scratch: vec![0.0f32; moe_pin_cap * ku],
+            host_x_scratch: vec![0.0f32; moe_pin_cap * d],
+            host_out_scratch: vec![0.0f32; moe_pin_cap * d],
             token_ids_buf,
             pos_buf,
             decode_graphs: [None, None, None],
+            core_prefix_graphs: [None, None, None],
             cur_buf,
             inp_sa_buf,
             ffn_inp_buf,
@@ -897,6 +1070,85 @@ impl Inkling2CudaRunner {
 
     pub fn set_dspark_tap_slot(&mut self, slot: usize) {
         self.dspark_tap_slot = slot;
+    }
+
+    #[inline]
+    pub fn has_host_offload_layers(&self) -> bool {
+        self.host_offloaded_moe_layers > 0
+    }
+
+    #[inline]
+    pub fn vram_expert_mask(&self) -> &[bool] {
+        &self.vram_expert_mask
+    }
+
+    pub fn weights_mode(&self) -> String {
+        if self.host_offloaded_moe_layers == 0 {
+            return "device-vram".to_string();
+        }
+        let mut n_vram = 0usize;
+        let mut n_devmap = 0usize;
+        let mut n_host = 0usize;
+        for l in &self.layers {
+            if l.gate_up_exps.is_some() {
+                n_vram += 1;
+            } else if l.host_imported_experts.is_some() {
+                n_devmap += 1;
+            } else {
+                n_host += 1;
+            }
+        }
+        format!("tiered_cuda(vram={n_vram},devmap={n_devmap},nvme={n_host})")
+    }
+
+    /// Best-effort zero-copy `CU_MEMHOSTREGISTER_DEVICEMAP` registration of a host RAM MoE layer (`P1-2`).
+    /// Shares the exact same `HugePageBytes` allocation with CPU `AVX2` workers (`0` duplicate RAM!).
+    pub fn register_host_moe_layer(
+        &mut self,
+        ip: usize,
+        gu_pin: Arc<dyn AsRef<[u8]> + Send + Sync>,
+        gu_len: usize,
+        dn_pin: Arc<dyn AsRef<[u8]> + Send + Sync>,
+        dn_len: usize,
+    ) -> Result<bool, CudaError> {
+        let Some(layer) = self.layers.get_mut(ip) else {
+            return Ok(false);
+        };
+        if layer.gate_up_exps.is_some() || layer.host_imported_experts.is_some() {
+            return Ok(false);
+        }
+        let gu_slice = (*gu_pin).as_ref();
+        let dn_slice = (*dn_pin).as_ref();
+        if gu_slice.len() < gu_len || dn_slice.len() < dn_len || gu_len == 0 || dn_len == 0 {
+            return Ok(false);
+        }
+        let gu_ptr = gu_slice.as_ptr() as *mut u8;
+        let dn_ptr = dn_slice.as_ptr() as *mut u8;
+        if !(gu_ptr as usize).is_multiple_of(4096) || !(dn_ptr as usize).is_multiple_of(4096) {
+            return Ok(false);
+        }
+        let gu_aligned = gu_slice.len() & !4095usize;
+        let dn_aligned = dn_slice.len() & !4095usize;
+        if gu_aligned < gu_len || dn_aligned < dn_len {
+            return Ok(false);
+        }
+        // SAFETY: `gu_pin` and `dn_pin` are `Arc`-pinned `HugePageBytes` stored inside `CudaImportedHostExperts`
+        // AFTER `gu_reg`/`dn_reg`, guaranteeing `Drop` unregisters `CUdeviceptr` before freeing host pages.
+        let gu_reg = match unsafe { self.ctx.register_host_devicemap(gu_ptr, gu_aligned) } {
+            Ok(r) => r,
+            Err(_) => return Ok(false),
+        };
+        let dn_reg = match unsafe { self.ctx.register_host_devicemap(dn_ptr, dn_aligned) } {
+            Ok(r) => r,
+            Err(_) => return Ok(false),
+        };
+        layer.host_imported_experts = Some(CudaImportedHostExperts {
+            gu_reg,
+            dn_reg,
+            _gu_pin: gu_pin,
+            _dn_pin: dn_pin,
+        });
+        Ok(true)
     }
 
     pub fn reset_state(&mut self) -> Result<(), CudaError> {
@@ -1186,6 +1438,51 @@ impl Inkling2CudaRunner {
 
     #[allow(clippy::too_many_arguments)]
     fn encode_layer(
+        &self,
+        il: usize,
+        ip: usize,
+        n_tok: usize,
+        start_pos: usize,
+        pos_dev_ptr: CUdeviceptr,
+        has_messages: bool,
+        save_snapshots: bool,
+        blocks_len: &mut usize,
+    ) -> Result<(), CudaError> {
+        self.encode_layer_pre_moe(
+            il,
+            ip,
+            n_tok,
+            start_pos,
+            pos_dev_ptr,
+            has_messages,
+            save_snapshots,
+            blocks_len,
+        )?;
+        let layer = &self.layers[ip];
+        let gu_ptr = layer
+            .gate_up_exps
+            .as_ref()
+            .expect("VRAM gate_up_exps required in encode_layer")
+            .device_ptr();
+        let dn_ptr = layer
+            .down_exps
+            .as_ref()
+            .expect("VRAM down_exps required in encode_layer")
+            .device_ptr();
+        self.encode_moe_from_ptrs(
+            ip,
+            gu_ptr,
+            dn_ptr,
+            n_tok,
+            self.cfg.n_expert_used,
+            self.cfg.n_expert,
+            false,
+        )?;
+        self.encode_layer_post_moe(il, ip, n_tok, save_snapshots)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_layer_pre_moe(
         &self,
         il: usize,
         ip: usize,
@@ -1742,8 +2039,6 @@ impl Inkling2CudaRunner {
         )?;
         let ne = self.cfg.n_expert;
         let ku = self.cfg.n_expert_used;
-        let n_ff = self.cfg.n_ff_exp;
-        let rows_slots = n_tok * ku;
         self.kernels.launch_moe_router_topk(
             &self.ctx,
             self.moe_logits.device_ptr(),
@@ -1757,18 +2052,37 @@ impl Inkling2CudaRunner {
             1.0e-20,
             self.cfg.expert_weights_scale,
             n_tok,
-        )?;
+        )
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    fn encode_moe_from_ptrs(
+        &self,
+        ip: usize,
+        gu_exps_ptr: CUdeviceptr,
+        dn_exps_ptr: CUdeviceptr,
+        n_tok: usize,
+        active_slots: usize,
+        active_n_exp: usize,
+        zero_slots_first: bool,
+    ) -> Result<(), CudaError> {
+        let d = self.cfg.n_embd;
+        let ku = self.cfg.n_expert_used;
+        let n_ff = self.cfg.n_ff_exp;
+        let layer = &self.layers[ip];
         let gu_scales_ptr = layer.gate_up_scales.as_ref().map_or(0, |b| b.device_ptr());
         let dn_scales_ptr = layer.down_scales.as_ref().map_or(0, |b| b.device_ptr());
 
         if n_tok >= 16
-            && ne <= 512
+            && active_n_exp <= 512
             && self.ctx.info().has_fp16_wmma()
             && d.is_multiple_of(32)
             && n_ff.is_multiple_of(32)
         {
-            // `P0-2`: Grouped `wmma` Tensor Core prefill GEMM across 3 passes!
+            let rows_slots = n_tok * ku;
+            if zero_slots_first {
+                self.moe_slot_outs.zero_prefix(rows_slots * d * 4)?;
+            }
             self.kernels.launch_moe_build_expert_buckets(
                 &self.ctx,
                 self.moe_top_ids.device_ptr(),
@@ -1776,11 +2090,11 @@ impl Inkling2CudaRunner {
                 self.moe_tile_offs.device_ptr(),
                 self.moe_sorted_ts.device_ptr(),
                 rows_slots,
-                ne,
+                active_n_exp,
             )?;
             self.kernels.launch_wmma_moe_grouped(
                 &self.ctx,
-                layer.gate_up_exps.device_ptr(),
+                gu_exps_ptr,
                 0,
                 0,
                 self.wo_out_buf.device_ptr(),
@@ -1796,7 +2110,7 @@ impl Inkling2CudaRunner {
                 layer.gate_up_row_bytes,
                 layer.gate_up_exp_bytes,
                 0,
-                ne,
+                active_n_exp,
                 ku,
                 n_tok,
                 0,
@@ -1830,7 +2144,7 @@ impl Inkling2CudaRunner {
             }
             self.kernels.launch_wmma_moe_grouped(
                 &self.ctx,
-                layer.down_exps.device_ptr(),
+                dn_exps_ptr,
                 0,
                 0,
                 self.moe_exp_hid.device_ptr(),
@@ -1846,14 +2160,23 @@ impl Inkling2CudaRunner {
                 layer.down_row_bytes,
                 layer.down_exp_bytes,
                 0,
-                ne,
+                active_n_exp,
                 ku,
                 n_tok,
                 1,
                 1,
             )?;
+            self.kernels.launch_moe_reduce_slots(
+                &self.ctx,
+                self.moe_slot_outs.device_ptr(),
+                self.moe_out_buf.device_ptr(),
+                d,
+                ku,
+                n_tok,
+            )
         } else {
-            // `P0-3`: Fused dual `Gate + Up + SiTU` `__dp4a` decode/DSpark-verify path!
+            let eff_slots = active_slots;
+            let rows_slots = n_tok * eff_slots;
             let in_xq_ptr = if is_q8_1_moe_dtype(layer.gate_up_dtype, d) {
                 self.kernels.launch_quantize_q8_1(
                     &self.ctx,
@@ -1869,8 +2192,8 @@ impl Inkling2CudaRunner {
 
             self.kernels.launch_moe_indexed_dual_gu_act(
                 &self.ctx,
-                layer.gate_up_exps.device_ptr(),
-                layer.gate_up_exps.device_ptr(),
+                gu_exps_ptr,
+                gu_exps_ptr,
                 0,
                 0,
                 0,
@@ -1889,7 +2212,7 @@ impl Inkling2CudaRunner {
                 layer.gate_up_exp_bytes,
                 layer.gate_up_exp_bytes,
                 n_ff * layer.gate_up_row_bytes,
-                ku,
+                eff_slots,
                 n_tok,
                 1,
                 self.cfg.situ_beta,
@@ -1912,7 +2235,7 @@ impl Inkling2CudaRunner {
 
             self.kernels.launch_moe_indexed_gemv_q8_1(
                 &self.ctx,
-                layer.down_exps.device_ptr(),
+                dn_exps_ptr,
                 0,
                 0,
                 dn_xq_ptr,
@@ -1926,21 +2249,32 @@ impl Inkling2CudaRunner {
                 n_ff,
                 layer.down_row_bytes,
                 layer.down_exp_bytes,
-                ku,
+                eff_slots,
                 n_tok,
                 1,
                 1,
             )?;
+            self.kernels.launch_moe_reduce_slots(
+                &self.ctx,
+                self.moe_slot_outs.device_ptr(),
+                self.moe_out_buf.device_ptr(),
+                d,
+                eff_slots,
+                n_tok,
+            )
         }
-        self.kernels.launch_moe_reduce_slots(
-            &self.ctx,
-            self.moe_slot_outs.device_ptr(),
-            self.moe_out_buf.device_ptr(),
-            d,
-            ku,
-            n_tok,
-        )?;
+    }
 
+    fn encode_layer_post_moe(
+        &self,
+        il: usize,
+        ip: usize,
+        n_tok: usize,
+        save_snapshots: bool,
+    ) -> Result<(), CudaError> {
+        let d = self.cfg.n_embd;
+        let kv_dim = self.cfg.kv_dim(ip);
+        let layer = &self.layers[ip];
         self.launch_shortconv(
             il,
             self.moe_out_buf.device_ptr(),
@@ -2366,18 +2700,657 @@ impl Inkling2CudaRunner {
             .launch()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn run_layer_hybrid(
+        &mut self,
+        il: usize,
+        ip: usize,
+        n_tok: usize,
+        start_pos: usize,
+        pos_dev_ptr: CUdeviceptr,
+        has_messages: bool,
+        save_snapshots: bool,
+        blocks_len: &mut usize,
+        mut host_single: Option<&mut CudaHostMoeFn<'_>>,
+        mut host_win: Option<&mut CudaHostMoeWindowFn<'_>>,
+    ) -> Result<(), CudaError> {
+        if self.layers[ip].gate_up_exps.is_some() {
+            return self.encode_layer(
+                il,
+                ip,
+                n_tok,
+                start_pos,
+                pos_dev_ptr,
+                has_messages,
+                save_snapshots,
+                blocks_len,
+            );
+        }
+
+        // If `k_gpu == ku` on a `DEVICEMAP` layer (`TM_CUDA_HYBRID_GPU_EXPS=8`), run 100% on GPU!
+        let ku = self.cfg.n_expert_used;
+        let ne = self.cfg.n_expert;
+        let d = self.cfg.n_embd;
+        let n_ff = self.cfg.n_ff_exp;
+        if n_tok == 1
+            && self.hybrid_gpu_exps >= ku
+            && let Some(ref ext) = self.layers[ip].host_imported_experts
+        {
+            let gu_p = ext.gu_reg.device_ptr();
+            let dn_p = ext.dn_reg.device_ptr();
+            self.encode_layer_pre_moe(
+                il,
+                ip,
+                1,
+                start_pos,
+                pos_dev_ptr,
+                has_messages,
+                save_snapshots,
+                blocks_len,
+            )?;
+            self.encode_moe_from_ptrs(ip, gu_p, dn_p, 1, ku, ne, false)?;
+            return self.encode_layer_post_moe(il, ip, 1, save_snapshots);
+        }
+
+        self.encode_layer_pre_moe(
+            il,
+            ip,
+            n_tok,
+            start_pos,
+            pos_dev_ptr,
+            has_messages,
+            save_snapshots,
+            blocks_len,
+        )?;
+
+        // Async D2H of `[n_tok, d]` normed input + `[n_tok, ku]` router ids/weights, followed by `ev_dtoh`!
+        self.wo_out_buf
+            .copy_to_pinned_async(0, &mut self.pinned_moe_x, 0, n_tok * d * 4)?;
+        self.moe_top_ids
+            .copy_to_pinned_async(0, &mut self.pinned_moe_ids, 0, n_tok * ku * 4)?;
+        self.moe_top_weights
+            .copy_to_pinned_async(0, &mut self.pinned_moe_ws, 0, n_tok * ku * 4)?;
+        self.ev_dtoh.record()?;
+
+        // Enqueue GPU's zero-copy PCIe `DEVICEMAP` share immediately on `stream` so GPU executes
+        // concurrently while CPU wakes up on `ev_dtoh`!
+        let mut k_gpu = 0usize;
+        let mut split_e = 0usize;
+        if let Some(ref ext) = self.layers[ip].host_imported_experts {
+            let gu_p = ext.gu_reg.device_ptr();
+            let dn_p = ext.dn_reg.device_ptr();
+            if n_tok == 1 && self.hybrid_gpu_exps > 0 {
+                k_gpu = self.hybrid_gpu_exps.min(ku);
+                self.encode_moe_from_ptrs(ip, gu_p, dn_p, 1, k_gpu, ne, false)?;
+            } else if n_tok >= 16
+                && ne <= 512
+                && self.ctx.info().has_fp16_wmma()
+                && d.is_multiple_of(32)
+                && n_ff.is_multiple_of(32)
+            {
+                split_e = (ne / 4).max(1);
+                self.encode_moe_from_ptrs(ip, gu_p, dn_p, n_tok, ku, split_e, true)?;
+            }
+        }
+
+        // Wait ONLY for the tiny D2H transfer (`ev_dtoh`), NOT the PCIe GPU MoE kernels queued after it!
+        self.ev_dtoh.synchronize()?;
+
+        self.host_x_scratch[..n_tok * d].copy_from_slice(self.pinned_moe_x.as_f32_slice(n_tok * d));
+        for (dst, &src) in self.host_top_ids_scratch[..n_tok * ku]
+            .iter_mut()
+            .zip(self.pinned_moe_ids.as_u32_slice(n_tok * ku))
+        {
+            *dst = src as usize;
+        }
+        self.host_top_ws_scratch[..n_tok * ku]
+            .copy_from_slice(self.pinned_moe_ws.as_f32_slice(n_tok * ku));
+
+        if n_tok == 1 {
+            if k_gpu < ku {
+                if let Some(ref mut cb) = host_single {
+                    cb(
+                        ip,
+                        &self.host_x_scratch[..d],
+                        &self.host_top_ids_scratch[k_gpu..ku],
+                        &self.host_top_ws_scratch[k_gpu..ku],
+                        &mut self.host_out_scratch[..d],
+                    );
+                } else if let Some(ref mut cb_w) = host_win {
+                    cb_w(
+                        ip,
+                        1,
+                        &self.host_x_scratch[..d],
+                        &self.host_top_ids_scratch[k_gpu..ku],
+                        &self.host_top_ws_scratch[k_gpu..ku],
+                        &mut self.host_out_scratch[..d],
+                    );
+                } else {
+                    return Err(CudaError::InvalidDimensions(format!(
+                        "layer {ip} MoE experts are offloaded to host, but no host callback was provided"
+                    )));
+                }
+                self.pinned_moe_out
+                    .as_f32_slice_mut(d)
+                    .copy_from_slice(&self.host_out_scratch[..d]);
+                if k_gpu == 0 {
+                    self.moe_out_buf
+                        .copy_from_pinned_async(0, &self.pinned_moe_out, 0, d * 4)?;
+                } else {
+                    self.inp_sa_buf
+                        .copy_from_pinned_async(0, &self.pinned_moe_out, 0, d * 4)?;
+                    self.kernels.launch_add_scaled(
+                        &self.ctx,
+                        self.moe_out_buf.device_ptr(),
+                        self.inp_sa_buf.device_ptr(),
+                        1.0,
+                        d,
+                    )?;
+                }
+            }
+        } else {
+            if split_e > 0 {
+                for idx in 0..n_tok * ku {
+                    if self.host_top_ids_scratch[idx] < split_e {
+                        self.host_top_ws_scratch[idx] = 0.0;
+                    }
+                }
+            }
+            if let Some(ref mut cb_w) = host_win {
+                cb_w(
+                    ip,
+                    n_tok,
+                    &self.host_x_scratch[..n_tok * d],
+                    &self.host_top_ids_scratch[..n_tok * ku],
+                    &self.host_top_ws_scratch[..n_tok * ku],
+                    &mut self.host_out_scratch[..n_tok * d],
+                );
+            } else if let Some(ref mut cb) = host_single {
+                for t in 0..n_tok {
+                    cb(
+                        ip,
+                        &self.host_x_scratch[t * d..(t + 1) * d],
+                        &self.host_top_ids_scratch[t * ku..(t + 1) * ku],
+                        &self.host_top_ws_scratch[t * ku..(t + 1) * ku],
+                        &mut self.host_out_scratch[t * d..(t + 1) * d],
+                    );
+                }
+            } else {
+                return Err(CudaError::InvalidDimensions(format!(
+                    "layer {ip} MoE experts are offloaded to host, but no host window callback was provided"
+                )));
+            }
+            self.pinned_moe_out
+                .as_f32_slice_mut(n_tok * d)
+                .copy_from_slice(&self.host_out_scratch[..n_tok * d]);
+            if split_e == 0 {
+                self.moe_out_buf.copy_from_pinned_async(
+                    0,
+                    &self.pinned_moe_out,
+                    0,
+                    n_tok * d * 4,
+                )?;
+            } else {
+                self.inp_sa_buf.copy_from_pinned_async(
+                    0,
+                    &self.pinned_moe_out,
+                    0,
+                    n_tok * d * 4,
+                )?;
+                self.kernels.launch_add_scaled(
+                    &self.ctx,
+                    self.moe_out_buf.device_ptr(),
+                    self.inp_sa_buf.device_ptr(),
+                    1.0,
+                    n_tok * d,
+                )?;
+            }
+        }
+
+        self.encode_layer_post_moe(il, ip, n_tok, save_snapshots)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_chunk_hybrid(
+        &mut self,
+        n_tok: usize,
+        start_pos: usize,
+        pos_dev_ptr: CUdeviceptr,
+        preloaded_embed: bool,
+        compute_last_logits: bool,
+        compute_all_argmax: bool,
+        save_snapshots: bool,
+        dspark_visits: &[usize],
+        mut host_single: Option<&mut CudaHostMoeFn<'_>>,
+        mut host_win: Option<&mut CudaHostMoeWindowFn<'_>>,
+    ) -> Result<(), CudaError> {
+        let d = self.cfg.n_embd;
+        let max_blocks = self.cfg.max_depth_blocks();
+        let blk_tok_stride = max_blocks * d;
+
+        if !preloaded_embed {
+            self.kernels.launch_embed(
+                &self.ctx,
+                &self.token_embd,
+                self.token_ids_buf.device_ptr(),
+                self.inp_sa_buf.device_ptr(),
+                n_tok,
+                1.0,
+            )?;
+            self.kernels.launch_rms_norm(
+                &self.ctx,
+                self.inp_sa_buf.device_ptr(),
+                self.token_embd_norm.device_ptr(),
+                self.cur_buf.device_ptr(),
+                d,
+                n_tok,
+                self.cfg.rms_eps,
+            )?;
+        }
+
+        let mut blocks_len = 0usize;
+        let mut visit = 0usize;
+        if !self.cfg.is_looped() {
+            for il in 0..self.cfg.n_layers_phys {
+                self.maybe_capture_visit_tap(
+                    visit,
+                    self.cur_buf.device_ptr(),
+                    dspark_visits,
+                    n_tok,
+                )?;
+                visit += 1;
+                self.run_layer_hybrid(
+                    il,
+                    il,
+                    n_tok,
+                    start_pos,
+                    pos_dev_ptr,
+                    false,
+                    save_snapshots,
+                    &mut blocks_len,
+                    host_single.as_deref_mut(),
+                    host_win.as_deref_mut(),
+                )?;
+            }
+        } else {
+            let cs = self.cfg.core_start;
+            let ce = self.cfg.core_end;
+            for il in 0..cs {
+                self.maybe_capture_visit_tap(
+                    visit,
+                    self.cur_buf.device_ptr(),
+                    dspark_visits,
+                    n_tok,
+                )?;
+                visit += 1;
+                self.run_layer_hybrid(
+                    il,
+                    il,
+                    n_tok,
+                    start_pos,
+                    pos_dev_ptr,
+                    false,
+                    save_snapshots,
+                    &mut blocks_len,
+                    host_single.as_deref_mut(),
+                    host_win.as_deref_mut(),
+                )?;
+            }
+
+            let prelude_blocks_len = blocks_len;
+            self.kernels.launch_copy_2d_rows(
+                &self.ctx,
+                self.prelude_buf.device_ptr(),
+                self.cur_buf.device_ptr(),
+                n_tok * d,
+                n_tok * d,
+                n_tok * d,
+                1,
+            )?;
+            if prelude_blocks_len > 0 {
+                self.kernels.launch_copy_2d_rows(
+                    &self.ctx,
+                    self.prelude_blocks_buf.device_ptr(),
+                    self.blocks_buf.device_ptr(),
+                    prelude_blocks_len * d,
+                    blk_tok_stride,
+                    blk_tok_stride,
+                    n_tok,
+                )?;
+            }
+
+            let can_graph_core = n_tok == 1
+                && pos_dev_ptr != 0
+                && !save_snapshots
+                && dspark_visits.is_empty()
+                && self.core_vram_prefix > 0
+                && self.cfg.n_passes <= 3;
+
+            let mut bank_len = 0usize;
+            for pass in 0..self.cfg.n_passes {
+                if pass > 0 {
+                    let bank_start = prelude_blocks_len + 1;
+                    bank_len = blocks_len.saturating_sub(bank_start);
+                    if bank_len > 0 {
+                        self.kernels.launch_copy_2d_rows(
+                            &self.ctx,
+                            self.bank_buf.device_ptr(),
+                            self.blocks_buf.device_ptr() + (bank_start * d * 4) as u64,
+                            bank_len * d,
+                            blk_tok_stride,
+                            blk_tok_stride,
+                            n_tok,
+                        )?;
+                    }
+                    self.kernels.launch_copy_2d_rows(
+                        &self.ctx,
+                        self.bank_out_buf.device_ptr(),
+                        self.cur_buf.device_ptr(),
+                        n_tok * d,
+                        n_tok * d,
+                        n_tok * d,
+                        1,
+                    )?;
+                    self.kernels.launch_copy_2d_rows(
+                        &self.ctx,
+                        self.cur_buf.device_ptr(),
+                        self.prelude_buf.device_ptr(),
+                        n_tok * d,
+                        n_tok * d,
+                        n_tok * d,
+                        1,
+                    )?;
+                    blocks_len = prelude_blocks_len;
+                    if prelude_blocks_len > 0 {
+                        self.kernels.launch_copy_2d_rows(
+                            &self.ctx,
+                            self.blocks_buf.device_ptr(),
+                            self.prelude_blocks_buf.device_ptr(),
+                            prelude_blocks_len * d,
+                            blk_tok_stride,
+                            blk_tok_stride,
+                            n_tok,
+                        )?;
+                    }
+                }
+
+                let graph_end = if can_graph_core {
+                    cs + self.core_vram_prefix
+                } else {
+                    cs
+                };
+                if graph_end > cs {
+                    if self.core_prefix_graphs[pass].is_none() {
+                        let ctx = self.ctx.clone();
+                        let mut cap_blks = blocks_len;
+                        let g = CudaGraphExec::capture(&ctx, || {
+                            for ip in cs..graph_end {
+                                let il = if pass == 0 {
+                                    ip
+                                } else {
+                                    self.cfg.n_layers_phys + (pass - 1) * (ce - cs) + (ip - cs)
+                                };
+                                if pass > 0 {
+                                    let loop_w = &self.loop_layers[ip - cs];
+                                    self.launch_mix_depth(
+                                        self.bank_buf.device_ptr(),
+                                        self.bank_out_buf.device_ptr(),
+                                        loop_w.msg_query.device_ptr(),
+                                        self.messages_buf.device_ptr(),
+                                        bank_len,
+                                        LOOP_CTRL_COUNT,
+                                        blk_tok_stride,
+                                        d,
+                                        LOOP_CTRL_COUNT,
+                                        1,
+                                        1,
+                                    )?;
+                                }
+                                self.encode_layer(
+                                    il,
+                                    ip,
+                                    1,
+                                    0,
+                                    pos_dev_ptr,
+                                    pass > 0,
+                                    false,
+                                    &mut cap_blks,
+                                )?;
+                            }
+                            Ok(())
+                        })?;
+                        self.core_prefix_graphs[pass] = Some(g);
+                    }
+                    self.core_prefix_graphs[pass]
+                        .as_ref()
+                        .expect("captured core prefix CUDA graph")
+                        .launch()?;
+                    for ip in cs..graph_end {
+                        if ip.is_multiple_of(self.cfg.attn_res_block_size) {
+                            blocks_len += 1;
+                        }
+                        visit += 1;
+                    }
+                }
+
+                for ip in graph_end..ce {
+                    let il = if pass == 0 {
+                        ip
+                    } else {
+                        self.cfg.n_layers_phys + (pass - 1) * (ce - cs) + (ip - cs)
+                    };
+                    self.maybe_capture_visit_tap(
+                        visit,
+                        self.cur_buf.device_ptr(),
+                        dspark_visits,
+                        n_tok,
+                    )?;
+                    visit += 1;
+                    if pass > 0 {
+                        let loop_w = &self.loop_layers[ip - cs];
+                        self.launch_mix_depth(
+                            self.bank_buf.device_ptr(),
+                            self.bank_out_buf.device_ptr(),
+                            loop_w.msg_query.device_ptr(),
+                            self.messages_buf.device_ptr(),
+                            bank_len,
+                            LOOP_CTRL_COUNT,
+                            blk_tok_stride,
+                            d,
+                            LOOP_CTRL_COUNT,
+                            1,
+                            n_tok,
+                        )?;
+                    }
+                    self.run_layer_hybrid(
+                        il,
+                        ip,
+                        n_tok,
+                        start_pos,
+                        pos_dev_ptr,
+                        pass > 0,
+                        save_snapshots,
+                        &mut blocks_len,
+                        host_single.as_deref_mut(),
+                        host_win.as_deref_mut(),
+                    )?;
+                }
+            }
+
+            for il in ce..self.cfg.n_layers_phys {
+                self.maybe_capture_visit_tap(
+                    visit,
+                    self.cur_buf.device_ptr(),
+                    dspark_visits,
+                    n_tok,
+                )?;
+                visit += 1;
+                self.run_layer_hybrid(
+                    il,
+                    il,
+                    n_tok,
+                    start_pos,
+                    pos_dev_ptr,
+                    false,
+                    save_snapshots,
+                    &mut blocks_len,
+                    host_single.as_deref_mut(),
+                    host_win.as_deref_mut(),
+                )?;
+            }
+        }
+
+        self.launch_mix_depth(
+            self.blocks_buf.device_ptr(),
+            self.cur_buf.device_ptr(),
+            self.output_res_query.device_ptr(),
+            self.inp_sa_buf.device_ptr(),
+            blocks_len,
+            1,
+            blk_tok_stride,
+            d,
+            1,
+            1,
+            n_tok,
+        )?;
+        self.kernels.launch_rms_norm(
+            &self.ctx,
+            self.inp_sa_buf.device_ptr(),
+            self.output_norm.device_ptr(),
+            self.cur_buf.device_ptr(),
+            d,
+            n_tok,
+            self.cfg.rms_eps,
+        )?;
+        self.maybe_capture_visit_tap(
+            self.cfg.n_layers,
+            self.cur_buf.device_ptr(),
+            dspark_visits,
+            n_tok,
+        )?;
+
+        let cap = self.cfg.final_logit_softcapping.unwrap_or(0.0);
+        if compute_all_argmax {
+            self.kernels.launch_linear(
+                &self.ctx,
+                &self.output,
+                self.cur_buf.device_ptr(),
+                self.xq_scratch.device_ptr(),
+                false,
+                self.logits_padded_buf.device_ptr(),
+                n_tok,
+                false,
+            )?;
+            let mut pl = self.logits_padded_buf.device_ptr();
+            let mut pm: CUdeviceptr = 0;
+            let mut pids = self.argmax_dev.device_ptr();
+            let mut ppr: CUdeviceptr = 0;
+            let mut nv = self.cfg.vocab_size as i32;
+            let mut rs = self.cfg.vocab_padded as i32;
+            let mut off = 0i32;
+            let mut c_cap = cap;
+            let mut args: [*mut c_void; 8] = [
+                (&mut pl as *mut CUdeviceptr).cast(),
+                (&mut pm as *mut CUdeviceptr).cast(),
+                (&mut pids as *mut CUdeviceptr).cast(),
+                (&mut ppr as *mut CUdeviceptr).cast(),
+                (&mut nv as *mut i32).cast(),
+                (&mut rs as *mut i32).cast(),
+                (&mut off as *mut i32).cast(),
+                (&mut c_cap as *mut f32).cast(),
+            ];
+            // SAFETY: Matches `softcap_argmax_f32`.
+            unsafe {
+                self.ctx.launch(
+                    "softcap_argmax_f32",
+                    self.ik.softcap_argmax,
+                    (1, n_tok as u32, 1),
+                    (256, 1, 1),
+                    0,
+                    &mut args,
+                )?;
+            }
+        } else if compute_last_logits {
+            let last_x = self.cur_buf.device_ptr() + ((n_tok - 1) * d * 4) as u64;
+            self.kernels.launch_linear(
+                &self.ctx,
+                &self.output,
+                last_x,
+                self.xq_scratch.device_ptr(),
+                false,
+                self.logits_padded_buf.device_ptr(),
+                1,
+                false,
+            )?;
+            if cap > 0.0 {
+                let mut px = self.logits_padded_buf.device_ptr();
+                let mut c_cap = cap;
+                let mut len = self.cfg.vocab_size;
+                let mut args: [*mut c_void; 3] = [
+                    (&mut px as *mut CUdeviceptr).cast(),
+                    (&mut c_cap as *mut f32).cast(),
+                    (&mut len as *mut usize).cast(),
+                ];
+                // SAFETY: Matches `softcap_inplace_f32`.
+                unsafe {
+                    self.ctx.launch(
+                        "softcap_inplace_f32",
+                        self.ik.softcap_inplace,
+                        ((self.cfg.vocab_size as u32).div_ceil(256), 1, 1),
+                        (256, 1, 1),
+                        0,
+                        &mut args,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn forward_token(
         &mut self,
         token_id: u32,
         pos: usize,
         compute_logits: bool,
     ) -> Result<&[f32], CudaError> {
+        self.forward_token_hybrid(token_id, pos, compute_logits, None)
+    }
+
+    pub fn forward_token_hybrid(
+        &mut self,
+        token_id: u32,
+        pos: usize,
+        compute_logits: bool,
+        host_moe: Option<&mut CudaHostMoeFn<'_>>,
+    ) -> Result<&[f32], CudaError> {
         if pos >= self.max_ctx || (token_id as usize) >= self.cfg.vocab_size {
             return Err(CudaError::InvalidDimensions(format!(
                 "invalid token_id={token_id} or pos={pos}"
             )));
         }
-        self.run_decode_step(token_id, pos, compute_logits, false)?;
+        if self.host_offloaded_moe_layers == 0 {
+            self.run_decode_step(token_id, pos, compute_logits, false)?;
+        } else {
+            self.pinned_ids.write_u32_at(0, &[token_id]);
+            self.pinned_pos.write_u32_at(0, &[pos as u32]);
+            self.token_ids_buf
+                .copy_from_pinned_async(0, &self.pinned_ids, 0, 4)?;
+            self.pos_buf
+                .copy_from_pinned_async(0, &self.pinned_pos, 0, 4)?;
+            let pos_ptr = self.pos_buf.device_ptr();
+            self.encode_chunk_hybrid(
+                1,
+                0,
+                pos_ptr,
+                false,
+                compute_logits,
+                false,
+                false,
+                &[],
+                host_moe,
+                None,
+            )?;
+        }
         if compute_logits {
             self.logits_padded_buf.copy_to_f32(&mut self.logits_host)?;
         } else {
@@ -2387,16 +3360,47 @@ impl Inkling2CudaRunner {
     }
 
     pub fn forward_token_greedy(&mut self, token_id: u32, pos: usize) -> Result<u32, CudaError> {
+        self.forward_token_greedy_hybrid(token_id, pos, None)
+    }
+
+    pub fn forward_token_greedy_hybrid(
+        &mut self,
+        token_id: u32,
+        pos: usize,
+        host_moe: Option<&mut CudaHostMoeFn<'_>>,
+    ) -> Result<u32, CudaError> {
         if pos >= self.max_ctx || (token_id as usize) >= self.cfg.vocab_size {
             return Err(CudaError::InvalidDimensions(format!(
                 "invalid token_id={token_id} or pos={pos}"
             )));
         }
-        self.run_decode_step(token_id, pos, false, true)?;
+        if self.host_offloaded_moe_layers == 0 {
+            self.run_decode_step(token_id, pos, false, true)?;
+        } else {
+            self.pinned_ids.write_u32_at(0, &[token_id]);
+            self.pinned_pos.write_u32_at(0, &[pos as u32]);
+            self.token_ids_buf
+                .copy_from_pinned_async(0, &self.pinned_ids, 0, 4)?;
+            self.pos_buf
+                .copy_from_pinned_async(0, &self.pinned_pos, 0, 4)?;
+            let pos_ptr = self.pos_buf.device_ptr();
+            self.encode_chunk_hybrid(
+                1,
+                0,
+                pos_ptr,
+                false,
+                false,
+                true,
+                false,
+                &[],
+                host_moe,
+                None,
+            )?;
+        }
         self.argmax_dev.read_u32()
     }
 
-    /// Evaluates a multi-token verification or prefill window (`1..=MAX_CUDA_BATCH`), optionally
+    /// Evaluates a multi-token verification or prefill window (`1..=batch_cap`), optionally
     /// saving `ShortConv` rollback snapshots, capturing `DSpark` visit taps, and returning greedy
     /// argmax token IDs for every window position!
     #[allow(clippy::too_many_arguments)]
@@ -2407,15 +3411,38 @@ impl Inkling2CudaRunner {
         compute_last_logits: bool,
         save_conv_snapshots: bool,
         dspark_visits: &[usize],
+        out_argmax: Option<&mut [u32]>,
+    ) -> Result<&[f32], CudaError> {
+        self.forward_window_hybrid(
+            window_tokens,
+            start_pos,
+            compute_last_logits,
+            save_conv_snapshots,
+            dspark_visits,
+            None,
+            out_argmax,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_window_hybrid(
+        &mut self,
+        window_tokens: &[u32],
+        start_pos: usize,
+        compute_last_logits: bool,
+        save_conv_snapshots: bool,
+        dspark_visits: &[usize],
+        host_win: Option<&mut CudaHostMoeWindowFn<'_>>,
         mut out_argmax: Option<&mut [u32]>,
     ) -> Result<&[f32], CudaError> {
         if window_tokens.is_empty() {
             return Ok(&self.logits_host);
         }
         let w = window_tokens.len();
-        if w > MAX_CUDA_BATCH || start_pos + w > self.max_ctx {
+        if w > self.batch_cap || start_pos + w > self.max_ctx {
             return Err(CudaError::InvalidDimensions(format!(
-                "window len {w} at pos {start_pos} exceeds limits"
+                "window len {w} at pos {start_pos} exceeds limits (batch_cap={})",
+                self.batch_cap
             )));
         }
         for &tid in window_tokens {
@@ -2430,16 +3457,31 @@ impl Inkling2CudaRunner {
         self.pinned_ids.write_u32_at(0, window_tokens);
         self.token_ids_buf
             .copy_from_pinned_async(0, &self.pinned_ids, 0, w * 4)?;
-        self.encode_chunk(
-            w,
-            start_pos,
-            0,
-            false,
-            compute_last_logits && !want_all_argmax,
-            want_all_argmax,
-            save_conv_snapshots,
-            dspark_visits,
-        )?;
+        if self.host_offloaded_moe_layers == 0 {
+            self.encode_chunk(
+                w,
+                start_pos,
+                0,
+                false,
+                compute_last_logits && !want_all_argmax,
+                want_all_argmax,
+                save_conv_snapshots,
+                dspark_visits,
+            )?;
+        } else {
+            self.encode_chunk_hybrid(
+                w,
+                start_pos,
+                0,
+                false,
+                compute_last_logits && !want_all_argmax,
+                want_all_argmax,
+                save_conv_snapshots,
+                dspark_visits,
+                None,
+                host_win,
+            )?;
+        }
         if let Some(ref mut dst) = out_argmax {
             // SAFETY: `[u32]` is POD; `w <= MAX_INKLING2_CUDA_SPEC_WINDOW`.
             let bytes =
@@ -2464,7 +3506,7 @@ impl Inkling2CudaRunner {
         }
         let mut off = 0usize;
         while off < token_ids.len() {
-            let b = (token_ids.len() - off).min(MAX_CUDA_BATCH);
+            let b = (token_ids.len() - off).min(self.batch_cap);
             let is_last = off + b == token_ids.len();
             let _ = self.forward_window_with_taps(
                 &token_ids[off..off + b],
@@ -2969,9 +4011,9 @@ impl DFlashCudaRunner {
             ring_cap,
             ctx_feat_ring,
             ctx_feat_pos: vec![-1; ring_cap],
-            inj_norm_buf: ctx.alloc_zeroed(MAX_CUDA_BATCH * d * 4)?,
-            inj_k_buf: ctx.alloc_zeroed(MAX_CUDA_BATCH * kv_dim * 4)?,
-            inj_v_buf: ctx.alloc_zeroed(MAX_CUDA_BATCH * kv_dim * 4)?,
+            inj_norm_buf: ctx.alloc_zeroed(target.batch_cap.max(bs) * d * 4)?,
+            inj_k_buf: ctx.alloc_zeroed(target.batch_cap.max(bs) * kv_dim * 4)?,
+            inj_v_buf: ctx.alloc_zeroed(target.batch_cap.max(bs) * kv_dim * 4)?,
             inp_l_buf: ctx.alloc_zeroed(bs * d * 4)?,
             norm_blk_buf: ctx.alloc_zeroed(bs * d * 4)?,
             q_blk_buf: ctx.alloc_zeroed(bs * q_dim * 4)?,
@@ -2988,7 +4030,8 @@ impl DFlashCudaRunner {
             latent_buf: ctx.alloc_zeroed(rank * 4)?,
             correction_buf: ctx.alloc_zeroed(d * 4)?,
             corr_hidden_buf: ctx.alloc_zeroed(d * 4)?,
-            xq_scratch: ctx.alloc_zeroed(MAX_CUDA_BATCH * (max_cols / 32) * BLOCK_Q8_1_BYTES)?,
+            xq_scratch: ctx
+                .alloc_zeroed(target.batch_cap.max(bs) * (max_cols / 32) * BLOCK_Q8_1_BYTES)?,
             draft_toks_buf: ctx.alloc_zeroed((bs + 4) * 4)?,
             draft_probs_buf: ctx.alloc_zeroed((bs + 4) * 4)?,
         })

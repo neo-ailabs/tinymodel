@@ -829,7 +829,7 @@ impl Inkling2VkRunner {
         let headroom = if info.unified_memory {
             2048 * 1024 * 1024u64
         } else {
-            680 * 1024 * 1024u64
+            460 * 1024 * 1024u64
         };
         let default_vram_budget = info.device_local_bytes.saturating_sub(headroom);
         let vram_budget = vram_budget_override
@@ -1919,7 +1919,7 @@ impl Inkling2VkRunner {
             None
         };
         let default_hybrid_gpu_exps = if !info.unified_memory && cfg.n_expert_used >= 4 {
-            (cfg.n_expert_used / 4).clamp(1, 3)
+            (cfg.n_expert_used / 4).clamp(1, 4)
         } else {
             0
         };
@@ -2307,7 +2307,7 @@ impl Inkling2VkRunner {
     }
 
     #[inline]
-    pub(crate) fn fused_q8_active(&self) -> bool {
+    pub fn fused_q8_active(&self) -> bool {
         self.dp4a_q8_enabled
             && self.ops_wg == 128
             && self.moe_wg == 128
@@ -3071,7 +3071,9 @@ impl Inkling2VkRunner {
                 let st = self.schedule[cursor];
                 self.advance_depth_counts(st, &mut b, &mut pb, &mut bk);
                 cursor += 1;
-                if self.layers[st.ip].vram_experts.is_none() {
+                if self.layers[st.ip].vram_experts.is_none()
+                    && self.layer_gpu_ext_experts(st.ip) < self.cfg.n_expert_used
+                {
                     stop_host = Some((st.il, st.ip));
                     break;
                 }
@@ -6767,18 +6769,23 @@ impl Inkling2VkRunner {
             .layers
             .iter()
             .any(|l| l.host_imported_experts.is_some());
-        // Concurrent PCIe (`e_id < split_e`) + Host DDR4 (`e_id >= split_e`) prefill partitioning
-        // for short/medium windows (`9..=64`, splitting 50/50 between GPU PCIe and Host DDR4);
-        // larger windows (`w > 64`, e.g. `pp512`) amortize each expert read across many tokens via
-        // GPU `CoopMatF16` grouped MoE over PCIe (`allow_host_imported`).
+        // Concurrent PCIe (`e_id < split_e`) + Host DDR4 (`e_id >= split_e`) prefill partitioning:
+        // On non-CoopMat GPUs (e.g. Turing `T1000` over PCIe), host multi-core DDR4 `AVX2` is ~3x
+        // faster than scalar/DP4A grouped MoE over PCIe, so offload 75% (`e_id >= n_expert / 4`) to
+        // CPU for ALL prefill windows! On CoopMat GPUs, split 50/50 up to `w <= 128`.
         let prefill_split_e = if can_grouped_imported
-            && w <= 64
             && has_imported
             && host_moe_win.is_some()
             && !self.ctx.info().unified_memory
             && self.cfg.n_expert >= 16
         {
-            (self.cfg.n_expert / 2).clamp(1, self.cfg.n_expert - 1)
+            if !self.ctx.info().coopmat_f16_f32acc {
+                (self.cfg.n_expert / 4).clamp(1, self.cfg.n_expert - 1)
+            } else if w <= 128 {
+                (self.cfg.n_expert / 2).clamp(1, self.cfg.n_expert - 1)
+            } else {
+                0
+            }
         } else {
             0
         };

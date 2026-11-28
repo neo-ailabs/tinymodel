@@ -13,10 +13,14 @@ pub mod qwen35_runner;
 pub mod qwen4exp_runner;
 
 pub use driver::{
-    CUdeviceptr, CudaBuffer, CudaContext, CudaDeviceInfo, CudaEvent, CudaPinnedBuffer,
+    CUdeviceptr, CudaBuffer, CudaContext, CudaDeviceInfo, CudaEvent, CudaHostRegistered,
+    CudaPinnedBuffer,
 };
 pub use hy4_runner::Hy4CudaRunner;
-pub use inkling2_runner::{DFlashCudaRunner, Inkling2CudaRunner, MAX_INKLING2_CUDA_SPEC_WINDOW};
+pub use inkling2_runner::{
+    CudaHostMoeFn, CudaHostMoeWindowFn, DFlashCudaRunner, Inkling2CudaRunner,
+    MAX_INKLING2_CUDA_SPEC_WINDOW,
+};
 pub use kernels::{BLOCK_Q8_1_BYTES, CudaKernels, CudaMat, MMVQ_MAX_TOK, dtype_cuda_tag};
 pub use llama_runner::{CudaProfileReport, CudaStageStat, LlamaCudaRunner};
 pub use qwen4exp_runner::Qwen4ExpCudaRunner;
@@ -100,6 +104,15 @@ impl CudaRunner {
         max_ctx: usize,
         kv_type: KvType,
     ) -> Result<Self, CudaError> {
+        Self::from_gguf_with_draft_reserve(gguf, max_ctx, kv_type, 0)
+    }
+
+    pub fn from_gguf_with_draft_reserve(
+        gguf: &tm_gguf::GgufFile,
+        max_ctx: usize,
+        kv_type: KvType,
+        draft_reserve_bytes: usize,
+    ) -> Result<Self, CudaError> {
         let arch = gguf.req_str("general.architecture")?;
         match arch {
             "llama" | "qwen2" | "qwen3" | "smollm3" | "phi3" | "mistral" | "mistral3" | "olmo2"
@@ -114,7 +127,12 @@ impl CudaRunner {
                 Qwen4ExpCudaRunner::from_gguf_with_kv_type(gguf, max_ctx, kv_type)?,
             )),
             "inkling2" | "inkling2_loop" => Ok(CudaRunner::Inkling2(
-                Inkling2CudaRunner::from_gguf_with_kv_type(gguf, max_ctx, kv_type)?,
+                Inkling2CudaRunner::from_gguf_with_draft_reserve(
+                    gguf,
+                    max_ctx,
+                    kv_type,
+                    draft_reserve_bytes,
+                )?,
             )),
             other => Err(CudaError::UnsupportedArch(other.to_string())),
         }
@@ -193,6 +211,7 @@ impl CudaRunner {
             CudaRunner::Llama(r) => r.host_offloaded_moe_layers,
             CudaRunner::Qwen35(r) => r.host_offloaded_moe_layers,
             CudaRunner::Qwen4Exp(r) => r.host_offloaded_moe_layers,
+            CudaRunner::Inkling2(r) => r.host_offloaded_moe_layers,
             _ => 0,
         }
     }

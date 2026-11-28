@@ -249,3 +249,39 @@ flowchart LR
 - **Google Pixel 8（Tensor G3，8GB Android 手机）**：真机可用内存仅 `3.8–4.1 GiB`，连 `12.1 GiB` 的 `3×` 循环核专家也无法驻留，每步需经 UFS 读取 `> 2.6 GiB` 并迅速触发 `VIRTUAL-SKIN` 温控降频，物理上不适合运行 `25.91 GiB` 全量 `Q8_0`（推荐运行已实测 `14.56 tok/s` 的 `Gemma 4 E2B` 或 `38.96 tok/s` 的 `Qwen3.5-0.8B`）。
 - **Raspberry Pi 5（8GB / 16GB + Gen3×1 NVMe HAT）**：16GB 板虽可锁住循环核专家，但单通道 PCIe Gen3×1（`~820 MB/s`）读取 9–12 层外层专家每步需 `~750–950 ms`，实效约 **`0.8–1.0 tok/s`**（仅适合功能验证，严禁使用 MicroSD）。
 - **Raspberry Pi 4B / Pi Zero 2W（`micro` 档，`512 MB – 8 GB`）**：模型体积为 Zero 2W 可用内存的 **77 倍**，物理不可行；同时本分支已验证 `--no-default-features --features micro` 零警告通过编译，不增加 `micro` 档任何负担。
+
+---
+
+## 8. 2026-11-28 `ADR-027` 深度优化复测与同机对标 `Strata 0.1.70`（`i7-12700 + NVIDIA T1000 8GB + 15.4 GiB DDR4 + NVMe`）
+
+在配备 **Intel Core i7-12700（8P+4E，`15.39 GiB` DDR4 实测带宽 `32.69 GB/s`）+ NVIDIA T1000 8GB（Turing `sm_75`，PCIe Gen3 ×16）+ Intel UHD 770 + PCIe 4.0 NVMe** 的工作站上，针对全量 `Inkling-2-Mini-Q8_0.gguf`（`25.90 GiB`）+ `dspark-Inkling-2-Mini-Q8_0.gguf`（`383.6 MiB`）与 `Strata 0.1.70` 的对比瓶颈，按优先级落地了 **`ADR-027` 六项全栈优化**（主机整数 `Q8_0 × Q8_0` 对齐 + 单屏障无排空 `O_DIRECT`、`NvmeLayerRamCache` 按层频率老化热专家缓存、精确 `DSpark` 显存预留与 NVMe 分级置信度门控、`16` 专家超块乒乓双缓冲预填充 + 非 CoopMat `25%:75%` PCIe/DDR4 并发分流、以及 `Inkling2CudaRunner` 循环感知三层 `VRAM + DEVICEMAP + NVMe` 异构执行与核心前缀 `CudaGraphExec`）。
+
+### 8.1 同机优化前后与 `Strata 0.1.70` 实测总表（`max_ctx = 2048`，8 线程）
+
+| 引擎 / 后端模式 | 存储分层（24 物理专家层） | 加载耗时 | 峰值 RSS | `p_code` (`70` pp) 预填充 | `p_code` (`64` tg) 解码 | `p64` (`59` pp / `64` tg) 解码 | 贪心哈希一致性（`p_code`） |
+|---|---|---:|---:|---:|---:|---:|---|
+| **`tinymodel --vulkan`**（优化前基线） | `vram=5, ext=10, nvme=9` | `7.40 s` | `10.53 GiB` | `13.34–14.29 tok/s` | `4.34–4.36 tok/s` (`230.6 ms`) | `4.32 tok/s` (`231.5 ms`) | 基线 (`float_act`) |
+| **`tinymodel --vulkan`（`ADR-027` 优化后）** | **`vram=5, ext=10, nvme=9` + 热专家缓存** | **`7.45–7.57 s`** | **`11.04 GiB`** | **`15.86 tok/s` (`+18.9%`)** | **`5.21 tok/s` (`191.9 ms`, `+19.8%`)** | **`5.35 tok/s` (`187.0 ms`, `+23.8%`)** | ✅ `2a276dafadb21afa` |
+| **`tinymodel --vulkan + DSpark`**（优化前基线） | `vram=4, ext=10, nvme=10` | `7.75 s` | `10.95 GiB` | `12.75–14.60 tok/s` | `3.11–3.21 tok/s` | `3.08 tok/s` | 基线 |
+| **`tinymodel --vulkan + DSpark`（`ADR-027` 优化后）** | **`vram=5, ext=10, nvme=9` + 分级门控/熔断** | **`7.83–7.87 s`** | **`11.48 GiB`** | **`15.76 tok/s`** | **`5.04 tok/s` (`+57%–62%`)** | **`4.98 tok/s` (`+61.7%`)** | ✅ `2a276dafadb21afa`（**0 差异**） |
+| **`tinymodel --cuda`**（优化前基线） | 仅支持全显存 | — | — | ❌ `OutOfDeviceMemory` | ❌ `OutOfDeviceMemory` | ❌ `OutOfDeviceMemory` | — |
+| **`tinymodel --cuda`（`ADR-027` 新增三层！）** | **`vram=4, devmap=10, nvme=10` + `core_prefix_graphs`** | **`8.09–8.22 s`** | **`10.80 GiB`** | **`13.88 tok/s`** | **`4.89 tok/s` (`204.4 ms`)** | **`5.00 tok/s` (`199.9 ms`)** | ✅ `2a276dafadb21afa`（**与 Vulkan 100% 一致**） |
+| **`tinymodel --cuda + DSpark`（`ADR-027` 新增！）** | `vram=4, devmap=10, nvme=10` + GPU `DSpark` | `8.16–9.03 s` | `10.80 GiB` | `13.72 tok/s` | `3.94 tok/s`（接受率 **`70.6%` `36/51`**） | `4.56 tok/s` | ✅ `2a276dafadb21afa`（**与单步 100% 一致**） |
+| **`tinymodel --gpu cpu`**（优化前基线，8T `AVX2`） | `ram=10, nvme=14` | `4.73 s` | `11.84 GiB` | `4.22 tok/s` | `1.51 tok/s` (`660.7 ms`) | — | 基线 |
+| **`tinymodel --gpu cpu`（`ADR-027` 优化后，8T `AVX2`）** | **`ram=10, nvme=14` + 热专家缓存 + 整数 `Q8_0`** | **`4.70 s`** | **`12.44 GiB`** | **`3.89–4.22 tok/s`** | **`1.79 tok/s` (`557.8 ms`, `+18.5%`)** | — | ✅ `ad7bce5b3518320d`（**与 Vulkan 32 步 100% 一致**） |
+| **`Strata 0.1.70 --gpu 0 --ssd-experts`**（同机对照） | 无循环核优先级，触发 Swap 抖动 | `57.70 s` | Swap 溢出 | 超时 / OOM (`137`) | **`< 0.25 tok/s`**（`120 s` 超时） | — | — |
+| **`Strata 0.1.70 --cpu --ssd-experts`**（`--ram-experts-gb 9.5`） | 静态 RAM 专家预算 + SSD 流 | `~6.2 s` | `~12.1 GiB` | `18.7–19.0 tok/s` | **`1.10 tok/s` (`909 ms`)** | — | — |
+
+### 8.2 硬件级时间剖析（`TM_VK_PROF=1`）验证
+
+- **优化前**（`p_code` 单步解码）：`submits/tok = 58.0 | gpu_submit+exec+wait = 110.21 ms | host_moe = 190.47 ms (33.0 calls/tok) | bridge = 0.10 ms`（总流水耗时 `230.6 ms/tok`）。
+- **`ADR-027` 优化后**（`p_code` 单步解码）：`submits/tok = 58.0 | gpu_submit+exec+wait = 100.75 ms (-9.46 ms) | host_moe = 157.46 ms (-33.01 ms, -17.3%) | bridge = 0.07 ms`（总流水耗时 **`191.9 ms/tok`**，等效解码带宽 **`28.18–28.93 GB/s`**）。
+
+### 8.3 六大固定参考设备更新评估（`AGENTS.md` §8）
+
+- **1. 本机工作站（i7-12700 + `15.4 GiB` DDR4 + `NVIDIA T1000 8GB` + PCIe 4.0 NVMe）**：`--vulkan` 稳定达 **`5.21–5.35 tok/s`**（预填充 **`15.86 tok/s`**），`--cuda` 原生三层跑通达 **`4.89–5.00 tok/s`**，纯 CPU 达 **`1.79 tok/s`**（`1.63×` `Strata` CPU），全程零页缓存污染、零 `kswapd` 抖动。
+- **2. Apple M4（`16 GB` vs `32 GB / 64 GB` macOS UMA）**：`16 GB` M4 在 `52%` XNU 防压缩上限下同样直接受益于 `NvmeLayerRamCache` 热专家缓存与 `16` 专家超块双缓冲 `F_NOCACHE` 预填充（预计单步升至 **`3.6–4.3 tok/s`**、预填充升至 **`55–80 tok/s`**）；`32 GB+` M4 全量零拷贝常驻 Metal UMA，配 `DSpark` 可达 **`30–38 tok/s`**。
+- **3. Rockchip RK3588（`16 GB` / `32 GB` Linux SBC，`4×A76 + 4×A55` + PCIe 3.0 ×4 NVMe）**：`16 GB` 板在 `84%` 纯 CPU 水位 + `NvmeLayerRamCache` + 整数 `Q8_0 × Q8_0` `dotprod` 加持下，12 层外层专家的 PCIe 3.0 NVMe 流式解码预计从 `1.6–2.0` 提升至 **`2.0–2.5 tok/s`**；`32 GB` 板全量常驻内存零读盘可达 **`4.0–5.8 tok/s`（`< 9.5 W`）**。
+- **4. Google Pixel 8（Tensor G3，`8 GB` Android 手机）**：空闲 RAM 仅 `3.8–4.1 GiB`，无法容纳 `12.1 GiB` 的 `3×` 循环核专家，持续 UFS 读取会迅速触发机身 `VIRTUAL-SKIN` 温控，仍应部署 `Gemma 4 E2B`（已实测 `14.56 tok/s`）或 `Qwen3.5-0.8B`（`38.96 tok/s`）。
+- **5. Raspberry Pi 5（`8 GB` / `16 GB` + PCIe Gen3×1 NVMe HAT）**：`16 GB` 板可借助 `NvmeLayerRamCache` 减少约 `15%–25%` 的外层热门专家 Gen3×1 读盘次数，单步吞吐预计微升至 **`0.9–1.2 tok/s`**（预填充受益于 `16` 专家连续超块顺序 DMA 提升至 **`4.5–6.5 tok/s`**）。
+- **6. Raspberry Pi 4B / Pi Zero 2W（`micro` 档，`512 MB – 8 GB`）**：超出物理存储与带宽边界，不可运行 `25.90 GiB` `Q8_0`；`micro` 纯静态编译路径保持零新增体积。

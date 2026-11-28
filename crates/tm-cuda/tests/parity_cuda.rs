@@ -755,6 +755,88 @@ out.write_bytes(bytes(hdr))
         );
     }
 
+    // Verify P1-2 3-Tier `Inkling2CudaRunner` (`VRAM + DEVICEMAP Host RAM + NvmeDirect` + `NvmeLayerRamCache`)!
+    {
+        // SAFETY: Single-threaded test (`--test-threads=1`) temporarily sets tiering env vars.
+        unsafe {
+            std::env::set_var("TM_CUDA_INKLING2_VRAM_MIB", "0");
+            std::env::set_var("TM_INKLING2_CACHE_EXPERTS", "2");
+        }
+        let mut ik_tiered =
+            Inkling2CudaRunner::from_gguf_with_kv_type(&ik_gguf, 64, KvType::F16).unwrap();
+        assert!(ik_tiered.has_host_offload_layers());
+        let hm = tm_models::Inkling2Model::from_gguf_with_options(
+            &ik_gguf,
+            &tm_models::Inkling2LoadOptions {
+                vram_expert_layers: ik_tiered.vram_expert_mask().to_vec(),
+                ram_expert_budget_bytes: Some(0), // Force all offloaded layers onto `NvmeDirect` + `NvmeLayerRamCache`!
+                host_moe_only: true,
+            },
+        )
+        .unwrap();
+        assert!(hm.stats.nvme_direct_expert_layers > 0);
+        assert_eq!(hm.stats.nvme_cache_slots_per_layer, 2);
+        let mut hs = tm_models::Inkling2State::new_host_moe_only(&hm);
+        let pool_h = ThreadPool::new(2);
+        let kt_h = active_kernels();
+
+        for (step, &tid) in ik_toks.iter().enumerate() {
+            let mut cb =
+                |ip: usize, cur_n: &[f32], t_ids: &[usize], t_w: &[f32], m_out: &mut [f32]| {
+                    let mut hctx = hs.host_moe_ctx_mut();
+                    hm.eval_moe_experts_ctx(
+                        ip, cur_n, t_ids, t_w, &pool_h, kt_h, &mut hctx, m_out, false,
+                    );
+                };
+            let got = ik_tiered
+                .forward_token_hybrid(tid, step, true, Some(&mut cb))
+                .unwrap();
+            assert_eq!(
+                argmax(got),
+                argmax(&ik_ref[step]),
+                "3-tier Inkling2CudaRunner Top-1 mismatch at step {step}"
+            );
+        }
+        ik_tiered.reset_state().unwrap();
+        let mut win_am_t = [0u32; 4];
+        {
+            let mut cb_w = |ip: usize,
+                            w_len: usize,
+                            cur_w: &[f32],
+                            ids_w: &[usize],
+                            ws_w: &[f32],
+                            out_w: &mut [f32]| {
+                let mut hctx = hs.host_moe_ctx_mut();
+                hm.eval_moe_experts_window_ctx(
+                    ip, w_len, cur_w, ids_w, ws_w, &pool_h, kt_h, &mut hctx, out_w, false,
+                );
+            };
+            let _ = ik_tiered
+                .forward_window_hybrid(
+                    &ik_toks[0..4],
+                    0,
+                    false,
+                    false,
+                    &[],
+                    Some(&mut cb_w),
+                    Some(&mut win_am_t),
+                )
+                .unwrap();
+        }
+        for s in 0..4 {
+            assert_eq!(
+                win_am_t[s],
+                argmax(&ik_ref[s]),
+                "3-tier Inkling2CudaRunner window mismatch at {s}"
+            );
+        }
+        // SAFETY: Restore environment variables before continuing.
+        unsafe {
+            std::env::remove_var("TM_CUDA_INKLING2_VRAM_MIB");
+            std::env::remove_var("TM_INKLING2_CACHE_EXPERTS");
+        }
+    }
+
     // Also verify DFlashCudaRunner (`DSpark`) builds and runs deterministic `inject + draft` on GPU!
     let dflash_py = r#"
 import struct, sys

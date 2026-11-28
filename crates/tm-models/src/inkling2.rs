@@ -181,6 +181,8 @@ pub struct Inkling2PlacementStats {
     pub ram_mmap_expert_layers: usize,
     pub ram_owned_expert_layers: usize,
     pub nvme_direct_expert_layers: usize,
+    pub nvme_cache_slots_per_layer: usize,
+    pub nvme_cache_bytes: u64,
     pub core_layers_in_fast_tiers: usize,
     pub ram_owned_bytes: u64,
     pub nvme_bytes_per_decode_tok: u64,
@@ -331,9 +333,128 @@ pub struct Inkling2Model<'a> {
     max_expert_chunk_bytes: usize,
 }
 
+/// Per-layer frequency-aged hot-expert RAM cache for `NvmeDirect` MoE layers (`0-ULP` lossless).
+pub struct NvmeLayerRamCache {
+    pub n_slots: usize,
+    pub gu_eb: usize,
+    pub dn_eb: usize,
+    pub counts: Vec<u16>,
+    pub exp_to_slot: Vec<i16>,
+    pub slot_exp: Vec<u16>,
+    pub tick: u32,
+    pub gu_data: Vec<u8>,
+    pub dn_data: Vec<u8>,
+}
+
+impl NvmeLayerRamCache {
+    pub fn new(n_expert: usize, n_slots: usize, gu_eb: usize, dn_eb: usize) -> Self {
+        let clamped = n_slots.min(n_expert);
+        Self {
+            n_slots: clamped,
+            gu_eb,
+            dn_eb,
+            counts: vec![0u16; n_expert],
+            exp_to_slot: vec![-1i16; n_expert],
+            slot_exp: vec![u16::MAX; clamped],
+            tick: 0,
+            gu_data: vec![0u8; clamped * gu_eb],
+            dn_data: vec![0u8; clamped * dn_eb],
+        }
+    }
+
+    #[inline]
+    pub fn record_visit(&mut self, active_ids: &[usize]) {
+        self.tick = self.tick.wrapping_add(1);
+        if self.tick.is_multiple_of(64) {
+            for (e, c) in self.counts.iter_mut().enumerate() {
+                let floor = u16::from(self.exp_to_slot[e] >= 0);
+                *c = (*c >> 1).max(floor);
+            }
+        }
+        for &e_id in active_ids {
+            if e_id < self.counts.len() {
+                self.counts[e_id] = self.counts[e_id].saturating_add(1);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, e_id: usize) -> Option<(&[u8], &[u8])> {
+        let s = *self.exp_to_slot.get(e_id)?;
+        if s < 0 {
+            return None;
+        }
+        let su = s as usize;
+        Some((
+            &self.gu_data[su * self.gu_eb..(su + 1) * self.gu_eb],
+            &self.dn_data[su * self.dn_eb..(su + 1) * self.dn_eb],
+        ))
+    }
+
+    #[inline]
+    pub fn reset(&mut self) {
+        self.counts.fill(0);
+        self.exp_to_slot.fill(-1);
+        self.slot_exp.fill(u16::MAX);
+        self.tick = 0;
+    }
+
+    #[inline]
+    pub fn try_insert(&mut self, e_id: usize, gu_bytes: &[u8], dn_bytes: &[u8]) {
+        self.try_insert_protecting(e_id, gu_bytes, dn_bytes, 0..0);
+    }
+
+    #[inline]
+    pub fn try_insert_protecting(
+        &mut self,
+        e_id: usize,
+        gu_bytes: &[u8],
+        dn_bytes: &[u8],
+        protect_range: std::ops::Range<usize>,
+    ) {
+        if self.n_slots == 0 || e_id >= self.exp_to_slot.len() || self.exp_to_slot[e_id] >= 0 {
+            return;
+        }
+        let target_slot = if let Some(free_s) = self.slot_exp.iter().position(|&x| x == u16::MAX) {
+            Some(free_s)
+        } else {
+            let mut min_s = usize::MAX;
+            let mut min_c = u16::MAX;
+            for (s, &res_e) in self.slot_exp.iter().enumerate() {
+                let ru = res_e as usize;
+                if protect_range.contains(&ru) {
+                    continue;
+                }
+                let c = self.counts[ru];
+                if c < min_c {
+                    min_c = c;
+                    min_s = s;
+                }
+            }
+            if min_s != usize::MAX && self.counts[e_id] > min_c.saturating_add(1) {
+                let old_e = self.slot_exp[min_s] as usize;
+                self.exp_to_slot[old_e] = -1;
+                Some(min_s)
+            } else {
+                None
+            }
+        };
+        if let Some(su) = target_slot {
+            self.gu_data[su * self.gu_eb..(su + 1) * self.gu_eb].copy_from_slice(gu_bytes);
+            self.dn_data[su * self.dn_eb..(su + 1) * self.dn_eb].copy_from_slice(dn_bytes);
+            self.slot_exp[su] = e_id as u16;
+            self.exp_to_slot[e_id] = su as i16;
+        }
+    }
+}
+
+/// Number of contiguous experts read per sequential `O_DIRECT` super-chunk during prefill (`P1-1`).
+const SEQ_STREAM_CHUNK_EXPS: usize = 16;
+
 /// Per-expert worker item used for parallel zero-allocation `O_DIRECT` + AVX2 MoE execution.
 pub struct ExpertWorkSlot {
     pub slot: PageAlignedSlot,
+    pub dn_slot: PageAlignedSlot,
     pub mv_scratch: MatvecScratch,
     pub gate_up_buf: Vec<f32>,
     pub hidden_buf: Vec<f32>,
@@ -344,6 +465,23 @@ pub struct ExpertWorkSlot {
     /// Multi-token window hidden buffer `[MAX_INKLING2_WINDOW * n_ff_exp]` for grouped MoE.
     pub win_hidden_buf: Vec<f32>,
     pub out_buf: Vec<f32>,
+    /// Per-worker chunk buffer for sequential super-chunk prefill (`<= ceil(16 / n_workers)` experts).
+    pub chunk_hidden_buf: Vec<f32>,
+    pub chunk_out_buf: Vec<f32>,
+}
+
+/// Disjoint mutable borrow bundle from [`Inkling2State`] for zero-allocation overlapped
+/// NVMe `O_DIRECT` + per-layer hot-expert RAM cache execution (`P0-1`, `P0-2`, `P1-1`).
+pub struct HostMoeCtx<'a> {
+    pub io_pool: &'a ThreadPool,
+    pub coord_pool: &'a ThreadPool,
+    pub serial_pool: &'a ThreadPool,
+    pub expert_slots: &'a mut [ExpertWorkSlot],
+    pub seq_slot_a: &'a mut [PageAlignedSlot; 4],
+    pub seq_slot_b: &'a mut [PageAlignedSlot; 4],
+    pub nvme_caches: &'a mut [Option<NvmeLayerRamCache>],
+    pub mv_scratch: &'a mut MatvecScratch,
+    pub win_slot_outs: &'a mut [f32],
 }
 
 /// Pre-allocated per-session inference state for `Inkling2Model` (`0` heap allocations on token path).
@@ -401,7 +539,14 @@ pub struct Inkling2State {
     /// Dedicated concurrent I/O pool (`top_k <= 8` threads) for `NvmeDirect` SSD expert streaming
     /// so `-t 4` P-core compute pools still issue full queue-depth `8` `pread`s on outer layers.
     io_pool: ThreadPool,
+    /// 2-way coordinator pool overlapping NVMe `O_DIRECT` I/O with multi-core AVX2 compute (`P0-1`).
+    coord_pool: ThreadPool,
     pub expert_slots: Vec<ExpertWorkSlot>,
+    /// Ping-pong `4`-stripe (`16`-expert super-chunk) `O_DIRECT` slots for sequential prefill (`P1-1`).
+    seq_slot_a: [PageAlignedSlot; 4],
+    seq_slot_b: [PageAlignedSlot; 4],
+    /// Per-layer frequency-aged hot-expert RAM caches for `NvmeDirect` layers (`P0-2`).
+    nvme_caches: Vec<Option<NvmeLayerRamCache>>,
     /// Pre-allocated `[MAX_INKLING2_WINDOW * n_expert_used * n_embd]` per-slot outputs for `0-ULP`
     /// deterministic multi-token grouped MoE evaluation.
     pub win_slot_outs: Vec<f32>,
@@ -875,11 +1020,12 @@ impl<'a> Inkling2Model<'a> {
                     .map(|b| (b.total_bytes, b.available_bytes))
                     .unwrap_or((16 * 1024 * 1024 * 1024, sys_avail));
                 // When `skip_dense` is true (`host_moe_only`), dense weights are 0 bytes on host;
-                // otherwise reserve `rem_dense_layer_bytes` + 1.85 GiB for OS, KV state & scratch.
+                // reserve `1.45 GiB` for OS, driver & pre-allocated `O_DIRECT` pipeline slots (`P0-2`).
+                // Otherwise reserve `rem_dense_layer_bytes` + `1.50 GiB` for OS, KV state & scratch.
                 let reserve = if skip_dense {
-                    2300 * 1024 * 1024u64
+                    1850 * 1024 * 1024u64
                 } else {
-                    rem_dense_layer_bytes + 1850 * 1024 * 1024u64
+                    rem_dense_layer_bytes + 1500 * 1024 * 1024u64
                 };
                 let by_avail = fresh_avail.saturating_sub(reserve);
                 #[cfg(target_os = "macos")]
@@ -894,16 +1040,36 @@ impl<'a> Inkling2Model<'a> {
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    let _ = sys_tot;
-                    by_avail
+                    // When GPU hybrid offload is active (`skip_dense || has_vram_skip`), cap
+                    // anonymous MoE + cache + `O_DIRECT` scratch below 70% of physical RAM
+                    // (`~10.8 GiB` on `15.4 GiB` hosts) so GPU drivers (`libnvidia-glcore` /
+                    // `DEVICEMAP` / `VK_EXT_external_memory_host`) never trigger Linux `kswapd`
+                    // swapouts. In pure CPU mode (`!skip_dense && !has_vram_skip`), allow up to
+                    // 84% of physical RAM (`0` GPU driver RSS).
+                    if skip_dense || has_vram_skip {
+                        let linux_moe_cap = (sys_tot * 70) / 100;
+                        by_avail.min(linux_moe_cap)
+                    } else {
+                        let owned_dense = output.bytes().len() as u64 + rem_dense_layer_bytes;
+                        let linux_cpu_cap = ((sys_tot * 84) / 100).saturating_sub(owned_dense);
+                        by_avail.min(linux_cpu_cap)
+                    }
                 }
             };
-            let mut rem_budget = explicit_budget.unwrap_or(auto_budget);
+            let io_scratch_reserve = if explicit_budget.is_none() {
+                340 * 1024 * 1024u64
+            } else {
+                0
+            };
+            let mut rem_budget = explicit_budget
+                .unwrap_or(auto_budget)
+                .saturating_sub(io_scratch_reserve);
 
             let mut priority_order: Vec<usize> = (cfg.core_start..cfg.core_end).collect();
             priority_order.extend(0..cfg.core_start);
             priority_order.extend(cfg.core_end..n_phys);
 
+            let mut nvme_cnt = 0usize;
             for ip in priority_order {
                 let in_vram = opts.vram_expert_layers.get(ip).copied().unwrap_or(false);
                 if in_vram {
@@ -913,7 +1079,27 @@ impl<'a> Inkling2Model<'a> {
                 if need <= rem_budget {
                     ram_expert_plan[ip] = true;
                     rem_budget -= need;
+                } else {
+                    nvme_cnt += 1;
                 }
+            }
+
+            // Allocate fractional leftover `rem_budget` (or explicit `TM_INKLING2_CACHE_EXPERTS`)
+            // into per-layer frequency-aged hot-expert RAM caches (`P0-2`).
+            let env_cache_exps: Option<usize> = std::env::var("TM_INKLING2_CACHE_EXPERTS")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok());
+            if nvme_cnt > 0 {
+                let single_exp_b = (expert_layer_bytes[0] / (n_exp as u64)).max(1);
+                let slots_per_layer = if let Some(k) = env_cache_exps {
+                    k.min(n_exp)
+                } else if explicit_budget.is_none() {
+                    ((rem_budget / (nvme_cnt as u64 * single_exp_b)) as usize).min(32)
+                } else {
+                    0
+                };
+                stats.nvme_cache_slots_per_layer = slots_per_layer;
+                stats.nvme_cache_bytes = (nvme_cnt * slots_per_layer) as u64 * single_exp_b;
             }
         }
 
@@ -1643,6 +1829,9 @@ impl<'a> Inkling2Model<'a> {
                     continue;
                 }
                 let e_id = top_ids_win[tok_i * top_k + k_idx];
+                if e_id >= n_expert {
+                    continue;
+                }
                 let u = if exp_to_u[e_id] != u16::MAX {
                     exp_to_u[e_id] as usize
                 } else {
@@ -2146,6 +2335,1032 @@ impl<'a> Inkling2Model<'a> {
             moe_out,
             true,
         );
+    }
+
+    /// Evaluates selected MoE experts for a single token using overlapped NVMe `O_DIRECT`
+    /// read-compute double buffering (`P0-1`) and per-layer frequency-aged hot-expert RAM cache (`P0-2`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn eval_moe_experts_ctx(
+        &self,
+        ip: usize,
+        cur_normed: &[f32],
+        top_ids: &[usize],
+        top_weights: &[f32],
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        hctx: &mut HostMoeCtx<'_>,
+        moe_out: &mut [f32],
+        float_act: bool,
+    ) {
+        let ExpertLayerStore::NvmeDirect {
+            gate_up_offset,
+            gate_up_dtype,
+            gate_up_expert_bytes,
+            down_offset,
+            down_dtype,
+            down_expert_bytes,
+        } = &self.layers[ip].experts
+        else {
+            self.eval_moe_experts_inner(
+                ip,
+                cur_normed,
+                top_ids,
+                top_weights,
+                pool,
+                Some(hctx.io_pool),
+                hctx.serial_pool,
+                kt,
+                hctx.expert_slots,
+                hctx.mv_scratch,
+                moe_out,
+                float_act,
+            );
+            return;
+        };
+
+        let top_k = top_ids.len();
+        if top_k == 0 || top_k > 32 || hctx.expert_slots.len() < top_k {
+            self.eval_moe_experts_inner(
+                ip,
+                cur_normed,
+                top_ids,
+                top_weights,
+                pool,
+                Some(hctx.io_pool),
+                hctx.serial_pool,
+                kt,
+                hctx.expert_slots,
+                hctx.mv_scratch,
+                moe_out,
+                float_act,
+            );
+            return;
+        }
+
+        let mv_fn = if float_act {
+            matvec_f32_unquant_act
+        } else {
+            matvec_f32
+        };
+        let n_embd = self.cfg.n_embd;
+        let n_ff = self.cfg.n_ff_exp;
+        let n_expert = self.cfg.n_expert;
+        let beta = self.cfg.situ_beta;
+        let lb = self.cfg.situ_linear_beta;
+        let gu_scales = self.layers[ip].ffn_gate_up_exps_scale.as_deref();
+        let dn_scales = self.layers[ip].ffn_down_exps_scale.as_deref();
+        let rdr = self
+            .direct_reader
+            .as_ref()
+            .expect("DirectTensorReader required for NvmeDirect expert layer");
+
+        let mut is_hit = [false; 32];
+        let mut any_miss = false;
+        let mut gu_pads = [0usize; 32];
+        let mut dn_pads = [0usize; 32];
+        if let Some(cache) = hctx.nvme_caches.get_mut(ip).and_then(|c| c.as_mut()) {
+            cache.record_visit(&top_ids[..top_k]);
+            for j in 0..top_k {
+                let e_id = top_ids[j];
+                if top_weights[j] == 0.0 || e_id >= n_expert {
+                    continue;
+                }
+                if cache.get(e_id).is_some() {
+                    is_hit[j] = true;
+                } else {
+                    any_miss = true;
+                    gu_pads[j] =
+                        ((*gate_up_offset + (e_id * *gate_up_expert_bytes) as u64) & 4095) as usize;
+                    dn_pads[j] =
+                        ((*down_offset + (e_id * *down_expert_bytes) as u64) & 4095) as usize;
+                }
+            }
+        } else {
+            for j in 0..top_k {
+                let e_id = top_ids[j];
+                if top_weights[j] != 0.0 && e_id < n_expert {
+                    any_miss = true;
+                    gu_pads[j] =
+                        ((*gate_up_offset + (e_id * *gate_up_expert_bytes) as u64) & 4095) as usize;
+                    dn_pads[j] =
+                        ((*down_offset + (e_id * *down_expert_bytes) as u64) & 4095) as usize;
+                }
+            }
+        }
+
+        // Single-barrier per-expert continuous streaming (`0` queue-drain bubbles between `gate_up`
+        // and `down` NAND reads!) + zero-IO in-RAM execution on `NvmeLayerRamCache` hits!
+        let nvme_pool = if any_miss && hctx.io_pool.num_threads() > pool.num_threads() {
+            hctx.io_pool
+        } else {
+            pool
+        };
+        {
+            let cache_ref = hctx.nvme_caches.get(ip).and_then(|c| c.as_ref());
+            let ser_p = hctx.serial_pool;
+            nvme_pool.parallel_for_each_mut(&mut hctx.expert_slots[..top_k], |j, ws| {
+                let e_id = top_ids[j];
+                if top_weights[j] == 0.0 || e_id >= n_expert {
+                    ws.out_buf[..n_embd].fill(0.0);
+                    return;
+                }
+                if is_hit[j]
+                    && let Some(c_ref) = cache_ref
+                {
+                    let (gu_bytes, dn_bytes) = c_ref.get(e_id).expect("cached expert hit");
+                    mv_fn(
+                        ser_p,
+                        kt,
+                        *gate_up_dtype,
+                        gu_bytes,
+                        cur_normed,
+                        &mut ws.mv_scratch,
+                        &mut ws.gate_up_buf[..2 * n_ff],
+                        2 * n_ff,
+                        n_embd,
+                    );
+                    if let Some(sc) = gu_scales {
+                        let s_e = sc[e_id];
+                        for v in &mut ws.gate_up_buf[..2 * n_ff] {
+                            *v *= s_e;
+                        }
+                    }
+                    apply_situ_glu(
+                        &ws.gate_up_buf[..n_ff],
+                        &ws.gate_up_buf[n_ff..2 * n_ff],
+                        &mut ws.hidden_buf[..n_ff],
+                        beta,
+                        lb,
+                    );
+                    mv_fn(
+                        ser_p,
+                        kt,
+                        *down_dtype,
+                        dn_bytes,
+                        &ws.hidden_buf[..n_ff],
+                        &mut ws.mv_scratch,
+                        &mut ws.out_buf[..n_embd],
+                        n_embd,
+                        n_ff,
+                    );
+                    if let Some(sc) = dn_scales {
+                        let s_e = sc[e_id];
+                        for v in &mut ws.out_buf[..n_embd] {
+                            *v *= s_e;
+                        }
+                    }
+                } else {
+                    let gu_off = *gate_up_offset + (e_id * *gate_up_expert_bytes) as u64;
+                    let gu_bytes = rdr
+                        .read_into_slot(gu_off, *gate_up_expert_bytes, &mut ws.slot)
+                        .expect("O_DIRECT gate_up expert read failed");
+                    mv_fn(
+                        ser_p,
+                        kt,
+                        *gate_up_dtype,
+                        gu_bytes,
+                        cur_normed,
+                        &mut ws.mv_scratch,
+                        &mut ws.gate_up_buf[..2 * n_ff],
+                        2 * n_ff,
+                        n_embd,
+                    );
+                    if let Some(sc) = gu_scales {
+                        let s_e = sc[e_id];
+                        for v in &mut ws.gate_up_buf[..2 * n_ff] {
+                            *v *= s_e;
+                        }
+                    }
+                    apply_situ_glu(
+                        &ws.gate_up_buf[..n_ff],
+                        &ws.gate_up_buf[n_ff..2 * n_ff],
+                        &mut ws.hidden_buf[..n_ff],
+                        beta,
+                        lb,
+                    );
+                    let dn_off = *down_offset + (e_id * *down_expert_bytes) as u64;
+                    let dn_bytes = rdr
+                        .read_into_slot(dn_off, *down_expert_bytes, &mut ws.dn_slot)
+                        .expect("O_DIRECT down expert read failed");
+                    mv_fn(
+                        ser_p,
+                        kt,
+                        *down_dtype,
+                        dn_bytes,
+                        &ws.hidden_buf[..n_ff],
+                        &mut ws.mv_scratch,
+                        &mut ws.out_buf[..n_embd],
+                        n_embd,
+                        n_ff,
+                    );
+                    if let Some(sc) = dn_scales {
+                        let s_e = sc[e_id];
+                        for v in &mut ws.out_buf[..n_embd] {
+                            *v *= s_e;
+                        }
+                    }
+                }
+            });
+        }
+
+        if any_miss && let Some(cache) = hctx.nvme_caches.get_mut(ip).and_then(|c| c.as_mut()) {
+            for j in 0..top_k {
+                if !is_hit[j] && top_weights[j] != 0.0 {
+                    let ws = &hctx.expert_slots[j];
+                    let gu_bytes = ws.slot.subslice(gu_pads[j], *gate_up_expert_bytes);
+                    let dn_bytes = ws.dn_slot.subslice(dn_pads[j], *down_expert_bytes);
+                    cache.try_insert(top_ids[j], gu_bytes, dn_bytes);
+                }
+            }
+        }
+
+        moe_out.fill(0.0);
+        for (j, &w_e) in top_weights.iter().enumerate().take(top_k) {
+            if w_e == 0.0 {
+                continue;
+            }
+            let out_j = &hctx.expert_slots[j].out_buf[..n_embd];
+            for (m, &o) in moe_out[..n_embd].iter_mut().zip(out_j) {
+                *m += w_e * o;
+            }
+        }
+    }
+
+    /// Evaluates selected MoE experts across a multi-token window (`1 <= W <= MAX_INKLING2_WINDOW`)
+    /// using per-layer hot-expert RAM caches (`P0-2`) and `16`-expert sequential `O_DIRECT`
+    /// ping-pong super-chunk streaming (`P1-1`) with `0-ULP` determinism.
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    pub fn eval_moe_experts_window_ctx(
+        &self,
+        ip: usize,
+        window_len: usize,
+        cur_normed_win: &[f32],
+        top_ids_win: &[usize],
+        top_weights_win: &[f32],
+        pool: &ThreadPool,
+        kt: &KernelTable,
+        hctx: &mut HostMoeCtx<'_>,
+        moe_out_win: &mut [f32],
+        float_act: bool,
+    ) {
+        if window_len == 1 {
+            self.eval_moe_experts_ctx(
+                ip,
+                cur_normed_win,
+                top_ids_win,
+                top_weights_win,
+                pool,
+                kt,
+                hctx,
+                moe_out_win,
+                float_act,
+            );
+            return;
+        }
+        let ExpertLayerStore::NvmeDirect {
+            gate_up_offset,
+            gate_up_dtype,
+            gate_up_expert_bytes,
+            down_offset,
+            down_dtype,
+            down_expert_bytes,
+        } = &self.layers[ip].experts
+        else {
+            self.eval_moe_experts_window_inner(
+                ip,
+                window_len,
+                cur_normed_win,
+                top_ids_win,
+                top_weights_win,
+                pool,
+                Some(hctx.io_pool),
+                hctx.serial_pool,
+                kt,
+                hctx.expert_slots,
+                hctx.mv_scratch,
+                hctx.win_slot_outs,
+                moe_out_win,
+                float_act,
+            );
+            return;
+        };
+
+        let n_embd = self.cfg.n_embd;
+        let n_ff = self.cfg.n_ff_exp;
+        let n_expert = self.cfg.n_expert;
+        let top_k = top_ids_win.len() / window_len;
+        let beta = self.cfg.situ_beta;
+        let lb = self.cfg.situ_linear_beta;
+        let gu_scales = self.layers[ip].ffn_gate_up_exps_scale.as_deref();
+        let dn_scales = self.layers[ip].ffn_down_exps_scale.as_deref();
+        let rdr = self
+            .direct_reader
+            .as_ref()
+            .expect("DirectTensorReader required for NvmeDirect expert layer");
+
+        const MAX_UNIQ_EXPS: usize = 512;
+        assert!(n_expert <= MAX_UNIQ_EXPS && (2..=MAX_INKLING2_WINDOW).contains(&window_len));
+        let mut uniq_exps = [0usize; MAX_UNIQ_EXPS];
+        let mut uniq_mask = [[0u64; 4]; MAX_UNIQ_EXPS];
+        let mut exp_to_u = [u16::MAX; MAX_UNIQ_EXPS];
+        let mut uniq_kslot = [[0u8; MAX_INKLING2_WINDOW]; MAX_UNIQ_EXPS];
+        let mut uniq_mcnt = [0usize; MAX_UNIQ_EXPS];
+        let mut n_uniq = 0usize;
+
+        for tok_i in 0..window_len {
+            let word = tok_i >> 6;
+            let bit = 1u64 << (tok_i & 63);
+            for k_idx in 0..top_k {
+                if top_weights_win[tok_i * top_k + k_idx] == 0.0 {
+                    continue;
+                }
+                let e_id = top_ids_win[tok_i * top_k + k_idx];
+                if e_id >= n_expert {
+                    continue;
+                }
+                let u = if exp_to_u[e_id] != u16::MAX {
+                    exp_to_u[e_id] as usize
+                } else {
+                    let u = n_uniq;
+                    exp_to_u[e_id] = u as u16;
+                    uniq_exps[u] = e_id;
+                    n_uniq += 1;
+                    u
+                };
+                uniq_mask[u][word] |= bit;
+                uniq_kslot[u][tok_i] = k_idx as u8;
+                uniq_mcnt[u] += 1;
+            }
+        }
+
+        if let Some(cache) = hctx.nvme_caches.get_mut(ip).and_then(|c| c.as_mut()) {
+            cache.record_visit(&uniq_exps[..n_uniq]);
+        }
+
+        // P1-1: For dense prefill windows (`n_uniq >= 24`), stream `16`-expert contiguous super-chunks
+        // (`4` parallel `O_DIRECT` stripes per super-chunk) double-buffered with 8-core AVX2 GEMM!
+        if n_uniq >= 24
+            && n_expert >= SEQ_STREAM_CHUNK_EXPS
+            && hctx.expert_slots.len() >= 8
+            && !hctx.expert_slots[0].chunk_hidden_buf.is_empty()
+        {
+            let n_chunks = n_expert.div_ceil(SEQ_STREAM_CHUNK_EXPS);
+            let gu_eb = *gate_up_expert_bytes;
+            let dn_eb = *down_expert_bytes;
+            let gu_base = *gate_up_offset;
+            let dn_base = *down_offset;
+
+            let calc_stripes = |c: usize,
+                                base_off: u64,
+                                eb: usize,
+                                cache_opt: Option<&NvmeLayerRamCache>|
+             -> ([bool; 4], [u64; 4], [usize; 4], [usize; 4]) {
+                let c_start = c * SEQ_STREAM_CHUNK_EXPS;
+                let c_len = (n_expert - c_start).min(SEQ_STREAM_CHUNK_EXPS);
+                let mut need = [false; 4];
+                let mut offs = [0u64; 4];
+                let mut lens = [0usize; 4];
+                let mut pads = [0usize; 4];
+                for s in 0..4 {
+                    let s_start = c_start + s * 4;
+                    let s_len = c_len.saturating_sub(s * 4).min(4);
+                    if s_len == 0 {
+                        continue;
+                    }
+                    let mut active_miss = false;
+                    for sub in 0..s_len {
+                        let e_id = s_start + sub;
+                        if exp_to_u[e_id] != u16::MAX
+                            && cache_opt.is_none_or(|cr| cr.get(e_id).is_none())
+                        {
+                            active_miss = true;
+                            break;
+                        }
+                    }
+                    if active_miss {
+                        need[s] = true;
+                        let off = base_off + (s_start * eb) as u64;
+                        offs[s] = off;
+                        lens[s] = s_len * eb;
+                        pads[s] = (off & 4095) as usize;
+                    }
+                }
+                (need, offs, lens, pads)
+            };
+
+            // Prologue: DMA `gate_up(0)` into `seq_slot_a` across 4 `O_DIRECT` threads (`QD = 4`).
+            let (mut gu_need, gu_offs_0, gu_lens_0, mut gu_pads) = {
+                let c_ref = hctx.nvme_caches.get(ip).and_then(|ca| ca.as_ref());
+                calc_stripes(0, gu_base, gu_eb, c_ref)
+            };
+            {
+                let io_p = hctx.io_pool;
+                io_p.parallel_for_each_mut(&mut hctx.seq_slot_a[..], |s, slot| {
+                    if gu_need[s] {
+                        let _ = rdr
+                            .read_into_slot(gu_offs_0[s], gu_lens_0[s], slot)
+                            .expect("O_DIRECT super-chunk gate_up read failed");
+                    }
+                });
+            }
+
+            for c in 0..n_chunks {
+                let c_start = c * SEQ_STREAM_CHUNK_EXPS;
+                let c_len = (n_expert - c_start).min(SEQ_STREAM_CHUNK_EXPS);
+
+                // Overlap `down(c)` DMA into `seq_slot_b` with `gate_up(c) + SiTU` AVX2 GEMM!
+                let (dn_need, dn_offs, dn_lens, dn_pads) = {
+                    let c_ref = hctx.nvme_caches.get(ip).and_then(|ca| ca.as_ref());
+                    calc_stripes(c, dn_base, dn_eb, c_ref)
+                };
+                {
+                    let c_ref = hctx.nvme_caches.get(ip).and_then(|ca| ca.as_ref());
+                    let sa_ref = &hctx.seq_slot_a;
+                    let sb_mut = &mut hctx.seq_slot_b[..];
+                    let exp_slots_mut = &mut hctx.expert_slots[..8];
+                    let io_p = hctx.io_pool;
+                    let ser_p = hctx.serial_pool;
+                    hctx.coord_pool.join_pair(
+                        || {
+                            io_p.parallel_for_each_mut(sb_mut, |s, slot| {
+                                if dn_need[s] {
+                                    let _ = rdr
+                                        .read_into_slot(dn_offs[s], dn_lens[s], slot)
+                                        .expect("O_DIRECT super-chunk down read failed");
+                                }
+                            });
+                        },
+                        || {
+                            pool.parallel_for_each_mut(exp_slots_mut, |w_idx, ws| {
+                                for sub_idx in 0..2 {
+                                    let rel_e = 2 * w_idx + sub_idx;
+                                    if rel_e >= c_len {
+                                        continue;
+                                    }
+                                    let e_id = c_start + rel_e;
+                                    let u_tag = exp_to_u[e_id];
+                                    if u_tag == u16::MAX {
+                                        continue;
+                                    }
+                                    let u = u_tag as usize;
+                                    let mask = uniq_mask[u];
+                                    let mut m_cnt = 0usize;
+                                    for tok_i in 0..window_len {
+                                        if (mask[tok_i >> 6] & (1u64 << (tok_i & 63))) != 0 {
+                                            ws.win_in_buf[m_cnt * n_embd..(m_cnt + 1) * n_embd]
+                                                .copy_from_slice(
+                                                    &cur_normed_win
+                                                        [tok_i * n_embd..(tok_i + 1) * n_embd],
+                                                );
+                                            m_cnt += 1;
+                                        }
+                                    }
+                                    let gu_bytes =
+                                        if let Some((gb, _)) = c_ref.and_then(|cr| cr.get(e_id)) {
+                                            gb
+                                        } else {
+                                            let st = rel_e / 4;
+                                            let sub = rel_e % 4;
+                                            sa_ref[st].subslice(gu_pads[st] + sub * gu_eb, gu_eb)
+                                        };
+                                    if float_act {
+                                        matvec_batch_f32_unquant_act(
+                                            ser_p,
+                                            kt,
+                                            *gate_up_dtype,
+                                            gu_bytes,
+                                            &ws.win_in_buf[..m_cnt * n_embd],
+                                            m_cnt,
+                                            &mut ws.mv_scratch,
+                                            &mut ws.win_gate_up_buf[..m_cnt * 2 * n_ff],
+                                            2 * n_ff,
+                                            n_embd,
+                                        );
+                                    } else {
+                                        matmul_f32(
+                                            ser_p,
+                                            kt,
+                                            *gate_up_dtype,
+                                            gu_bytes,
+                                            &ws.win_in_buf[..m_cnt * n_embd],
+                                            &mut ws.mv_scratch,
+                                            &mut ws.win_gate_up_buf[..m_cnt * 2 * n_ff],
+                                            2 * n_ff,
+                                            n_embd,
+                                            m_cnt,
+                                        );
+                                    }
+                                    if let Some(sc) = gu_scales {
+                                        let s_e = sc[e_id];
+                                        for v in &mut ws.win_gate_up_buf[..m_cnt * 2 * n_ff] {
+                                            *v *= s_e;
+                                        }
+                                    }
+                                    let h_base = sub_idx * MAX_INKLING2_WINDOW * n_ff;
+                                    for m in 0..m_cnt {
+                                        let gu_m =
+                                            &ws.win_gate_up_buf[m * 2 * n_ff..(m + 1) * 2 * n_ff];
+                                        apply_situ_glu(
+                                            &gu_m[..n_ff],
+                                            &gu_m[n_ff..2 * n_ff],
+                                            &mut ws.chunk_hidden_buf
+                                                [h_base + m * n_ff..h_base + (m + 1) * n_ff],
+                                            beta,
+                                            lb,
+                                        );
+                                    }
+                                }
+                            });
+                        },
+                    );
+                }
+
+                // Warm up per-layer hot-expert RAM cache for free while BOTH `seq_slot_a` (`gate_up(c)`)
+                // and `seq_slot_b` (`down(c)`) are simultaneously resident!
+                if let Some(cache) = hctx.nvme_caches.get_mut(ip).and_then(|ca| ca.as_mut()) {
+                    let mut cand = [(0usize, 0usize); SEQ_STREAM_CHUNK_EXPS];
+                    let mut n_cand = 0usize;
+                    for rel_e in 0..c_len {
+                        let e_id = c_start + rel_e;
+                        let u_tag = exp_to_u[e_id];
+                        if u_tag != u16::MAX && cache.get(e_id).is_none() {
+                            cand[n_cand] = (rel_e, uniq_mcnt[u_tag as usize]);
+                            n_cand += 1;
+                        }
+                    }
+                    cand[..n_cand].sort_unstable_by_key(|a| std::cmp::Reverse(a.1));
+                    for &(rel_e, m_cnt) in &cand[..n_cand] {
+                        let e_id = c_start + rel_e;
+                        if m_cnt > 1 {
+                            for _ in 1..m_cnt.min(8) {
+                                cache.counts[e_id] = cache.counts[e_id].saturating_add(1);
+                            }
+                        }
+                        let st = rel_e / 4;
+                        let sub = rel_e % 4;
+                        if gu_need[st] && dn_need[st] {
+                            let gu_b =
+                                hctx.seq_slot_a[st].subslice(gu_pads[st] + sub * gu_eb, gu_eb);
+                            let dn_b =
+                                hctx.seq_slot_b[st].subslice(dn_pads[st] + sub * dn_eb, dn_eb);
+                            // Never evict an active expert belonging to `[c_start .. c_start + c_len)`
+                            // before `down(c)` executes on it below!
+                            cache.try_insert_protecting(
+                                e_id,
+                                gu_b,
+                                dn_b,
+                                c_start..(c_start + c_len),
+                            );
+                        }
+                    }
+                }
+
+                // Compute next chunk's stripe plan BEFORE mutably borrowing `seq_slot_a` for `c + 1`.
+                let next_plan = if c + 1 < n_chunks {
+                    let c_ref = hctx.nvme_caches.get(ip).and_then(|ca| ca.as_ref());
+                    Some(calc_stripes(c + 1, gu_base, gu_eb, c_ref))
+                } else {
+                    None
+                };
+
+                // Overlap `gate_up(c + 1)` DMA into `seq_slot_a` with `down(c)` AVX2 GEMM!
+                {
+                    let c_ref = hctx.nvme_caches.get(ip).and_then(|ca| ca.as_ref());
+                    let sa_mut = &mut hctx.seq_slot_a[..];
+                    let sb_ref = &hctx.seq_slot_b;
+                    let exp_slots_mut = &mut hctx.expert_slots[..8];
+                    let io_p = hctx.io_pool;
+                    let ser_p = hctx.serial_pool;
+                    hctx.coord_pool.join_pair(
+                        || {
+                            if let Some((n_need, n_offs, n_lens, _)) = next_plan {
+                                io_p.parallel_for_each_mut(sa_mut, |s, slot| {
+                                    if n_need[s] {
+                                        let _ = rdr
+                                            .read_into_slot(n_offs[s], n_lens[s], slot)
+                                            .expect("O_DIRECT super-chunk gate_up read failed");
+                                    }
+                                });
+                            }
+                        },
+                        || {
+                            pool.parallel_for_each_mut(exp_slots_mut, |w_idx, ws| {
+                                for sub_idx in 0..2 {
+                                    let rel_e = 2 * w_idx + sub_idx;
+                                    if rel_e >= c_len {
+                                        continue;
+                                    }
+                                    let e_id = c_start + rel_e;
+                                    let u_tag = exp_to_u[e_id];
+                                    if u_tag == u16::MAX {
+                                        continue;
+                                    }
+                                    let m_cnt = uniq_mcnt[u_tag as usize];
+                                    let dn_bytes =
+                                        if let Some((_, db)) = c_ref.and_then(|cr| cr.get(e_id)) {
+                                            db
+                                        } else {
+                                            let st = rel_e / 4;
+                                            let sub = rel_e % 4;
+                                            sb_ref[st].subslice(dn_pads[st] + sub * dn_eb, dn_eb)
+                                        };
+                                    let h_base = sub_idx * MAX_INKLING2_WINDOW * n_ff;
+                                    let o_base = sub_idx * MAX_INKLING2_WINDOW * n_embd;
+                                    if float_act {
+                                        matvec_batch_f32_unquant_act(
+                                            ser_p,
+                                            kt,
+                                            *down_dtype,
+                                            dn_bytes,
+                                            &ws.chunk_hidden_buf[h_base..h_base + m_cnt * n_ff],
+                                            m_cnt,
+                                            &mut ws.mv_scratch,
+                                            &mut ws.chunk_out_buf[o_base..o_base + m_cnt * n_embd],
+                                            n_embd,
+                                            n_ff,
+                                        );
+                                    } else {
+                                        matmul_f32(
+                                            ser_p,
+                                            kt,
+                                            *down_dtype,
+                                            dn_bytes,
+                                            &ws.chunk_hidden_buf[h_base..h_base + m_cnt * n_ff],
+                                            &mut ws.mv_scratch,
+                                            &mut ws.chunk_out_buf[o_base..o_base + m_cnt * n_embd],
+                                            n_embd,
+                                            n_ff,
+                                            m_cnt,
+                                        );
+                                    }
+                                    if let Some(sc) = dn_scales {
+                                        let s_e = sc[e_id];
+                                        for v in
+                                            &mut ws.chunk_out_buf[o_base..o_base + m_cnt * n_embd]
+                                        {
+                                            *v *= s_e;
+                                        }
+                                    }
+                                }
+                            });
+                        },
+                    );
+                }
+
+                // Scatter `chunk_out_buf` into `win_slot_outs` for deterministic `0..top_k` reduction.
+                for w_idx in 0..8 {
+                    let ws = &hctx.expert_slots[w_idx];
+                    for sub_idx in 0..2 {
+                        let rel_e = 2 * w_idx + sub_idx;
+                        if rel_e >= c_len {
+                            continue;
+                        }
+                        let e_id = c_start + rel_e;
+                        let u_tag = exp_to_u[e_id];
+                        if u_tag == u16::MAX {
+                            continue;
+                        }
+                        let u = u_tag as usize;
+                        let mask = uniq_mask[u];
+                        let kslots = &uniq_kslot[u];
+                        let o_base = sub_idx * MAX_INKLING2_WINDOW * n_embd;
+                        let mut m_idx = 0usize;
+                        for (tok_i, &ks) in kslots.iter().enumerate().take(window_len) {
+                            if (mask[tok_i >> 6] & (1u64 << (tok_i & 63))) == 0 {
+                                continue;
+                            }
+                            let dst_off = (tok_i * top_k + (ks as usize)) * n_embd;
+                            hctx.win_slot_outs[dst_off..dst_off + n_embd].copy_from_slice(
+                                &ws.chunk_out_buf
+                                    [o_base + m_idx * n_embd..o_base + (m_idx + 1) * n_embd],
+                            );
+                            m_idx += 1;
+                        }
+                    }
+                }
+
+                if let Some((n_need, _, _, n_pads)) = next_plan {
+                    gu_need = n_need;
+                    gu_pads = n_pads;
+                }
+            }
+        } else {
+            // Small speculative verification windows (`n_uniq < 24`): evaluate RAM-cache hits first,
+            // then stream remaining misses in overlapped `gate_up`/`down` waves!
+            let mut hits_u = [0usize; MAX_UNIQ_EXPS];
+            let mut misses_u = [0usize; MAX_UNIQ_EXPS];
+            let mut n_hits = 0usize;
+            let mut n_misses = 0usize;
+            {
+                let c_ref = hctx.nvme_caches.get(ip).and_then(|ca| ca.as_ref());
+                let mut order = [0usize; MAX_UNIQ_EXPS];
+                for u in 0..n_uniq {
+                    order[u] = u;
+                }
+                order[..n_uniq].sort_unstable_by(|&a, &b| {
+                    uniq_mcnt[b].cmp(&uniq_mcnt[a]).then_with(|| a.cmp(&b))
+                });
+                for &u in &order[..n_uniq] {
+                    if c_ref.is_some_and(|cr| cr.get(uniq_exps[u]).is_some()) {
+                        hits_u[n_hits] = u;
+                        n_hits += 1;
+                    } else {
+                        misses_u[n_misses] = u;
+                        n_misses += 1;
+                    }
+                }
+            }
+
+            let n_workers = hctx.expert_slots.len().max(1);
+
+            let mut base_h = 0usize;
+            while base_h < n_hits {
+                let batch_h = (n_hits - base_h).min(hctx.expert_slots.len().max(1));
+                {
+                    let c_ref = hctx
+                        .nvme_caches
+                        .get(ip)
+                        .and_then(|ca| ca.as_ref())
+                        .expect("cache exists for hits");
+                    let ser_p = hctx.serial_pool;
+                    pool.parallel_for_each_mut(&mut hctx.expert_slots[..batch_h], |rel_h, ws| {
+                        let u = hits_u[base_h + rel_h];
+                        let e_id = uniq_exps[u];
+                        let mask = uniq_mask[u];
+                        let (gu_bytes, dn_bytes) = c_ref.get(e_id).expect("cached window hit");
+                        let mut m_cnt = 0usize;
+                        for tok_i in 0..window_len {
+                            if (mask[tok_i >> 6] & (1u64 << (tok_i & 63))) != 0 {
+                                ws.win_in_buf[m_cnt * n_embd..(m_cnt + 1) * n_embd]
+                                    .copy_from_slice(
+                                        &cur_normed_win[tok_i * n_embd..(tok_i + 1) * n_embd],
+                                    );
+                                m_cnt += 1;
+                            }
+                        }
+                        if float_act {
+                            matvec_batch_f32_unquant_act(
+                                ser_p,
+                                kt,
+                                *gate_up_dtype,
+                                gu_bytes,
+                                &ws.win_in_buf[..m_cnt * n_embd],
+                                m_cnt,
+                                &mut ws.mv_scratch,
+                                &mut ws.win_gate_up_buf[..m_cnt * 2 * n_ff],
+                                2 * n_ff,
+                                n_embd,
+                            );
+                        } else {
+                            matmul_f32(
+                                ser_p,
+                                kt,
+                                *gate_up_dtype,
+                                gu_bytes,
+                                &ws.win_in_buf[..m_cnt * n_embd],
+                                &mut ws.mv_scratch,
+                                &mut ws.win_gate_up_buf[..m_cnt * 2 * n_ff],
+                                2 * n_ff,
+                                n_embd,
+                                m_cnt,
+                            );
+                        }
+                        if let Some(sc) = gu_scales {
+                            let s_e = sc[e_id];
+                            for v in &mut ws.win_gate_up_buf[..m_cnt * 2 * n_ff] {
+                                *v *= s_e;
+                            }
+                        }
+                        for m in 0..m_cnt {
+                            let gu_m = &ws.win_gate_up_buf[m * 2 * n_ff..(m + 1) * 2 * n_ff];
+                            apply_situ_glu(
+                                &gu_m[..n_ff],
+                                &gu_m[n_ff..2 * n_ff],
+                                &mut ws.win_hidden_buf[m * n_ff..(m + 1) * n_ff],
+                                beta,
+                                lb,
+                            );
+                        }
+                        if float_act {
+                            matvec_batch_f32_unquant_act(
+                                ser_p,
+                                kt,
+                                *down_dtype,
+                                dn_bytes,
+                                &ws.win_hidden_buf[..m_cnt * n_ff],
+                                m_cnt,
+                                &mut ws.mv_scratch,
+                                &mut ws.out_buf[..m_cnt * n_embd],
+                                n_embd,
+                                n_ff,
+                            );
+                        } else {
+                            matmul_f32(
+                                ser_p,
+                                kt,
+                                *down_dtype,
+                                dn_bytes,
+                                &ws.win_hidden_buf[..m_cnt * n_ff],
+                                &mut ws.mv_scratch,
+                                &mut ws.out_buf[..m_cnt * n_embd],
+                                n_embd,
+                                n_ff,
+                                m_cnt,
+                            );
+                        }
+                        if let Some(sc) = dn_scales {
+                            let s_e = sc[e_id];
+                            for v in &mut ws.out_buf[..m_cnt * n_embd] {
+                                *v *= s_e;
+                            }
+                        }
+                    });
+                }
+                for rel_h in 0..batch_h {
+                    let u = hits_u[base_h + rel_h];
+                    let mask = uniq_mask[u];
+                    let kslots = &uniq_kslot[u];
+                    let ws = &hctx.expert_slots[rel_h];
+                    let mut m_idx = 0usize;
+                    for (tok_i, &ks) in kslots.iter().enumerate().take(window_len) {
+                        if (mask[tok_i >> 6] & (1u64 << (tok_i & 63))) == 0 {
+                            continue;
+                        }
+                        let dst_off = (tok_i * top_k + (ks as usize)) * n_embd;
+                        hctx.win_slot_outs[dst_off..dst_off + n_embd]
+                            .copy_from_slice(&ws.out_buf[m_idx * n_embd..(m_idx + 1) * n_embd]);
+                        m_idx += 1;
+                    }
+                }
+                base_h += batch_h;
+            }
+
+            let nvme_pool = if hctx.io_pool.num_threads() > pool.num_threads() {
+                hctx.io_pool
+            } else {
+                pool
+            };
+            let mut base_m = 0usize;
+            while base_m < n_misses {
+                let batch_m = (n_misses - base_m).min(n_workers).min(32);
+                let mut gu_pads = [0usize; 32];
+                let mut dn_pads = [0usize; 32];
+                for rel_m in 0..batch_m {
+                    let e_id = uniq_exps[misses_u[base_m + rel_m]];
+                    gu_pads[rel_m] =
+                        ((*gate_up_offset + (e_id * *gate_up_expert_bytes) as u64) & 4095) as usize;
+                    dn_pads[rel_m] =
+                        ((*down_offset + (e_id * *down_expert_bytes) as u64) & 4095) as usize;
+                }
+                {
+                    let ser_p = hctx.serial_pool;
+                    nvme_pool.parallel_for_each_mut(
+                        &mut hctx.expert_slots[..batch_m],
+                        |rel_m, ws| {
+                            let u = misses_u[base_m + rel_m];
+                            let e_id = uniq_exps[u];
+                            let mask = uniq_mask[u];
+                            let mut m_cnt = 0usize;
+                            for tok_i in 0..window_len {
+                                if (mask[tok_i >> 6] & (1u64 << (tok_i & 63))) != 0 {
+                                    ws.win_in_buf[m_cnt * n_embd..(m_cnt + 1) * n_embd]
+                                        .copy_from_slice(
+                                            &cur_normed_win[tok_i * n_embd..(tok_i + 1) * n_embd],
+                                        );
+                                    m_cnt += 1;
+                                }
+                            }
+                            let gu_off = *gate_up_offset + (e_id * *gate_up_expert_bytes) as u64;
+                            let gu_bytes = rdr
+                                .read_into_slot(gu_off, *gate_up_expert_bytes, &mut ws.slot)
+                                .expect("O_DIRECT window gate_up read failed");
+                            if float_act {
+                                matvec_batch_f32_unquant_act(
+                                    ser_p,
+                                    kt,
+                                    *gate_up_dtype,
+                                    gu_bytes,
+                                    &ws.win_in_buf[..m_cnt * n_embd],
+                                    m_cnt,
+                                    &mut ws.mv_scratch,
+                                    &mut ws.win_gate_up_buf[..m_cnt * 2 * n_ff],
+                                    2 * n_ff,
+                                    n_embd,
+                                );
+                            } else {
+                                matmul_f32(
+                                    ser_p,
+                                    kt,
+                                    *gate_up_dtype,
+                                    gu_bytes,
+                                    &ws.win_in_buf[..m_cnt * n_embd],
+                                    &mut ws.mv_scratch,
+                                    &mut ws.win_gate_up_buf[..m_cnt * 2 * n_ff],
+                                    2 * n_ff,
+                                    n_embd,
+                                    m_cnt,
+                                );
+                            }
+                            if let Some(sc) = gu_scales {
+                                let s_e = sc[e_id];
+                                for v in &mut ws.win_gate_up_buf[..m_cnt * 2 * n_ff] {
+                                    *v *= s_e;
+                                }
+                            }
+                            for m in 0..m_cnt {
+                                let gu_m = &ws.win_gate_up_buf[m * 2 * n_ff..(m + 1) * 2 * n_ff];
+                                apply_situ_glu(
+                                    &gu_m[..n_ff],
+                                    &gu_m[n_ff..2 * n_ff],
+                                    &mut ws.win_hidden_buf[m * n_ff..(m + 1) * n_ff],
+                                    beta,
+                                    lb,
+                                );
+                            }
+                            let dn_off = *down_offset + (e_id * *down_expert_bytes) as u64;
+                            let dn_bytes = rdr
+                                .read_into_slot(dn_off, *down_expert_bytes, &mut ws.dn_slot)
+                                .expect("O_DIRECT window down read failed");
+                            if float_act {
+                                matvec_batch_f32_unquant_act(
+                                    ser_p,
+                                    kt,
+                                    *down_dtype,
+                                    dn_bytes,
+                                    &ws.win_hidden_buf[..m_cnt * n_ff],
+                                    m_cnt,
+                                    &mut ws.mv_scratch,
+                                    &mut ws.out_buf[..m_cnt * n_embd],
+                                    n_embd,
+                                    n_ff,
+                                );
+                            } else {
+                                matmul_f32(
+                                    ser_p,
+                                    kt,
+                                    *down_dtype,
+                                    dn_bytes,
+                                    &ws.win_hidden_buf[..m_cnt * n_ff],
+                                    &mut ws.mv_scratch,
+                                    &mut ws.out_buf[..m_cnt * n_embd],
+                                    n_embd,
+                                    n_ff,
+                                    m_cnt,
+                                );
+                            }
+                            if let Some(sc) = dn_scales {
+                                let s_e = sc[e_id];
+                                for v in &mut ws.out_buf[..m_cnt * n_embd] {
+                                    *v *= s_e;
+                                }
+                            }
+                        },
+                    );
+                }
+                if let Some(cache) = hctx.nvme_caches.get_mut(ip).and_then(|ca| ca.as_mut()) {
+                    for rel_m in 0..batch_m {
+                        let e_id = uniq_exps[misses_u[base_m + rel_m]];
+                        let ws = &hctx.expert_slots[rel_m];
+                        let gu_b = ws.slot.subslice(gu_pads[rel_m], *gate_up_expert_bytes);
+                        let dn_b = ws.dn_slot.subslice(dn_pads[rel_m], *down_expert_bytes);
+                        cache.try_insert(e_id, gu_b, dn_b);
+                    }
+                }
+                for rel_m in 0..batch_m {
+                    let u = misses_u[base_m + rel_m];
+                    let mask = uniq_mask[u];
+                    let kslots = &uniq_kslot[u];
+                    let ws = &hctx.expert_slots[rel_m];
+                    let mut m_idx = 0usize;
+                    for (tok_i, &ks) in kslots.iter().enumerate().take(window_len) {
+                        if (mask[tok_i >> 6] & (1u64 << (tok_i & 63))) == 0 {
+                            continue;
+                        }
+                        let dst_off = (tok_i * top_k + (ks as usize)) * n_embd;
+                        hctx.win_slot_outs[dst_off..dst_off + n_embd]
+                            .copy_from_slice(&ws.out_buf[m_idx * n_embd..(m_idx + 1) * n_embd]);
+                        m_idx += 1;
+                    }
+                }
+                base_m += batch_m;
+            }
+        }
+
+        moe_out_win.fill(0.0);
+        for tok_i in 0..window_len {
+            let out_t = &mut moe_out_win[tok_i * n_embd..(tok_i + 1) * n_embd];
+            for k_idx in 0..top_k {
+                let w_e = top_weights_win[tok_i * top_k + k_idx];
+                if w_e == 0.0 {
+                    continue;
+                }
+                let slot_o = &hctx.win_slot_outs
+                    [(tok_i * top_k + k_idx) * n_embd..(tok_i * top_k + k_idx + 1) * n_embd];
+                for (m, &o) in out_t.iter_mut().zip(slot_o.iter()) {
+                    *m += w_e * o;
+                }
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3094,20 +4309,30 @@ impl<'a> Inkling2Model<'a> {
             &mut state.top_ids,
             &mut state.top_weights,
         );
-        self.eval_moe_experts_inner(
-            ip,
-            &state.wo_out[..n_embd],
-            &state.top_ids,
-            &state.top_weights,
-            pool,
-            Some(&state.io_pool),
-            &state.serial_pool,
-            kt,
-            &mut state.expert_slots,
-            &mut state.mv_scratch,
-            &mut state.moe_out,
-            false,
-        );
+        {
+            let mut hctx = HostMoeCtx {
+                io_pool: &state.io_pool,
+                coord_pool: &state.coord_pool,
+                serial_pool: &state.serial_pool,
+                expert_slots: &mut state.expert_slots,
+                seq_slot_a: &mut state.seq_slot_a,
+                seq_slot_b: &mut state.seq_slot_b,
+                nvme_caches: &mut state.nvme_caches,
+                mv_scratch: &mut state.mv_scratch,
+                win_slot_outs: &mut state.win_slot_outs,
+            };
+            self.eval_moe_experts_ctx(
+                ip,
+                &state.wo_out[..n_embd],
+                &state.top_ids,
+                &state.top_weights,
+                pool,
+                kt,
+                &mut hctx,
+                &mut state.moe_out,
+                false,
+            );
+        }
 
         {
             let conv_hist = shortconv_slice_mut(&mut state.layers[n_slots + il]);
@@ -4067,22 +5292,31 @@ impl<'a> Inkling2Model<'a> {
             );
         }
 
-        self.eval_moe_experts_window_inner(
-            ip,
-            w,
-            &state.win_wo_out[..w * n_embd],
-            &state.win_top_ids[..w * top_k],
-            &state.win_top_weights[..w * top_k],
-            pool,
-            Some(&state.io_pool),
-            &state.serial_pool,
-            kt,
-            &mut state.expert_slots,
-            &mut state.mv_scratch,
-            &mut state.win_slot_outs[..w * top_k * n_embd],
-            &mut state.win_moe_out[..w * n_embd],
-            false,
-        );
+        {
+            let mut hctx = HostMoeCtx {
+                io_pool: &state.io_pool,
+                coord_pool: &state.coord_pool,
+                serial_pool: &state.serial_pool,
+                expert_slots: &mut state.expert_slots,
+                seq_slot_a: &mut state.seq_slot_a,
+                seq_slot_b: &mut state.seq_slot_b,
+                nvme_caches: &mut state.nvme_caches,
+                mv_scratch: &mut state.mv_scratch,
+                win_slot_outs: &mut state.win_slot_outs[..w * top_k * n_embd],
+            };
+            self.eval_moe_experts_window_ctx(
+                ip,
+                w,
+                &state.win_wo_out[..w * n_embd],
+                &state.win_top_ids[..w * top_k],
+                &state.win_top_weights[..w * top_k],
+                pool,
+                kt,
+                &mut hctx,
+                &mut state.win_moe_out[..w * n_embd],
+                false,
+            );
+        }
 
         {
             let conv_hist = shortconv_slice_mut(&mut state.layers[n_slots + il]);
@@ -4762,20 +5996,30 @@ impl<'a> Inkling2Model<'a> {
         prof.moe_route_ns += t_rt.elapsed().as_nanos() as u64;
 
         let t_moe = Instant::now();
-        self.eval_moe_experts_inner(
-            ip,
-            &state.wo_out[..n_embd],
-            &state.top_ids,
-            &state.top_weights,
-            pool,
-            Some(&state.io_pool),
-            &state.serial_pool,
-            kt,
-            &mut state.expert_slots,
-            &mut state.mv_scratch,
-            &mut state.moe_out,
-            false,
-        );
+        {
+            let mut hctx = HostMoeCtx {
+                io_pool: &state.io_pool,
+                coord_pool: &state.coord_pool,
+                serial_pool: &state.serial_pool,
+                expert_slots: &mut state.expert_slots,
+                seq_slot_a: &mut state.seq_slot_a,
+                seq_slot_b: &mut state.seq_slot_b,
+                nvme_caches: &mut state.nvme_caches,
+                mv_scratch: &mut state.mv_scratch,
+                win_slot_outs: &mut state.win_slot_outs,
+            };
+            self.eval_moe_experts_ctx(
+                ip,
+                &state.wo_out[..n_embd],
+                &state.top_ids,
+                &state.top_weights,
+                pool,
+                kt,
+                &mut hctx,
+                &mut state.moe_out,
+                false,
+            );
+        }
         let moe_ns = t_moe.elapsed().as_nanos() as u64;
         let k_used = self.cfg.n_expert_used as u64;
         match &layer.experts {
@@ -4912,16 +6156,31 @@ impl Inkling2State {
             .max(2 * cfg.n_embd);
 
         let need_direct_slots = model.stats.nvme_direct_expert_layers > 0;
+        let mut max_gu_eb = 4096usize;
+        let mut max_dn_eb = 4096usize;
+        for lw in &model.layers {
+            if let ExpertLayerStore::NvmeDirect {
+                gate_up_expert_bytes,
+                down_expert_bytes,
+                ..
+            } = lw.experts
+            {
+                max_gu_eb = max_gu_eb.max(gate_up_expert_bytes);
+                max_dn_eb = max_dn_eb.max(down_expert_bytes);
+            }
+        }
         let slot_cap = if need_direct_slots {
             model.max_expert_chunk_bytes + 8192
         } else {
             4096
         };
+        let dn_slot_cap = if need_direct_slots { max_dn_eb } else { 4096 };
         let n_exp_slots = cfg.n_expert_used.max(8);
         let mut expert_slots = Vec::with_capacity(n_exp_slots);
         for _ in 0..n_exp_slots {
             expert_slots.push(ExpertWorkSlot {
                 slot: PageAlignedSlot::new(slot_cap),
+                dn_slot: PageAlignedSlot::new(dn_slot_cap),
                 mv_scratch: MatvecScratch::new(cfg.n_embd.max(cfg.n_ff_exp)),
                 gate_up_buf: vec![0.0; 2 * cfg.n_ff_exp],
                 hidden_buf: vec![0.0; cfg.n_ff_exp],
@@ -4929,8 +6188,47 @@ impl Inkling2State {
                 win_gate_up_buf: vec![0.0; MAX_INKLING2_WINDOW * 2 * cfg.n_ff_exp],
                 win_hidden_buf: vec![0.0; MAX_INKLING2_WINDOW * cfg.n_ff_exp],
                 out_buf: vec![0.0; MAX_INKLING2_WINDOW * cfg.n_embd],
+                chunk_hidden_buf: if need_direct_slots {
+                    vec![0.0; 2 * MAX_INKLING2_WINDOW * cfg.n_ff_exp]
+                } else {
+                    Vec::new()
+                },
+                chunk_out_buf: if need_direct_slots {
+                    vec![0.0; 2 * MAX_INKLING2_WINDOW * cfg.n_embd]
+                } else {
+                    Vec::new()
+                },
             });
         }
+        let (seq_slot_a, seq_slot_b, nvme_caches) = if need_direct_slots {
+            let sa = std::array::from_fn(|_| PageAlignedSlot::new(4 * max_gu_eb));
+            let sb = std::array::from_fn(|_| PageAlignedSlot::new(4 * max_dn_eb));
+            let c_slots = model.stats.nvme_cache_slots_per_layer;
+            let caches = model
+                .layers
+                .iter()
+                .map(|lw| match lw.experts {
+                    ExpertLayerStore::NvmeDirect {
+                        gate_up_expert_bytes,
+                        down_expert_bytes,
+                        ..
+                    } if c_slots > 0 => Some(NvmeLayerRamCache::new(
+                        cfg.n_expert,
+                        c_slots,
+                        gate_up_expert_bytes,
+                        down_expert_bytes,
+                    )),
+                    _ => None,
+                })
+                .collect();
+            (sa, sb, caches)
+        } else {
+            (
+                std::array::from_fn(|_| PageAlignedSlot::new(4096)),
+                std::array::from_fn(|_| PageAlignedSlot::new(4096)),
+                Vec::new(),
+            )
+        };
 
         Self {
             max_ctx,
@@ -4984,7 +6282,11 @@ impl Inkling2State {
             } else {
                 1
             }),
+            coord_pool: ThreadPool::new(if need_direct_slots { 2 } else { 1 }),
             expert_slots,
+            seq_slot_a,
+            seq_slot_b,
+            nvme_caches,
             win_slot_outs: vec![0.0; MAX_INKLING2_WINDOW * cfg.n_expert_used * cfg.n_embd],
             win_cur: vec![0.0; MAX_INKLING2_WINDOW * cfg.n_embd],
             win_inp_sa: vec![0.0; MAX_INKLING2_WINDOW * cfg.n_embd],
@@ -5019,16 +6321,31 @@ impl Inkling2State {
     pub fn new_host_moe_only(model: &Inkling2Model<'_>) -> Self {
         let cfg = &model.cfg;
         let need_direct_slots = model.stats.nvme_direct_expert_layers > 0;
+        let mut max_gu_eb = 4096usize;
+        let mut max_dn_eb = 4096usize;
+        for lw in &model.layers {
+            if let ExpertLayerStore::NvmeDirect {
+                gate_up_expert_bytes,
+                down_expert_bytes,
+                ..
+            } = lw.experts
+            {
+                max_gu_eb = max_gu_eb.max(gate_up_expert_bytes);
+                max_dn_eb = max_dn_eb.max(down_expert_bytes);
+            }
+        }
         let slot_cap = if need_direct_slots {
             model.max_expert_chunk_bytes + 8192
         } else {
             4096
         };
+        let dn_slot_cap = if need_direct_slots { max_dn_eb } else { 4096 };
         let n_exp_slots = cfg.n_expert_used.max(8);
         let mut expert_slots = Vec::with_capacity(n_exp_slots);
         for _ in 0..n_exp_slots {
             expert_slots.push(ExpertWorkSlot {
                 slot: PageAlignedSlot::new(slot_cap),
+                dn_slot: PageAlignedSlot::new(dn_slot_cap),
                 mv_scratch: MatvecScratch::new(cfg.n_embd.max(cfg.n_ff_exp)),
                 gate_up_buf: vec![0.0; 2 * cfg.n_ff_exp],
                 hidden_buf: vec![0.0; cfg.n_ff_exp],
@@ -5036,8 +6353,47 @@ impl Inkling2State {
                 win_gate_up_buf: vec![0.0; MAX_INKLING2_WINDOW * 2 * cfg.n_ff_exp],
                 win_hidden_buf: vec![0.0; MAX_INKLING2_WINDOW * cfg.n_ff_exp],
                 out_buf: vec![0.0; MAX_INKLING2_WINDOW * cfg.n_embd],
+                chunk_hidden_buf: if need_direct_slots {
+                    vec![0.0; 2 * MAX_INKLING2_WINDOW * cfg.n_ff_exp]
+                } else {
+                    Vec::new()
+                },
+                chunk_out_buf: if need_direct_slots {
+                    vec![0.0; 2 * MAX_INKLING2_WINDOW * cfg.n_embd]
+                } else {
+                    Vec::new()
+                },
             });
         }
+        let (seq_slot_a, seq_slot_b, nvme_caches) = if need_direct_slots {
+            let sa = std::array::from_fn(|_| PageAlignedSlot::new(4 * max_gu_eb));
+            let sb = std::array::from_fn(|_| PageAlignedSlot::new(4 * max_dn_eb));
+            let c_slots = model.stats.nvme_cache_slots_per_layer;
+            let caches = model
+                .layers
+                .iter()
+                .map(|lw| match lw.experts {
+                    ExpertLayerStore::NvmeDirect {
+                        gate_up_expert_bytes,
+                        down_expert_bytes,
+                        ..
+                    } if c_slots > 0 => Some(NvmeLayerRamCache::new(
+                        cfg.n_expert,
+                        c_slots,
+                        gate_up_expert_bytes,
+                        down_expert_bytes,
+                    )),
+                    _ => None,
+                })
+                .collect();
+            (sa, sb, caches)
+        } else {
+            (
+                std::array::from_fn(|_| PageAlignedSlot::new(4096)),
+                std::array::from_fn(|_| PageAlignedSlot::new(4096)),
+                Vec::new(),
+            )
+        };
         Self {
             max_ctx: 0,
             layers: Vec::new(),
@@ -5090,7 +6446,11 @@ impl Inkling2State {
             } else {
                 1
             }),
+            coord_pool: ThreadPool::new(if need_direct_slots { 2 } else { 1 }),
             expert_slots,
+            seq_slot_a,
+            seq_slot_b,
+            nvme_caches,
             win_slot_outs: vec![0.0; MAX_INKLING2_WINDOW * cfg.n_expert_used * cfg.n_embd],
             win_cur: Vec::new(),
             win_inp_sa: Vec::new(),
@@ -5124,6 +6484,9 @@ impl Inkling2State {
         for ls in &mut self.layers {
             ls.reset();
         }
+        for c in self.nvme_caches.iter_mut().flatten() {
+            c.reset();
+        }
     }
 
     pub fn logits(&self) -> &[f32] {
@@ -5132,6 +6495,20 @@ impl Inkling2State {
 
     pub fn mv_scratch_mut(&mut self) -> &mut MatvecScratch {
         &mut self.mv_scratch
+    }
+
+    pub fn host_moe_ctx_mut(&mut self) -> HostMoeCtx<'_> {
+        HostMoeCtx {
+            io_pool: &self.io_pool,
+            coord_pool: &self.coord_pool,
+            serial_pool: &self.serial_pool,
+            expert_slots: &mut self.expert_slots,
+            seq_slot_a: &mut self.seq_slot_a,
+            seq_slot_b: &mut self.seq_slot_b,
+            nvme_caches: &mut self.nvme_caches,
+            mv_scratch: &mut self.mv_scratch,
+            win_slot_outs: &mut self.win_slot_outs,
+        }
     }
 
     pub fn host_moe_parts_mut(

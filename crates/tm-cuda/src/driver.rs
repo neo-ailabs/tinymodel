@@ -40,6 +40,7 @@ const CU_DEVICE_ATTRIBUTE_MAX_PERSISTING_L2_CACHE_SIZE: c_int = 108;
 
 const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;
 const CU_MEMHOSTALLOC_DEVICEMAP: c_uint = 0x02;
+const CU_MEMHOSTREGISTER_DEVICEMAP: c_uint = 0x02;
 const CU_LIMIT_PERSISTING_L2_CACHE_SIZE: c_int = 0x06;
 const CU_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW: c_int = 1;
 const CU_ACCESS_PROPERTY_STREAMING: c_int = 1;
@@ -72,9 +73,12 @@ type FnCuMemAllocV2 = unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult;
 type FnCuMemFreeV2 = unsafe extern "C" fn(CUdeviceptr) -> CUresult;
 type FnCuMemHostAlloc = unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> CUresult;
 type FnCuMemFreeHost = unsafe extern "C" fn(*mut c_void) -> CUresult;
+type FnCuMemHostRegister = unsafe extern "C" fn(*mut c_void, usize, c_uint) -> CUresult;
+type FnCuMemHostUnregister = unsafe extern "C" fn(*mut c_void) -> CUresult;
 type FnCuMemHostGetDevicePointerV2 =
     unsafe extern "C" fn(*mut CUdeviceptr, *mut c_void, c_uint) -> CUresult;
 type FnCuMemsetD8V2 = unsafe extern "C" fn(CUdeviceptr, u8, usize) -> CUresult;
+type FnCuMemsetD8Async = unsafe extern "C" fn(CUdeviceptr, u8, usize, CUstream) -> CUresult;
 type FnCuMemcpyHtoDV2 = unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) -> CUresult;
 type FnCuMemcpyDtoHV2 = unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult;
 type FnCuMemcpyDtoDV2 = unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize) -> CUresult;
@@ -139,8 +143,11 @@ pub(crate) struct CudaDriver {
     pub cu_mem_free: FnCuMemFreeV2,
     pub cu_mem_host_alloc: Option<FnCuMemHostAlloc>,
     pub cu_mem_free_host: Option<FnCuMemFreeHost>,
+    pub cu_mem_host_register: Option<FnCuMemHostRegister>,
+    pub cu_mem_host_unregister: Option<FnCuMemHostUnregister>,
     pub cu_mem_host_get_device_pointer: Option<FnCuMemHostGetDevicePointerV2>,
     pub cu_memset_d8: FnCuMemsetD8V2,
+    pub cu_memset_d8_async: Option<FnCuMemsetD8Async>,
     #[allow(dead_code)]
     pub cu_memcpy_htod: FnCuMemcpyHtoDV2,
     #[allow(dead_code)]
@@ -229,10 +236,15 @@ impl CudaDriver {
                 cu_mem_free: load_sym(&lib, b"cuMemFree_v2\0")?,
                 cu_mem_host_alloc: load_sym(&lib, b"cuMemHostAlloc\0").ok(),
                 cu_mem_free_host: load_sym(&lib, b"cuMemFreeHost\0").ok(),
+                cu_mem_host_register: load_sym(&lib, b"cuMemHostRegister_v2\0")
+                    .or_else(|_| load_sym(&lib, b"cuMemHostRegister\0"))
+                    .ok(),
+                cu_mem_host_unregister: load_sym(&lib, b"cuMemHostUnregister\0").ok(),
                 cu_mem_host_get_device_pointer: load_sym(&lib, b"cuMemHostGetDevicePointer_v2\0")
                     .or_else(|_| load_sym(&lib, b"cuMemHostGetDevicePointer\0"))
                     .ok(),
                 cu_memset_d8: load_sym(&lib, b"cuMemsetD8_v2\0")?,
+                cu_memset_d8_async: load_sym(&lib, b"cuMemsetD8Async\0").ok(),
                 cu_memcpy_htod: load_sym(&lib, b"cuMemcpyHtoD_v2\0")?,
                 cu_memcpy_dtoh: load_sym(&lib, b"cuMemcpyDtoH_v2\0")?,
                 cu_memcpy_dtod: load_sym(&lib, b"cuMemcpyDtoD_v2\0")?,
@@ -720,6 +732,57 @@ impl CudaContext {
         })
     }
 
+    /// Registers an existing page-aligned host memory region (`HugePageBytes`) with
+    /// `CU_MEMHOSTREGISTER_DEVICEMAP` (`P1-2`), returning a zero-copy GPU `CUdeviceptr`
+    /// that shares the exact same physical DDR pages with CPU `AVX2` workers (`0` duplicate RAM!).
+    ///
+    /// # Safety
+    /// Caller must ensure `host_ptr .. host_ptr + bytes` remains valid and unmoved until the
+    /// returned [`CudaHostRegistered`] guard is dropped.
+    pub unsafe fn register_host_devicemap(
+        &self,
+        host_ptr: *mut u8,
+        bytes: usize,
+    ) -> Result<CudaHostRegistered, CudaError> {
+        if bytes == 0 || host_ptr.is_null() {
+            return Err(CudaError::InvalidDimensions(
+                "empty host buffer for cuMemHostRegister".into(),
+            ));
+        }
+        self.bind_current()?;
+        let (Some(reg_fn), Some(unreg_fn), Some(dev_ptr_fn)) = (
+            self.inner.drv.cu_mem_host_register,
+            self.inner.drv.cu_mem_host_unregister,
+            self.inner.drv.cu_mem_host_get_device_pointer,
+        ) else {
+            return Err(CudaError::DriverLoad(
+                "cuMemHostRegister/cuMemHostGetDevicePointer unavailable".into(),
+            ));
+        };
+        let raw_ptr = host_ptr.cast::<c_void>();
+        let mut ptr_dev: CUdeviceptr = 0;
+        // SAFETY: Caller guarantees `[host_ptr .. host_ptr + bytes)` is page-aligned and outlives `CudaHostRegistered`.
+        unsafe {
+            self.inner.drv.check(
+                "cuMemHostRegister_v2(DEVICEMAP)",
+                reg_fn(raw_ptr, bytes, CU_MEMHOSTREGISTER_DEVICEMAP),
+            )?;
+            if let Err(e) = self.inner.drv.check(
+                "cuMemHostGetDevicePointer_v2",
+                dev_ptr_fn(&mut ptr_dev, raw_ptr, 0),
+            ) {
+                let _ = unreg_fn(raw_ptr);
+                return Err(e);
+            }
+        }
+        Ok(CudaHostRegistered {
+            ctx: self.clone(),
+            host_ptr: raw_ptr,
+            dev_ptr: ptr_dev,
+            bytes,
+        })
+    }
+
     /// Best-effort Ampere/Ada/Hopper/Blackwell L2 persisting cache hint (`P1-3`) for hot weight ranges
     /// (e.g., MTP / DFly2 / DSpark draft trunk or shared experts). Safely no-ops on `sm_75` or restricted drivers.
     pub fn pin_l2_persisting(&self, base_ptr: CUdeviceptr, num_bytes: usize) {
@@ -1123,6 +1186,70 @@ impl CudaBuffer {
             )
         }
     }
+
+    /// True asynchronous D2H DMA copy into page-locked `CudaPinnedBuffer` (`P1-2`).
+    pub fn copy_to_pinned_async(
+        &self,
+        src_offset: usize,
+        pinned: &mut CudaPinnedBuffer,
+        dst_offset: usize,
+        byte_len: usize,
+    ) -> Result<(), CudaError> {
+        if byte_len == 0 {
+            return Ok(());
+        }
+        if src_offset.saturating_add(byte_len) > self.bytes
+            || dst_offset.saturating_add(byte_len) > pinned.bytes
+        {
+            return Err(CudaError::InvalidDimensions(
+                "pinned D2H async copy out of bounds".into(),
+            ));
+        }
+        self.ctx.bind_current()?;
+        // SAFETY: `pinned.ptr + dst_offset` is page-locked (`cuMemHostAlloc`) and valid for `byte_len` bytes.
+        unsafe {
+            self.ctx.inner.drv.check(
+                "cuMemcpyDtoHAsync_v2",
+                (self.ctx.inner.drv.cu_memcpy_dtoh_async)(
+                    pinned.ptr.add(dst_offset).cast::<c_void>(),
+                    self.ptr + src_offset as u64,
+                    byte_len,
+                    self.ctx.inner.stream,
+                ),
+            )
+        }
+    }
+
+    /// Stream-ordered zero-fill of `[0 .. byte_len)` inside `self`.
+    pub fn zero_prefix(&self, byte_len: usize) -> Result<(), CudaError> {
+        if byte_len == 0 {
+            return Ok(());
+        }
+        if byte_len > self.bytes {
+            return Err(CudaError::InvalidDimensions(
+                "zero_prefix exceeds buffer size".into(),
+            ));
+        }
+        self.ctx.bind_current()?;
+        // SAFETY: Valid `self.ptr` and `byte_len <= self.bytes`; stream-ordered on `self.ctx.inner.stream`.
+        unsafe {
+            if let Some(ms_async) = self.ctx.inner.drv.cu_memset_d8_async {
+                self.ctx.inner.drv.check(
+                    "cuMemsetD8Async",
+                    ms_async(self.ptr, 0, byte_len, self.ctx.inner.stream),
+                )
+            } else {
+                self.ctx.inner.drv.check(
+                    "cuStreamSynchronize",
+                    (self.ctx.inner.drv.cu_stream_synchronize)(self.ctx.inner.stream),
+                )?;
+                self.ctx.inner.drv.check(
+                    "cuMemsetD8_v2",
+                    (self.ctx.inner.drv.cu_memset_d8)(self.ptr, 0, byte_len),
+                )
+            }
+        }
+    }
 }
 
 impl Drop for CudaBuffer {
@@ -1192,6 +1319,20 @@ impl CudaPinnedBuffer {
     }
 
     #[inline]
+    pub fn as_f32_slice(&self, len_f32: usize) -> &[f32] {
+        assert!(len_f32 * 4 <= self.bytes && (self.ptr as usize).is_multiple_of(4));
+        // SAFETY: `cuMemHostAlloc` returns >= 256B-aligned page-locked memory; `len_f32 * 4 <= self.bytes`.
+        unsafe { core::slice::from_raw_parts(self.ptr.cast::<f32>(), len_f32) }
+    }
+
+    #[inline]
+    pub fn as_u32_slice(&self, len_u32: usize) -> &[u32] {
+        assert!(len_u32 * 4 <= self.bytes && (self.ptr as usize).is_multiple_of(4));
+        // SAFETY: `cuMemHostAlloc` returns >= 256B-aligned page-locked memory; `len_u32 * 4 <= self.bytes`.
+        unsafe { core::slice::from_raw_parts(self.ptr.cast::<u32>(), len_u32) }
+    }
+
+    #[inline]
     pub fn as_f32_slice_mut(&mut self, len_f32: usize) -> &mut [f32] {
         assert!(len_f32 * 4 <= self.bytes && (self.ptr as usize).is_multiple_of(4));
         // SAFETY: `cuMemHostAlloc` returns >= 256B-aligned page-locked memory; `len_f32 * 4 <= self.bytes`.
@@ -1242,6 +1383,46 @@ impl Drop for CudaPinnedBuffer {
                 let _ = (self.ctx.inner.drv.cu_stream_synchronize)(self.ctx.inner.stream);
                 if let Some(free_fn) = self.ctx.inner.drv.cu_mem_free_host {
                     let _ = free_fn(self.ptr.cast::<c_void>());
+                }
+            }
+        }
+    }
+}
+
+/// RAII guard for external host memory registered with `cuMemHostRegister_v2(CU_MEMHOSTREGISTER_DEVICEMAP)`.
+pub struct CudaHostRegistered {
+    ctx: CudaContext,
+    host_ptr: *mut c_void,
+    dev_ptr: CUdeviceptr,
+    bytes: usize,
+}
+
+// SAFETY: Device-mapped host registration is valid across threads within the CUDA primary context.
+unsafe impl Send for CudaHostRegistered {}
+// SAFETY: Shared references only read `dev_ptr` / `bytes`.
+unsafe impl Sync for CudaHostRegistered {}
+
+impl CudaHostRegistered {
+    #[inline]
+    pub fn device_ptr(&self) -> CUdeviceptr {
+        self.dev_ptr
+    }
+
+    #[inline]
+    pub fn byte_len(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for CudaHostRegistered {
+    fn drop(&mut self) {
+        if !self.host_ptr.is_null() {
+            // SAFETY: Synchronize stream before unregistering mapped host pages.
+            unsafe {
+                let _ = (self.ctx.inner.drv.cu_ctx_set_current)(self.ctx.inner.ctx);
+                let _ = (self.ctx.inner.drv.cu_stream_synchronize)(self.ctx.inner.stream);
+                if let Some(unreg) = self.ctx.inner.drv.cu_mem_host_unregister {
+                    let _ = unreg(self.host_ptr);
                 }
             }
         }
